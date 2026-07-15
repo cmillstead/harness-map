@@ -654,7 +654,30 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
     }
 
 
-def build_headline(always_loaded, hooks_section):
+# Reused CONSTANT — canonical origin: skills/coding-team/hooks/hook-health-check.py:177-204
+# check_instruction_file_lengths (threshold 200, "case study #24"). This collector
+# REIMPLEMENTS the scan harness-wide (that function is coding-team-scoped). Keep the
+# constant in sync; do NOT introduce a divergent threshold.
+INSTRUCTION_LINE_LIMIT = 200
+
+
+def flag_long_instructions(root):
+    flags = []
+    for pattern in ("rules/*.md", "skills/*/SKILL.md", "skills/*/*/SKILL.md",
+                     "skills/*/phases/*.md", "skills/*/prompts/*.md", "skills/*/agents/*.md",
+                     "commands/*.md", "agents/*.md"):
+        for fp in root.glob(pattern):
+            text, evidence = _read_text(fp)
+            if text is None:
+                continue
+            n = len(text.splitlines())
+            if n > INSTRUCTION_LINE_LIMIT:
+                flags.append({"path": _rel(root, fp), "lines": n,
+                              "threshold": INSTRUCTION_LINE_LIMIT, "evidence": evidence})
+    return flags
+
+
+def build_headline(always_loaded, hooks_section, instruction_length_flags):
     totals = always_loaded["totals"]
     return {
         "always_loaded_words": totals["words"],
@@ -662,7 +685,7 @@ def build_headline(always_loaded, hooks_section):
         "always_loaded_file_count": totals["file_count"],
         "duplicate_pair_count": 0,
         "unchecked_binary_count": 0,
-        "instruction_files_over_200": 0,
+        "instruction_files_over_200": len(instruction_length_flags),
         "orphan_registration_count": len(hooks_section["orphan_registrations"]),
         "orphan_script_count": len(hooks_section["orphan_scripts"]),
     }
@@ -691,6 +714,7 @@ def build_document(root, project_root):
     hooks_section = reconcile_hooks(root, settings, inaccessible, blind_spots)
     permissions_section = collect_permissions(settings, settings_parsed_ok)
     config_section = collect_config(root, settings, settings_parsed_ok, blind_spots)
+    instruction_length_flags = flag_long_instructions(root)
 
     totals = {
         "words": sum(f["words"] for f in files),
@@ -716,7 +740,7 @@ def build_document(root, project_root):
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "root": str(root),
-        "headline": build_headline(always_loaded, hooks_section),
+        "headline": build_headline(always_loaded, hooks_section, instruction_length_flags),
         "always_loaded": always_loaded,
         "on_demand": on_demand,
         "enforcement": {
@@ -724,7 +748,7 @@ def build_document(root, project_root):
             "permissions": permissions_section,
         },
         "config": config_section,
-        "instruction_length_flags": [],
+        "instruction_length_flags": instruction_length_flags,
         "duplication": {"shingle_k": 8, "metric": "containment", "threshold": 0.6, "pairs": []},
         "phantom_refs": [],
         "promotion_candidates": [],

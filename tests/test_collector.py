@@ -344,3 +344,38 @@ def test_absent_settings_is_not_an_error(fake_harness):
     (fake_harness / "settings.json").unlink()
     doc = run_collector(fake_harness)
     assert not any("settings.json" in e for e in doc["errors"])  # absent != malformed
+
+def test_long_instruction_file_flagged(fake_harness):
+    (fake_harness / "commands" / "big.md").write_text("\n".join(f"line {i}" for i in range(250)))
+    doc = run_collector(fake_harness)
+    flagged = {f["path"] for f in doc["instruction_length_flags"]}
+    assert any("commands/big.md" in p for p in flagged)
+    row = next(f for f in doc["instruction_length_flags"] if "commands/big.md" in f["path"])
+    assert row["threshold"] == 200 and row["lines"] >= 250
+
+def test_short_instruction_file_not_flagged(fake_harness):
+    doc = run_collector(fake_harness)
+    assert all("agents/demo-agent.md" not in f["path"] for f in doc["instruction_length_flags"])
+
+def test_skill_internal_phase_over_200_is_length_flagged(fake_harness):
+    big = fake_harness / "skills" / "coding-team" / "phases"
+    big.mkdir(parents=True, exist_ok=True)
+    (big / "big.md").write_text("\n".join(f"line {i}" for i in range(230)))
+    doc = run_collector(fake_harness)
+    flagged = {f["path"] for f in doc["instruction_length_flags"]}
+    assert any("skills/coding-team/phases/big.md" in p for p in flagged)
+
+# EM addition — pins the skills/*/agents/*.md glob I added below:
+def test_skill_internal_agent_over_200_is_length_flagged(fake_harness):
+    adir = fake_harness / "skills" / "coding-team" / "agents"
+    adir.mkdir(parents=True, exist_ok=True)
+    (adir / "big-agent.md").write_text("\n".join(f"line {i}" for i in range(210)))
+    doc = run_collector(fake_harness)
+    assert any("skills/coding-team/agents/big-agent.md" in f["path"] for f in doc["instruction_length_flags"])
+
+# EM addition — pins the headline wiring:
+def test_headline_instruction_files_over_200_matches(fake_harness):
+    (fake_harness / "commands" / "big.md").write_text("\n".join(f"line {i}" for i in range(250)))
+    doc = run_collector(fake_harness)
+    assert doc["headline"]["instruction_files_over_200"] == len(doc["instruction_length_flags"])
+    assert doc["headline"]["instruction_files_over_200"] >= 1
