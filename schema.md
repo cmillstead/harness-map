@@ -30,7 +30,7 @@ Top-level keys are ALL present on every run. When a category has no data, its ar
     "orphan_registration_count": 0, "orphan_script_count": 0
   },
   "always_loaded": {
-    "files": [{"path": "rel", "category": "claude_md|project_claude_md|memory|rule|coding_team_rule",
+    "files": [{"path": "rel", "category": "claude_md|project_claude_md|memory|rule|coding_team_rule|skill_rule",
                "words": 0, "lines": 0, "tokens_est": 0, "evidence": "VERIFIED|INACCESSIBLE"}],
     "conditional_variants": [{"path": "rel", "project_slug": "", "words": 0, "lines": 0,
                               "tokens_est": 0, "evidence": "VERIFIED"}],
@@ -80,7 +80,7 @@ Top-level keys are ALL present on every run. When a category has no data, its ar
 ### Field notes
 
 - **`headline`** — an eight-number rollup used as the diff unit between runs (see Note 3 below). Every field is a plain count, computed from the other sections.
-- **`always_loaded`** — everything paid for on every conversation turn regardless of whether the skill/rule is invoked: root and project `CLAUDE.md` files, memory files, `rules/*.md`, coding-team rules, plus the *description* text of every skill and agent (their bodies are NOT always-loaded — only the frontmatter description shown in the picker). `conditional_variants` covers per-project `CLAUDE.md` variants that load only when that project is the cwd.
+- **`always_loaded`** — everything paid for on every conversation turn regardless of whether the skill/rule is invoked: root and project `CLAUDE.md` files, memory files, `rules/*.md`, coding-team rules, plus the *description* text of every skill and agent (their bodies are NOT always-loaded — only the frontmatter description shown in the picker). `conditional_variants` covers per-project `CLAUDE.md` variants that load only when that project is the cwd. The rule scan is generalized to `skills/*/rules/*.md` (any sub-skill's rules dir), scanned AFTER `rules/*.md` so a rule reachable via both a `rules/` deploy symlink and a sub-skill source is deduped by physical identity and counted once under `rules/` (category `rule`). A sub-skill's own rule files carry category `coding_team_rule` when the sub-skill is `coding-team` (retained for baseline continuity) and `skill_rule` for every other sub-skill. Hook test detection is likewise generalized to `hooks/tests` + `skills/*/hooks/tests`.
 - **`on_demand`** — content that loads only when a skill/agent is actually invoked: skill `SKILL.md` files, their internal `phases/`, `prompts/`, `agents/` bodies, and memory file bodies (as opposed to the memory index entry, which is always-loaded).
 - **`enforcement.hooks`** — see Note 3 (registration vs target status) below; this is the section that distinction governs.
 - **`config`** — a snapshot of `settings.json` / `.claude.json`-level configuration. `env_keys` is names only (see Note 2). `evidence` at the `config` level covers whether `settings.json` itself was readable.
