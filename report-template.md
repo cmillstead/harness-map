@@ -10,7 +10,7 @@ The collector's 8 headline fields, verbatim:
 - Always-loaded estimated tokens: {always_loaded_tokens_est}
 - Always-loaded file count: {always_loaded_file_count}
 - Duplicate-pair count: {duplicate_pair_count}
-- Unchecked-binary count (binary files that couldn't be word-counted): {unchecked_binary_count}
+- Unchecked-binary count: {unchecked_binary_count} — reserved; always 0 in v1 — no binary scan is performed (the walk reads only `.md`/`.py`/`.sh` via `errors='replace'`); do NOT read this 0 as "clean."
 - Instruction-files-over-200 count: {instruction_files_over_200}
 - Orphan-registration count: {orphan_registration_count}
 - Orphan-script count: {orphan_script_count}
@@ -74,7 +74,7 @@ Separate from the headline block above — derived from `promotion_candidates` w
 
 ## 5. Blind Spots
 
-Full INACCESSIBLE list plus these standing v1 disclosures (verbatim, every report):
+Full INACCESSIBLE list plus these standing v1 disclosures (verbatim, every report). The collector's `errors[]` MUST also render here — never omit it; a non-empty `errors[]` rendered nowhere produces a falsely-clean report, contradicting the "inaccessible ≠ clean" invariant:
 
 - Per-project `CLAUDE.md` weight NOT collected — always-loaded weight is UNDERCOUNTED.
 - Staleness = phantom-refs only; git-age correlation + retired-tool-rule detection deferred to v2.
@@ -83,6 +83,12 @@ Full INACCESSIBLE list plus these standing v1 disclosures (verbatim, every repor
 | Path | Reason |
 |---|---|
 | {path} | {reason} |
+
+### Collector Errors
+
+Runtime anomalies the collector itself hit (malformed/unreadable settings.json, glob failures, crash fallback) — render the full list, or "none":
+
+- {errors[]} (or "none")
 
 ## 6. Diff vs Previous Run
 

@@ -13,6 +13,7 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -513,12 +514,16 @@ def parse_settings(root, errors, blind_spots):
     (always_loaded, hooks, duplication, phantom_refs, ...), because `headline` is the
     run-to-run diff unit and a one-file settings problem must never fabricate a false
     "everything vanished" diff:
-    - Genuinely ABSENT (FileNotFoundError): the common, expected case — nothing wrong.
-      Silent: ({}, False) plus a blind_spot note, no errors[] entry.
+    - Genuinely ABSENT (FileNotFoundError, and settings_path is NOT a symlink): the
+      common, expected case — nothing wrong. Silent: ({}, False) plus a blind_spot note,
+      no errors[] entry.
     - PRESENT but unreadable-as-a-file (any other OSError — IsADirectoryError,
-      PermissionError, ELOOP — or JSONDecodeError): a real anomaly, symmetric handling
-      for both branches — record a descriptive errors[] entry and return ({}, False) so
-      the run continues with config evidence INACCESSIBLE, same as the absent case,
+      PermissionError, ELOOP — or JSONDecodeError; OR a FileNotFoundError where
+      settings_path IS a symlink, i.e. a PRESENT-but-BROKEN symlink whose target does
+      not exist — is_symlink() is True even for a dangling target, so this is
+      distinguished from genuine absence): a real anomaly, symmetric handling across all
+      these cases — record a descriptive errors[] entry and return ({}, False) so the
+      run continues with config evidence INACCESSIBLE, same shape as the absent case,
       just LOUD instead of silent. (main()'s top-level `except Exception` guard remains
       a defense-in-depth backstop for anything unanticipated; it no longer has an
       organic trigger via settings.json specifically — the intended, more robust
@@ -527,6 +532,9 @@ def parse_settings(root, errors, blind_spots):
     try:
         text = settings_path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
+        if settings_path.is_symlink():
+            errors.append("settings.json is a broken symlink (target does not exist)")
+            return {}, False
         blind_spots.append("settings.json not found; permissions/config/hooks reflect defaults.")
         return {}, False
     except OSError as e:
@@ -1300,12 +1308,48 @@ def main(argv=None):
     except Exception as exc:  # noqa: BLE001 — collector must always emit a FULL-key valid envelope
         doc = _empty_document(root)
         doc["errors"].append(f"collector crashed: {exc!r}")
+    # Serialize defensively: a lone UTF-16 surrogate (e.g. surviving json.loads out of a
+    # crafted settings.json — Python allows lone surrogates in str) is unencodable as
+    # UTF-8 under ensure_ascii=False. Force-detect it HERE (encode, discard the bytes) so
+    # the always-valid-JSON-envelope invariant holds even at print()/write_text() time,
+    # which sits OUTSIDE the build_document try/except above — a fallback to
+    # ensure_ascii=True (which escapes the surrogate back to \ud800 safely) never fails.
     text = json.dumps(doc, indent=args.indent, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except (UnicodeEncodeError, TypeError):
+        text = json.dumps(doc, indent=args.indent, ensure_ascii=True)
     if out_path is not None:
+        # Re-validate IMMEDIATELY before writing (narrows the TOCTOU window between the
+        # earlier check and this write — the residual window between THIS check and the
+        # mkstemp call below is an accepted, documented low-risk limitation for a
+        # single-user local tool; not fully closed). Write hard-link-safely: an
+        # outside-root HARD LINK whose inode is also linked under --root passes
+        # resolve()-based path checks (hard links are invisible to path resolution), so a
+        # naive write_text() would truncate that shared inode — a read-only bypass.
+        # Writing to a temp file in the SAME directory, then os.replace()-ing it onto
+        # out_path, only ever retargets the out-path NAME at a fresh inode; any
+        # under-root hard-linked inode keeps its original, untouched content.
+        tmp_name = None
         try:
-            out_path.write_text(text, encoding="utf-8")
+            resolved_recheck = out_path.resolve()
+            if resolved_recheck == root or root in resolved_recheck.parents:
+                raise OSError("--out resolved inside --root at write time (TOCTOU)")
+            fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, out_path)
+            tmp_name = None
         except OSError as exc:
             print(f"warning: could not write --out: {exc}", file=sys.stderr)
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
     print(text)  # stdout is the primary contract — always emit the built document, write-or-not
     return 0
 

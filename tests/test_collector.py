@@ -726,6 +726,52 @@ def test_permission_denied_settings_degrades_not_catastrophically(fake_harness):
     assert doc["config"]["evidence"] == "INACCESSIBLE"
     assert doc["always_loaded"]["totals"]["file_count"] > 0
 
+def test_surrogate_in_settings_json_still_emits_valid_json(fake_harness):
+    # A1: a lone UTF-16 surrogate in settings.json survives json.loads (Python allows it
+    # in str) but crashes json.dumps(..., ensure_ascii=False) + UTF-8 encode downstream
+    # (print/write). main() must still emit VALID JSON on stdout — never nothing.
+    # Force STRICT stdout encoding (Python's true default) rather than inheriting this
+    # shell's PYTHONIOENCODING=...:backslashreplace override, which would otherwise mask
+    # the crash and make this test pass regardless of the fix.
+    (fake_harness / "settings.json").write_text(
+        json.dumps({"hooks": {}, "permissions": {"allow": [], "deny": []},
+                    "model": "\ud800", "enabledPlugins": {}}))
+    env = dict(os.environ, PYTHONIOENCODING="utf-8:strict")
+    proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness)],
+                          capture_output=True, text=True, timeout=30, env=env)
+    assert proc.returncode == 0, proc.stderr
+    json.loads(proc.stdout)  # must parse as valid JSON, not raise
+
+def test_broken_settings_symlink_degrades_loudly_not_silently(fake_harness):
+    # A2: a PRESENT-but-broken symlink at settings.json also raises FileNotFoundError on
+    # read (same as genuinely absent) — but it's present-but-unreadable, so it must be
+    # LOUD (errors[]), not silently treated as absent.
+    settings_path = fake_harness / "settings.json"
+    settings_path.unlink()
+    settings_path.symlink_to(fake_harness / "does-not-exist.json")
+    doc = run_collector(fake_harness)
+    assert doc["errors"], "expected an errors[] entry for the broken settings.json symlink"
+    assert doc["config"]["evidence"] == "INACCESSIBLE"
+    assert doc["always_loaded"]["totals"]["file_count"] > 0
+
+def test_out_hard_link_to_under_root_file_does_not_truncate_it(fake_harness, tmp_path):
+    # A3: an outside-root HARD LINK whose inode is also linked under --root passes the
+    # resolve()-based --out guard (hard links are invisible to path resolution), so a
+    # naive write_text() would truncate the shared inode — a read-only bypass. The fix
+    # writes via a temp file + os.replace, which only ever retargets the OUT-PATH NAME,
+    # never the canary's original inode.
+    if not hasattr(os, "link"):
+        pytest.skip("os.link unavailable on this platform")
+    canary = fake_harness / "canary.txt"
+    canary_content = "canary content — must survive\n"
+    canary.write_text(canary_content)
+    out_dir = tmp_path / "out-dir"
+    out_dir.mkdir()
+    linked_out = out_dir / "out.json"
+    os.link(canary, linked_out)
+    run_collector(fake_harness, "--out", str(linked_out))
+    assert canary.read_text() == canary_content, "read-only invariant violated: canary was overwritten"
+
 def test_env_values_never_leak_and_config_keys_are_exact(fake_harness):
     # F9: unique sentinel value per env key; NONE may appear; config has EXACTLY the allowed field set.
     sentinels = {"K_ALPHA": "VAL_ALPHA_9f3", "K_BRAVO": "VAL_BRAVO_7c1"}

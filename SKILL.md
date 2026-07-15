@@ -35,17 +35,17 @@ Long is not the same as bad; repeated wording is not automatically redundant. Pr
 
 ## Workflow
 
-Step A — Run the collector with the Bash tool, writing the sidecar DIRECTLY from the collector: `python3 ~/.claude/skills/harness-map/collector.py --root ~/.claude --out ~/Documents/obsidian-vault/AI/output/harness-map-YYYY-MM-DD.json`. It is a plain `python3` script — NO model needed to execute it. It emits JSON to stdout AND writes the sidecar; it reads only. The sidecar is the collector's output BYTE-FOR-BYTE — NEVER have the model re-serialize the JSON (a re-render can drift and would break the diff-vs-previous rule below).
+Step A — Run the collector with the Bash tool, writing the sidecar DIRECTLY from the collector: `python3 ~/.claude/skills/harness-map/collector.py --root ~/.claude --project-root ~/.claude --out ~/Documents/obsidian-vault/AI/output/harness-map-YYYY-MM-DD.json`. Pin `--project-root` to the harness itself so the D7 diff is cwd-stable — `--project-root` defaults to the invoking shell's cwd, and an unpinned run from a product repo vs from `~/.claude` would fabricate headline deltas that are cwd artifacts, not real drift. It is a plain `python3` script — NO model needed to execute it. It emits JSON to stdout AND writes the sidecar; it reads only. The sidecar is the collector's output BYTE-FOR-BYTE — NEVER have the model re-serialize the JSON (a re-render can drift and would break the diff-vs-previous rule below).
 
 Step B — Synthesis (this is the skill's model work): consume the collector JSON from stdout, read `~/.claude/skills/harness-map/report-template.md` AND `~/.claude/skills/harness-map/schema.md` by ABSOLUTE path with the Read tool (never cwd-relative), then write the report with the Write tool to `~/Documents/obsidian-vault/AI/output/harness-map-YYYY-MM-DD.md`. The report `.md` plus the collector-written sidecar `.json` are the ONLY two outputs, both in the vault output dir — NEVER write inside `~/.claude`.
 
 ## Report Contract — 6 Sections
 
-1. **Headline numbers** — always-loaded words, estimated tokens, file count, duplicate-pair count, unchecked-binary count, instruction-files-over-200 count, orphan-registration count, orphan-script count.
+1. **Headline numbers** — always-loaded words, estimated tokens, file count, duplicate-pair count, unchecked-binary count (reserved; always 0 in v1 — no binary scan is performed, the walk reads only `.md`/`.py`/`.sh` via `errors='replace'`; do NOT read this 0 as "clean"), instruction-files-over-200 count, orphan-registration count, orphan-script count.
 2. **System map** — always-loaded / on-demand / enforcement, each row carrying its evidence label (VERIFIED / INFERRED / INACCESSIBLE).
 3. **CIVC coverage matrix** — gaps stated explicitly, never omitted.
 4. **Numbered drag candidates** — each tagged with EXACTLY ONE outcome from `keep / give it one home / load it later / turn it into a check / probation / retire safely`, each with evidence, what-must-survive, and risk-if-wrong.
-5. **Blind Spots** — the full INACCESSIBLE list plus standing not-statically-collectable disclosures.
+5. **Blind Spots** — the full INACCESSIBLE list plus standing not-statically-collectable disclosures. The collector's `errors[]` (runtime anomalies: malformed/unreadable settings.json, glob failures, crash fallback) MUST also render here — a non-empty `errors[]` rendered nowhere produces a falsely-clean report, contradicting the inaccessible≠clean invariant above; NEVER omit it.
 6. **Diff vs previous run** — see the Diff rule below.
 
 ## CIVC Matrix
