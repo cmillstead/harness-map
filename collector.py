@@ -129,6 +129,10 @@ def _script_from_command(command, root):
         return None, f"no script token in hook command: {command[:80]}"
     raw = Path(token)
     if str(raw).startswith("~"):
+        # Registered commands literally read "~/.claude/hooks/...": remap that literal
+        # ~-path onto `root / "hooks"` (not the real home dir) so a non-default --root
+        # (and every fixture in these tests) reconciles against the actual registered
+        # hook path instead of the real, unrelated $HOME.
         expanded = raw.expanduser()
         try:
             return (root / "hooks") / expanded.relative_to(Path("~/.claude/hooks").expanduser()), None
@@ -179,7 +183,12 @@ def _iter_hook_commands(settings):
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            for h in entry.get("hooks", []):
+            # `entry.get("hooks", [])` only substitutes the default when the key is ABSENT —
+            # an explicit "hooks": null yields None, and `for h in None` raises TypeError.
+            entry_hooks = entry.get("hooks", [])
+            if not isinstance(entry_hooks, list):
+                continue
+            for h in entry_hooks:
                 if isinstance(h, dict) and h.get("type") == "command" and isinstance(h.get("command"), str):
                     yield h["command"]
 
@@ -446,10 +455,14 @@ def parse_settings(root, errors):
     if evidence == "INACCESSIBLE" or text is None:
         return {}, False
     try:
-        return json.loads(text), True
+        parsed = json.loads(text)
     except json.JSONDecodeError as e:
         errors.append(f"failed to parse settings.json: {e}")
         return {}, False
+    if not isinstance(parsed, dict):
+        errors.append("settings.json is not a JSON object; treated as empty.")
+        return {}, False
+    return parsed, True
 
 
 def collect_permissions(settings, parsed_ok):
@@ -479,6 +492,9 @@ def _read_json_name_list(path, key, blind_spots):
     except json.JSONDecodeError:
         blind_spots.append(f"{path.name} exists but is not valid JSON; treated as empty.")
         return [], 0
+    if not isinstance(data, dict):
+        blind_spots.append(f"{path.name} is not a JSON object; ignored.")
+        return [], 0
     entries = data.get(key, {})
     names = sorted(entries.keys()) if isinstance(entries, dict) else []
     return names, len(names)
@@ -498,11 +514,17 @@ def collect_config(root, settings, parsed_ok, blind_spots):
     installed_plugins, installed_plugin_count = _read_json_name_list(
         root / "plugins" / "installed_plugins.json", "installed", blind_spots)
 
+    # The live settings.json shape is a nested object ({"sandbox": {"enabled": bool, ...}}),
+    # NOT a bare bool — bool(non-empty dict) is always True, so a naive bool(settings.get(...))
+    # reports sandboxing ON even when "enabled" is explicitly False. Read the nested flag.
+    _sandbox_raw = settings.get("sandbox")
+    sandbox = bool(_sandbox_raw.get("enabled", False)) if isinstance(_sandbox_raw, dict) else bool(_sandbox_raw)
+
     return {
         "env_keys": env_keys, "env_key_count": len(env_keys),
         "model": settings.get("model"),
         "cleanup_period_days": settings.get("cleanupPeriodDays", 0),
-        "sandbox": bool(settings.get("sandbox")),
+        "sandbox": sandbox,
         "enabled_plugins": enabled_plugins, "plugin_count": len(enabled_plugins),
         "marketplaces": marketplaces, "marketplace_count": marketplace_count,
         "installed_plugins": installed_plugins, "installed_plugin_count": installed_plugin_count,
@@ -536,10 +558,9 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
                 "registration_evidence": "VERIFIED",
             })
             continue
-        except PermissionError:
-            inaccessible.append({"path": _rel_safe(root, script_path), "reason": "unreadable"})
-            continue
         except OSError:
+            # PermissionError is an OSError subclass, so this catches it too — a
+            # permission-denied target is inaccessible, never an orphan (schema.md Note 3).
             inaccessible.append({"path": _rel_safe(root, script_path), "reason": "unreadable"})
             continue
         direct_registered_names.add(script_path.name)
@@ -571,10 +592,13 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
             continue
         try:
             literals = _dispatcher_string_literals(text)
-        except SyntaxError:
+        except (SyntaxError, RecursionError) as e:
+            # A dispatcher's source is untrusted, scanned DATA — a malformed or pathologically
+            # nested file (e.g. RecursionError from deep AST nesting) must never crash the
+            # collector. Fall back to a best-effort line scan instead.
             blind_spots.append(
-                f"{disp.name}: not valid Python (SyntaxError) — fell back to a line scan for "
-                "quoted script names, which may over- or under-count reachability.")
+                f"{disp.name}: not valid Python ({type(e).__name__}) — fell back to a line "
+                "scan for quoted script names, which may over- or under-count reachability.")
             literals = _fallback_scan_dispatcher_literals(text, disk_names)
         for lit in literals:
             base = Path(lit).name

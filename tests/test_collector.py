@@ -290,3 +290,57 @@ def test_hook_symlink_target_outside_root_is_noted(fake_harness, tmp_path):
     (fake_harness / "settings.json").write_text(json.dumps({"hooks": {}}))
     doc = run_collector(fake_harness)
     assert any("linked.py" in b and "outside" in b for b in doc["blind_spots"])
+
+def test_sandbox_nested_disabled_reports_false(fake_harness):
+    import json as _j
+    s = _j.loads((fake_harness / "settings.json").read_text())
+    s["sandbox"] = {"enabled": False, "autoAllowBashIfSandboxed": True}
+    (fake_harness / "settings.json").write_text(_j.dumps(s))
+    doc = run_collector(fake_harness)
+    assert doc["config"]["sandbox"] is False
+
+def test_non_dict_settings_survives(fake_harness):
+    (fake_harness / "settings.json").write_text("null")  # valid JSON, not an object
+    doc = run_collector(fake_harness)  # run_collector asserts returncode 0 + parses stdout
+    assert doc["schema_version"] == 1
+    assert any("settings.json is not a JSON object" in e for e in doc["errors"])
+
+def test_null_hooks_value_survives(fake_harness):
+    (fake_harness / "settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": None}]}}))
+    doc = run_collector(fake_harness)
+    assert doc["schema_version"] == 1  # did not crash on `for h in None`
+
+def test_non_dict_plugins_json_survives(fake_harness):
+    (fake_harness / "plugins" / "installed_plugins.json").write_text("[]")  # array, not object
+    doc = run_collector(fake_harness)
+    assert doc["config"]["installed_plugins"] == [] and doc["config"]["installed_plugin_count"] == 0
+
+def test_dispatcher_syntaxerror_falls_back(fake_harness):
+    hooks = fake_harness / "hooks"
+    (hooks / "session-start-dispatcher.py").write_text("CHECKS = ['reached.py'\ndef (:\n")  # invalid Python
+    (hooks / "reached.py").write_text("# reached via fallback scanner\n")
+    (fake_harness / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [
+        {"hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/session-start-dispatcher.py"}]}]}}))
+    doc = run_collector(fake_harness)
+    assert "reached.py" not in {o["name"] for o in doc["enforcement"]["hooks"]["orphan_scripts"]}
+    assert any("fallback" in b.lower() or "syntax" in b.lower() for b in doc["blind_spots"])
+
+def test_headline_reflects_orphan_counts(fake_harness):
+    hooks = fake_harness / "hooks"
+    (hooks / "orphan_a.py").write_text("# nobody\n")
+    (hooks / "orphan_b.sh").write_text("# nobody\n")
+    (fake_harness / "settings.json").write_text(json.dumps({"hooks": {}}))
+    doc = run_collector(fake_harness)
+    assert doc["headline"]["orphan_script_count"] == len(doc["enforcement"]["hooks"]["orphan_scripts"])
+    assert doc["headline"]["orphan_script_count"] >= 2
+
+def test_malformed_plugins_json_noted_not_crashed(fake_harness):
+    (fake_harness / "plugins" / "known_marketplaces.json").write_text("{ bad json")
+    doc = run_collector(fake_harness)
+    assert doc["config"]["marketplaces"] == [] and doc["config"]["marketplace_count"] == 0
+    assert any("known_marketplaces" in b for b in doc["blind_spots"])
+
+def test_absent_settings_is_not_an_error(fake_harness):
+    (fake_harness / "settings.json").unlink()
+    doc = run_collector(fake_harness)
+    assert not any("settings.json" in e for e in doc["errors"])  # absent != malformed
