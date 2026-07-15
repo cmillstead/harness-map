@@ -527,11 +527,14 @@ def test_promotion_candidate_hook_covered_true_when_hook_mentions_keyword(fake_h
     assert covered
 
 def test_prose_generic_never_clause_not_hook_covered(fake_harness):
-    # A plain-prose NEVER clause naming no specific enforcement target (no snake_case
-    # symbol, path, or filename) must NOT be marked hook_covered, even though generic
-    # words like "commit"/"secrets" may appear somewhere in a hook body.
-    (fake_harness / "rules" / "a.md").write_text("NEVER commit secrets to the repo.")
-    (fake_harness / "hooks" / "x.py").write_text("# do commit checks on secrets here\n")
+    # Regression pin for the _hook_covered degeneracy: a plain-prose NEVER clause whose
+    # only shared word with the hook corpus is a generic English word (here "escalate" —
+    # deliberately NOT in _HOOK_COVERED_STOPWORDS, and containing no _ / / . specificity
+    # marker). Pre-fix this returned hook_covered=True (any 4-char word leaked); the
+    # specificity gate must now return False. If this ever flips back to True, the gate
+    # has regressed.
+    (fake_harness / "rules" / "a.md").write_text("NEVER escalate beyond the request.")
+    (fake_harness / "hooks" / "x.py").write_text("# logic that may escalate on failure\n")
     doc = run_collector(fake_harness)
     never = [c for c in doc["promotion_candidates"] if c["pattern"] == "NEVER"]
     assert never and all(c["hook_covered"] is False for c in never)
