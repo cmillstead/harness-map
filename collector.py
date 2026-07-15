@@ -970,16 +970,25 @@ def _excerpt_around(text, start, end, radius=60):
 
 
 def _hook_covered(excerpt, trigger_text, hooks_corpus_lower):
-    """Best-effort cross-reference: does any non-trigger, non-stopword identifier (>=4
-    chars) from the excerpt appear in the hooks corpus (hook script bodies + registered
-    settings.json commands)? A hit means synthesis should propose EXTENDING that existing
-    hook rather than proposing a new one — this collector only surfaces the raw signal."""
+    """Best-effort cross-reference: does any SPECIFIC token from the excerpt — a
+    snake_case identifier (contains `_`), or a path/filename (contains `/` or `.`) —
+    appear in the hooks corpus (hook script bodies + registered settings.json commands)?
+    Plain English words never qualify, even if >=4 chars and absent from the stopword
+    list: against a corpus the size of the whole harness, common words leak through and
+    make the signal meaningless, so only tokens that plausibly NAME a real enforcement
+    target (a symbol, path, or filename) are considered. A hit means synthesis should
+    propose EXTENDING that existing hook rather than proposing a new one — this
+    collector only surfaces the raw signal."""
     if not hooks_corpus_lower:
         return False
     trigger_lower = trigger_text.lower()
-    for w in re.findall(r"[a-zA-Z_]{4,}", excerpt):
+    tokens = set(re.findall(r"[a-zA-Z_]{4,}", excerpt))
+    tokens.update(re.findall(r"[A-Za-z0-9_]+(?:[./][A-Za-z0-9_-]+)+", excerpt))
+    for w in tokens:
         wl = w.lower()
         if wl == trigger_lower or wl in _HOOK_COVERED_STOPWORDS:
+            continue
+        if not ("_" in wl or "/" in wl or "." in wl):
             continue
         if wl in hooks_corpus_lower:
             return True
