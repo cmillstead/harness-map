@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import pytest
@@ -17,8 +18,6 @@ def run_collector(root, *args, project_root=None):
     return json.loads(proc.stdout)
 
 def _active_slug(fake_harness):
-    import os
-    import re
     proj = fake_harness.parent / "active-repo"
     return proj, re.sub(r"[/.]", "-", os.path.abspath(str(proj)))
 
@@ -113,3 +112,22 @@ def test_empty_harness_does_not_crash(tmp_path):
     doc = run_collector(root)
     assert doc["always_loaded"]["totals"]["file_count"] == 0
     assert doc["schema_version"] == 1
+
+def test_out_write_failure_still_emits_stdout(fake_harness, tmp_path):
+    missing = tmp_path / "nonexistent-dir" / "out.json"  # parent dir does not exist
+    doc = run_collector(fake_harness, "--out", str(missing))  # run_collector asserts returncode 0 + parses stdout
+    assert doc["schema_version"] == 1
+    assert not missing.exists()  # write failed, but stdout was preserved and exit stayed 0
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_unreadable_project_dir_does_not_blank_inventory(fake_harness):
+    locked = fake_harness / "projects" / "locked-proj-slug" / "memory"
+    locked.mkdir(parents=True)
+    (locked / "MEMORY.md").write_text("# locked\n")
+    os.chmod(locked, 0)
+    try:
+        doc = run_collector(fake_harness)
+        assert doc["always_loaded"]["totals"]["file_count"] >= 3  # NOT blanked to the fallback
+        assert any("locked-proj-slug" in i["path"] for i in doc["inaccessible"])
+    finally:
+        os.chmod(locked, 0o755)

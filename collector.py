@@ -54,11 +54,26 @@ def _rel(root, p):
     return str(Path(p).relative_to(root))
 
 
+def _project_slug(project_root):
+    """CC per-project memory dir name: abspath with every '/' and '.' replaced by '-'."""
+    return re.sub(r"[/.]", "-", os.path.abspath(str(project_root)))
+
+
 def _read_text(path):
     try:
         return path.read_text(encoding="utf-8", errors="replace"), "VERIFIED"
     except OSError:
         return None, "INACCESSIBLE"
+
+
+def _safe_exists(path):
+    """Path.exists()/is_symlink() can raise PermissionError etc. (they only swallow ENOENT/
+    ENOTDIR). Treat any OSError as 'cannot determine' so one locked dir marks just that entry
+    inaccessible instead of blanking the whole inventory. Returns (present, ok)."""
+    try:
+        return (path.exists() or path.is_symlink()), True
+    except OSError:
+        return False, False
 
 
 def _metrics(text):
@@ -67,12 +82,21 @@ def _metrics(text):
     return words, lines, round(words * 1.3)
 
 
-def _file_entry(root, path, category, inaccessible, rel_root=None):
-    """Read one file and build a schema `files[]`/`memory_bodies[]`-style entry.
-    On OSError, append to `inaccessible` and return None."""
+def _read_checked(root, path, inaccessible, rel_root=None):
+    """Read text; on INACCESSIBLE append to inaccessible[] and return None. Preserves the
+    exact inaccessible-append behavior the call sites previously inlined."""
     text, evidence = _read_text(path)
     if evidence == "INACCESSIBLE":
         inaccessible.append({"path": _rel(rel_root or root, path), "reason": "unreadable"})
+        return None
+    return text
+
+
+def _file_entry(root, path, category, inaccessible, rel_root=None):
+    """Read one file and build a schema `files[]`/`memory_bodies[]`-style entry.
+    On OSError, append to `inaccessible` and return None."""
+    text = _read_checked(root, path, inaccessible, rel_root=rel_root)
+    if text is None:
         return None
     words, lines, tokens_est = _metrics(text)
     return {
@@ -81,7 +105,7 @@ def _file_entry(root, path, category, inaccessible, rel_root=None):
         "words": words,
         "lines": lines,
         "tokens_est": tokens_est,
-        "evidence": evidence,
+        "evidence": "VERIFIED",
     }
 
 
@@ -93,25 +117,35 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
     conditional_variants = []
 
     root_claude = root / "CLAUDE.md"
-    if root_claude.exists() or root_claude.is_symlink():
+    present, ok = _safe_exists(root_claude)
+    if not ok:
+        inaccessible.append({"path": _rel(root, root_claude), "reason": "unreadable"})
+    elif present:
         entry = _file_entry(root, root_claude, "claude_md", inaccessible)
         if entry:
             files.append(entry)
 
     active_slug = None
     if project_root is not None:
-        active_slug = re.sub(r"[/.]", "-", os.path.abspath(str(project_root)))
+        active_slug = _project_slug(project_root)
         # Only count this project's CLAUDE.md if the project is registered under this
         # harness root's projects/<slug>/memory/ — otherwise --project-root defaulting to
         # an unrelated cwd would leak an unrelated CLAUDE.md into an unrelated --root's count.
         if (root / "projects" / active_slug / "memory").is_dir():
             proj_claude = Path(project_root) / "CLAUDE.md"
-            if proj_claude.exists() or proj_claude.is_symlink():
+            present, ok = _safe_exists(proj_claude)
+            if not ok:
+                inaccessible.append({"path": _rel(project_root, proj_claude), "reason": "unreadable"})
+            elif present:
                 entry = _file_entry(root, proj_claude, "project_claude_md", inaccessible,
                                      rel_root=project_root)
                 if entry:
                     files.append(entry)
 
+    # Deliberately single-level: iterdir()/glob("*.md") only, no recursion — so there is no
+    # walk to follow symlinks through. A symlinked skill/rule DIR is followed and reported
+    # under its harness-relative name by design. Recursive, symlink-loop-prone trees (hooks/)
+    # are handled in Task 3 with explicit name+target recording instead of a body read.
     projects_dir = root / "projects"
     if projects_dir.is_dir():
         try:
@@ -120,7 +154,13 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
             slug_dirs = []
         for slug_dir in slug_dirs:
             idx = slug_dir / "memory" / "MEMORY.md"
-            if not (idx.exists() or idx.is_symlink()):
+            present, ok = _safe_exists(idx)
+            if not ok:
+                # A single locked slug dir is marked inaccessible; the loop continues so one
+                # bad project does not blank the rest of the inventory.
+                inaccessible.append({"path": _rel(root, idx), "reason": "unreadable"})
+                continue
+            if not present:
                 continue
             slug = slug_dir.name
             if slug == active_slug:
@@ -128,9 +168,8 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
                 if entry:
                     files.append(entry)
             else:
-                text, evidence = _read_text(idx)
-                if evidence == "INACCESSIBLE":
-                    inaccessible.append({"path": _rel(root, idx), "reason": "unreadable"})
+                text = _read_checked(root, idx, inaccessible)
+                if text is None:
                     continue
                 words, lines, tokens_est = _metrics(text)
                 conditional_variants.append({
@@ -139,17 +178,21 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
                     "words": words,
                     "lines": lines,
                     "tokens_est": tokens_est,
-                    "evidence": evidence,
+                    "evidence": "VERIFIED",
                 })
 
     # Note (comment per task spec): root ~/.claude/MEMORY.md does NOT exist in the live
     # harness — only the memory/ stub directory. We still count memory/MEMORY.md when present.
     stub = root / "memory" / "MEMORY.md"
-    if stub.exists() or stub.is_symlink():
+    present, ok = _safe_exists(stub)
+    if not ok:
+        inaccessible.append({"path": _rel(root, stub), "reason": "unreadable"})
+    elif present:
         entry = _file_entry(root, stub, "memory", inaccessible)
         if entry:
             files.append(entry)
 
+    # Deliberately single-level: glob("*.md") only, no recursion into subdirectories.
     for pattern, category in ((root / "rules", "rule"), (root / "skills" / "coding-team" / "rules", "coding_team_rule")):
         if not pattern.is_dir():
             continue
@@ -171,6 +214,9 @@ def collect_descriptions(root, inaccessible):
     skill_descriptions = []
     agent_descriptions = []
 
+    # Deliberately single-level: iterdir()/glob("*.md") only, no recursion — so there is no
+    # walk to follow symlinks through. A symlinked skill DIR is followed and reported under
+    # its harness-relative name by design.
     skills_dir = root / "skills"
     if skills_dir.is_dir():
         try:
@@ -179,15 +225,14 @@ def collect_descriptions(root, inaccessible):
             skill_dirs = []
         for skill_dir in skill_dirs:
             skill_md = skill_dir / "SKILL.md"
-            try:
-                if not skill_md.exists():
-                    continue
-            except OSError:
+            present, ok = _safe_exists(skill_md)
+            if not ok:
                 inaccessible.append({"path": _rel(root, skill_md), "reason": "unreadable"})
                 continue
-            text, evidence = _read_text(skill_md)
-            if evidence == "INACCESSIBLE":
-                inaccessible.append({"path": _rel(root, skill_md), "reason": "unreadable"})
+            if not present:
+                continue
+            text = _read_checked(root, skill_md, inaccessible)
+            if text is None:
                 continue
             desc = _frontmatter_description(text)
             skill_descriptions.append({
@@ -203,9 +248,8 @@ def collect_descriptions(root, inaccessible):
         except OSError:
             agent_files = []
         for f in agent_files:
-            text, evidence = _read_text(f)
-            if evidence == "INACCESSIBLE":
-                inaccessible.append({"path": _rel(root, f), "reason": "unreadable"})
+            text = _read_checked(root, f, inaccessible)
+            if text is None:
                 continue
             desc = _frontmatter_description(text)
             agent_descriptions.append({
@@ -224,6 +268,9 @@ def collect_on_demand(root, project_root, inaccessible):
     skill_internal_bodies = []
     memory_bodies = []
 
+    # Deliberately single-level: iterdir()/glob("*.md") only, no recursion — so there is no
+    # walk to follow symlinks through. A symlinked skill DIR is followed and reported under
+    # its harness-relative name by design.
     skills_dir = root / "skills"
     if skills_dir.is_dir():
         try:
@@ -233,19 +280,14 @@ def collect_on_demand(root, project_root, inaccessible):
         for skill_dir in skill_dirs:
             name = skill_dir.name
             skill_md = skill_dir / "SKILL.md"
-            try:
-                exists = skill_md.exists()
-            except OSError:
-                exists = None
-            if exists is None:
+            present, ok = _safe_exists(skill_md)
+            if not ok:
                 inaccessible.append({"path": _rel(root, skill_md), "reason": "unreadable"})
                 continue
             has_test = (skill_dir / "tests").is_dir()
-            if exists:
-                text, evidence = _read_text(skill_md)
-                if evidence == "INACCESSIBLE":
-                    inaccessible.append({"path": _rel(root, skill_md), "reason": "unreadable"})
-                else:
+            if present:
+                text = _read_checked(root, skill_md, inaccessible)
+                if text is not None:
                     words, lines, _ = _metrics(text)
                     skills.append({
                         "name": name,
@@ -264,9 +306,8 @@ def collect_on_demand(root, project_root, inaccessible):
                 except OSError:
                     body_files = []
                 for f in body_files:
-                    text, evidence = _read_text(f)
-                    if evidence == "INACCESSIBLE":
-                        inaccessible.append({"path": _rel(root, f), "reason": "unreadable"})
+                    text = _read_checked(root, f, inaccessible)
+                    if text is None:
                         continue
                     words, lines, _ = _metrics(text)
                     skill_internal_bodies.append({
@@ -279,7 +320,7 @@ def collect_on_demand(root, project_root, inaccessible):
                     })
 
     if project_root is not None:
-        active_slug = re.sub(r"[/.]", "-", os.path.abspath(str(project_root)))
+        active_slug = _project_slug(project_root)
         mem_dir = root / "projects" / active_slug / "memory"
         if mem_dir.is_dir():
             try:
@@ -289,9 +330,8 @@ def collect_on_demand(root, project_root, inaccessible):
             for f in mem_files:
                 if f.name == "MEMORY.md":
                     continue
-                text, evidence = _read_text(f)
-                if evidence == "INACCESSIBLE":
-                    inaccessible.append({"path": _rel(root, f), "reason": "unreadable"})
+                text = _read_checked(root, f, inaccessible)
+                if text is None:
                     continue
                 words, lines, _ = _metrics(text)
                 memory_bodies.append({
@@ -437,14 +477,17 @@ def main():
         }
 
     text = json.dumps(doc, indent=args.indent)
+    print(text)  # stdout is the primary contract — always emit the built document first
     if args.out:
-        out_path = Path(args.out).resolve()
-        root_path = Path(args.root).resolve()
-        if root_path in out_path.parents or out_path == root_path:
-            print(json.dumps({"error": "--out must be outside --root (read-only invariant)"}), file=sys.stderr)
-            sys.exit(1)
-        out_path.write_text(text, encoding="utf-8")
-    print(text)
+        try:
+            out_path = Path(args.out).resolve()
+            root_path = Path(args.root).resolve()
+            if root_path in out_path.parents or out_path == root_path:
+                print(json.dumps({"error": "--out must be outside --root (read-only invariant)"}), file=sys.stderr)
+            else:
+                out_path.write_text(text, encoding="utf-8")
+        except (OSError, ValueError) as e:
+            print(json.dumps({"error": f"--out write failed: {type(e).__name__}: {e}"}), file=sys.stderr)
 
 
 if __name__ == "__main__":
