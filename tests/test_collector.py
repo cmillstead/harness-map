@@ -882,4 +882,121 @@ def test_blind_spots_rule_scope_is_generalized(fake_harness):
     # not the coding-team-only path, so the released report is accurate on any harness.
     doc = run_collector(fake_harness)
     assert any("skills/*/rules" in b for b in doc["blind_spots"])
+
+
+# ---------------------------------------------------------------------------
+# Consolidated fix round (FIX A-H)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_out_bad_root_still_emits_envelope_and_skips_sidecar(tmp_path):
+    # FIX A [HARDEN HIGH]: a nonexistent/inaccessible --root must not crash before the
+    # crash-safe envelope is built when --out is ALSO given (os.stat(root) in the upfront
+    # --out guard was unguarded). The always-valid-JSON-envelope invariant must hold: exit
+    # 0, valid JSON on stdout, and the sidecar is skipped (nothing safe to validate --out
+    # against) rather than the process raising an unhandled traceback / exiting 2.
+    missing_root = tmp_path / "does-not-exist"
+    out_file = tmp_path / "o.json"
+    proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(missing_root),
+                           "--out", str(out_file)], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)  # must parse as valid, full-key JSON
+    assert doc["schema_version"] == 1
+    assert not out_file.exists(), "sidecar must NOT be written when --root is inaccessible"
+    assert "not accessible" in proc.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_always_loaded_skills_root_inaccessible_records_error_not_crash(tmp_path):
+    # FIX B [HARDEN MED + QA LOW]: skills_root.is_dir() in walk_always_loaded and in
+    # _hook_test_stems must not propagate an uncaught OSError (Path.is_dir() re-raises
+    # PermissionError, unlike ENOENT/ENOTDIR/ELOOP which it swallows) — both call sites are
+    # wrapped and disclose an errors[] entry instead. Isolated via a REAL filesystem
+    # permission failure (a symlink whose target's PARENT dir is chmod 000 — no mock): this
+    # makes is_dir() on root/"skills" raise EACCES without touching root's own permission
+    # bits, which would otherwise also trip unrelated (pre-existing, out-of-scope)
+    # unguarded is_dir() calls elsewhere in the collector (e.g. collect_descriptions) and
+    # obscure which guard is under test. The two target functions are called directly
+    # (not via the full CLI/build_document pipeline) for the same isolation reason.
+    root = tmp_path / "claude"
+    hidden = tmp_path / "hidden-skills-target"
+    (root / "rules").mkdir(parents=True)
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (root / "skills").symlink_to(hidden / "skills")  # resolving this raises EACCES
+    try:
+        errors_walk = []
+        files, _variants = _collector.walk_always_loaded(root, None, [], errors_walk)
+        errors_hook = []
+        stems = _collector._hook_test_stems(root, errors_hook)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert any("skills is_dir failed" in e for e in errors_walk), errors_walk
+    assert any("skills is_dir failed" in e for e in errors_hook), errors_hook
+    assert files == []
+    assert stems == set()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_always_loaded_rules_dir_inaccessible_records_error_not_crash(tmp_path):
+    # FIX C [HARDEN LOW]: the rule_dirs consumption loop's `rules_dir.is_dir()` must not
+    # propagate an uncaught OSError either — same mechanism as FIX B, now exercised on
+    # root/"rules" (the first entry in rule_dirs) via the same real-filesystem technique.
+    root = tmp_path / "claude"
+    hidden = tmp_path / "hidden-rules-target"
+    root.mkdir(parents=True)
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (root / "rules").symlink_to(hidden / "rules")
+    try:
+        errors = []
+        files, _variants = _collector.walk_always_loaded(root, None, [], errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert any("rules is_dir failed" in e for e in errors), errors
+    assert files == []
+
+
+def test_headline_over200_flags_subskill_rules_file(fake_harness):
+    # FIX D [QA MED]: flag_long_instructions must scan skills/*/rules/*.md too (previously
+    # only 3 of the 4 rule scans were generalized), so a >200-line sub-skill rules file
+    # actually surfaces in instruction_length_flags / the instruction_files_over_200 band.
+    other_rules = fake_harness / "skills" / "otherskill" / "rules"
+    other_rules.mkdir(parents=True, exist_ok=True)
+    (other_rules / "long.md").write_text("\n".join(f"line {i}" for i in range(230)))
+    doc = run_collector(fake_harness)
+    flagged = {f["path"] for f in doc["instruction_length_flags"]}
+    assert "skills/otherskill/rules/long.md" in flagged
+
+
+def test_hook_disk_files_dedups_single_sort_matches_prior_ordering(fake_harness):
+    # FIX G [SIMPLIFY LOW]: collapsing the double-sort in _hook_disk_files to a single
+    # name-keyed sort must preserve the exact ordering behavior (name-sorted across BOTH
+    # .py and .sh extensions together), not just avoid a crash.
+    hooks = fake_harness / "hooks"
+    (hooks / "b_hook.sh").write_text("# b\n")
+    (hooks / "a_hook.py").write_text("# a\n")
+    (hooks / "c_hook.py").write_text("# c\n")
+    names = [p.name for p in _collector._hook_disk_files(fake_harness)]
+    assert names == sorted(names)
+
+
+def test_headline_snapshot_matches_fixture(fake_harness):
+    # FIX H [QA MED — drift guard]: a FIXTURE-based (not live-~/.claude) headline snapshot,
+    # deterministic and small, so a future change to any of the 4 generalized scan
+    # functions (walk_always_loaded, scan_duplication, _staleness_corpus,
+    # flag_long_instructions) that alters output shape is caught by the suite instead of
+    # only by the separate live-harness regression diff (which is flaky as the real
+    # harness evolves).
+    doc = run_collector(fake_harness)
+    assert doc["headline"] == {
+        "always_loaded_words": 134,
+        "always_loaded_tokens_est": 175,
+        "always_loaded_file_count": 5,
+        "duplicate_pair_count": 0,
+        "unchecked_binary_count": 0,
+        "instruction_files_over_200": 0,
+        "orphan_registration_count": 0,
+        "orphan_script_count": 0,
+    }
     assert not any("skills/coding-team/rules/*.md reflects" in b for b in doc["blind_spots"])

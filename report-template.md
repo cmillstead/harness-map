@@ -126,7 +126,7 @@ Compared against `harness-map-{prior-date}.json`:
 | Always-loaded tokens (est) | {prior} | {current} | {delta} |
 | File count | {prior} | {current} | {delta} |
 | Duplicate-pair count | {prior} | {current} | {delta} |
-| Length-flag count | {prior} | {current} | {delta} |
+| Instruction-files-over-200 | {prior} | {current} | {delta} |
 | Orphan-registration count | {prior} | {current} | {delta} |
 | Orphan-script count | {prior} | {current} | {delta} |
 

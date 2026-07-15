@@ -378,7 +378,12 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
     # (baseline continuity), every other sub-skill's rules get "skill_rule".
     rule_dirs = [(root / "rules", "rule")]
     skills_root = root / "skills"
-    if skills_root.is_dir():
+    try:
+        skills_root_is_dir = skills_root.is_dir()
+    except OSError as e:
+        errors.append(f"skills is_dir failed for {skills_root}: {e}")
+        skills_root_is_dir = False
+    if skills_root_is_dir:
         try:
             sub_skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
         except OSError as e:
@@ -395,7 +400,11 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
                 category = "coding_team_rule" if skill_dir.name == "coding-team" else "skill_rule"
                 rule_dirs.append((sub_rules, category))
     for rules_dir, category in rule_dirs:
-        if not rules_dir.is_dir():
+        try:
+            if not rules_dir.is_dir():
+                continue
+        except OSError as e:
+            errors.append(f"rules is_dir failed for {rules_dir}: {e}")
             continue
         try:
             names = sorted(rules_dir.glob("*.md"))
@@ -668,10 +677,10 @@ def _hook_disk_files(root):
     guarded + sorted listing before diverging into their own downstream logic."""
     hooks_dir = root / "hooks"
     try:
-        disk_files = sorted(hooks_dir.glob("*.py")) + sorted(hooks_dir.glob("*.sh"))
+        disk_files = sorted(list(hooks_dir.glob("*.py")) + list(hooks_dir.glob("*.sh")),
+                             key=lambda p: p.name)
     except OSError:
         return []
-    disk_files.sort(key=lambda p: p.name)
     return disk_files
 
 
@@ -805,7 +814,11 @@ def flag_long_instructions(root):
     # you'd actually edit to shorten the file) is seen first and reported; the deploy-symlink
     # duplicate is skipped.
     seen = set()
-    for pattern in ("rules/*.md", "skills/*/SKILL.md", "skills/*/*/SKILL.md",
+    # skills/*/rules/*.md generalizes the coding-team-only rules scan (release portability,
+    # matching walk_always_loaded/scan_duplication/_staleness_corpus); listed right after
+    # rules/*.md so a physically-symlinked rule is seen/reported under its rules/*.md path
+    # first, same precedence as those three scans.
+    for pattern in ("rules/*.md", "skills/*/rules/*.md", "skills/*/SKILL.md", "skills/*/*/SKILL.md",
                      "skills/*/phases/*.md", "skills/*/prompts/*.md", "skills/*/agents/*.md",
                      "commands/*.md", "agents/*.md"):
         for fp in root.glob(pattern):
@@ -1099,18 +1112,25 @@ def collect_promotion_candidates(root, corpus_files, settings):
     return candidates
 
 
-def _hook_test_stems(root):
+def _hook_test_stems(root, errors):
     """Normalized (snake_case) stems named by test files under hooks/tests/ and
-    skills/coding-team/hooks/tests/ — "test_guard.py" and "guard_test.py" both yield
-    "guard". Read-only, single-level glob per dir (no recursion needed: hook tests live
-    directly in these two known locations)."""
+    skills/*/hooks/tests/ (generalized from the coding-team-only scope for release
+    portability) — "test_guard.py" and "guard_test.py" both yield "guard". Read-only,
+    single-level glob per dir (no recursion needed: hook tests live directly in these
+    known locations). `errors` is the shared build_document errors[] list — an
+    inaccessible ancestor is disclosed there rather than silently swallowed."""
     stems = set()
     # Generalized skills/coding-team/hooks/tests -> skills/*/hooks/tests for release portability.
     # `stems` is a set, so union order is irrelevant; baseline-stable because coding-team is the
     # only sub-skill with a hooks/tests dir on this harness.
     test_dirs = [root / "hooks" / "tests"]
     skills_root = root / "skills"
-    if skills_root.is_dir():
+    try:
+        skills_root_is_dir = skills_root.is_dir()
+    except OSError as e:
+        errors.append(f"skills is_dir failed for {skills_root}: {e}")
+        skills_root_is_dir = False
+    if skills_root_is_dir:
         try:
             skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
         except OSError:
@@ -1142,13 +1162,13 @@ def _hook_test_stems(root):
     return stems
 
 
-def _detect_hook_test_coverage(root):
+def _detect_hook_test_coverage(root, errors):
     """PRESENCE-only signal: does a hook script have a matching test file? NOT adequacy —
     a hooks/tests/test_x.py with a single trivial assertion counts as covered, same as a
     thorough suite (the "6 of 66" reality). Symlinked hooks are deduped by physical
     identity so one script counts once even if reachable via multiple glob paths."""
     disk_files = _hook_disk_files(root)
-    test_stems = _hook_test_stems(root)
+    test_stems = _hook_test_stems(root, errors)
 
     result = []
     seen_keys = set()
@@ -1198,14 +1218,14 @@ def _detect_skill_test_coverage(root):
     return [{"name": d.name, "has_test": _skill_has_test_asset(d)} for d in skill_dirs]
 
 
-def detect_test_coverage(root, on_demand):
+def detect_test_coverage(root, on_demand, errors):
     """Whether each hook script and each skill has an associated test ASSET — a
     PRESENCE check, not an adequacy check (the "6 of 66" reality: a tests/ dir holding
     one trivial assertion counts as covered exactly like a thorough suite). Cross-links
     the same per-skill has_test verdict onto on_demand["skills"] (mutated in place) by
     skill name, so both sections agree instead of on_demand carrying its own narrower
     (tests/-dir-only) check."""
-    hooks_result = _detect_hook_test_coverage(root)
+    hooks_result = _detect_hook_test_coverage(root, errors)
     skills_result = _detect_skill_test_coverage(root)
 
     skills_has_test = {s["name"]: s["has_test"] for s in skills_result}
@@ -1292,7 +1312,7 @@ def build_document(root, project_root):
         "memory_bodies": memory_bodies,
     }
 
-    test_coverage_section = detect_test_coverage(root, on_demand)
+    test_coverage_section = detect_test_coverage(root, on_demand, errors)
 
     doc = {
         "schema_version": SCHEMA_VERSION,
@@ -1360,15 +1380,23 @@ def main(argv=None):
     root = Path(args.root).expanduser().resolve()
     out_path = None
     if args.out is not None:
-        root_stat = os.stat(root)                            # root is a resolved, existing dir
-        # normpath collapses a root-EXITING '..' (e.g. <root>/../x.json -> <root-parent>/x.json)
-        # so a path that only textually traverses root is not falsely rejected (FIX 3).
-        lexical = Path(os.path.normpath(str(Path(args.out).expanduser())))
-        resolved = Path(args.out).expanduser().resolve()     # resolves symlink aliases
-        for cand in (lexical, resolved):
-            if _resolves_inside_root(cand, root, root_stat):  # case/hardlink-robust (FIX 2)
-                ap.error("--out must be outside --root (read-only invariant)")
-        out_path = resolved                                  # write through the validated resolved path
+        try:
+            root_stat = os.stat(root)                        # root is expected to be an existing dir
+        except OSError as e:
+            # A bad/inaccessible --root must NOT crash before the crash-safe envelope below —
+            # skip the --out write (nothing safe to validate against) but still fall through to
+            # build_document/print so the always-valid-JSON-envelope invariant holds.
+            print(f"warning: --root not accessible, skipping --out write: {e}", file=sys.stderr)
+            root_stat = None
+        if root_stat is not None:
+            # normpath collapses a root-EXITING '..' (e.g. <root>/../x.json -> <root-parent>/x.json)
+            # so a path that only textually traverses root is not falsely rejected (FIX 3).
+            lexical = Path(os.path.normpath(str(Path(args.out).expanduser())))
+            resolved = Path(args.out).expanduser().resolve()  # resolves symlink aliases
+            for cand in (lexical, resolved):
+                if _resolves_inside_root(cand, root, root_stat):  # case/hardlink-robust (FIX 2)
+                    ap.error("--out must be outside --root (read-only invariant)")
+            out_path = resolved                                # write through the validated resolved path
     try:
         doc = build_document(root, args.project_root)
     except Exception as exc:  # noqa: BLE001 — collector must always emit a FULL-key valid envelope
