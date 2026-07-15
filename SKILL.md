@@ -50,7 +50,7 @@ Step B — Synthesis (this is the skill's model work): consume the collector JSO
 
 ## CIVC Matrix
 
-Reference the two-axis grid — verbs (Afford, Inform, Constrain, Verify, Correct, Evolve) × surfaces (context, tools, memory, permissions, orchestration, observability) — from `~/Documents/obsidian-vault/AI/kb/Docs/harness-inventory-four-verbs.md` §9. Every cell gets a verdict; empty cells ARE the roadmap, not an omission.
+Reference the two-axis grid — verbs (Afford, Inform, Constrain, Verify, Correct, Evolve) × surfaces (context, tools, memory, permissions, orchestration, observability) — from the vendored, in-skill file `~/.claude/skills/harness-map/civc-reference.md` (read it by ABSOLUTE path with the Read tool). Every cell gets exactly one verdict (covered / thin / empty); empty cells ARE the roadmap, not an omission.
 
 ## Diff vs Previous Run (D7)
 
