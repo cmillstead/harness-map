@@ -48,6 +48,10 @@ Step B — Synthesis (this is the skill's model work): consume the collector JSO
 5. **Blind Spots** — the full INACCESSIBLE list plus standing not-statically-collectable disclosures. The collector's `errors[]` (runtime anomalies: malformed/unreadable settings.json, glob failures, crash fallback) MUST also render here — a non-empty `errors[]` rendered nowhere produces a falsely-clean report, contradicting the inaccessible≠clean invariant above; NEVER omit it.
 6. **Diff vs previous run** — see the Diff rule below.
 
+## Headline Bands (Step B fill)
+
+For section 1, fill each `{*_band}` placeholder by applying the FIXED thresholds in report-template.md's "Fixed band thresholds" table to the matching collector JSON value — NEVER invent a band per-run (runs must stay comparable). Compute the weight band ONCE from `always_loaded_tokens_est` and render that SAME `{weight_band}` label on BOTH the words line and the tokens line (the words line has no separate threshold — this guarantees the two weight verdicts never disagree). `always_loaded_file_count` renders "informational" (no severity); `unchecked_binary_count` renders "reserved (not inspected)" and MUST NOT render green/CLEAN (0 means not scanned, not clean — distinct from `orphan_*` counts, whose scans actually ran, so their 0 IS CLEAN). Keep the `[^slug]` footnote references verbatim from the template — they render as visible footnotes in raw text and hover popovers in Obsidian; do NOT convert them to `<abbr title>` hover.
+
 ## CIVC Matrix
 
 Reference the two-axis grid — verbs (Afford, Inform, Constrain, Verify, Correct, Evolve) × surfaces (context, tools, memory, permissions, orchestration, observability) — from the vendored, in-skill file `~/.claude/skills/harness-map/civc-reference.md` (read it by ABSOLUTE path with the Read tool). Every cell gets exactly one verdict (covered / thin / empty); empty cells ARE the roadmap, not an omission.

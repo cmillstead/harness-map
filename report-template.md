@@ -4,16 +4,38 @@ Fill-in skeleton for the synthesis pass. Every `{placeholder}` is replaced with 
 
 ## 1. Headline Numbers
 
-The collector's 8 headline fields, verbatim:
+The collector's 8 headline fields, each with an always-visible benchmark band and a footnote gloss. Bands come from the FIXED thresholds in the table below — never invented per-run, so successive runs are comparable.
 
-- Always-loaded words: {always_loaded_words}
-- Always-loaded estimated tokens: {always_loaded_tokens_est}
-- Always-loaded file count: {always_loaded_file_count}
-- Duplicate-pair count: {duplicate_pair_count}
-- Unchecked-binary count: {unchecked_binary_count} — reserved; always 0 in v1 — no binary scan is performed (the walk reads only `.md`/`.py`/`.sh` via `errors='replace'`); do NOT read this 0 as "clean."
-- Instruction-files-over-200 count: {instruction_files_over_200}
-- Orphan-registration count: {orphan_registration_count}
-- Orphan-script count: {orphan_script_count}
+- Always-loaded words: {always_loaded_words} — **{weight_band}**[^words]
+- Always-loaded estimated tokens: {always_loaded_tokens_est} — **{weight_band}**[^tokens]
+- Always-loaded file count: {always_loaded_file_count} — informational[^filecount]
+- Duplicate-pair count: {duplicate_pair_count} — **{dup_band}**[^dup]
+- Unchecked-binary count: {unchecked_binary_count} — reserved (not inspected)[^binary]
+- Instruction-files-over-200 count: {instruction_files_over_200} — **{over200_band}**[^over200]
+- Orphan-registration count: {orphan_registration_count} — **{orphanreg_band}**[^orphanreg]
+- Orphan-script count: {orphan_script_count} — **{orphanscript_band}**[^orphanscript]
+
+### Fixed band thresholds (apply verbatim every run)
+
+| Metric | Bands |
+|---|---|
+| always_loaded_tokens_est (the weight band) | <5,000 LOW / 5,000–12,000 MODERATE / >12,000 HIGH |
+| always_loaded_words | weight band shown = the tokens band, computed once from always_loaded_tokens_est (no separate word threshold) |
+| always_loaded_file_count | informational — no severity band |
+| duplicate_pair_count | 0 CLEAN / ≥1 REVIEW |
+| unchecked_binary_count | reserved — always renders "reserved (not inspected)", NEVER CLEAN |
+| instruction_files_over_200 | 0 CLEAN / ≥1 → that many compliance-risk files |
+| orphan_registration_count | 0 CLEAN / >0 ACT |
+| orphan_script_count | 0 CLEAN / >0 ACT |
+
+[^words]: The weight verdict is derived ONCE from `always_loaded_tokens_est` (the canonical cost signal) and shown identically on BOTH weight lines, so the words and tokens verdicts can never disagree at a threshold boundary. The words count itself remains the raw figure.
+[^tokens]: Bands <5k LOW / 5–12k MODERATE / >12k HIGH. The cost of always-loaded weight is ATTENTION DILUTION and per-turn COMPOUNDING, not context-window exhaustion — 8k tokens is <1% of a 1M window. Anchor: CLAUDE.md alone ≈2.5k tokens, so ~5k is two CLAUDE.md-equivalents and ~12k is where dilution compounds materially across turns.
+[^filecount]: Informational, no severity band — file count is a weak proxy; 16 small files can weigh less than 3 large ones. Read `always_loaded_tokens_est` as the real cost signal.
+[^dup]: 0 CLEAN / ≥1 REVIEW (not ACT) — duplication is a candidate signal, not a defect. Command↔skill wrapper pairs and symlinked-rule pairs are expected-benign; review whether each pair is one declared home with callers (benign) or genuine two-home duplication.
+[^binary]: Reserved; always 0 in v1 — no binary scan is performed (the walk reads only `.md`/`.py`/`.sh` via `errors='replace'`). This 0 means "not inspected," NEVER "no binaries found" — do not read it as a clean bill.
+[^over200]: 0 CLEAN / ≥1 → that many compliance-risk files. The harness's operative threshold: context saturation degrades instruction compliance beyond ~200 lines per file, so each flagged file is one unit of compliance risk.
+[^orphanreg]: 0 CLEAN / >0 ACT — a registration pointing at a missing script is dead enforcement (a hook that will never fire). Any >0 is structural breakage to act on.
+[^orphanscript]: 0 CLEAN / >0 ACT — a script on disk reached by no registration and no dispatcher is dead code (best-effort static; a dynamic-dispatch caveat applies). Any >0 warrants action.
 
 ## 2. System Map
 
