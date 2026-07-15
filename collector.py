@@ -351,13 +351,13 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
                 seen.add(key)
 
     # Deliberately single-level: glob("*.md") only, no recursion into subdirectories.
-    for pattern, category in ((root / "rules", "rule"), (root / "skills" / "coding-team" / "rules", "coding_team_rule")):
-        if not pattern.is_dir():
+    for rules_dir, category in ((root / "rules", "rule"), (root / "skills" / "coding-team" / "rules", "coding_team_rule")):
+        if not rules_dir.is_dir():
             continue
         try:
-            names = sorted(pattern.glob("*.md"))
+            names = sorted(rules_dir.glob("*.md"))
         except OSError as e:
-            errors.append(f"rules glob failed for {pattern}: {e}")
+            errors.append(f"rules glob failed for {rules_dir}: {e}")
             continue
         for f in names:
             key = _physical_key(f)
@@ -508,20 +508,29 @@ def collect_on_demand(root, project_root, inaccessible):
 
 
 def parse_settings(root, errors, blind_spots):
-    """Read + parse root/settings.json. Deliberately NARROWER than the shared _read_text
-    helper used everywhere else in this file: only a genuinely ABSENT file (the common,
-    expected case — nothing wrong) is silent, returning ({}, False) plus a blind_spot
-    note. Any OTHER read failure (settings.json exists as a DIRECTORY, permission
-    denied, etc.) is a real anomaly on a file central enough to deserve visibility, so it
-    propagates UNCAUGHT — main()'s top-level guard converts it into a recorded error
-    rather than silently masking a broken install. On JSONDecodeError, append a message
-    containing "settings.json" to errors[] and return ({}, False) so the run continues
-    with defaults. Returns (settings_dict, parsed_ok)."""
+    """Read + parse root/settings.json. Two distinct outcomes, both NON-fatal —
+    build_document always continues and populates every settings-INDEPENDENT section
+    (always_loaded, hooks, duplication, phantom_refs, ...), because `headline` is the
+    run-to-run diff unit and a one-file settings problem must never fabricate a false
+    "everything vanished" diff:
+    - Genuinely ABSENT (FileNotFoundError): the common, expected case — nothing wrong.
+      Silent: ({}, False) plus a blind_spot note, no errors[] entry.
+    - PRESENT but unreadable-as-a-file (any other OSError — IsADirectoryError,
+      PermissionError, ELOOP — or JSONDecodeError): a real anomaly, symmetric handling
+      for both branches — record a descriptive errors[] entry and return ({}, False) so
+      the run continues with config evidence INACCESSIBLE, same as the absent case,
+      just LOUD instead of silent. (main()'s top-level `except Exception` guard remains
+      a defense-in-depth backstop for anything unanticipated; it no longer has an
+      organic trigger via settings.json specifically — the intended, more robust
+      outcome.) Returns (settings_dict, parsed_ok)."""
     settings_path = root / "settings.json"
     try:
         text = settings_path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         blind_spots.append("settings.json not found; permissions/config/hooks reflect defaults.")
+        return {}, False
+    except OSError as e:
+        errors.append(f"settings.json unreadable: {e!r}")
         return {}, False
     try:
         parsed = json.loads(text)
@@ -601,13 +610,27 @@ def collect_config(root, settings, parsed_ok, blind_spots):
     }
 
 
+def _hook_disk_files(root):
+    """hooks/*.py + hooks/*.sh on disk, name-sorted, never raising (an unreadable hooks/
+    dir yields []). Deliberately single-level: no recursion, so there is no walk to
+    follow symlinks through — a symlinked hook FILE is included by name. Shared by
+    reconcile_hooks and _detect_hook_test_coverage, which both need the identical
+    guarded + sorted listing before diverging into their own downstream logic."""
+    hooks_dir = root / "hooks"
+    try:
+        disk_files = sorted(hooks_dir.glob("*.py")) + sorted(hooks_dir.glob("*.sh"))
+    except OSError:
+        return []
+    disk_files.sort(key=lambda p: p.name)
+    return disk_files
+
+
 def reconcile_hooks(root, settings, inaccessible, blind_spots):
     """Dispatcher-aware reconciliation: resolve every hook `command` registered in
     settings.json against hooks/ on disk, then fan reachability through any registered
     *-dispatcher.py's string-literal CHECKS-style list. Registration evidence (the
     settings.json line was read) and target status (stat() of the resolved script) are
     always kept as distinct facts — see schema.md Note 3."""
-    hooks_dir = root / "hooks"
     registered = []
     orphan_registrations = []
     direct_registered_names = set()
@@ -642,14 +665,8 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
             "target_evidence": "VERIFIED",
         })
 
-    # Deliberately single-level: hooks/*.py + hooks/*.sh only, no recursion — so there is no
-    # walk to follow symlinks through. A symlinked hook FILE is included by name; see the
-    # outside-root symlink check below.
-    try:
-        disk_files = sorted(hooks_dir.glob("*.py")) + sorted(hooks_dir.glob("*.sh"))
-    except OSError:
-        disk_files = []
-    disk_files.sort(key=lambda p: p.name)
+    # See the outside-root symlink check below for the symlinked-hook-FILE handling note.
+    disk_files = _hook_disk_files(root)
     disk_names = {p.name for p in disk_files}
 
     dispatcher_reached_names = set()
@@ -825,7 +842,7 @@ def scan_duplication(root, blind_spots):
                 blind_spots.append(
                     f"{_rel(root, fp)} exceeds {MAX_FILE_BYTES} bytes; skipped in duplication scan.")
                 continue
-            text, evidence = _read_text(fp)
+            text, _ = _read_text(fp)
             if text is None:
                 continue
             words = _normalize_words(text)
@@ -879,7 +896,7 @@ def _hooks_body_corpus(root):
             except OSError:
                 candidates = []
             for fp in candidates:
-                text, evidence = _read_text(fp)
+                text, _ = _read_text(fp)
                 if text:
                     parts.append(text)
     return "\n".join(parts)
@@ -1059,12 +1076,7 @@ def _detect_hook_test_coverage(root):
     a hooks/tests/test_x.py with a single trivial assertion counts as covered, same as a
     thorough suite (the "6 of 66" reality). Symlinked hooks are deduped by physical
     identity so one script counts once even if reachable via multiple glob paths."""
-    hooks_dir = root / "hooks"
-    try:
-        disk_files = sorted(hooks_dir.glob("*.py")) + sorted(hooks_dir.glob("*.sh"))
-    except OSError:
-        disk_files = []
-    disk_files.sort(key=lambda p: p.name)
+    disk_files = _hook_disk_files(root)
     test_stems = _hook_test_stems(root)
 
     result = []
@@ -1254,7 +1266,7 @@ def _empty_document(root):
         "enforcement": {"hooks": {"registered": [], "orphan_registrations": [],
             "scripts_on_disk": [], "orphan_scripts": []},
             "permissions": {"allow_count": 0, "deny_count": 0, "ask_count": 0, "evidence": "INACCESSIBLE"}},
-        "config": {"env_keys": [], "env_key_count": 0, "model": None, "cleanup_period_days": None,
+        "config": {"env_keys": [], "env_key_count": 0, "model": None, "cleanup_period_days": 0,
                    "sandbox": False, "enabled_plugins": [], "plugin_count": 0,
                    "marketplaces": [], "marketplace_count": 0,
                    "installed_plugins": [], "installed_plugin_count": 0, "evidence": "INACCESSIBLE"},

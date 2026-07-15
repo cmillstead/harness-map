@@ -688,19 +688,43 @@ def test_large_file_skip_disclosed_in_blind_spots(fake_harness):
     doc = run_collector(fake_harness)
     assert any("huge.md" in b for b in doc["blind_spots"])
 
-def test_unexpected_exception_yields_full_key_envelope(fake_harness):
-    # R7: trigger a REAL crash organically (no patched/faked module state) — settings.json exists as a
-    # DIRECTORY, not a file. parse_settings only catches FileNotFoundError and
-    # json.JSONDecodeError (see Task 3), so reading a directory raises IsADirectoryError
-    # uncaught, propagating out of build_document. main's top-level guard must still emit a
-    # FULL-key valid envelope + errors[], never a partial/silent result.
+def test_unreadable_settings_degrades_not_catastrophically(fake_harness):
+    # P2 regression pin: settings.json PRESENT but unreadable-as-a-file (a directory here)
+    # must degrade GRACEFULLY (symmetric with the JSONDecodeError branch: record an
+    # errors[] entry, config evidence INACCESSIBLE, continue) rather than propagate an
+    # uncaught OSError out of build_document. Pre-fix, that uncaught OSError hit main()'s
+    # top-level `except Exception` guard, which emits an ALL-ZEROS _empty_document
+    # envelope — wiping every settings-INDEPENDENT section (always_loaded, hooks,
+    # duplication, phantom_refs) that was fully collectable, fabricating a false
+    # "everything vanished" run-to-run headline diff from a one-file permission glitch.
+    # main()'s top-level guard is retained as a defense-in-depth backstop (verified
+    # key-complete by the harden audit) — it simply no longer has an organic trigger via
+    # settings.json, which is the intended, more robust outcome.
     (fake_harness / "settings.json").unlink()
     (fake_harness / "settings.json").mkdir()
     doc = run_collector(fake_harness)
     for key in ("schema_version", "headline", "always_loaded", "on_demand", "enforcement",
                 "config", "duplication", "test_coverage", "inaccessible", "blind_spots", "errors"):
-        assert key in doc, f"crash envelope missing {key}"
-    assert doc["errors"], "expected the organic settings.json-as-directory crash to be recorded"
+        assert key in doc, f"envelope missing {key}"
+    assert doc["errors"], "expected an errors[] entry for the unreadable settings.json"
+    assert doc["config"]["evidence"] == "INACCESSIBLE"
+    # THE regression pin: settings-independent sections must survive intact, not zero out.
+    assert doc["always_loaded"]["totals"]["file_count"] > 0
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_permission_denied_settings_degrades_not_catastrophically(fake_harness):
+    # Sibling of the directory case above: settings.json present but chmod 000 (can't
+    # even open it) must degrade the same way — errors[] entry, INACCESSIBLE, and the
+    # settings-independent sections survive.
+    settings_path = fake_harness / "settings.json"
+    os.chmod(settings_path, 0)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        os.chmod(settings_path, 0o644)
+    assert doc["errors"], "expected an errors[] entry for the permission-denied settings.json"
+    assert doc["config"]["evidence"] == "INACCESSIBLE"
+    assert doc["always_loaded"]["totals"]["file_count"] > 0
 
 def test_env_values_never_leak_and_config_keys_are_exact(fake_harness):
     # F9: unique sentinel value per env key; NONE may appear; config has EXACTLY the allowed field set.
