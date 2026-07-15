@@ -73,6 +73,16 @@ def _project_slug(project_root):
     return re.sub(r"[/.]", "-", os.path.abspath(str(project_root)))
 
 
+def _physical_key(path):
+    """Resolved physical identity, for deduping a file reachable via multiple glob paths
+    (a deploy symlink in rules/ or agents/ pointing at the submodule source). Guarded so a
+    broken symlink can't crash the walk."""
+    try:
+        return os.path.realpath(str(path))
+    except OSError:
+        return str(path)
+
+
 def _read_text(path):
     try:
         return path.read_text(encoding="utf-8", errors="replace"), "VERIFIED"
@@ -216,15 +226,25 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
     project's own CLAUDE.md (outside --root), rules/*.md, and coding-team rules."""
     files = []
     conditional_variants = []
+    # A file reachable via multiple glob paths (a rules/ deploy symlink pointing at its
+    # skills/coding-team/rules/ submodule source) is ONE physical file and must be counted
+    # ONCE. `seen` covers every append to `files` below, in append order — so a symlinked
+    # rule is counted under its deployed/always-loaded location (rules/, seen first) and the
+    # submodule-source duplicate is skipped. `conditional_variants` is NOT deduped against
+    # this set: those are different projects' distinct MEMORY.md files, not glob duplicates.
+    seen = set()
 
     root_claude = root / "CLAUDE.md"
     present, ok = _safe_exists(root_claude)
     if not ok:
         inaccessible.append({"path": _rel(root, root_claude), "reason": "unreadable"})
     elif present:
-        entry = _file_entry(root, root_claude, "claude_md", inaccessible)
-        if entry:
-            files.append(entry)
+        key = _physical_key(root_claude)
+        if key not in seen:
+            entry = _file_entry(root, root_claude, "claude_md", inaccessible)
+            if entry:
+                files.append(entry)
+                seen.add(key)
 
     active_slug = None
     if project_root is not None:
@@ -238,10 +258,13 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
             if not ok:
                 inaccessible.append({"path": _rel(project_root, proj_claude), "reason": "unreadable"})
             elif present:
-                entry = _file_entry(root, proj_claude, "project_claude_md", inaccessible,
-                                     rel_root=project_root)
-                if entry:
-                    files.append(entry)
+                key = _physical_key(proj_claude)
+                if key not in seen:
+                    entry = _file_entry(root, proj_claude, "project_claude_md", inaccessible,
+                                         rel_root=project_root)
+                    if entry:
+                        files.append(entry)
+                        seen.add(key)
 
     # Deliberately single-level: iterdir()/glob("*.md") only, no recursion — so there is no
     # walk to follow symlinks through. A symlinked skill/rule DIR is followed and reported
@@ -265,9 +288,12 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
                 continue
             slug = slug_dir.name
             if slug == active_slug:
-                entry = _file_entry(root, idx, "memory", inaccessible)
-                if entry:
-                    files.append(entry)
+                key = _physical_key(idx)
+                if key not in seen:
+                    entry = _file_entry(root, idx, "memory", inaccessible)
+                    if entry:
+                        files.append(entry)
+                        seen.add(key)
             else:
                 text = _read_checked(root, idx, inaccessible)
                 if text is None:
@@ -289,9 +315,12 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
     if not ok:
         inaccessible.append({"path": _rel(root, stub), "reason": "unreadable"})
     elif present:
-        entry = _file_entry(root, stub, "memory", inaccessible)
-        if entry:
-            files.append(entry)
+        key = _physical_key(stub)
+        if key not in seen:
+            entry = _file_entry(root, stub, "memory", inaccessible)
+            if entry:
+                files.append(entry)
+                seen.add(key)
 
     # Deliberately single-level: glob("*.md") only, no recursion into subdirectories.
     for pattern, category in ((root / "rules", "rule"), (root / "skills" / "coding-team" / "rules", "coding_team_rule")):
@@ -303,9 +332,13 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
             errors.append(f"rules glob failed for {pattern}: {e}")
             continue
         for f in names:
+            key = _physical_key(f)
+            if key in seen:
+                continue
             entry = _file_entry(root, f, category, inaccessible)
             if entry:
                 files.append(entry)
+                seen.add(key)
 
     return files, conditional_variants
 
@@ -663,13 +696,23 @@ INSTRUCTION_LINE_LIMIT = 200
 
 def flag_long_instructions(root):
     flags = []
+    # `seen` dedupes a file reachable via multiple glob paths (a deploy symlink under
+    # agents/ + its canonical submodule source under skills/*/agents/). The glob order
+    # below lists skills/*/agents/*.md BEFORE agents/*.md, so the canonical path (the one
+    # you'd actually edit to shorten the file) is seen first and reported; the deploy-symlink
+    # duplicate is skipped.
+    seen = set()
     for pattern in ("rules/*.md", "skills/*/SKILL.md", "skills/*/*/SKILL.md",
                      "skills/*/phases/*.md", "skills/*/prompts/*.md", "skills/*/agents/*.md",
                      "commands/*.md", "agents/*.md"):
         for fp in root.glob(pattern):
+            key = _physical_key(fp)
+            if key in seen:
+                continue
             text, evidence = _read_text(fp)
             if text is None:
                 continue
+            seen.add(key)
             n = len(text.splitlines())
             if n > INSTRUCTION_LINE_LIMIT:
                 flags.append({"path": _rel(root, fp), "lines": n,
@@ -704,6 +747,9 @@ def build_document(root, project_root):
         "memory/MEMORY.md index is inventoried as a conditional_variant.",
         "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not "
         "fetched or verified.",
+        "The always-loaded classification of skills/coding-team/rules/*.md reflects the "
+        "design's assertion and cannot be statically verified — CC's actual session-start "
+        "injection set is not introspectable from disk.",
     ]
 
     files, conditional_variants = walk_always_loaded(root, project_root, inaccessible, errors)

@@ -379,3 +379,39 @@ def test_headline_instruction_files_over_200_matches(fake_harness):
     doc = run_collector(fake_harness)
     assert doc["headline"]["instruction_files_over_200"] == len(doc["instruction_length_flags"])
     assert doc["headline"]["instruction_files_over_200"] >= 1
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_symlinked_rule_counted_once_in_always_loaded(fake_harness):
+    # rules/dup.md is a symlink to the coding-team rule skills/coding-team/rules/c.md (same bytes).
+    target = fake_harness / "skills" / "coding-team" / "rules" / "c.md"
+    os.symlink(target, fake_harness / "rules" / "dup.md")
+    doc = run_collector(fake_harness)
+    import os.path as _op
+    realtarget = _op.realpath(str(target))
+    hits = [f for f in doc["always_loaded"]["files"]
+            if _op.realpath(str(fake_harness / f["path"])) == realtarget]
+    assert len(hits) == 1, f"symlinked rule double-counted: {[h['path'] for h in hits]}"
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_symlinked_agent_flagged_once(fake_harness):
+    src = fake_harness / "skills" / "coding-team" / "agents"
+    src.mkdir(parents=True, exist_ok=True)
+    big = src / "big-agent.md"
+    big.write_text("\n".join(f"line {i}" for i in range(210)))
+    (fake_harness / "agents").mkdir(exist_ok=True)
+    os.symlink(big, fake_harness / "agents" / "big-agent.md")
+    doc = run_collector(fake_harness)
+    import os.path as _op
+    realbig = _op.realpath(str(big))
+    hits = [f for f in doc["instruction_length_flags"]
+            if _op.realpath(str(fake_harness / f["path"])) == realbig]
+    assert len(hits) == 1, f"symlinked agent double-flagged: {[h['path'] for h in hits]}"
+
+def test_distinct_basenames_not_deduped(fake_harness):
+    # guard against over-dedup: the active project index and the memory/ stub share basename
+    # MEMORY.md but are different physical files — both must remain.
+    proj = fake_harness.parent / "active-repo"
+    doc = run_collector(fake_harness, project_root=proj)
+    mem_paths = [f["path"] for f in doc["always_loaded"]["files"] if f["path"].endswith("MEMORY.md")]
+    assert any(p == "memory/MEMORY.md" for p in mem_paths)
+    assert any(p.startswith("projects/") for p in mem_paths)
