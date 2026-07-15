@@ -478,3 +478,93 @@ def test_symlinked_file_not_selfpaired_in_duplication(fake_harness):
     doc = run_collector(fake_harness)
     assert not any({p["a"], p["b"]} == {"rules/linked.md", "skills/coding-team/rules/c.md"}
                    for p in doc["duplication"]["pairs"])
+
+def test_existing_path_ref_not_phantom(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("See `rules/b.md` for details.")
+    doc = run_collector(fake_harness)
+    assert not any(r["ref"] == "rules/b.md" for r in doc["phantom_refs"])
+
+def test_missing_path_ref_is_phantom(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("See `rules/ghost.md` for details.")
+    doc = run_collector(fake_harness)
+    assert "rules/ghost.md" in {r["ref"] for r in doc["phantom_refs"]}
+
+def test_unread_env_flag_is_phantom_candidate(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("Bypass with `WRITE_GUARD_ALLOW_NOWHERE=1`.")
+    doc = run_collector(fake_harness)
+    assert "WRITE_GUARD_ALLOW_NOWHERE" in {r["ref"] for r in doc["phantom_refs"] if r["kind"] == "env_flag"}
+
+def test_prose_never_clause_is_promotion_candidate(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("NEVER commit secrets. Files must be under 200 lines.")
+    doc = run_collector(fake_harness)
+    assert "NEVER" in {c["pattern"] for c in doc["promotion_candidates"]}
+
+def test_prose_always_clause_is_promotion_candidate(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("ALWAYS run tests before committing.")
+    doc = run_collector(fake_harness)
+    assert "ALWAYS" in {c["pattern"] for c in doc["promotion_candidates"]}
+
+def test_prose_must_clause_is_promotion_candidate(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("You must not commit secrets.")
+    doc = run_collector(fake_harness)
+    assert "must" in {c["pattern"] for c in doc["promotion_candidates"]}
+
+def test_prose_numeric_cap_is_promotion_candidate(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("Keep instruction files under 200 lines.")
+    doc = run_collector(fake_harness)
+    assert "numeric_cap" in {c["pattern"] for c in doc["promotion_candidates"]}
+
+def test_prose_required_file_assertion_is_promotion_candidate(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("This workflow requires `schema.md` to exist.")
+    doc = run_collector(fake_harness)
+    assert "required_file" in {c["pattern"] for c in doc["promotion_candidates"]}
+
+def test_promotion_candidate_hook_covered_true_when_hook_mentions_keyword(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("NEVER bypass write_guard.")
+    (fake_harness / "hooks" / "write-guard.py").write_text("# enforces write_guard checks\n")
+    doc = run_collector(fake_harness)
+    covered = [c for c in doc["promotion_candidates"] if c["pattern"] == "NEVER" and c["hook_covered"] is True]
+    assert covered
+
+def test_prose_generic_never_clause_not_hook_covered(fake_harness):
+    # A plain-prose NEVER clause naming no specific enforcement target (no snake_case
+    # symbol, path, or filename) must NOT be marked hook_covered, even though generic
+    # words like "commit"/"secrets" may appear somewhere in a hook body.
+    (fake_harness / "rules" / "a.md").write_text("NEVER commit secrets to the repo.")
+    (fake_harness / "hooks" / "x.py").write_text("# do commit checks on secrets here\n")
+    doc = run_collector(fake_harness)
+    never = [c for c in doc["promotion_candidates"] if c["pattern"] == "NEVER"]
+    assert never and all(c["hook_covered"] is False for c in never)
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_symlinked_rule_refs_not_double_reported(fake_harness):
+    # A symlinked rule scanned via both rules/ and coding-team/rules/ must report its phantom ref ONCE.
+    target = fake_harness / "skills" / "coding-team" / "rules" / "c.md"
+    target.write_text("See `rules/ghost.md` for details.")
+    os.symlink(target, fake_harness / "rules" / "linked.md")
+    doc = run_collector(fake_harness)
+    ghost_hits = [r for r in doc["phantom_refs"] if r["ref"] == "rules/ghost.md"]
+    assert len(ghost_hits) == 1
+
+def test_mismatched_backticks_do_not_produce_multiline_ref(fake_harness):
+    # A fenced code block (or a markdown table) with no internal single-backtick chars
+    # pairs the single-backtick regex across the WHOLE block/table, producing one giant
+    # multi-line "token" — found on the live harness. Must never surface as a ref.
+    (fake_harness / "rules" / "a.md").write_text(
+        "Some rule text.\n\n```bash\npath/to/thing --json\nother line\n```\n"
+        "More text after.\n"
+    )
+    doc = run_collector(fake_harness)
+    assert not any("\n" in r["ref"] for r in doc["phantom_refs"])
+
+def test_prose_span_with_slash_not_treated_as_path_ref(fake_harness):
+    # A stray unpaired backtick elsewhere in the file can pair the regex across ordinary
+    # prose containing a slash (e.g. "sessions/machines") — such a span, even single-line,
+    # is never a legitimate path token, because a real path token never contains spaces.
+    # Found on the live harness (CLAUDE.md).
+    (fake_harness / "rules" / "a.md").write_text(
+        "Some text with a stray backtick ` then normal prose about sessions/machines "
+        "and other words before the next ` backtick appears.\n"
+    )
+    doc = run_collector(fake_harness)
+    assert not any(" " in r["ref"] for r in doc["phantom_refs"])

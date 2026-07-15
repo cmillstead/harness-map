@@ -22,6 +22,33 @@ _QUOTED_TOKEN = re.compile(r"""['"]([^'"]+)['"]""")
 _NORM_RE = re.compile(r"[^a-z0-9]+")
 _SCRIPT_INTERPRETERS = {"python", "python3", "bash", "sh", "node"}
 
+# --- phantom-ref / promotion-candidate scanning constants ---
+_GENERIC_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_PATH_EXT_RE = re.compile(r"[\w./~-]+\.(?:md|py|sh|json)")
+_ENV_FLAG_NAME_RE = re.compile(r"^([A-Z][A-Z0-9_]{4,})(?:=.*)?$")
+_ENV_FLAG_SHAPE_RE = re.compile(r"_ALLOW_|_SKIP_|GUARD|WRITE_")
+_NEVER_RE = re.compile(r"\bNEVER\b")
+_ALWAYS_RE = re.compile(r"\bALWAYS\b")
+_MUST_RE = re.compile(r"\bmust\b")
+_NUMERIC_CAP_RE = re.compile(r"≤\s*\d+|>\s*\d+\s*lines?|\bunder\s+\d+\b|\bat\s+most\s+\d+\b",
+                              re.IGNORECASE)
+_REQUIRED_FILE_RE = re.compile(r"requires?\s+`[^`]+`|\bmust\s+exist\b", re.IGNORECASE)
+_PROMOTION_PATTERNS = (
+    ("NEVER", _NEVER_RE),
+    ("ALWAYS", _ALWAYS_RE),
+    ("must", _MUST_RE),
+    ("numeric_cap", _NUMERIC_CAP_RE),
+    ("required_file", _REQUIRED_FILE_RE),
+)
+# Common English words long enough (>=4 chars) to spuriously "match" a hook body during the
+# advisory hook_covered cross-reference — excluded so the heuristic isn't trivially noisy.
+_HOOK_COVERED_STOPWORDS = {
+    "never", "always", "must", "this", "that", "with", "from", "have", "will", "your",
+    "into", "when", "than", "then", "files", "keep", "before", "after", "workflow",
+    "details", "instruction", "instructions", "under", "lines", "line", "requires",
+    "exist", "commit", "secrets", "tests", "committing",
+}
+
 
 def _frontmatter_description(text):
     """Extract the front-matter `description` across all 4 YAML forms: plain single-line,
@@ -829,6 +856,161 @@ def scan_duplication(root, blind_spots):
     }
 
 
+def _hooks_body_corpus(root):
+    """Concatenated hooks/*.py + hooks/*.sh bodies, ORIGINAL case, for literal env-flag
+    grep and the promotion-candidate hook_covered cross-reference.
+    Caveat: a hook that reads the flag name from a variable rather than a literal string
+    (os.environ[SOME_VAR] indirection) is invisible to this substring check — a
+    false-positive "phantom" env flag is possible. Best-effort only."""
+    parts = []
+    hooks_dir = root / "hooks"
+    if hooks_dir.is_dir():
+        for pattern in ("*.py", "*.sh"):
+            try:
+                candidates = sorted(hooks_dir.glob(pattern))
+            except OSError:
+                candidates = []
+            for fp in candidates:
+                text, evidence = _read_text(fp)
+                if text:
+                    parts.append(text)
+    return "\n".join(parts)
+
+
+def _staleness_corpus(root, inaccessible):
+    """Corpus for phantom-ref + promotion-candidate scanning: rules/*.md,
+    skills/coding-team/rules/*.md, and the harness CLAUDE.md — deduped by physical
+    identity so a symlinked rule (deploy path + submodule source) is scanned once."""
+    seen = set()
+    corpus = []
+    paths = []
+    for pattern in ("rules/*.md", "skills/coding-team/rules/*.md"):
+        try:
+            paths.extend(sorted(root.glob(pattern)))
+        except OSError:
+            pass
+    claude = root / "CLAUDE.md"
+    present, ok = _safe_exists(claude)
+    if ok and present:
+        paths.append(claude)
+    for fp in paths:
+        key = _physical_key(fp)
+        if key in seen:
+            continue
+        seen.add(key)
+        text = _read_checked(root, fp, inaccessible)
+        if text is None:
+            continue
+        corpus.append((_rel(root, fp), text))
+    return corpus
+
+
+def _looks_like_path_token(token):
+    return bool(_PATH_EXT_RE.fullmatch(token)) or "/" in token
+
+
+def check_phantom_refs(root, corpus_files, inaccessible):
+    """Backtick-quoted path and env-flag tokens that don't resolve to anything real. A
+    path OUTSIDE --root is reported as kind="external" (INFERRED, resolved: null) — the
+    collector never claims a file outside its scanned scope is phantom; it genuinely
+    cannot see it either way, so it only classifies, never asserts absence."""
+    refs = []
+    seen = set()
+    hooks_corpus = _hooks_body_corpus(root)
+
+    for rel_path, text in corpus_files:
+        for m in _GENERIC_BACKTICK_RE.finditer(text):
+            token = m.group(1)
+            if re.search(r"\s", token):
+                # A legitimate single-line path/env-flag backtick token never contains
+                # whitespace. A match containing whitespace (space OR newline) means the
+                # regex paired mismatched backticks — across a fenced code block with no
+                # internal backticks, a markdown table, or an unrelated stray backtick
+                # elsewhere in the prose — never a real ref. Reject rather than surface a
+                # garbage multi-word/multi-line "ref".
+                continue
+            if _looks_like_path_token(token):
+                norm = re.sub(r"^~/\.claude/?", "", token)
+                if norm.startswith("/") or norm.startswith("~"):
+                    key = (rel_path, norm, "external")
+                    if key not in seen:
+                        seen.add(key)
+                        refs.append({"source": rel_path, "ref": norm, "kind": "external",
+                                     "resolved": None, "evidence": "INFERRED"})
+                    continue
+                candidate = root / norm
+                present, ok = _safe_exists(candidate)
+                if not ok:
+                    inaccessible.append({"path": _rel_safe(root, candidate), "reason": "unreadable"})
+                    continue
+                if present:
+                    continue
+                key = (rel_path, norm, "path")
+                if key not in seen:
+                    seen.add(key)
+                    refs.append({"source": rel_path, "ref": norm, "kind": "path",
+                                 "resolved": False, "evidence": "VERIFIED"})
+                continue
+            env_match = _ENV_FLAG_NAME_RE.match(token)
+            if env_match:
+                name = env_match.group(1)
+                if _ENV_FLAG_SHAPE_RE.search(name) and name not in hooks_corpus:
+                    key = (rel_path, name, "env_flag")
+                    if key not in seen:
+                        seen.add(key)
+                        refs.append({"source": rel_path, "ref": name, "kind": "env_flag",
+                                     "resolved": False, "evidence": "INFERRED"})
+    return refs
+
+
+def _excerpt_around(text, start, end, radius=60):
+    lo = max(0, start - radius)
+    hi = min(len(text), end + radius)
+    return text[lo:hi].strip().replace("\n", " ")
+
+
+def _hook_covered(excerpt, trigger_text, hooks_corpus_lower):
+    """Best-effort cross-reference: does any non-trigger, non-stopword identifier (>=4
+    chars) from the excerpt appear in the hooks corpus (hook script bodies + registered
+    settings.json commands)? A hit means synthesis should propose EXTENDING that existing
+    hook rather than proposing a new one — this collector only surfaces the raw signal."""
+    if not hooks_corpus_lower:
+        return False
+    trigger_lower = trigger_text.lower()
+    for w in re.findall(r"[a-zA-Z_]{4,}", excerpt):
+        wl = w.lower()
+        if wl == trigger_lower or wl in _HOOK_COVERED_STOPWORDS:
+            continue
+        if wl in hooks_corpus_lower:
+            return True
+    return False
+
+
+def collect_promotion_candidates(root, corpus_files, settings):
+    """Prose in an instruction file that reads like a hard rule (NEVER/ALWAYS/must, a
+    numeric cap, a required-file assertion) but may have no corresponding hook enforcing
+    it. Advisory SIGNALS only — synthesis proposes extending an EXISTING covered hook
+    before creating a new one; this collector never makes that judgment itself."""
+    candidates = []
+    hooks_corpus_lower = _hooks_body_corpus(root).lower()
+    commands_lower = "\n".join(_iter_hook_commands(settings)).lower()
+    combined_lower = hooks_corpus_lower + "\n" + commands_lower
+
+    for rel_path, text in corpus_files:
+        for pattern_name, regex in _PROMOTION_PATTERNS:
+            for m in regex.finditer(text):
+                excerpt = _excerpt_around(text, m.start(), m.end())
+                hook_covered = _hook_covered(excerpt, m.group(0), combined_lower)
+                candidates.append({
+                    "source": rel_path,
+                    "pattern": pattern_name,
+                    "excerpt": excerpt,
+                    "hook_covered": hook_covered,
+                    "evidence": "INFERRED",
+                })
+    return candidates
+
+
 def build_headline(always_loaded, hooks_section, instruction_length_flags, duplication_section):
     totals = always_loaded["totals"]
     return {
@@ -871,6 +1053,9 @@ def build_document(root, project_root):
     config_section = collect_config(root, settings, settings_parsed_ok, blind_spots)
     instruction_length_flags = flag_long_instructions(root)
     duplication_section = scan_duplication(root, blind_spots)
+    corpus_files = _staleness_corpus(root, inaccessible)
+    phantom_refs = check_phantom_refs(root, corpus_files, inaccessible)
+    promotion_candidates = collect_promotion_candidates(root, corpus_files, settings)
 
     totals = {
         "words": sum(f["words"] for f in files),
@@ -907,8 +1092,8 @@ def build_document(root, project_root):
         "config": config_section,
         "instruction_length_flags": instruction_length_flags,
         "duplication": duplication_section,
-        "phantom_refs": [],
-        "promotion_candidates": [],
+        "phantom_refs": phantom_refs,
+        "promotion_candidates": promotion_candidates,
         "test_coverage": {
             "hooks": [], "skills": [],
             "summary": {"hooks_with_test": 0, "hooks_total": 0, "skills_with_test": 0, "skills_total": 0},
