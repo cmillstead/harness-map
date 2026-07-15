@@ -507,13 +507,21 @@ def collect_on_demand(root, project_root, inaccessible):
     return skills, skill_internal_bodies, memory_bodies
 
 
-def parse_settings(root, errors):
-    """Read + parse root/settings.json. On JSONDecodeError, append a message containing
-    "settings.json" to errors[] and return ({}, False) so the run continues with defaults
-    (absent file also returns ({}, False) silently — a missing settings.json is not an
-    error). Returns (settings_dict, parsed_ok)."""
-    text, evidence = _read_text(root / "settings.json")
-    if evidence == "INACCESSIBLE" or text is None:
+def parse_settings(root, errors, blind_spots):
+    """Read + parse root/settings.json. Deliberately NARROWER than the shared _read_text
+    helper used everywhere else in this file: only a genuinely ABSENT file (the common,
+    expected case — nothing wrong) is silent, returning ({}, False) plus a blind_spot
+    note. Any OTHER read failure (settings.json exists as a DIRECTORY, permission
+    denied, etc.) is a real anomaly on a file central enough to deserve visibility, so it
+    propagates UNCAUGHT — main()'s top-level guard converts it into a recorded error
+    rather than silently masking a broken install. On JSONDecodeError, append a message
+    containing "settings.json" to errors[] and return ({}, False) so the run continues
+    with defaults. Returns (settings_dict, parsed_ok)."""
+    settings_path = root / "settings.json"
+    try:
+        text = settings_path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        blind_spots.append("settings.json not found; permissions/config/hooks reflect defaults.")
         return {}, False
     try:
         parsed = json.loads(text)
@@ -1028,7 +1036,10 @@ def _hook_test_stems(root):
     stems = set()
     for rel in ("hooks/tests", "skills/coding-team/hooks/tests"):
         test_dir = root / rel
-        if not test_dir.is_dir():
+        try:
+            if not test_dir.is_dir():
+                continue
+        except OSError:
             continue
         try:
             test_files = test_dir.glob("*.py")
@@ -1168,7 +1179,7 @@ def build_document(root, project_root):
     skill_descriptions, agent_descriptions = collect_descriptions(root, inaccessible)
     skills, skill_internal_bodies, memory_bodies = collect_on_demand(root, project_root, inaccessible)
 
-    settings, settings_parsed_ok = parse_settings(root, errors)
+    settings, settings_parsed_ok = parse_settings(root, errors, blind_spots)
     hooks_section = reconcile_hooks(root, settings, inaccessible, blind_spots)
     permissions_section = collect_permissions(settings, settings_parsed_ok)
     config_section = collect_config(root, settings, settings_parsed_ok, blind_spots)
@@ -1225,58 +1236,67 @@ def build_document(root, project_root):
     return doc
 
 
-def main():
-    parser = argparse.ArgumentParser(description="harness-map collector: read-only harness inventory.")
-    parser.add_argument("--root", default=str(Path.home() / ".claude"))
-    parser.add_argument("--project-root", default=os.getcwd())
-    parser.add_argument("--out", default=None)
-    parser.add_argument("--indent", type=int, default=2)
-    args = parser.parse_args()
+def _empty_document(root):
+    """Full schema envelope, every top-level key present and empty (F8) — the crash-path
+    fallback so main()'s top-level guard never emits a partial/silent stub. Mirrors
+    build_document's REAL current shape exactly (including on_demand.memory_bodies and
+    always_loaded.conditional_variants), not a trimmed subset."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(), "root": str(root),
+        "headline": {k: 0 for k in ("always_loaded_words", "always_loaded_tokens_est",
+            "always_loaded_file_count", "duplicate_pair_count", "unchecked_binary_count",
+            "instruction_files_over_200", "orphan_registration_count", "orphan_script_count")},
+        "always_loaded": {"files": [], "conditional_variants": [], "skill_descriptions": [],
+                          "agent_descriptions": [],
+                          "totals": {"words": 0, "tokens_est": 0, "file_count": 0}},
+        "on_demand": {"skills": [], "skill_internal_bodies": [], "memory_bodies": []},
+        "enforcement": {"hooks": {"registered": [], "orphan_registrations": [],
+            "scripts_on_disk": [], "orphan_scripts": []},
+            "permissions": {"allow_count": 0, "deny_count": 0, "ask_count": 0, "evidence": "INACCESSIBLE"}},
+        "config": {"env_keys": [], "env_key_count": 0, "model": None, "cleanup_period_days": None,
+                   "sandbox": False, "enabled_plugins": [], "plugin_count": 0,
+                   "marketplaces": [], "marketplace_count": 0,
+                   "installed_plugins": [], "installed_plugin_count": 0, "evidence": "INACCESSIBLE"},
+        "instruction_length_flags": [], "duplication": {"shingle_k": SHINGLE_K,
+            "metric": "containment", "threshold": DUP_THRESHOLD, "pairs": []},
+        "phantom_refs": [], "promotion_candidates": [],
+        "test_coverage": {"hooks": [], "skills": [], "summary": {"hooks_with_test": 0,
+            "hooks_total": 0, "skills_with_test": 0, "skills_total": 0}},
+        "inaccessible": [], "blind_spots": [], "errors": [],
+    }
 
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Read-only harness map collector.")
+    ap.add_argument("--root", default=str(Path.home() / ".claude"))
+    ap.add_argument("--project-root", default=os.getcwd())
+    ap.add_argument("--out", default=None, help="Optional JSON out-path; MUST be outside --root.")
+    ap.add_argument("--indent", type=int, default=2)
+    args = ap.parse_args(argv)
+    root = Path(args.root).expanduser().resolve()
+    out_path = None
+    if args.out is not None:
+        lexical = Path(args.out).expanduser()               # NOT resolved (catches non-symlink cases)
+        resolved = lexical.resolve()                         # resolves symlink aliases
+        for cand in (lexical, resolved):
+            if cand == root or root in cand.parents:
+                ap.error("--out must be outside --root (read-only invariant)")
+        out_path = resolved                                  # write through the validated resolved path
     try:
-        doc = build_document(args.root, args.project_root)
-    except OSError as e:
-        doc = {
-            "schema_version": SCHEMA_VERSION,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "root": str(Path(args.root).resolve()) if Path(args.root).exists() else args.root,
-            "headline": {
-                "always_loaded_words": 0, "always_loaded_tokens_est": 0, "always_loaded_file_count": 0,
-                "duplicate_pair_count": 0, "unchecked_binary_count": 0, "instruction_files_over_200": 0,
-                "orphan_registration_count": 0, "orphan_script_count": 0,
-            },
-            "always_loaded": {"files": [], "conditional_variants": [], "skill_descriptions": [],
-                               "agent_descriptions": [], "totals": {"words": 0, "tokens_est": 0, "file_count": 0}},
-            "on_demand": {"skills": [], "skill_internal_bodies": [], "memory_bodies": []},
-            "enforcement": {"hooks": {"registered": [], "orphan_registrations": [],
-                                       "scripts_on_disk": [], "orphan_scripts": []},
-                             "permissions": {"allow_count": 0, "deny_count": 0, "ask_count": 0,
-                                              "evidence": "INACCESSIBLE"}},
-            "config": {"env_keys": [], "env_key_count": 0, "model": None, "cleanup_period_days": 0,
-                       "sandbox": False, "enabled_plugins": [], "plugin_count": 0, "marketplaces": [],
-                       "marketplace_count": 0, "installed_plugins": [], "installed_plugin_count": 0,
-                       "evidence": "INACCESSIBLE"},
-            "instruction_length_flags": [], "duplication": {"shingle_k": 8, "metric": "containment",
-                                                              "threshold": 0.6, "pairs": []},
-            "phantom_refs": [], "promotion_candidates": [],
-            "test_coverage": {"hooks": [], "skills": [], "summary": {"hooks_with_test": 0, "hooks_total": 0,
-                                                                       "skills_with_test": 0, "skills_total": 0}},
-            "inaccessible": [], "blind_spots": [], "errors": [f"fatal collector error: {e}"],
-        }
-
-    text = json.dumps(doc, indent=args.indent)
-    print(text)  # stdout is the primary contract — always emit the built document first
-    if args.out:
+        doc = build_document(root, args.project_root)
+    except Exception as exc:  # noqa: BLE001 — collector must always emit a FULL-key valid envelope
+        doc = _empty_document(root)
+        doc["errors"].append(f"collector crashed: {exc!r}")
+    text = json.dumps(doc, indent=args.indent, ensure_ascii=False)
+    if out_path is not None:
         try:
-            out_path = Path(args.out).resolve()
-            root_path = Path(args.root).resolve()
-            if root_path in out_path.parents or out_path == root_path:
-                print(json.dumps({"error": "--out must be outside --root (read-only invariant)"}), file=sys.stderr)
-            else:
-                out_path.write_text(text, encoding="utf-8")
-        except (OSError, ValueError) as e:
-            print(json.dumps({"error": f"--out write failed: {type(e).__name__}: {e}"}), file=sys.stderr)
+            out_path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            print(f"warning: could not write --out: {exc}", file=sys.stderr)
+    print(text)  # stdout is the primary contract — always emit the built document, write-or-not
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
