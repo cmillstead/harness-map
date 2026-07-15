@@ -129,6 +129,25 @@ def _safe_exists(path):
         return False, False
 
 
+def _resolves_inside_root(candidate, root, root_stat):
+    """True if `candidate` is root or lies inside it. Robust beyond string comparison:
+    (1) lexical/resolved parents check (case-sensitive, kept for defense in depth); PLUS
+    (2) an st_dev/st_ino identity check (os.path.samestat) against root for `candidate` and
+    each of its EXISTING ancestors — this catches a case-insensitive collision on APFS
+    (e.g. `.CLAUDE` vs `.claude`) and directory hard-link / bind-mount aliases that the
+    string checks miss, consistent with main()'s existing hard-link write defense."""
+    if candidate == root or root in candidate.parents:
+        return True
+    for anc in (candidate, *candidate.parents):
+        try:
+            st = os.stat(anc)
+        except OSError:
+            continue  # a not-yet-existent ancestor (the out-file itself) — nothing to compare
+        if os.path.samestat(st, root_stat):
+            return True
+    return False
+
+
 def _metrics(text):
     words = len(text.split())
     lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
@@ -352,7 +371,30 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
                 seen.add(key)
 
     # Deliberately single-level: glob("*.md") only, no recursion into subdirectories.
-    for rules_dir, category in ((root / "rules", "rule"), (root / "skills" / "coding-team" / "rules", "coding_team_rule")):
+    # root/rules/*.md is scanned FIRST so a rule reachable via BOTH a rules/ deploy symlink and
+    # a sub-skill's rules/ source is counted ONCE under rules/ (category "rule") — the physical
+    # `seen` dedup below drops the later sub-skill duplicate. Generalized from coding-team-only to
+    # any skills/*/rules/ for release portability; coding-team keeps its "coding_team_rule" label
+    # (baseline continuity), every other sub-skill's rules get "skill_rule".
+    rule_dirs = [(root / "rules", "rule")]
+    skills_root = root / "skills"
+    if skills_root.is_dir():
+        try:
+            sub_skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
+        except OSError as e:
+            errors.append(f"skills iterdir failed for {skills_root}: {e}")
+            sub_skill_dirs = []
+        for skill_dir in sub_skill_dirs:
+            sub_rules = skill_dir / "rules"
+            try:
+                is_rules_dir = sub_rules.is_dir()
+            except OSError as e:
+                errors.append(f"rules is_dir check failed for {sub_rules}: {e}")
+                continue
+            if is_rules_dir:
+                category = "coding_team_rule" if skill_dir.name == "coding-team" else "skill_rule"
+                rule_dirs.append((sub_rules, category))
+    for rules_dir, category in rule_dirs:
         if not rules_dir.is_dir():
             continue
         try:
@@ -825,7 +867,9 @@ def scan_duplication(root, blind_spots):
     fully subsumed by a longer one (schema.md Note 2). SIGNALS only: this is a candidate
     list. Deciding "one declared home + callers" for a pair is a synthesis-pass JUDGMENT,
     not something this collector decides."""
-    patterns = ("rules/*.md", "skills/coding-team/rules/*.md", "skills/*/SKILL.md",
+    # Generalized skills/coding-team/rules -> skills/*/rules for release portability; the
+    # seen_physical dedup below still collapses a rule reachable via multiple glob paths.
+    patterns = ("rules/*.md", "skills/*/rules/*.md", "skills/*/SKILL.md",
                 "skills/*/phases/*.md", "agents/*.md", "commands/*.md")
     seen_physical = set()
     corpus = []  # [(rel_path, shingle_set), ...]
@@ -917,7 +961,9 @@ def _staleness_corpus(root, inaccessible):
     seen = set()
     corpus = []
     paths = []
-    for pattern in ("rules/*.md", "skills/coding-team/rules/*.md"):
+    # Generalized skills/coding-team/rules -> skills/*/rules for release portability; deduped by
+    # physical identity so a symlinked rule (deploy path + sub-skill source) is scanned once.
+    for pattern in ("rules/*.md", "skills/*/rules/*.md"):
         try:
             paths.extend(sorted(root.glob(pattern)))
         except OSError:
@@ -1059,8 +1105,25 @@ def _hook_test_stems(root):
     "guard". Read-only, single-level glob per dir (no recursion needed: hook tests live
     directly in these two known locations)."""
     stems = set()
-    for rel in ("hooks/tests", "skills/coding-team/hooks/tests"):
-        test_dir = root / rel
+    # Generalized skills/coding-team/hooks/tests -> skills/*/hooks/tests for release portability.
+    # `stems` is a set, so union order is irrelevant; baseline-stable because coding-team is the
+    # only sub-skill with a hooks/tests dir on this harness.
+    test_dirs = [root / "hooks" / "tests"]
+    skills_root = root / "skills"
+    if skills_root.is_dir():
+        try:
+            skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
+        except OSError:
+            skill_dirs = []
+        for skill_dir in skill_dirs:
+            candidate = skill_dir / "hooks" / "tests"
+            try:
+                is_candidate_dir = candidate.is_dir()
+            except OSError:
+                continue
+            if is_candidate_dir:
+                test_dirs.append(candidate)
+    for test_dir in test_dirs:
         try:
             if not test_dir.is_dir():
                 continue
@@ -1190,9 +1253,9 @@ def build_document(root, project_root):
         "memory/MEMORY.md index is inventoried as a conditional_variant.",
         "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not "
         "fetched or verified.",
-        "The always-loaded classification of skills/coding-team/rules/*.md reflects the "
-        "design's assertion and cannot be statically verified — CC's actual session-start "
-        "injection set is not introspectable from disk.",
+        "The always-loaded classification of skills/*/rules/*.md (each sub-skill's rules dir) "
+        "reflects the design's assertion and cannot be statically verified — CC's actual "
+        "session-start injection set is not introspectable from disk.",
     ]
 
     files, conditional_variants = walk_always_loaded(root, project_root, inaccessible, errors)
@@ -1297,10 +1360,13 @@ def main(argv=None):
     root = Path(args.root).expanduser().resolve()
     out_path = None
     if args.out is not None:
-        lexical = Path(args.out).expanduser()               # NOT resolved (catches non-symlink cases)
-        resolved = lexical.resolve()                         # resolves symlink aliases
+        root_stat = os.stat(root)                            # root is a resolved, existing dir
+        # normpath collapses a root-EXITING '..' (e.g. <root>/../x.json -> <root-parent>/x.json)
+        # so a path that only textually traverses root is not falsely rejected (FIX 3).
+        lexical = Path(os.path.normpath(str(Path(args.out).expanduser())))
+        resolved = Path(args.out).expanduser().resolve()     # resolves symlink aliases
         for cand in (lexical, resolved):
-            if cand == root or root in cand.parents:
+            if _resolves_inside_root(cand, root, root_stat):  # case/hardlink-robust (FIX 2)
                 ap.error("--out must be outside --root (read-only invariant)")
         out_path = resolved                                  # write through the validated resolved path
     try:
@@ -1333,7 +1399,7 @@ def main(argv=None):
         tmp_name = None
         try:
             resolved_recheck = out_path.resolve()
-            if resolved_recheck == root or root in resolved_recheck.parents:
+            if _resolves_inside_root(resolved_recheck, root, os.stat(root)):
                 raise OSError("--out resolved inside --root at write time (TOCTOU)")
             fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:

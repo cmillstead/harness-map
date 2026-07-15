@@ -798,3 +798,88 @@ def test_injection_content_is_data_not_instruction(fake_harness):
     row = next(f for f in doc["always_loaded"]["files"] if f["path"] == "rules/a.md")
     assert row["words"] > 0
     assert "SECRET" not in json.dumps(doc.get("errors", []))
+
+
+def test_generalized_rule_scan_labels_noncoding_skill_rules(fake_harness):
+    # A3: a NON-coding-team sub-skill's rules/*.md is always-loaded weight, category "skill_rule";
+    # coding-team's own rule keeps "coding_team_rule" (baseline-stable label).
+    otherskill = fake_harness / "skills" / "otherskill" / "rules"
+    otherskill.mkdir(parents=True, exist_ok=True)
+    (otherskill / "x.md").write_text("Other skill rule body " * 10)
+    doc = run_collector(fake_harness)
+    by_path = {f["path"]: f for f in doc["always_loaded"]["files"]}
+    assert "skills/otherskill/rules/x.md" in by_path
+    assert by_path["skills/otherskill/rules/x.md"]["category"] == "skill_rule"
+    # coding-team fixture rule c.md still labeled coding_team_rule
+    assert any(f["category"] == "coding_team_rule" and f["path"].endswith("rules/c.md")
+               for f in doc["always_loaded"]["files"])
+
+
+def test_generalized_hook_test_scan_finds_noncoding_skill_tests(fake_harness):
+    # A3: a hook test under a NON-coding-team sub-skill's hooks/tests marks its hook covered.
+    hooks = fake_harness / "hooks"
+    (hooks / "myguard.py").write_text("# guard\n")
+    tdir = fake_harness / "skills" / "otherskill" / "hooks" / "tests"
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / "test_myguard.py").write_text("def test_x():\n    assert True\n")
+    doc = run_collector(fake_harness)
+    cov = {h["name"]: h["has_test"] for h in doc["test_coverage"]["hooks"]}
+    assert cov.get("myguard.py") is True
+
+
+def test_out_dir_convention_inside_root_rejected(fake_harness):
+    # DA1: the ./harness-map-reports/ convention resolving INSIDE --root is rejected by the guard
+    # (the derived <dir>/harness-map-DATE.json path, not just a bare inside-root file).
+    derived = fake_harness / "harness-map-reports" / "harness-map-2026-07-15.json"
+    proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                           "--out", str(derived)], capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0
+    assert "outside --root" in proc.stderr
+    assert not derived.exists()
+
+
+def test_out_dir_convention_outside_root_written(fake_harness, tmp_path):
+    # DA1 accept-direction (carve-out audit): a valid outside-root out-dir still writes the sidecar.
+    outdir = tmp_path / "harness-map-reports"
+    outdir.mkdir()
+    good = outdir / "harness-map-2026-07-15.json"
+    run_collector(fake_harness, "--out", str(good))
+    assert good.exists()
+    json.loads(good.read_text())
+
+
+def test_out_case_insensitive_inside_root_rejected(fake_harness):
+    # FIX2: on a case-INSENSITIVE FS (macOS APFS default), a mis-cased inside-root --out must
+    # still be rejected via the st_dev/st_ino identity (samestat) check, since the lexical/
+    # resolved string checks are case-sensitive. Skip on case-sensitive filesystems.
+    probe = fake_harness / ".CaseProbe"
+    probe.write_text("x")
+    case_insensitive = (fake_harness / ".caseprobe").exists()
+    probe.unlink()
+    if not case_insensitive:
+        import pytest
+        pytest.skip("filesystem is case-sensitive")
+    parent, _, leaf = str(fake_harness).rstrip("/").rpartition("/")
+    bad = f"{parent}/{leaf.upper()}/reports/x.json"  # e.g. .../CLAUDE/reports/x.json
+    proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                           "--out", bad], capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0
+    assert not (fake_harness / "reports" / "x.json").exists()
+
+
+def test_out_dotdot_exits_root_accepted(fake_harness, tmp_path):
+    # FIX3: a path that TEXTUALLY traverses root but RESOLVES outside it must be accepted.
+    # <root>/../sidecar_out.json normalizes to tmp_path/sidecar_out.json (outside root).
+    good = f"{fake_harness}/../sidecar_out.json"
+    proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                           "--out", good], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "sidecar_out.json").exists()
+
+
+def test_blind_spots_rule_scope_is_generalized(fake_harness):
+    # FIX4: the always-loaded-rules disclosure names the generalized skills/*/rules scope,
+    # not the coding-team-only path, so the released report is accurate on any harness.
+    doc = run_collector(fake_harness)
+    assert any("skills/*/rules" in b for b in doc["blind_spots"])
+    assert not any("skills/coding-team/rules/*.md reflects" in b for b in doc["blind_spots"])
