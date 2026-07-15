@@ -19,6 +19,7 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 _FM_DESC_LINE = re.compile(r"^description:\s*(.*)$")
 _QUOTED_TOKEN = re.compile(r"""['"]([^'"]+)['"]""")
+_NORM_RE = re.compile(r"[^a-z0-9]+")
 _SCRIPT_INTERPRETERS = {"python", "python3", "bash", "sh", "node"}
 
 
@@ -720,13 +721,121 @@ def flag_long_instructions(root):
     return flags
 
 
-def build_headline(always_loaded, hooks_section, instruction_length_flags):
+SHINGLE_K = 8
+DUP_THRESHOLD = 0.6
+MAX_SHINGLES_PER_FILE = 4000
+MAX_FILE_BYTES = 200_000
+MAX_PAIRS = 50
+
+
+def _containment(a_set, b_set):
+    smaller = min(len(a_set), len(b_set))
+    if smaller == 0:
+        return 0.0
+    return len(a_set & b_set) / smaller  # |A∩B| / min(|A|,|B|)
+
+
+def _normalize_words(text):
+    """Lowercase, then replace (never delete) markdown punctuation with a space so
+    "a.b" tokenizes as two words "a", "b" rather than merging into "ab"."""
+    return _NORM_RE.sub(" ", text.lower()).split()
+
+
+def _ordered_capped_shingles(words, k=SHINGLE_K, cap=MAX_SHINGLES_PER_FILE):
+    """Overlapping k-word shingles in document order, deduped and capped deterministically:
+    the FIRST `cap` DISTINCT shingles by document order are retained — never a set(...)
+    truncation, whose iteration order is unspecified and would make output non-deterministic
+    across runs/interpreters for a file that exceeds the cap."""
+    ordered = []
+    seen = set()
+    for i in range(len(words) - k + 1):
+        sh = " ".join(words[i:i + k])
+        if sh in seen:
+            continue
+        seen.add(sh)
+        ordered.append(sh)
+        if len(ordered) >= cap:
+            break
+    return set(ordered)
+
+
+def scan_duplication(root, blind_spots):
+    """Candidate near-duplicate pairs by containment coefficient (|A∩B| / min(|A|,|B|))
+    over k=8 word shingles — chosen over Jaccard because it correctly flags a short file
+    fully subsumed by a longer one (schema.md Note 2). SIGNALS only: this is a candidate
+    list. Deciding "one declared home + callers" for a pair is a synthesis-pass JUDGMENT,
+    not something this collector decides."""
+    patterns = ("rules/*.md", "skills/coding-team/rules/*.md", "skills/*/SKILL.md",
+                "skills/*/phases/*.md", "agents/*.md", "commands/*.md")
+    seen_physical = set()
+    corpus = []  # [(rel_path, shingle_set), ...]
+    for pattern in patterns:
+        try:
+            candidates = sorted(root.glob(pattern))
+        except OSError:
+            candidates = []
+        for fp in candidates:
+            # A file reachable via multiple glob paths (a rules/ deploy symlink pointing at
+            # its skills/coding-team/rules/ submodule source) is ONE physical file — it must
+            # never be compared against itself as a false-positive duplicate pair.
+            key = _physical_key(fp)
+            if key in seen_physical:
+                continue
+            seen_physical.add(key)
+            try:
+                size = fp.stat().st_size
+            except OSError:
+                continue
+            if size > MAX_FILE_BYTES:
+                blind_spots.append(
+                    f"{_rel(root, fp)} exceeds {MAX_FILE_BYTES} bytes; skipped in duplication scan.")
+                continue
+            text, evidence = _read_text(fp)
+            if text is None:
+                continue
+            words = _normalize_words(text)
+            shingles = _ordered_capped_shingles(words)
+            if not shingles:
+                blind_spots.append(
+                    f"{_rel(root, fp)} has fewer than {SHINGLE_K} normalized words; "
+                    "skipped in duplication scan.")
+                continue
+            corpus.append((_rel(root, fp), shingles))
+
+    pairs = []
+    for i in range(len(corpus)):
+        path_a, set_a = corpus[i]
+        for j in range(i + 1, len(corpus)):
+            path_b, set_b = corpus[j]
+            score = _containment(set_a, set_b)
+            if score < DUP_THRESHOLD:
+                continue
+            shared = set_a & set_b
+            sample = min(shared) if shared else ""
+            a, b = sorted((path_a, path_b))
+            pairs.append({"a": a, "b": b, "score": score, "shared_sample": sample,
+                          "evidence": "INFERRED"})
+
+    # Deterministic across runs, including when a file exceeds the shingle cap: sort by
+    # (-score, a, b), then cap to the top MAX_PAIRS.
+    pairs.sort(key=lambda p: (-p["score"], p["a"], p["b"]))
+    pairs = pairs[:MAX_PAIRS]
+
+    return {
+        "shingle_k": SHINGLE_K,
+        "metric": "containment",
+        "threshold": DUP_THRESHOLD,
+        "pairs": pairs,
+    }
+
+
+def build_headline(always_loaded, hooks_section, instruction_length_flags, duplication_section):
     totals = always_loaded["totals"]
     return {
         "always_loaded_words": totals["words"],
         "always_loaded_tokens_est": totals["tokens_est"],
         "always_loaded_file_count": totals["file_count"],
-        "duplicate_pair_count": 0,
+        "duplicate_pair_count": len(duplication_section["pairs"]),
         "unchecked_binary_count": 0,
         "instruction_files_over_200": len(instruction_length_flags),
         "orphan_registration_count": len(hooks_section["orphan_registrations"]),
@@ -761,6 +870,7 @@ def build_document(root, project_root):
     permissions_section = collect_permissions(settings, settings_parsed_ok)
     config_section = collect_config(root, settings, settings_parsed_ok, blind_spots)
     instruction_length_flags = flag_long_instructions(root)
+    duplication_section = scan_duplication(root, blind_spots)
 
     totals = {
         "words": sum(f["words"] for f in files),
@@ -786,7 +896,8 @@ def build_document(root, project_root):
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "root": str(root),
-        "headline": build_headline(always_loaded, hooks_section, instruction_length_flags),
+        "headline": build_headline(always_loaded, hooks_section, instruction_length_flags,
+                                    duplication_section),
         "always_loaded": always_loaded,
         "on_demand": on_demand,
         "enforcement": {
@@ -795,7 +906,7 @@ def build_document(root, project_root):
         },
         "config": config_section,
         "instruction_length_flags": instruction_length_flags,
-        "duplication": {"shingle_k": 8, "metric": "containment", "threshold": 0.6, "pairs": []},
+        "duplication": duplication_section,
         "phantom_refs": [],
         "promotion_candidates": [],
         "test_coverage": {

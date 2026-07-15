@@ -415,3 +415,66 @@ def test_distinct_basenames_not_deduped(fake_harness):
     mem_paths = [f["path"] for f in doc["always_loaded"]["files"] if f["path"].endswith("MEMORY.md")]
     assert any(p == "memory/MEMORY.md" for p in mem_paths)
     assert any(p.startswith("projects/") for p in mem_paths)
+
+def _uw(prefix, n):  # n space-joined unique words: prefix00 prefix01 ...
+    return " ".join(f"{prefix}{i:02d}" for i in range(n))
+
+def test_containment_beats_jaccard_emits_pair(fake_harness):
+    block = _uw("w", 17)
+    (fake_harness / "rules" / "a.md").write_text(block)
+    (fake_harness / "skills" / "coding-team" / "rules" / "c.md").write_text(block + " " + _uw("x", 85))
+    doc = run_collector(fake_harness)
+    pair = next((p for p in doc["duplication"]["pairs"]
+                 if {p["a"], p["b"]} == {"rules/a.md", "skills/coding-team/rules/c.md"}), None)
+    assert pair is not None, "containment ~1.0 must emit where whole-file Jaccard (~0.1) would miss"
+    assert pair["score"] >= 0.6
+    assert pair["shared_sample"]
+    assert doc["duplication"]["metric"] == "containment"
+    assert doc["duplication"]["shingle_k"] == 8
+    assert doc["duplication"]["threshold"] == 0.6
+
+def test_containment_exactly_at_threshold_emits(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text(_uw("w", 17))
+    (fake_harness / "rules" / "b.md").write_text(_uw("w", 13) + " " + _uw("y", 85))
+    doc = run_collector(fake_harness)
+    pair = next((p for p in doc["duplication"]["pairs"]
+                 if {p["a"], p["b"]} == {"rules/a.md", "rules/b.md"}), None)
+    assert pair is not None and abs(pair["score"] - 0.6) < 1e-9
+
+def test_containment_just_below_threshold_not_emitted(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text(_uw("w", 17))
+    (fake_harness / "rules" / "b.md").write_text(_uw("w", 12) + " " + _uw("y", 85))
+    doc = run_collector(fake_harness)
+    assert not any({p["a"], p["b"]} == {"rules/a.md", "rules/b.md"} for p in doc["duplication"]["pairs"])
+
+def test_disjoint_files_not_paired(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text(_uw("alpha", 30))
+    (fake_harness / "rules" / "b.md").write_text(_uw("bravo", 30))
+    doc = run_collector(fake_harness)
+    assert not any({p["a"], p["b"]} == {"rules/a.md", "rules/b.md"} for p in doc["duplication"]["pairs"])
+
+def test_duplication_output_is_deterministic(fake_harness):
+    block = _uw("w", 17)
+    (fake_harness / "rules" / "a.md").write_text(block)
+    (fake_harness / "skills" / "coding-team" / "rules" / "c.md").write_text(block + " " + _uw("x", 40))
+    (fake_harness / "rules" / "b.md").write_text(block + " " + _uw("z", 40))
+    d1 = run_collector(fake_harness)["duplication"]
+    d2 = run_collector(fake_harness)["duplication"]
+    assert json.dumps(d1, sort_keys=False) == json.dumps(d2, sort_keys=False)
+
+def test_duplication_deterministic_when_shingle_cap_exceeded(fake_harness):
+    big = " ".join(f"t{i:05d}" for i in range(4200))
+    (fake_harness / "rules" / "a.md").write_text(big)
+    (fake_harness / "rules" / "b.md").write_text(big)
+    d1 = run_collector(fake_harness)["duplication"]
+    d2 = run_collector(fake_harness)["duplication"]
+    assert json.dumps(d1, sort_keys=False) == json.dumps(d2, sort_keys=False)
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_symlinked_file_not_selfpaired_in_duplication(fake_harness):
+    target = fake_harness / "skills" / "coding-team" / "rules" / "c.md"
+    target.write_text(_uw("w", 40))
+    os.symlink(target, fake_harness / "rules" / "linked.md")
+    doc = run_collector(fake_harness)
+    assert not any({p["a"], p["b"]} == {"rules/linked.md", "skills/coding-team/rules/c.md"}
+                   for p in doc["duplication"]["pairs"])
