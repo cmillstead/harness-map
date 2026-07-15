@@ -131,3 +131,162 @@ def test_unreadable_project_dir_does_not_blank_inventory(fake_harness):
         assert any("locked-proj-slug" in i["path"] for i in doc["inaccessible"])
     finally:
         os.chmod(locked, 0o755)
+
+def _build_hooks_harness(root):
+    hooks = root / "hooks"
+    (hooks / "session-start-dispatcher.py").write_text("CHECKS = ['foo_check.py']\n")
+    (hooks / "direct.py").write_text("# direct\n")
+    (hooks / "foo_check.py").write_text("# via dispatcher\n")
+    (hooks / "lonely.py").write_text("# nowhere\n")
+    settings = {"hooks": {
+        "SessionStart": [{"hooks": [{"type": "command",
+            "command": "python3 ~/.claude/hooks/session-start-dispatcher.py"}]}],
+        "PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "python3 ~/.claude/hooks/direct.py"},
+            {"type": "command", "command": "python3 ~/.claude/hooks/absent.py"}]}]},
+        "permissions": {"allow": ["Bash(ls:*)", "Read(*)"], "deny": ["Bash(rm:*)"]}}
+    (root / "settings.json").write_text(json.dumps(settings))
+
+def test_reconcile_flags_orphan_registration(fake_harness):
+    _build_hooks_harness(fake_harness)
+    doc = run_collector(fake_harness)
+    assert any("absent.py" in o["script"] for o in doc["enforcement"]["hooks"]["orphan_registrations"])
+    row = next(o for o in doc["enforcement"]["hooks"]["orphan_registrations"] if "absent.py" in o["script"])
+    assert row["target_status"] == "missing" and row["registration_evidence"] == "VERIFIED"
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_reconcile_permission_denied_target_is_inaccessible_not_orphan(fake_harness):
+    locked_dir = fake_harness / "hooks" / "locked"
+    locked_dir.mkdir()
+    (locked_dir / "denied.py").write_text("# denied\n")
+    os.chmod(locked_dir, 0)
+    try:
+        settings = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "python3 ~/.claude/hooks/locked/denied.py"}]}]}}
+        (fake_harness / "settings.json").write_text(json.dumps(settings))
+        doc = run_collector(fake_harness)
+        assert not any("denied.py" in o["script"] for o in doc["enforcement"]["hooks"]["orphan_registrations"])
+        assert any("denied.py" in i["path"] for i in doc["inaccessible"])
+    finally:
+        os.chmod(locked_dir, 0o755)
+
+def test_dispatcher_fanned_script_not_orphan(fake_harness):
+    _build_hooks_harness(fake_harness)
+    doc = run_collector(fake_harness)
+    scripts = {s["name"]: s for s in doc["enforcement"]["hooks"]["scripts_on_disk"]}
+    assert scripts["foo_check.py"]["registered_via"] == "dispatcher"
+    assert scripts["foo_check.py"]["evidence"] == "INFERRED"
+    assert "foo_check.py" not in {o["name"] for o in doc["enforcement"]["hooks"]["orphan_scripts"]}
+
+def test_truly_unreferenced_script_flagged(fake_harness):
+    _build_hooks_harness(fake_harness)
+    doc = run_collector(fake_harness)
+    assert "lonely.py" in {o["name"] for o in doc["enforcement"]["hooks"]["orphan_scripts"]}
+
+def test_direct_registration_resolved(fake_harness):
+    _build_hooks_harness(fake_harness)
+    doc = run_collector(fake_harness)
+    scripts = {s["name"]: s for s in doc["enforcement"]["hooks"]["scripts_on_disk"]}
+    assert scripts["direct.py"]["registered_via"] == "direct"
+
+def test_permissions_counted(fake_harness):
+    _build_hooks_harness(fake_harness)
+    doc = run_collector(fake_harness)
+    perms = doc["enforcement"]["permissions"]
+    assert perms["allow_count"] == 2 and perms["deny_count"] == 1
+
+def test_malformed_settings_survived(fake_harness):
+    (fake_harness / "settings.json").write_text("{ not valid json")
+    doc = run_collector(fake_harness)
+    assert any("settings.json" in e for e in doc["errors"])
+
+def test_config_surface_collected_without_secrets(fake_harness):
+    doc = run_collector(fake_harness)
+    cfg = doc["config"]
+    assert set(cfg["env_keys"]) == {"FAKE_TOKEN", "ENABLE_X"}
+    assert cfg["env_key_count"] == 2
+    assert "s3cr3t-should-never-appear" not in json.dumps(doc)
+    assert cfg["model"] == "opus[1m]"
+    plugins = {p["name"]: p["enabled"] for p in cfg["enabled_plugins"]}
+    assert plugins == {"demo-plugin@official": True, "off-plugin@official": False}
+    assert cfg["plugin_count"] == 2
+    assert cfg["cleanup_period_days"] == 3650 and cfg["sandbox"] is True
+    assert set(cfg["marketplaces"]) == {"official", "community"}
+    assert cfg["marketplace_count"] == 2
+    assert set(cfg["installed_plugins"]) == {"demo-plugin@official"}
+    assert cfg["installed_plugin_count"] == 1
+
+@pytest.mark.parametrize("command,expected_basename", [
+    ("python3 ~/.claude/hooks/x.py", "x.py"),
+    ("/usr/bin/python3 ~/.claude/hooks/x.py", "x.py"),
+    ("/usr/bin/env python3 ~/.claude/hooks/x.py", "x.py"),
+    ("python3 ~/.claude/hooks/x.py --foo bar", "x.py"),
+    ("bash '~/.claude/hooks/quoted path.sh'", "quoted path.sh"),
+    ("~/.claude/hooks/x.py --foo", "x.py"),
+    ("./hooks/x.py --foo", "x.py"),
+])
+def test_script_token_extraction_forms(fake_harness, command, expected_basename):
+    settings = {"hooks": {"PreToolUse": [{"matcher": "Bash",
+                "hooks": [{"type": "command", "command": command}]}]}}
+    (fake_harness / "hooks" / (expected_basename)).write_text("# hook\n")
+    (fake_harness / "settings.json").write_text(json.dumps(settings))
+    doc = run_collector(fake_harness)
+    registered = {Path(r["script"]).name: r for r in doc["enforcement"]["hooks"]["registered"]}
+    assert expected_basename in registered
+    row = registered[expected_basename]
+    assert row["exists"] is True
+    assert row["registered_via"] == "direct"
+    orphan_reg_names = {Path(o["script"]).name for o in doc["enforcement"]["hooks"]["orphan_registrations"]}
+    orphan_script_names = {o["name"] for o in doc["enforcement"]["hooks"]["orphan_scripts"]}
+    assert expected_basename not in orphan_reg_names
+    assert expected_basename not in orphan_script_names
+
+def test_unsupported_command_form_surfaced_not_dropped(fake_harness):
+    settings = {"hooks": {"PreToolUse": [{"matcher": "Bash",
+                "hooks": [{"type": "command", "command": "rtk hook claude"}]}]}}
+    (fake_harness / "settings.json").write_text(json.dumps(settings))
+    doc = run_collector(fake_harness)
+    assert any("unsupported hook command form" in b for b in doc["blind_spots"])
+
+def test_dispatcher_reachability_only_if_registered(fake_harness):
+    hooks = fake_harness / "hooks"
+    (hooks / "unreg-dispatcher.py").write_text("CHECKS = ['foo_check.py']\n")
+    (hooks / "foo_check.py").write_text("# body\n")
+    (fake_harness / "settings.json").write_text(json.dumps({"hooks": {}}))
+    doc = run_collector(fake_harness)
+    assert "foo_check.py" in {o["name"] for o in doc["enforcement"]["hooks"]["orphan_scripts"]}
+
+def test_dispatcher_comment_mention_does_not_confer_reachability(fake_harness):
+    hooks = fake_harness / "hooks"
+    (hooks / "session-start-dispatcher.py").write_text(
+        '"""Runs commented.py checks."""\n# also mentions commented.py in a comment\nCHECKS = []\n')
+    (hooks / "commented.py").write_text("# body\n")
+    (fake_harness / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [
+        {"hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/session-start-dispatcher.py"}]}]}}))
+    doc = run_collector(fake_harness)
+    assert "commented.py" in {o["name"] for o in doc["enforcement"]["hooks"]["orphan_scripts"]}
+
+def test_orphan_scripts_exact_set_on_live_like_fixture(fake_harness):
+    hooks = fake_harness / "hooks"
+    (hooks / "session-start-dispatcher.py").write_text("CHECKS = ['reached.py']\n")
+    (hooks / "reached.py").write_text("# reached via dispatcher string literal\n")
+    (hooks / "direct.py").write_text("# directly registered\n")
+    (hooks / "orphan_a.py").write_text("# nobody references\n")
+    (hooks / "orphan_b.sh").write_text("# nobody references\n")
+    (fake_harness / "settings.json").write_text(json.dumps({"hooks": {
+        "SessionStart": [{"hooks": [{"type": "command",
+            "command": "python3 ~/.claude/hooks/session-start-dispatcher.py"}]}],
+        "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command",
+            "command": "python3 ~/.claude/hooks/direct.py"}]}]}}))
+    doc = run_collector(fake_harness)
+    assert {o["name"] for o in doc["enforcement"]["hooks"]["orphan_scripts"]} == {"orphan_a.py", "orphan_b.sh"}
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_hook_symlink_target_outside_root_is_noted(fake_harness, tmp_path):
+    outside = tmp_path / "outside-hook.py"
+    outside.write_text("# lives outside the harness root\n")
+    link = fake_harness / "hooks" / "linked.py"
+    os.symlink(outside, link)
+    (fake_harness / "settings.json").write_text(json.dumps({"hooks": {}}))
+    doc = run_collector(fake_harness)
+    assert any("linked.py" in b and "outside" in b for b in doc["blind_spots"])
