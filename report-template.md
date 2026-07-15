@@ -92,7 +92,7 @@ Runtime anomalies the collector itself hit (malformed/unreadable settings.json, 
 
 ## 6. Diff vs Previous Run
 
-Selection rule: most recent `harness-map-*.json` strictly before today.
+Selection rule: most recent `harness-map-*.json` in OUT_DIR strictly before today.
 
 Either:
 
@@ -114,4 +114,4 @@ First run — no prior map (baseline).
 
 ## Sidecar Note
 
-This run also wrote `harness-map-YYYY-MM-DD.json` (machine-readable snapshot) alongside this report; the next run diffs against it.
+This run also wrote `harness-map-YYYY-MM-DD.json` (machine-readable snapshot) into the same report directory (the operator-chosen `OUT_DIR`, default `./harness-map-reports/`) as this report; the next run diffs against it.
