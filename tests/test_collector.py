@@ -571,3 +571,37 @@ def test_prose_span_with_slash_not_treated_as_path_ref(fake_harness):
     )
     doc = run_collector(fake_harness)
     assert not any(" " in r["ref"] for r in doc["phantom_refs"])
+
+def test_hook_with_test_asset_marked_covered(fake_harness):
+    (fake_harness / "hooks" / "guard.py").write_text("# hook\n")
+    (fake_harness / "hooks" / "tests").mkdir()
+    (fake_harness / "hooks" / "tests" / "test_guard.py").write_text("def test_guard(): assert True\n")
+    doc = run_collector(fake_harness)
+    hooks = {h["name"]: h for h in doc["test_coverage"]["hooks"]}
+    assert hooks["guard.py"]["has_test"] is True
+
+def test_hook_without_test_asset_marked_uncovered(fake_harness):
+    (fake_harness / "hooks" / "naked.py").write_text("# hook\n")
+    doc = run_collector(fake_harness)
+    hooks = {h["name"]: h for h in doc["test_coverage"]["hooks"]}
+    assert hooks["naked.py"]["has_test"] is False
+    assert doc["test_coverage"]["summary"]["hooks_total"] >= 1
+
+def test_hyphenated_hook_matches_underscore_test(fake_harness):
+    (fake_harness / "hooks" / "hook-health-check.py").write_text("# hook\n")
+    (fake_harness / "hooks" / "tests").mkdir()
+    (fake_harness / "hooks" / "tests" / "test_hook_health_check.py").write_text("def test_x(): assert True\n")
+    doc = run_collector(fake_harness)
+    hooks = {h["name"]: h for h in doc["test_coverage"]["hooks"]}
+    assert hooks["hook-health-check.py"]["has_test"] is True
+
+def test_skill_with_tests_dir_marked_covered(fake_harness):
+    (fake_harness / "skills" / "demo" / "tests").mkdir(parents=True)
+    (fake_harness / "skills" / "demo" / "tests" / "test_demo.py").write_text("def test_x(): assert True\n")
+    (fake_harness / "skills" / "bare").mkdir(parents=True)
+    (fake_harness / "skills" / "bare" / "SKILL.md").write_text("---\nname: bare\ndescription: bare skill.\n---\n")
+    doc = run_collector(fake_harness)
+    skills = {s["name"]: s for s in doc["test_coverage"]["skills"]}
+    assert skills["demo"]["has_test"] is True
+    assert skills["bare"]["has_test"] is False
+    assert doc["test_coverage"]["summary"]["skills_total"] >= 2

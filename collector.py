@@ -1020,6 +1020,118 @@ def collect_promotion_candidates(root, corpus_files, settings):
     return candidates
 
 
+def _hook_test_stems(root):
+    """Normalized (snake_case) stems named by test files under hooks/tests/ and
+    skills/coding-team/hooks/tests/ — "test_guard.py" and "guard_test.py" both yield
+    "guard". Read-only, single-level glob per dir (no recursion needed: hook tests live
+    directly in these two known locations)."""
+    stems = set()
+    for rel in ("hooks/tests", "skills/coding-team/hooks/tests"):
+        test_dir = root / rel
+        if not test_dir.is_dir():
+            continue
+        try:
+            test_files = test_dir.glob("*.py")
+        except OSError:
+            test_files = []
+        for f in test_files:
+            stem = f.stem
+            if stem.startswith("test_"):
+                stems.add(stem[len("test_"):])
+            elif stem.endswith("_test"):
+                stems.add(stem[:-len("_test")])
+    return stems
+
+
+def _detect_hook_test_coverage(root):
+    """PRESENCE-only signal: does a hook script have a matching test file? NOT adequacy —
+    a hooks/tests/test_x.py with a single trivial assertion counts as covered, same as a
+    thorough suite (the "6 of 66" reality). Symlinked hooks are deduped by physical
+    identity so one script counts once even if reachable via multiple glob paths."""
+    hooks_dir = root / "hooks"
+    try:
+        disk_files = sorted(hooks_dir.glob("*.py")) + sorted(hooks_dir.glob("*.sh"))
+    except OSError:
+        disk_files = []
+    disk_files.sort(key=lambda p: p.name)
+    test_stems = _hook_test_stems(root)
+
+    result = []
+    seen_keys = set()
+    for fp in disk_files:
+        key = _physical_key(fp)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        stem_norm = fp.stem.replace("-", "_")
+        result.append({"name": fp.name, "has_test": stem_norm in test_stems})
+    return result
+
+
+def _skill_has_test_asset(skill_dir):
+    """PRESENCE-only signal (see _detect_hook_test_coverage docstring): a tests/ dir, an
+    evals/ dir, or any test_*.py / *_eval.* file anywhere under the skill dir. Unlike
+    _safe_exists, Path.is_dir() does NOT swallow PermissionError (only ENOENT-family
+    errors) — a permission-denied skill dir is already surfaced as inaccessible by
+    collect_descriptions()/collect_on_demand(); this function must only avoid crashing
+    the whole run, not duplicate that reporting."""
+    try:
+        if (skill_dir / "tests").is_dir() or (skill_dir / "evals").is_dir():
+            return True
+    except OSError:
+        pass
+    try:
+        if next(skill_dir.rglob("test_*.py"), None) is not None:
+            return True
+    except OSError:
+        pass
+    try:
+        if next(skill_dir.rglob("*_eval.*"), None) is not None:
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _detect_skill_test_coverage(root):
+    skills_dir = root / "skills"
+    if not skills_dir.is_dir():
+        return []
+    try:
+        skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
+    except OSError:
+        skill_dirs = []
+    return [{"name": d.name, "has_test": _skill_has_test_asset(d)} for d in skill_dirs]
+
+
+def detect_test_coverage(root, on_demand):
+    """Whether each hook script and each skill has an associated test ASSET — a
+    PRESENCE check, not an adequacy check (the "6 of 66" reality: a tests/ dir holding
+    one trivial assertion counts as covered exactly like a thorough suite). Cross-links
+    the same per-skill has_test verdict onto on_demand["skills"] (mutated in place) by
+    skill name, so both sections agree instead of on_demand carrying its own narrower
+    (tests/-dir-only) check."""
+    hooks_result = _detect_hook_test_coverage(root)
+    skills_result = _detect_skill_test_coverage(root)
+
+    skills_has_test = {s["name"]: s["has_test"] for s in skills_result}
+    for entry in on_demand.get("skills", []):
+        name = entry.get("name")
+        if name in skills_has_test:
+            entry["has_test"] = skills_has_test[name]
+
+    return {
+        "hooks": hooks_result,
+        "skills": skills_result,
+        "summary": {
+            "hooks_with_test": sum(1 for h in hooks_result if h["has_test"]),
+            "hooks_total": len(hooks_result),
+            "skills_with_test": sum(1 for s in skills_result if s["has_test"]),
+            "skills_total": len(skills_result),
+        },
+    }
+
+
 def build_headline(always_loaded, hooks_section, instruction_length_flags, duplication_section):
     totals = always_loaded["totals"]
     return {
@@ -1086,6 +1198,8 @@ def build_document(root, project_root):
         "memory_bodies": memory_bodies,
     }
 
+    test_coverage_section = detect_test_coverage(root, on_demand)
+
     doc = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1103,10 +1217,7 @@ def build_document(root, project_root):
         "duplication": duplication_section,
         "phantom_refs": phantom_refs,
         "promotion_candidates": promotion_candidates,
-        "test_coverage": {
-            "hooks": [], "skills": [],
-            "summary": {"hooks_with_test": 0, "hooks_total": 0, "skills_with_test": 0, "skills_total": 0},
-        },
+        "test_coverage": test_coverage_section,
         "inaccessible": inaccessible,
         "blind_spots": blind_spots,
         "errors": errors,
