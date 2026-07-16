@@ -828,7 +828,7 @@ th{color:var(--muted);font-weight:600}
 .badge.orphan{border-color:var(--crit);color:var(--crit)}
 .badge.direct{border-color:#009e73;color:#009e73}
 .badge.dispatcher{border-color:var(--accent);color:var(--accent)}
-.cell-label{font-size:8px;fill:var(--text)}
+.cell-label{font-size:12px;fill:var(--text)}
 .legend-swatch{display:inline-block;width:10px;height:10px;margin-right:4px;border-radius:2px;vertical-align:middle}
 svg text{font-family:inherit}
 footer.sources{border-top:1px solid var(--border);padding:10px 20px;color:var(--muted);font-size:0.78rem}
@@ -915,8 +915,8 @@ def _render_treemap_svg(tree, heat, dom_id):
             f'fill="{esc_html(c.get("fill", "#56b4e9"))}" class="{rect_cls}" '
             f'data-node-key="{esc_html(c["node_key"])}"><title>{esc_html(c["path"])} '
             f'(friction: {heat_n})</title></rect>')
-        if float(c["w"]) > 40 and float(c["h"]) > 14:
-            tx, ty = _fmt_float(float(c["x"]) + 2), _fmt_float(float(c["y"]) + 10)
+        if float(c["w"]) > 56 and float(c["h"]) > 18:
+            tx, ty = _fmt_float(float(c["x"]) + 2), _fmt_float(float(c["y"]) + 13)
             parts.append(f'<text x="{tx}" y="{ty}" class="cell-label">{label}</text>')
             if heat_n:
                 bx = _fmt_float(float(c["x"]) + float(c["w"]) - 2)
