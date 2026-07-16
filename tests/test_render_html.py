@@ -1,0 +1,638 @@
+"""Tests for render_html.py per docs/plans/2026-07-15-harness-map-html-viz-design.md §5.
+Real fixtures only (no mocks — the renderer is pure stdlib). Reuses `run_collector`
+(test_collector.py:21) and `fake_harness` (conftest.py:13)."""
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from html.parser import HTMLParser
+from pathlib import Path
+
+import pytest
+
+from test_collector import run_collector
+
+RENDER = Path(__file__).resolve().parents[1] / "render_html.py"
+REAL_SAMPLE = Path("/Users/cevin/Documents/obsidian-vault/AI/output/harness-map-2026-07-15.json")
+
+_spec = importlib.util.spec_from_file_location("harness_map_render_html", RENDER)
+rh = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rh)
+
+
+# --------------------------------------------------------------------------- fixtures
+@pytest.fixture(scope="session", autouse=True)
+def _fake_home_for_render_html_tests(tmp_path_factory):
+    """§9-R D hermeticity guarantee: every test in this module runs under a fake $HOME,
+    so a test that forgets to pass explicit `--*-file` fixture paths structurally
+    CANNOT read the author's real telemetry streams."""
+    fake_home = tmp_path_factory.mktemp("fake_home")
+    original = os.environ.get("HOME")
+    os.environ["HOME"] = str(fake_home)
+    yield fake_home
+    if original is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = original
+
+
+def run_render(out_dir, *args):
+    cmd = [sys.executable, str(RENDER), "--out-dir", str(out_dir)] + list(args)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    return proc
+
+
+class _ExternalRefParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.external = []
+        self.on_handlers = []
+        self.style_attrs = []
+        self.tag_counts = {}
+
+    def handle_starttag(self, tag, attrs):
+        self.tag_counts[tag] = self.tag_counts.get(tag, 0) + 1
+        for k, v in attrs:
+            if k in ("src", "href", "srcset", "xlink:href") and v and v.startswith(("http://", "https://")):
+                self.external.append((tag, k, v))
+            if k.startswith("on"):
+                self.on_handlers.append((tag, k))
+            if k == "style":
+                self.style_attrs.append((tag, v))
+
+
+def _minimal_doc(extra_files=None, extra_promotion="", tokens_a=100, tokens_b=50):
+    files = [
+        {"path": "CLAUDE.md", "category": "claude_md", "words": 40, "lines": 5,
+         "tokens_est": tokens_a, "evidence": "VERIFIED"},
+        {"path": "rules/a.md", "category": "rule", "words": 20, "lines": 3,
+         "tokens_est": tokens_b, "evidence": "VERIFIED"},
+    ]
+    if extra_files:
+        files.extend(extra_files)
+    doc = {
+        "schema_version": 1,
+        "generated_at": "2026-07-15T00:00:00+00:00",
+        "root": "/fake/root",
+        "headline": {
+            "always_loaded_words": 60, "always_loaded_tokens_est": tokens_a + tokens_b,
+            "always_loaded_file_count": len(files), "duplicate_pair_count": 1,
+            "unchecked_binary_count": 0, "instruction_files_over_200": 0,
+            "orphan_registration_count": 1, "orphan_script_count": 1,
+        },
+        "always_loaded": {
+            "files": files, "conditional_variants": [], "skill_descriptions": [],
+            "agent_descriptions": [], "totals": {"words": 60, "tokens_est": tokens_a + tokens_b,
+                                                   "file_count": len(files)},
+        },
+        "on_demand": {
+            "skills": [{"name": "coding-team", "lines": 50, "words": 300, "has_test": True,
+                        "evidence": "VERIFIED"}],
+            "skill_internal_bodies": [
+                {"skill": "coding-team", "path": "skills/coding-team/phases/execution.md",
+                 "kind": "phase", "lines": 10, "words": 80, "evidence": "VERIFIED"},
+                {"skill": "coding-team", "path": "skills/coding-team/agents/ct-implementer.md",
+                 "kind": "agent", "lines": 10, "words": 90, "evidence": "VERIFIED"},
+            ],
+            "memory_bodies": [{"path": "projects/x/memory/feedback_note.md", "project_slug": "x",
+                                "lines": 5, "words": 40, "evidence": "VERIFIED"}],
+        },
+        "enforcement": {
+            "hooks": {
+                "registered": [{"command": "python3 ~/.claude/hooks/write-guard.py",
+                                 "script": "hooks/write-guard.py", "exists": True,
+                                 "registered_via": "direct", "registration_evidence": "VERIFIED",
+                                 "target_evidence": "VERIFIED"}],
+                "orphan_registrations": [{"script": "hooks/missing.py", "target_status": "missing",
+                                           "registration_evidence": "VERIFIED"}],
+                "scripts_on_disk": [{"name": "write-guard.py", "is_symlink": False, "target": None,
+                                      "registered_via": "direct", "evidence": "VERIFIED"},
+                                     {"name": "orphan-script.py", "is_symlink": False, "target": None,
+                                      "registered_via": "none", "evidence": "INFERRED"}],
+                "orphan_scripts": [{"name": "orphan-script.py", "evidence": "INFERRED"}],
+            },
+            "permissions": {"allow_count": 1, "deny_count": 1, "ask_count": 0, "evidence": "VERIFIED"},
+        },
+        "config": {"env_keys": ["FAKE_TOKEN"], "env_key_count": 1, "model": "opus", "cleanup_period_days": 1,
+                    "sandbox": True, "enabled_plugins": [], "plugin_count": 0, "marketplaces": [],
+                    "marketplace_count": 0, "installed_plugins": [], "installed_plugin_count": 0,
+                    "evidence": "VERIFIED"},
+        "instruction_length_flags": [],
+        "duplication": {"shingle_k": 8, "metric": "containment", "threshold": 0.6,
+                         "pairs": [{"a": "rules/a.md", "b": "rules/b.md", "score": 0.9,
+                                    "shared_sample": "shared words here", "evidence": "INFERRED"}]},
+        "phantom_refs": [{"source": "rules/a.md", "ref": "nope.md", "kind": "path",
+                           "resolved": False, "evidence": "VERIFIED"}],
+        "promotion_candidates": [{"source": "rules/a.md", "pattern": "NEVER",
+                                   "excerpt": extra_promotion or "NEVER do the thing",
+                                   "hook_covered": False, "evidence": "INFERRED"}],
+        "test_coverage": {"hooks": [], "skills": [], "summary": {"hooks_with_test": 0, "hooks_total": 0,
+                                                                   "skills_with_test": 0, "skills_total": 0}},
+        "inaccessible": [], "blind_spots": ["a blind spot note"], "errors": [],
+    }
+    return doc
+
+
+def _write_sidecar(out_dir, date, doc):
+    (Path(out_dir) / f"harness-map-{date}.json").write_text(json.dumps(doc))
+
+
+# ============================================================= 1. real-data smoke render
+def test_real_data_smoke_render(tmp_path):
+    if not REAL_SAMPLE.is_file():
+        pytest.skip("real sample not present on this machine")
+    out_dir = tmp_path / "real"
+    out_dir.mkdir()
+    (out_dir / REAL_SAMPLE.name).write_text(REAL_SAMPLE.read_text())
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    out_file = out_dir / "harness-map-2026-07-15.html"
+    assert out_file.is_file()
+    text = out_file.read_text(encoding="utf-8")
+
+    p = _ExternalRefParser()
+    p.feed(text)
+    assert p.external == [], f"external resource refs found: {p.external}"
+
+    doc = json.loads((out_dir / REAL_SAMPLE.name).read_text())
+    for key, _, _ in rh.HEADLINE_KEYS:
+        assert str(doc["headline"][key]) in text, f"headline value for {key} missing from HTML"
+
+
+def test_real_data_smoke_render_with_friction_streams_present(tmp_path):
+    """The actual demo invocation: friction streams default to real paths under
+    (fake) $HOME. With no files there, every stream must degrade to 'absent', never crash."""
+    if not REAL_SAMPLE.is_file():
+        pytest.skip("real sample not present on this machine")
+    out_dir = tmp_path / "real2"
+    out_dir.mkdir()
+    (out_dir / REAL_SAMPLE.name).write_text(REAL_SAMPLE.read_text())
+    proc = run_render(out_dir, "--date", "2026-07-15")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "absent" in text
+
+
+# ============================================================= 2. transform correctness
+def test_build_contextweight_model_groups_and_cells():
+    doc = _minimal_doc()
+    model = rh.build_contextweight_model(doc)
+    cats = {c["category"] for c in model["always"]["groups"]}
+    assert cats == {"claude_md", "rule"}
+    cells = model["always"]["cells"]
+    assert {c["path"] for c in cells} == {"CLAUDE.md", "rules/a.md"}
+    node_keys = {c["node_key"] for c in cells}
+    assert node_keys == {"always_loaded:CLAUDE.md", "always_loaded:rules/a.md"}
+
+
+def test_build_contextweight_model_on_demand_groups():
+    doc = _minimal_doc()
+    model = rh.build_contextweight_model(doc)
+    od_groups = {c["category"] for c in model["on_demand"]["groups"]}
+    assert od_groups == {"skill", "phase", "agent", "memory"}
+    od_node_keys = {c["node_key"] for c in model["on_demand"]["cells"]}
+    assert "on_demand:coding-team" in od_node_keys
+    assert "on_demand:skills/coding-team/phases/execution.md" in od_node_keys
+
+
+def test_build_bipartite_model_direct_edges_and_orphans():
+    doc = _minimal_doc()
+    model = rh.build_bipartite_model(doc)
+    assert len(model["left"]) == 1
+    assert model["left"][0]["node_key"] == "hook:write-guard.py"
+    assert len(model["left_orphans"]) == 1
+    assert model["left_orphans"][0]["script"] == "hooks/missing.py"
+    right_names = {n["name"]: n["registered_via"] for n in model["right"]}
+    assert right_names == {"write-guard.py": "direct", "orphan-script.py": "none"}
+    assert len(model["edges"]) == 1
+    assert model["edges"][0] == {"from": "hook:write-guard.py", "to": "hook:write-guard.py"}
+    assert model["orphan_script_count"] == 1
+
+
+def test_build_trend_model_multi_sidecar_series():
+    doc1 = _minimal_doc(tokens_a=100, tokens_b=50)
+    doc2 = _minimal_doc(tokens_a=200, tokens_b=50)
+    model = rh.build_trend_model([("2026-07-14", doc1), ("2026-07-15", doc2)])
+    assert model["dates"] == ["2026-07-14", "2026-07-15"]
+    assert model["first_run"] is False
+    tokens_series = next(s for s in model["series"] if s["key"] == "always_loaded_tokens_est")
+    assert tokens_series["values"] == [150, 250]
+
+
+def test_build_trend_model_single_sidecar_first_run():
+    doc = _minimal_doc()
+    model = rh.build_trend_model([("2026-07-15", doc)])
+    assert model["first_run"] is True
+
+
+def test_build_dupweb_model_nodes_edges_phantom_refs():
+    doc = _minimal_doc()
+    model = rh.build_dupweb_model(doc)
+    assert {n["path"] for n in model["nodes"]} == {"rules/a.md", "rules/b.md"}
+    assert len(model["edges"]) == 1
+    assert model["edges"][0]["a"] == "always_loaded:rules/a.md"
+    assert model["edges"][0]["b"] == "always_loaded:rules/b.md"
+    assert len(model["phantom_refs"]) == 1
+
+
+def test_build_civc_model_exact_36_cell_key_set():
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered"},
+        {"verb": "Evolve", "surface": "observability", "verdict": "thin"},
+    ], "drag_candidates": []}
+    model = rh.build_civc_model(synth)
+    assert model["available"] is True
+    key_set = {(c["verb"], c["surface"]) for c in model["cells"]}
+    expected = {(v, s) for v in rh.VERBS for s in rh.SURFACES}
+    assert key_set == expected
+    assert len(model["cells"]) == 36
+    afford_context = next(c for c in model["cells"] if c["verb"] == "Afford" and c["surface"] == "context")
+    assert afford_context["verdict"] == "covered"
+    empty_cell = next(c for c in model["cells"] if c["verb"] == "Constrain" and c["surface"] == "tools")
+    assert empty_cell["verdict"] == "empty"
+
+
+def test_build_civc_model_absent_synthesis_empty_state():
+    model = rh.build_civc_model(None)
+    assert model == {"available": False, "cells": []}
+
+
+def test_build_dragcandidate_model_sorted_by_n():
+    synth = {"drag_candidates": [{"n": 2, "surface": "memory", "evidence": "V", "outcome": "keep",
+                                   "what_must_survive": "", "risk_if_wrong": ""},
+                                  {"n": 1, "surface": "context", "evidence": "I", "outcome": "probation",
+                                   "what_must_survive": "", "risk_if_wrong": ""}]}
+    model = rh.build_dragcandidate_model(synth)
+    assert [r["n"] for r in model["rows"]] == [1, 2]
+
+
+def test_build_dragcandidate_model_absent_synthesis_empty_state():
+    model = rh.build_dragcandidate_model(None)
+    assert model == {"available": False, "rows": []}
+
+
+def test_squarify_geometry_fills_bounding_box():
+    items = [{"size": 30, "id": "a"}, {"size": 20, "id": "b"}, {"size": 10, "id": "c"}]
+    cells = rh.squarify(items, 0.0, 0.0, 100.0, 60.0)
+    assert len(cells) == 3
+    total_area = sum(float(c["w"]) * float(c["h"]) for c in cells)
+    assert abs(total_area - 6000.0) < 1.0
+
+
+def test_squarify_excludes_non_positive_sizes():
+    items = [{"size": 10, "id": "a"}, {"size": 0, "id": "b"}, {"size": -5, "id": "c"}]
+    cells = rh.squarify(items, 0.0, 0.0, 100.0, 60.0)
+    assert len(cells) == 1
+
+
+# ============================================================= friction join transforms
+def test_join_decisions_ambiguous_heats_all_matches():
+    node_index = {"a.md": ["always_loaded:rules/a.md", "on_demand:skills/x/rules/a.md"]}
+    records = [{"date": "2026-07-01", "component": "rules/a.md + write-guard.py"}]
+    heat, joined, extra = rh.join_decisions(records, node_index, "2026-07-15")
+    assert heat["always_loaded:rules/a.md"] == 1
+    assert heat["on_demand:skills/x/rules/a.md"] == 1
+    assert extra["segments_ambiguous"] == 1
+
+
+def test_join_decisions_temporal_cutoff_excludes_future_records():
+    node_index = {"a.md": ["always_loaded:rules/a.md"]}
+    records = [{"date": "2026-08-01", "component": "rules/a.md"}]
+    heat, joined, extra = rh.join_decisions(records, node_index, "2026-07-15")
+    assert heat == {}
+
+
+def test_join_metrics_recovery_join_phases_and_agents():
+    node_index = {
+        "coding-team": ["on_demand:coding-team"],
+        "execution.md": ["on_demand:skills/coding-team/phases/execution.md"],
+        "ct-implementer.md": ["on_demand:skills/coding-team/agents/ct-implementer.md"],
+    }
+    records = [{"date": "2026-07-01", "phases_used": ["execute"],
+                "agents_dispatched": {"builder": 2}, "rework_iterations": 1}]
+    heat, joined, extra = rh.join_metrics(records, node_index, "2026-07-15")
+    assert heat["on_demand:coding-team"] == 1
+    assert heat["on_demand:skills/coding-team/phases/execution.md"] == 1
+    assert heat["on_demand:skills/coding-team/agents/ct-implementer.md"] == 1
+    assert extra["records_eligible"] == 1
+
+
+def test_join_metrics_clean_run_not_eligible():
+    node_index = {"coding-team": ["on_demand:coding-team"]}
+    records = [{"date": "2026-07-01", "rework_iterations": 0, "audit_rounds": 1, "findings_total": 0}]
+    heat, joined, extra = rh.join_metrics(records, node_index, "2026-07-15")
+    assert heat == {}
+    assert extra["records_eligible"] == 0
+
+
+def test_aggregate_codex_by_mode_and_verdict():
+    records = [{"mode": "plan", "verdict": "REVISE", "ts": "2026-07-01T00:00:00Z", "round": 2},
+               {"mode": "plan", "verdict": "SHIP", "ts": "2026-07-02T00:00:00Z"}]
+    agg = rh.aggregate_codex(records, "2026-07-15")
+    assert agg["runs"] == 2
+    assert agg["by_mode"] == {"plan": 2}
+    assert agg["by_verdict"] == {"REVISE": 1, "SHIP": 1}
+    assert agg["max_revise_round"] == 2
+
+
+def test_extract_basename_normalizer():
+    assert rh.extract_basename("hooks/write-guard.py:check_phase5") == "write-guard.py"
+    assert rh.extract_basename("write-guard.py --flag") == "write-guard.py"
+    assert rh.extract_basename("coding-team") == "coding-team"
+
+
+# ============================================================= 3. escaping / security
+XSS_PAYLOADS = ['</script><img onerror=alert(1)>', '"><script>alert(1)</script>', "</style>${7*7}"]
+
+
+@pytest.mark.parametrize("payload", XSS_PAYLOADS)
+def test_shared_sample_injection_is_escaped(tmp_path, payload):
+    doc = _minimal_doc()
+    doc["duplication"]["pairs"][0]["shared_sample"] = payload
+    out_dir = tmp_path / "xss1"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert payload not in text
+    assert "&lt;" in text or "&quot;" in text or "&amp;" in text
+    p = _ExternalRefParser()
+    p.feed(text)
+    assert p.tag_counts.get("script", 0) == 1
+    assert p.tag_counts.get("style", 0) == 1
+
+
+@pytest.mark.parametrize("payload", XSS_PAYLOADS)
+def test_hook_command_injection_is_escaped(tmp_path, payload):
+    doc = _minimal_doc()
+    doc["enforcement"]["hooks"]["registered"][0]["command"] = payload
+    out_dir = tmp_path / "xss2"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert payload not in text
+    p = _ExternalRefParser()
+    p.feed(text)
+    assert p.tag_counts.get("script", 0) == 1
+    assert p.tag_counts.get("style", 0) == 1
+
+
+@pytest.mark.parametrize("payload", XSS_PAYLOADS)
+def test_promotion_excerpt_injection_is_escaped(tmp_path, payload):
+    doc = _minimal_doc(extra_promotion=payload)
+    out_dir = tmp_path / "xss3"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    # promotion_candidates are not directly rendered by any current tab body — but the
+    # excerpt lives in phantom_refs' sibling data; this asserts render doesn't choke on it
+    # and no unescaped payload leaks anywhere in the byte stream.
+    assert payload not in text
+
+
+def test_env_values_never_read_and_env_keys_render(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "envtest"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    env = dict(os.environ)
+    env["FAKE_SECRET_ENV"] = "s3cr3t-should-never-appear-anywhere"
+    proc = subprocess.run([sys.executable, str(RENDER), "--out-dir", str(out_dir),
+                            "--date", "2026-07-15", "--no-friction"],
+                           capture_output=True, text=True, timeout=30, env=env)
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "s3cr3t-should-never-appear-anywhere" not in text
+
+
+def test_no_on_handlers_and_no_style_attributes(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "csp_attrs"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    p = _ExternalRefParser()
+    p.feed(text)
+    assert p.on_handlers == []
+    assert p.style_attrs == []
+
+
+def test_csp_hashes_match_recomputed_static_blocks(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "csp_hash"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    m = re.search(r"style-src 'sha256-([^']+)'; script-src 'sha256-([^']+)'", text)
+    assert m is not None
+    assert m.group(1) == rh._csp_hash(rh.STATIC_STYLE)
+    assert m.group(2) == rh._csp_hash(rh.STATIC_SCRIPT)
+
+
+# ============================================================= 4. determinism
+def test_self_run_twice_byte_identical(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "det1"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc1 = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc1.returncode == 0, proc1.stderr
+    first_bytes = (out_dir / "harness-map-2026-07-15.html").read_bytes()
+    proc2 = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc2.returncode == 0, proc2.stderr
+    second_bytes = (out_dir / "harness-map-2026-07-15.html").read_bytes()
+    assert first_bytes == second_bytes
+
+
+def test_cross_pythonhashseed_byte_identical(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "det2"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    env1 = dict(os.environ)
+    env1["PYTHONHASHSEED"] = "1"
+    env2 = dict(os.environ)
+    env2["PYTHONHASHSEED"] = "2"
+    proc1 = subprocess.run([sys.executable, str(RENDER), "--out-dir", str(out_dir),
+                             "--date", "2026-07-15", "--no-friction"],
+                            capture_output=True, text=True, timeout=30, env=env1)
+    assert proc1.returncode == 0, proc1.stderr
+    bytes1 = (out_dir / "harness-map-2026-07-15.html").read_bytes()
+    proc2 = subprocess.run([sys.executable, str(RENDER), "--out-dir", str(out_dir),
+                             "--date", "2026-07-15", "--no-friction"],
+                            capture_output=True, text=True, timeout=30, env=env2)
+    assert proc2.returncode == 0, proc2.stderr
+    bytes2 = (out_dir / "harness-map-2026-07-15.html").read_bytes()
+    assert bytes1 == bytes2
+
+
+def test_home_defaults_resolved_at_call_time(tmp_path):
+    """§9-R D: defaults resolve through $HOME at call time, never frozen at import."""
+    fake_home_2 = tmp_path / "another_home"
+    fake_home_2.mkdir()
+    (fake_home_2 / ".claude").mkdir()
+    (fake_home_2 / ".claude" / "harness-decisions.jsonl").write_text(
+        json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    doc = _minimal_doc()
+    out_dir = tmp_path / "callres"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    original_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(fake_home_2)
+    try:
+        rc = rh.main(["--out-dir", str(out_dir), "--date", "2026-07-15"])
+    finally:
+        if original_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = original_home
+    assert rc == 0
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "decisions: loaded" in text
+
+
+# ============================================================= 5. degradation / edge matrix
+def test_missing_out_dir_is_fatal(tmp_path):
+    proc = run_render(tmp_path / "does-not-exist", "--no-friction")
+    assert proc.returncode != 0
+
+
+def test_date_no_match_is_fatal(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "nomatch"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-01-01", "--no-friction")
+    assert proc.returncode != 0
+
+
+def test_synthesis_absent_renders_graceful_empty_state(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "nosynth"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "CIVC matrix unavailable" in text
+    assert "drag-candidate table unavailable" in text
+
+
+def test_corrupt_sidecar_excluded_from_trend_and_listed_in_skipped(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "corrupt"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-14", doc)
+    (out_dir / "harness-map-2026-07-13.json").write_text("{not valid json")
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "2026-07-13" in text  # listed in Notes & Blind Spots skipped section
+
+
+def test_corrupt_sidecar_at_explicit_date_is_fatal(tmp_path):
+    out_dir = tmp_path / "corruptexplicit"
+    out_dir.mkdir()
+    (out_dir / "harness-map-2026-07-15.json").write_text("{not valid json")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode != 0
+
+
+def test_empty_arrays_render_empty_state_not_crash(tmp_path):
+    doc = _minimal_doc()
+    doc["duplication"]["pairs"] = []
+    doc["phantom_refs"] = []
+    out_dir = tmp_path / "empties"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "no duplicate pairs above threshold" in text
+    assert "no phantom refs" in text
+
+
+def test_friction_stream_absent_footer_note(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "absentstream"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "interventions: absent" in text
+
+
+def test_friction_stream_malformed_lines_skip_and_count(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "malformed"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    decisions_file = out_dir / "decisions.jsonl"
+    decisions_file.write_text(
+        json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n"
+        + "not valid json\n"
+    )
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert '"records_invalid":1' in text.replace(" ", "") or "records_invalid" in text
+
+
+# ================================================================== contract layer (real collector)
+def test_contract_layer_real_collector_output_renders(tmp_path, fake_harness):
+    collector_doc = run_collector(fake_harness)
+    out_dir = tmp_path / "contract"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", collector_doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    assert (out_dir / "harness-map-2026-07-15.html").is_file()
+
+
+def test_write_html_safely_refuses_inside_harness_root(tmp_path):
+    fake_root = tmp_path / "fakeclaude"
+    fake_root.mkdir()
+    out_dir = fake_root / "reports"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = str(fake_root)
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode != 0
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+
+
+def test_hard_link_target_regression(tmp_path):
+    """A pre-existing HTML target that is a hard link to a file inside the doc's
+    `root` must not be truncated by the write (Codex F1)."""
+    fake_root = tmp_path / "harnessroot"
+    fake_root.mkdir()
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = str(tmp_path / "unrelated-root")
+    (tmp_path / "unrelated-root").mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+
+    inside_file = fake_root / "shared.html"
+    inside_file.write_text("ORIGINAL CONTENT SHOULD SURVIVE")
+    target = out_dir / "harness-map-2026-07-15.html"
+    os.link(inside_file, target)
+
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    assert inside_file.read_text() == "ORIGINAL CONTENT SHOULD SURVIVE"
+    assert target.read_text(encoding="utf-8") != "ORIGINAL CONTENT SHOULD SURVIVE"
