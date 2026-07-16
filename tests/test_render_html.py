@@ -525,7 +525,7 @@ def test_synthesis_absent_renders_graceful_empty_state(tmp_path):
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
-    assert "CIVC matrix unavailable" in text
+    assert "Coverage Matrix unavailable" in text
     assert "drag-candidate table unavailable" in text
 
 
@@ -674,6 +674,27 @@ def test_civc_notes_and_legend_render(tmp_path):
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     assert "Coverage scale" in text
     assert "<summary>note</summary>context note here</details>" in text
+
+
+def test_civc_renamed_to_coverage_matrix_in_display_text(tmp_path):
+    """The stale 4-letter acronym must not appear anywhere a human reads the page —
+    only the JSON schema key (`civc`) and internal identifiers (build_civc_model,
+    the `civc-legend` CSS class) may keep the old name (§Change 2)."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "civc_rename"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered", "note": "context note here"},
+    ], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Coverage Matrix" in text
+    assert "six verbs (what the harness does to behavior)" in text
+    assert "six surfaces (what it" in text
+    assert "CIVC" not in text.upper().replace("CIVC-LEGEND", "")
 
 
 @pytest.mark.parametrize("payload", XSS_PAYLOADS)

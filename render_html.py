@@ -839,6 +839,7 @@ footer.sources{border-top:1px solid var(--border);padding:10px 20px;color:var(--
 body.friction-on .friction-badge{display:inline}
 .friction-legend{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:0.75rem;padding:4px 20px 0}
 .legend-entry{display:inline-flex;align-items:center;gap:4px}
+.legend-swatch.fh0{background:var(--panel);border:1px solid var(--border)}
 .legend-note{color:var(--muted)}
 .friction-explainer{color:var(--muted);font-size:0.85rem;margin:0 0 10px 0}
 .friction-row-detail{display:block;color:var(--muted);font-size:0.78rem;margin-top:2px}
@@ -1010,7 +1011,7 @@ def _render_dupweb_tab(model):
 
 def _render_civc_drag_tab(civc, drag):
     if not civc["available"]:
-        civc_body = '<p class="empty-state">synthesis sidecar not found — CIVC matrix unavailable this run.</p>'
+        civc_body = '<p class="empty-state">synthesis sidecar not found — Coverage Matrix unavailable this run.</p>'
     else:
         legend = (
             '<p class="civc-legend">Coverage scale (empty cells are intentional roadmap, not blanks): '
@@ -1046,7 +1047,10 @@ def _render_civc_drag_tab(civc, drag):
         drag_body = f'<div class="overflow-x"><table><tr><th>#</th><th>Surface</th><th>Evidence</th><th>Outcome</th></tr>{rows}</table></div>'
     return (
         '<section id="panel-5" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-5" hidden>'
-        f'<div class="card"><h2>CIVC coverage matrix</h2>{civc_body}</div>'
+        '<div class="card"><h2>Coverage Matrix</h2>'
+        '<p class="subtitle">six verbs (what the harness does to behavior) '
+        '× six surfaces (what it’s made of)</p>'
+        f'{civc_body}</div>'
         f'<div class="card"><h2>Drag candidates</h2>{drag_body}</div></section>'
     )
 
@@ -1125,7 +1129,7 @@ def render_html(date, models, friction, notes):
            f"connect-src 'none'; base-uri 'none'; form-action 'none'\">")
 
     tabs = [("panel-1", "Context Weight"), ("panel-2", "Hook Wiring"), ("panel-3", "Trends"),
-            ("panel-4", "Duplication & Phantom Refs"), ("panel-5", "CIVC & Drag Candidates"),
+            ("panel-4", "Duplication & Phantom Refs"), ("panel-5", "Coverage Matrix"),
             ("panel-6", "Notes & Blind Spots")]
     tab_buttons = "".join(
         f'<button class="tab-btn" id="tab-btn-{i+1}" role="tab" data-target="{pid}" '
@@ -1151,11 +1155,12 @@ def render_html(date, models, friction, notes):
         '<button class="action-btn" id="expand-all">Expand all / print view</button>',
         "</div>",
         '<div class="friction-legend" id="friction-legend">'
+        '<span>Friction heat, once the overlay is on:</span>'
+        '<span class="legend-entry"><span class="legend-swatch fh0"></span>none</span>'
         '<span class="legend-entry"><span class="legend-swatch fh1"></span>some</span>'
-        '<span class="legend-entry"><span class="legend-swatch fh2"></span>more</span>'
         '<span class="legend-entry"><span class="legend-swatch fh4"></span>most-active</span>'
-        '<span class="legend-note">heated map cells also show a join-count badge '
-        'once the overlay is on</span></div>',
+        '<span class="legend-note">every heated cell also shows a join-count '
+        'badge in the corner (color is never the only signal)</span></div>',
         "<main>",
         _render_context_weight_tab(models["context_weight"], heat),
         _render_bipartite_tab(models["bipartite"]),
