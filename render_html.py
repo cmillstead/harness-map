@@ -69,6 +69,10 @@ AGENT_ALIAS = {
 CATEGORICAL_PALETTE = ("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00")
 HEAT_RAMP = ("#FEE5D9", "#FCAE91", "#FB6A4A", "#CB181D")
 STREAM_ORDER = ("decisions", "metrics", "interventions", "codex")
+STREAM_LABELS = {"decisions": "Decisions", "metrics": "Review metrics",
+                  "interventions": "Interventions", "codex": "Codex reviews"}
+CODEX_VERDICT_LABELS = {"APPROVED": "approved", "PASS": "pass", "REVISE": "needed revision",
+                         "SHIP": "shipped"}
 
 
 # --------------------------------------------------------------------------- escaping
@@ -634,6 +638,54 @@ def aggregate_codex(records, current_date):
             "max_revise_round": max(revise_rounds) if revise_rounds else 0}
 
 
+def _friction_sentence(f, codex_aggregate):
+    """One human-readable sentence per stream row, built ONLY from the same counters
+    already computed by the join functions (never new numbers) — the raw dict stays
+    available as a secondary/collapsed detail; this is the headline (demo-readability
+    follow-up)."""
+    label = STREAM_LABELS[f["stream"]]
+    status = f["status"]
+    if status == "disabled":
+        return f"{label} — friction overlay disabled for this render."
+    if status == "absent":
+        return f"{label} — stream not provided."
+    if status == "inaccessible":
+        return f"{label} — telemetry file exists but is not a readable file."
+    if f["stream"] == "decisions":
+        total, joined = f.get("segments_total", 0), f.get("segments_joined", 0)
+        window, ambiguous = f.get("records_dated_in_window", 0), f.get("segments_ambiguous", 0)
+        return (f"{label} — {joined} of {total} component references matched to map "
+                f"components ({window} records in window; {ambiguous} ambiguous).")
+    if f["stream"] == "metrics":
+        eligible, agg_only = f.get("records_eligible", 0), f.get("records_aggregate_only", 0)
+        attributed, invalid = eligible - agg_only, f.get("records_invalid", 0)
+        return (f"{label} — {attributed} of {eligible} eligible pipeline records attributed "
+                f"to phase/agent components ({agg_only} aggregate-only); {invalid} invalid lines.")
+    if f["stream"] == "interventions":
+        parsed, window = f.get("records_parsed", 0), f.get("records_dated_in_window", 0)
+        return f"{label} — {parsed} records parsed, {window} in window."
+    # codex — aggregate-only, no node join (§2.2)
+    runs = codex_aggregate["runs"]
+    return f"{label} — {runs} records, aggregate-only (target is a plan filename, not a map component)."
+
+
+def _codex_sentence(agg):
+    """English summary of `codex_aggregate` — derived entirely from its own dict,
+    never hardcoded numbers."""
+    runs = agg["runs"]
+    if runs == 0:
+        return "No Codex reviews recorded in this window."
+    mode_bits = ", ".join(f"{v} on {k}s" for k, v in agg["by_mode"].items())
+    mode_clause = f" — {mode_bits}" if mode_bits else ""
+    verdict_bits = ", ".join(f"{v} {CODEX_VERDICT_LABELS.get(k, k.lower())}"
+                              for k, v in agg["by_verdict"].items())
+    max_round = agg["max_revise_round"]
+    revise_clause = f" (up to {max_round} revise round{'s' if max_round != 1 else ''})" if max_round else ""
+    verdict_clause = f" Verdicts: {verdict_bits}{revise_clause}." if verdict_bits else ""
+    plural = "s" if runs != 1 else ""
+    return f"{runs} Codex review{plural}{mode_clause}.{verdict_clause}"
+
+
 def _stream_status(path, disabled):
     if disabled:
         return "disabled"
@@ -777,12 +829,34 @@ th{color:var(--muted);font-weight:600}
 .badge.direct{border-color:#009e73;color:#009e73}
 .badge.dispatcher{border-color:var(--accent);color:var(--accent)}
 .cell-label{font-size:8px;fill:var(--text)}
-.legend-swatch{display:inline-block;width:10px;height:10px;margin-right:4px;border-radius:2px}
+.legend-swatch{display:inline-block;width:10px;height:10px;margin-right:4px;border-radius:2px;vertical-align:middle}
 svg text{font-family:inherit}
 footer.sources{border-top:1px solid var(--border);padding:10px 20px;color:var(--muted);font-size:0.78rem}
 .overflow-x{overflow-x:auto}
 @media (prefers-reduced-motion: no-preference){button{transition:border-color .15s}}
+.cell-rect{stroke:var(--border);stroke-width:0.5}
+.friction-badge{display:none;font-size:7px;font-weight:600;fill:var(--text)}
+body.friction-on .friction-badge{display:inline}
+.friction-legend{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:0.75rem;padding:4px 20px 0}
+.legend-entry{display:inline-flex;align-items:center;gap:4px}
+.legend-note{color:var(--muted)}
+.friction-explainer{color:var(--muted);font-size:0.85rem;margin:0 0 10px 0}
+.friction-row-detail{display:block;color:var(--muted);font-size:0.78rem;margin-top:2px}
+details{color:var(--muted)}
+details > summary{cursor:pointer;color:var(--accent)}
+.civc-legend{color:var(--muted);font-size:0.8rem;margin:0 0 10px 0}
+td.verdict-covered{background:rgba(0,158,115,0.15)}
+td.verdict-thin{background:rgba(86,180,233,0.12)}
+td.verdict-empty{color:var(--muted)}
+.badge.verdict-thin{border-color:var(--accent);color:var(--accent)}
+.badge.verdict-covered{border-color:#009e73;color:#009e73}
 """
+_HEAT_CSS = "".join(
+    f"body.friction-on .fh{i}{{stroke:{color};stroke-width:2}}"
+    f".legend-swatch.fh{i}{{background:{color}}}"
+    for i, color in enumerate(HEAT_RAMP, start=1)
+)
+STATIC_STYLE = STATIC_STYLE + _HEAT_CSS
 
 STATIC_SCRIPT = """
 (function(){
@@ -822,23 +896,31 @@ def _csp_hash(block):
 
 # --------------------------------------------------------------------------- HTML render
 def _render_treemap_svg(tree, heat, dom_id):
+    """Heat is shown two ways once the friction overlay toggle is on (never color
+    alone, §UI): a CSS-class-driven stroke ramp on the cell, AND a text join-count
+    badge in the corner. Both are hidden-by-default via `body.friction-on` CSS so the
+    toggle button has a visible, demonstrable effect."""
     w, h = tree["canvas_w"], tree["canvas_h"]
     parts = [f'<svg viewBox="0 0 {_fmt_float(w)} {_fmt_float(h)}" '
              f'width="100%" height="360" role="img" aria-labelledby="{esc_html(dom_id)}-title">']
     parts.append(f'<title id="{esc_html(dom_id)}-title">Context-weight treemap</title>')
     for c in tree["cells"]:
         heat_n = heat.get(c["node_key"], 0)
-        stroke = HEAT_RAMP[min(heat_n, len(HEAT_RAMP) - 1)] if heat_n else "#00000000"
-        stroke_w = "2" if heat_n else "0.5"
+        bucket = min(heat_n, len(HEAT_RAMP)) if heat_n else 0
+        rect_cls = f"cell-rect fh{bucket}" if bucket else "cell-rect"
         label = esc_html(Path(c["path"]).name)
         parts.append(
             f'<rect x="{c["x"]}" y="{c["y"]}" width="{c["w"]}" height="{c["h"]}" '
-            f'fill="{esc_html(c.get("fill", "#56b4e9"))}" stroke="{stroke}" stroke-width="{stroke_w}" '
+            f'fill="{esc_html(c.get("fill", "#56b4e9"))}" class="{rect_cls}" '
             f'data-node-key="{esc_html(c["node_key"])}"><title>{esc_html(c["path"])} '
             f'(friction: {heat_n})</title></rect>')
         if float(c["w"]) > 40 and float(c["h"]) > 14:
             tx, ty = _fmt_float(float(c["x"]) + 2), _fmt_float(float(c["y"]) + 10)
             parts.append(f'<text x="{tx}" y="{ty}" class="cell-label">{label}</text>')
+            if heat_n:
+                bx = _fmt_float(float(c["x"]) + float(c["w"]) - 2)
+                parts.append(f'<text x="{bx}" y="{ty}" text-anchor="end" '
+                              f'class="friction-badge">{heat_n}</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -930,17 +1012,28 @@ def _render_civc_drag_tab(civc, drag):
     if not civc["available"]:
         civc_body = '<p class="empty-state">synthesis sidecar not found — CIVC matrix unavailable this run.</p>'
     else:
+        legend = (
+            '<p class="civc-legend">Coverage scale (empty cells are intentional roadmap, not blanks): '
+            '<span class="badge verdict-empty">empty</span> → '
+            '<span class="badge verdict-thin">thin</span> → '
+            '<span class="badge verdict-covered">covered</span>. '
+            'Cells with a "note" expose it via a details toggle.</p>'
+        )
         header = "".join(f"<th>{esc_html(s)}</th>" for s in SURFACES)
         rows = []
         by_verb = {}
         for c in civc["cells"]:
             by_verb.setdefault(c["verb"], []).append(c)
         for verb in VERBS:
-            cells = "".join(
-                f'<td class="verdict-{esc_html(c["verdict"])}">{esc_html(c["verdict"])}</td>'
-                for c in by_verb.get(verb, []))
-            rows.append(f"<tr><th>{esc_html(verb)}</th>{cells}</tr>")
-        civc_body = f'<div class="overflow-x"><table><tr><th></th>{header}</tr>{"".join(rows)}</table></div>'
+            cell_html = []
+            for c in by_verb.get(verb, []):
+                note_html = (f'<details><summary>note</summary>{esc_html(c["note"])}</details>'
+                             if c.get("note") else "")
+                cell_html.append(
+                    f'<td class="verdict-{esc_html(c["verdict"])}">{esc_html(c["verdict"])}{note_html}</td>')
+            rows.append(f"<tr><th>{esc_html(verb)}</th>{''.join(cell_html)}</tr>")
+        civc_body = (legend + f'<div class="overflow-x"><table><tr><th></th>{header}</tr>'
+                     f'{"".join(rows)}</table></div>')
     if not drag["available"]:
         drag_body = '<p class="empty-state">synthesis sidecar not found — drag-candidate table unavailable this run.</p>'
     elif not drag["rows"]:
@@ -982,23 +1075,33 @@ def _render_notes_tab(doc, skipped):
     )
 
 
+def _render_friction_row(f, codex_aggregate):
+    sentence = esc_html(_friction_sentence(f, codex_aggregate))
+    raw = {k: v for k, v in f.items() if k not in ("stream", "status", "path_display")}
+    raw_html = (f'<details class="friction-row-detail"><summary>raw counters</summary>'
+                f'{esc_html(json.dumps(raw, sort_keys=True))}</details>') if raw else ""
+    return (f'<tr><td>{esc_html(f["stream"])}</td><td>{esc_html(f["status"])}</td>'
+            f'<td>{esc_html(f["path_display"])}</td>'
+            f'<td>{sentence}{raw_html}</td></tr>')
+
+
 def _render_friction_panel(joined, footer, codex_aggregate):
-    rows = "".join(
-        f'<tr><td>{esc_html(f["stream"])}</td><td>{esc_html(f["status"])}</td>'
-        f'<td>{esc_html(f["path_display"])}</td>'
-        f'<td>{esc_html(json.dumps({k: v for k, v in f.items() if k not in ("stream","status","path_display")}, sort_keys=True))}</td></tr>'
-        for f in footer)
+    explainer = (
+        '<p class="friction-explainer">Friction = where your harness has seen the most churn. '
+        'These local telemetry streams (decisions, review metrics, Codex reviews, interventions) '
+        'are matched by name onto the components on the map — a data join, not a judgment.</p>'
+    )
+    rows = "".join(_render_friction_row(f, codex_aggregate) for f in footer)
     joined_count = sum(len(v) for v in joined.values())
     codex_html = (
         f'<div class="card"><h2>Codex aggregate (not node-joined)</h2>'
-        f'<p>runs: {esc_html(codex_aggregate["runs"])}; by_mode: {esc_html(json.dumps(codex_aggregate["by_mode"], sort_keys=True))}; '
-        f'by_verdict: {esc_html(json.dumps(codex_aggregate["by_verdict"], sort_keys=True))}; '
-        f'max_revise_round: {esc_html(codex_aggregate["max_revise_round"])}</p></div>'
+        f'<p>{esc_html(_codex_sentence(codex_aggregate))}</p></div>'
     )
     return (
         '<aside class="card" id="friction-panel">'
         f'<h2>Friction overlay — joined records: {joined_count}</h2>'
-        f'<div class="overflow-x"><table><tr><th>Stream</th><th>Status</th><th>Path</th><th>Counters</th></tr>{rows}</table></div>'
+        f'{explainer}'
+        f'<div class="overflow-x"><table><tr><th>Stream</th><th>Status</th><th>Path</th><th>What matched</th></tr>{rows}</table></div>'
         f'{codex_html}</aside>'
     )
 
@@ -1047,6 +1150,12 @@ def render_html(date, models, friction, notes):
         '<button class="action-btn" id="friction-toggle" aria-pressed="false">Show friction overlay</button>',
         '<button class="action-btn" id="expand-all">Expand all / print view</button>',
         "</div>",
+        '<div class="friction-legend" id="friction-legend">'
+        '<span class="legend-entry"><span class="legend-swatch fh1"></span>some</span>'
+        '<span class="legend-entry"><span class="legend-swatch fh2"></span>more</span>'
+        '<span class="legend-entry"><span class="legend-swatch fh4"></span>most-active</span>'
+        '<span class="legend-note">heated map cells also show a join-count badge '
+        'once the overlay is on</span></div>',
         "<main>",
         _render_context_weight_tab(models["context_weight"], heat),
         _render_bipartite_tab(models["bipartite"]),

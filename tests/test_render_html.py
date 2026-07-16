@@ -575,6 +575,123 @@ def test_friction_stream_absent_footer_note(tmp_path):
     assert "interventions: absent" in text
 
 
+def test_friction_panel_renders_english_sentences_not_raw_json(tmp_path):
+    """Demo-readability follow-up: the per-stream row must lead with a human sentence,
+    with the raw counter dict demoted to a collapsed <details> secondary."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "friction_english"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    decisions_file = out_dir / "decisions.jsonl"
+    decisions_file.write_text(
+        json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n"
+        + json.dumps({"date": "2026-07-02", "component": "no-match-here.md"}) + "\n"
+    )
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "component references matched to map components" in text
+    assert '<details class="friction-row-detail"><summary>raw counters</summary>' in text
+    assert "a data join, not a judgment" in text
+
+
+def test_friction_absent_stream_renders_plain_sentence(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "friction_absent"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Interventions — stream not provided." in text
+
+
+def test_metrics_stream_renders_attribution_sentence(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "friction_metrics"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    metrics_file = out_dir / "metrics.jsonl"
+    metrics_file.write_text(
+        json.dumps({"date": "2026-07-01", "rework_iterations": 1, "phases_used": ["execute"],
+                     "agents_dispatched": {"builder": 1}}) + "\n"
+    )
+    proc = run_render(out_dir, "--date", "2026-07-15", "--metrics-file", str(metrics_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "eligible pipeline records attributed to phase/agent components" in text
+
+
+def test_codex_aggregate_renders_english_sentence(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "friction_codex"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    codex_file = out_dir / "codex.jsonl"
+    codex_file.write_text(
+        json.dumps({"ts": "2026-07-01T00:00:00Z", "mode": "plan", "verdict": "APPROVED"}) + "\n"
+        + json.dumps({"ts": "2026-07-02T00:00:00Z", "mode": "diff", "verdict": "REVISE", "round": 2}) + "\n"
+    )
+    proc = run_render(out_dir, "--date", "2026-07-15", "--codex-file", str(codex_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "2 Codex reviews" in text
+    assert "on plans" in text
+    assert "on diffs" in text
+    assert "approved" in text
+    assert "needed revision" in text
+    assert "revise round" in text
+    assert '"runs":' not in text
+
+
+def test_friction_overlay_legend_and_heat_classes_render(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "friction_heat"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    decisions_file = out_dir / "decisions.jsonl"
+    decisions_file.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="friction-legend"' in text
+    assert "most-active" in text
+    assert 'class="cell-rect fh1"' in text
+    assert 'class="friction-badge"' in text
+
+
+def test_civc_notes_and_legend_render(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "civc_notes"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered", "note": "context note here"},
+    ], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Coverage scale" in text
+    assert "<summary>note</summary>context note here</details>" in text
+
+
+@pytest.mark.parametrize("payload", XSS_PAYLOADS)
+def test_civc_note_injection_is_escaped(tmp_path, payload):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "civc_xss"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered", "note": payload},
+    ], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert payload not in text
+
+
 def test_friction_stream_malformed_lines_skip_and_count(tmp_path):
     doc = _minimal_doc()
     out_dir = tmp_path / "malformed"
