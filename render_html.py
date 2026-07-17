@@ -11,6 +11,7 @@ this module implements it (precedence: 9-C2 > 9-R > body).
 """
 import argparse
 import base64
+import dataclasses
 import hashlib
 import html
 import json
@@ -1927,45 +1928,56 @@ def render_html(date, models, friction, notes):
     return "".join(parts)
 
 
-# ---------------------------------------------------------------------------------- main
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Render an interactive HTML map from harness-map sidecar(s).")
-    ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--date", default=None)
-    ap.add_argument("--metrics-file", default=None)
-    ap.add_argument("--decisions-file", default=None)
-    ap.add_argument("--codex-file", default=None)
-    ap.add_argument("--interventions-file", default=None)
-    ap.add_argument("--no-friction", action="store_true")
-    args = ap.parse_args(argv)
+class RenderError(Exception):
+    """Fatal render-pipeline condition (bad out-dir, no sidecar, schema mismatch).
+    Carries the exact message main() prints to stderr; serve.py surfaces it too."""
 
-    out_dir = Path(args.out_dir)
+
+@dataclasses.dataclass(frozen=True)
+class RenderContext:
+    date: str
+    doc: dict
+    models: dict
+    node_index: dict
+    friction: tuple          # (heat, joined, footer, codex_aggregate) — build_friction_overlay output
+    streams: dict            # the exact streams dict used, so the cheap path re-reads the same paths
+    friction_disabled: bool  # the retained --no-friction flag; MUST be threaded into every
+                              # build_friction_overlay call (all-None streams + disabled=False renders
+                              # "absent", disabled=True renders "disabled" — NOT interchangeable)
+    skipped: list
+    html_text: str
+    html_bytes: bytes        # html_text.encode("utf-8", "backslashreplace") — the served bytes
+
+
+def render_from_out_dir(out_dir, date=None, streams=None, no_friction=False):
+    """Build the HTML IN MEMORY (D3) from the collector sidecar(s) already present in
+    `out_dir` — the exact pipeline main() uses, minus the file write. Returns a frozen
+    RenderContext (carries date/doc/models/node_index/friction/streams/skipped/html_text/
+    html_bytes so the cheap B2 path reuses identical state). Raises RenderError on fatal
+    conditions. Deterministic: same sidecars + streams -> byte-identical html_text
+    (render_html() contract preserved). `streams` None is treated as the no-friction all-None dict."""
+    out_dir = Path(out_dir)
     if not out_dir.is_dir():
-        print(f"fatal: --out-dir does not exist or is not a directory: {out_dir}", file=sys.stderr)
-        return 1
-    if args.date is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
-        print(f"fatal: --date must be YYYY-MM-DD: {args.date}", file=sys.stderr)
-        return 1
+        raise RenderError(f"fatal: --out-dir does not exist or is not a directory: {out_dir}")
+    if date is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise RenderError(f"fatal: --date must be YYYY-MM-DD: {date}")
 
     sidecars = find_sidecars(out_dir)
     if not sidecars:
-        print(f"fatal: zero sidecars found in {out_dir}", file=sys.stderr)
-        return 1
+        raise RenderError(f"fatal: zero sidecars found in {out_dir}")
 
-    date, doc, skipped, err = select_current(sidecars, args.date)
+    sel_date, doc, skipped, err = select_current(sidecars, date)
     if err is not None:
-        print(f"fatal: {err}", file=sys.stderr)
-        return 1
+        raise RenderError(f"fatal: {err}")
     if doc.get("schema_version") != SCHEMA_VERSION:
-        print(f"fatal: selected sidecar has unsupported schema_version {doc.get('schema_version')}",
-              file=sys.stderr)
-        return 1
+        raise RenderError(
+            f"fatal: selected sidecar has unsupported schema_version {doc.get('schema_version')}")
 
     # Trend series: load every OTHER sidecar too, filtered to the same root + schema version
     # (Codex F13); corrupt/incompatible ones are excluded and noted in skipped[].
     dated_docs = []
     for d, p in sidecars:
-        if d == date:
+        if d == sel_date:
             dated_docs.append((d, doc))
             continue
         other_doc, other_err = load_sidecar(p)
@@ -1978,9 +1990,9 @@ def main(argv=None):
         dated_docs.append((d, other_doc))
     dated_docs.sort(key=lambda t: t[0])
 
-    synth, synth_err = load_synthesis(out_dir, date)
+    synth, synth_err = load_synthesis(out_dir, sel_date)
     if synth_err is not None:
-        skipped.append({"date": date, "reason": synth_err})
+        skipped.append({"date": sel_date, "reason": synth_err})
 
     models = {
         "context_weight": build_contextweight_model(doc),
@@ -1992,6 +2004,38 @@ def main(argv=None):
     }
     node_index = build_node_index(models)
 
+    if streams is None or no_friction:
+        streams = {"decisions": None, "metrics": None, "interventions": None, "codex": None}
+    friction = build_friction_overlay(doc, streams, node_index, sel_date, no_friction)
+
+    html_text = render_html(sel_date, models, friction, {"doc": doc, "skipped": skipped})
+
+    return RenderContext(
+        date=sel_date,
+        doc=doc,
+        models=models,
+        node_index=node_index,
+        friction=friction,
+        streams=streams,
+        friction_disabled=no_friction,
+        skipped=skipped,
+        html_text=html_text,
+        html_bytes=html_text.encode("utf-8", "backslashreplace"),
+    )
+
+
+# ---------------------------------------------------------------------------------- main
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Render an interactive HTML map from harness-map sidecar(s).")
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--date", default=None)
+    ap.add_argument("--metrics-file", default=None)
+    ap.add_argument("--decisions-file", default=None)
+    ap.add_argument("--codex-file", default=None)
+    ap.add_argument("--interventions-file", default=None)
+    ap.add_argument("--no-friction", action="store_true")
+    args = ap.parse_args(argv)
+
     if args.no_friction:
         streams = {"decisions": None, "metrics": None, "interventions": None, "codex": None}
     else:
@@ -2002,11 +2046,16 @@ def main(argv=None):
             "codex": Path(args.codex_file) if args.codex_file else home / ".claude" / "harness-codex.jsonl",
             "interventions": Path(args.interventions_file) if args.interventions_file else None,
         }
-    friction = build_friction_overlay(doc, streams, node_index, date, args.no_friction)
 
-    html_text = render_html(date, models, friction, {"doc": doc, "skipped": skipped})
+    try:
+        ctx = render_from_out_dir(
+            Path(args.out_dir), date=args.date, streams=streams, no_friction=args.no_friction)
+    except RenderError as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
-    out_path = out_dir / f"harness-map-{date}.html"
+    date, html_text, doc = ctx.date, ctx.html_text, ctx.doc
+    out_path = Path(args.out_dir) / f"harness-map-{date}.html"
     try:
         write_html_safely(out_path, html_text, doc.get("root"))
     except SystemExit as e:

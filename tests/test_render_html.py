@@ -621,6 +621,33 @@ def test_home_defaults_resolved_at_call_time(tmp_path):
     assert "decisions: loaded" in text
 
 
+def test_render_from_out_dir_matches_cli_bytes(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "helper"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    # in-memory helper (no-friction so no $HOME telemetry dependence)
+    streams = {"decisions": None, "metrics": None, "interventions": None, "codex": None}
+    ctx = rh.render_from_out_dir(
+        out_dir, date="2026-07-15", streams=streams, no_friction=True)
+    assert ctx.date == "2026-07-15"
+    assert ctx.doc["root"] == doc["root"]
+    assert ctx.html_bytes == ctx.html_text.encode("utf-8", "backslashreplace")
+    assert ctx.models and ctx.node_index is not None   # shared state carried for the cheap path
+    # CLI path must produce the identical bytes
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    on_disk = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert ctx.html_text == on_disk
+
+
+def test_render_from_out_dir_raises_on_missing_sidecar(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(rh.RenderError):
+        rh.render_from_out_dir(empty, date=None, streams=None, no_friction=True)
+
+
 # ============================================================= 5. degradation / edge matrix
 def test_missing_out_dir_is_fatal(tmp_path):
     proc = run_render(tmp_path / "does-not-exist", "--no-friction")
