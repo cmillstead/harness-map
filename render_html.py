@@ -67,7 +67,7 @@ AGENT_ALIAS = {
 }
 
 CATEGORICAL_PALETTE = ("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00")
-HEAT_RAMP = ("#FEE5D9", "#FCAE91", "#FB6A4A", "#CB181D")
+HEAT_RAMP = ("#FCAE91", "#FB6A4A", "#DE2D26", "#A50F15")
 STREAM_ORDER = ("decisions", "metrics", "interventions", "codex")
 STREAM_LABELS = {"decisions": "Decisions", "metrics": "Review metrics",
                   "interventions": "Interventions", "codex": "Codex reviews"}
@@ -835,8 +835,11 @@ footer.sources{border-top:1px solid var(--border);padding:10px 20px;color:var(--
 .overflow-x{overflow-x:auto}
 @media (prefers-reduced-motion: no-preference){button{transition:border-color .15s}}
 .cell-rect{stroke:var(--border);stroke-width:0.5}
-.friction-badge{display:none;font-size:7px;font-weight:600;fill:var(--text)}
+body.friction-on .cell-rect:not(.fh1):not(.fh2):not(.fh3):not(.fh4){opacity:0.25}
+body.friction-on .fh1,body.friction-on .fh2,body.friction-on .fh3,body.friction-on .fh4{opacity:1}
+.friction-badge{display:none;font-size:10px;font-weight:700;fill:#fff;paint-order:stroke;stroke:#000;stroke-width:2}
 body.friction-on .friction-badge{display:inline}
+#friction-toggle[aria-pressed="true"]{background:var(--crit);border-color:var(--crit);color:#fff;font-weight:600}
 .friction-legend{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:0.75rem;padding:4px 20px 0}
 .legend-entry{display:inline-flex;align-items:center;gap:4px}
 .legend-swatch.fh0{background:var(--panel);border:1px solid var(--border)}
@@ -853,7 +856,7 @@ td.verdict-empty{color:var(--muted)}
 .badge.verdict-covered{border-color:#009e73;color:#009e73}
 """
 _HEAT_CSS = "".join(
-    f"body.friction-on .fh{i}{{stroke:{color};stroke-width:2}}"
+    f"body.friction-on .fh{i}{{stroke:{color};stroke-width:4}}"
     f".legend-swatch.fh{i}{{background:{color}}}"
     for i, color in enumerate(HEAT_RAMP, start=1)
 )
@@ -875,9 +878,8 @@ STATIC_SCRIPT = """
   var overlayToggle = document.getElementById('friction-toggle');
   if (overlayToggle) {
     overlayToggle.addEventListener('click', function(){
-      var pressed = overlayToggle.getAttribute('aria-pressed') === 'true';
-      overlayToggle.setAttribute('aria-pressed', pressed ? 'false' : 'true');
-      document.body.classList.toggle('friction-on', !pressed);
+      var on = document.body.classList.toggle('friction-on');
+      overlayToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
   }
   var expandAll = document.getElementById('expand-all');
