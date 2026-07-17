@@ -860,3 +860,85 @@ def test_startup_url_is_flushed(tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+
+
+# =========================================================== Codex r3: synthesis sidecar
+def _coverage_covered_count(html_text):
+    """Count of 'covered'-verdict markers in the served page. A synthesis change that adds
+    covered CIVC cells raises this count, so it is a stable signal that the served Coverage
+    Matrix reflects the CURRENT synthesis sidecar (not a stale cached render)."""
+    return html_text.count("verdict-covered")
+
+
+def _write_synthesis(out_dir, date, covered_cells):
+    """Write a valid today-dated synthesis sidecar whose CIVC grid marks `covered_cells`
+    (list of (verb, surface)) as 'covered'; everything else defaults to empty."""
+    synth = out_dir / f"harness-synthesis-{date}.json"
+    civc = [{"verb": v, "surface": s, "verdict": "covered"} for (v, s) in covered_cells]
+    synth.write_text(json.dumps({"schema_version": 1, "civc": civc, "drag_candidates": []}))
+    return synth
+
+
+def test_synthesis_sidecar_change_triggers_rerender(tmp_path):
+    # Codex r3 FIX 1 (P1): render_from_out_dir reads harness-synthesis-<date>.json from
+    # out_dir to build the Coverage Matrix + drag models, but that sidecar lives OUTSIDE the
+    # collector-input surface the watcher tracks. A (re)write of the synthesis while the server
+    # runs must still be observed and trigger a FULL rebuild (the synthesis feeds MODELS, so the
+    # cheap friction-only path cannot pick it up), so the served Coverage Matrix stays live.
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "rules").mkdir()
+    (root / "rules" / "a.md").write_text("# rule a\n")
+    (root / "CLAUDE.md").write_text("# claude\n")
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    _write_synthesis(out_dir, today, [("Afford", "context")])  # valid synthesis BEFORE startup
+    server = _start_watching_server(out_dir, root, root)
+    try:
+        port = server.server_address[1]
+        _wait_settle(server)  # settle the startup rebuild
+        before_count = server.state.collect_count
+        before_cov = _coverage_covered_count(_get_root_body(port))
+        assert before_cov >= 1, "startup synthesis coverage not reflected in the served page"
+
+        # a NON-synthesis sweep with no change must NOT spuriously rebuild
+        _wait_settle(server)
+        assert server.state.collect_count == before_count, \
+            "a no-change sweep must not spuriously rebuild the synthesis-tracked surface"
+
+        # rewrite the synthesis with MORE covered cells -> a full rebuild + a live page update
+        _write_synthesis(out_dir, today,
+                         [("Afford", "context"), ("Inform", "tools"), ("Constrain", "memory")])
+        _wait_settle(server)
+        assert server.state.collect_count > before_count, \
+            "a synthesis-sidecar change must trigger a FULL rebuild (collect_count++)"
+        after_cov = _coverage_covered_count(_get_root_body(port))
+        assert after_cov > before_cov, \
+            "the served Coverage Matrix must reflect the rewritten synthesis sidecar"
+    finally:
+        _teardown_watching_server(server)
+
+
+def test_startup_malformed_synthesis_clean_fatal(tmp_path, capsys):
+    # Codex r3 FIX 2 (P2): a today-dated synthesis sidecar that is valid JSON with the right
+    # schema_version but a MALFORMED nested shape (mixed int/str drag_candidates[].n -> a
+    # TypeError deep in render_from_out_dir, the exact class the watcher backstop test uses)
+    # raised during build_server's STARTUP _rebuild must be contained: main() exits non-zero
+    # with the clean "fatal: could not start server" message, NOT a bare traceback.
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "rules").mkdir()
+    (root / "rules" / "a.md").write_text("# rule a\n")
+    (root / "CLAUDE.md").write_text("# claude\n")
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    synth = out_dir / f"harness-synthesis-{today}.json"
+    synth.write_text('{"schema_version": 1, "drag_candidates": [{"n": 1}, {"n": "x"}]}')
+    rv = srv.main(["--out-dir", str(out_dir), "--root", str(root),
+                   "--project-root", str(root), "--no-friction"])
+    assert rv == 1, "a malformed startup synthesis must yield a clean non-zero exit"
+    captured = capsys.readouterr()
+    assert "fatal: could not start server" in captured.err, \
+        f"expected the clean fatal message on stderr, got {captured.err!r}"

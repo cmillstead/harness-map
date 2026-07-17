@@ -143,6 +143,15 @@ class _State:
         self.clients_lock = threading.Lock()
         self.clients = []
         self.watch_snapshot = {}
+        # Codex r3 FIX 1: the synthesis sidecar (out_dir/harness-synthesis-<date>.json) is a
+        # render INPUT that feeds the Coverage Matrix + drag MODELS, but it lives under out_dir
+        # -- OUTSIDE the collector-input surface `watch_snapshot` covers AND distinct from the
+        # friction streams. It is tracked as its OWN parallel `_path_value` snapshot (existence/
+        # mtime/size), keyed by the served render's date, so a (re)write of the synthesis while
+        # the server runs forces a FULL `_rebuild` (never the cheap friction-only path, which
+        # reuses cached models). Seeded in build_server BEFORE the initial `_rebuild`, mirroring
+        # watch_snapshot's pre-rebuild ordering; advanced only after a successful settled rebuild.
+        self.synth_snapshot = None
 
     def register_client(self):
         """Add and return a fresh bounded (maxsize=1) queue for one SSE connection. The
@@ -259,6 +268,22 @@ def _watched_snapshot(root, project_root=None):
     symlink-target mtime changed) is the watcher's re-render signal."""
     return {path: _path_value(path)
             for path in collector.iter_input_paths(root, project_root)}
+
+
+def _synthesis_path(out_dir, date):
+    """The synthesis sidecar render_from_out_dir consumes for `date`
+    (harness-synthesis-<date>.json). It is the ONE render input that lives under out_dir
+    instead of root, so it is tracked separately from the collector-input surface (Codex r3)."""
+    return Path(out_dir) / f"harness-synthesis-{date}.json"
+
+
+def _synthesis_value(out_dir, date):
+    """`_path_value` change signal (existence / mtime / size) for the CURRENT-date synthesis
+    sidecar -- the same tuple form the collector-input snapshot uses, so a create/modify/delete
+    of the synthesis is detected identically. Keyed by the served render's `date` so a local
+    midnight rollover re-keys it consistently with the C18 date-mismatch guard (they use the
+    SAME `today`, so synthesis-tracking never fights the rollover logic)."""
+    return _path_value(_synthesis_path(out_dir, date))
 
 
 def _rebuild_friction_only(state, out_dir):
@@ -439,21 +464,33 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
         # continue WITHOUT advancing the snapshot. The stop-Event `return`s are not exceptions,
         # so the clean-shutdown path passes straight through this backstop untouched.
         try:
+            # `today` is computed ONCE per sweep and reused for BOTH the synthesis-sidecar key
+            # (Codex r3 FIX 1) and the C18 date-rollover check below, so the two never disagree
+            # on the date within a single iteration.
+            today = datetime.now().strftime("%Y-%m-%d")
             current = _watched_snapshot(root, project_root)
-            if current != state.watch_snapshot:
-                # Change detected: debounce until the snapshot holds steady for one full window.
+            synth_current = _synthesis_value(out_dir, today)  # Codex r3 FIX 1
+            if current != state.watch_snapshot or synth_current != state.synth_snapshot:
+                # Change detected (a collector input OR the synthesis sidecar moved): debounce
+                # until BOTH surfaces hold steady for one full window, then run ONE full rebuild.
                 while not stop_event.is_set():
                     if stop_event.wait(debounce_seconds):
                         return
                     settled = _watched_snapshot(root, project_root)
-                    if settled == current:
+                    settled_synth = _synthesis_value(out_dir, today)
+                    if settled == current and settled_synth == synth_current:
                         break
                     current = settled
+                    synth_current = settled_synth
                 if stop_event.is_set():
                     return
+                # A synthesis change MUST take the full-rebuild path (it feeds the Coverage
+                # Matrix + drag MODELS, which the cheap friction-only path reuses from cache and
+                # would leave stale) -- `_try_full_rebuild` is the only rebuild called here.
                 if not _try_full_rebuild(state, out_dir, root, project_root, label="rebuild"):
-                    continue  # do NOT advance the snapshot -> the change is retried next sweep
+                    continue  # do NOT advance either snapshot -> the change is retried next sweep
                 state.watch_snapshot = current
+                state.synth_snapshot = synth_current  # Codex r3 FIX 1: advance PRE-read value
                 # `_rebuild` already re-seeded stream_offsets from the sizes it saw at its
                 # start (FIX 1) -- no separate post-render re-seed here (that was the bug).
                 continue
@@ -480,7 +517,8 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
             # mismatch, force a full rebuild instead of the cheap path.
             with state.lock:
                 ctx_date = state.ctx.date
-            today = datetime.now().strftime("%Y-%m-%d")
+            # `today` was computed once at the top of this sweep (shared with the synthesis
+            # key), so the rollover check here reads the SAME date the synthesis-tracking used.
             if ctx_date != today:
                 if not _try_full_rebuild(state, out_dir, root, project_root,
                                           label="date-rollover recollect"):
@@ -674,9 +712,26 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     # watched path -> on a CLEAN startup this pre-rebuild baseline still equals what the first
     # sweep computes (no spurious re-render).
     state.watch_snapshot = _watched_snapshot(root, project_root)
+    # Codex r3 FIX 1: seed the synthesis-sidecar baseline BEFORE the initial `_rebuild`, using
+    # the same `today` the rebuild renders at, so a synthesis write concurrent with startup
+    # stays visible as a diff on the first sweep (safe direction) and a CLEAN startup (synthesis
+    # unchanged by the rebuild -- it lives in out_dir and is READ, never written, by `_rebuild`)
+    # produces no spurious first-sweep re-render.
+    state.synth_snapshot = _synthesis_value(out_dir, datetime.now().strftime("%Y-%m-%d"))
     # The initial `_rebuild` seeds stream_offsets from the sizes it captured at its START
     # (FIX 1) -- consistent with every subsequent rebuild, no separate post-render re-seed.
-    _rebuild(state, out_dir, root, project_root)
+    # Codex r3 FIX 2: an UNENUMERATED render fault at startup (e.g. a TypeError from a malformed
+    # synthesis sidecar deep in render_from_out_dir) is a TERMINAL startup failure -- normalize
+    # it to RenderError so main()'s existing (CollectorError/RenderError/OSError/SystemExit)
+    # catch prints a clean "fatal: could not start server" instead of a bare traceback. The
+    # enumerated startup exceptions propagate UNCHANGED (re-raised) so their type/message are
+    # preserved; this normalizes ONLY the unexpected ones and is NOT a swallow (always re-raised).
+    try:
+        _rebuild(state, out_dir, root, project_root)
+    except (CollectorError, render_html.RenderError, OSError, SystemExit):
+        raise
+    except Exception as exc:  # noqa: BLE001 - startup-failure normalizer (Codex r3 FIX 2): re-raises, never swallows
+        raise render_html.RenderError(f"startup render failed: {exc}") from exc
     server = _Server((host, port), RequestHandler)
     server.state = state
     server.out_dir = out_dir

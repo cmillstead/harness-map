@@ -1156,3 +1156,40 @@ def test_iter_input_paths_is_superset_of_real_build_document_reads(fake_harness)
             uncovered.append(str(path))
 
     assert not uncovered, f"paths read by build_document but not watched: {sorted(set(uncovered))}"
+
+
+def test_watch_walk_skips_generated_subtrees(fake_harness):
+    # Codex r3 FIX 3: the per-sweep os.walk (iter_input_paths, called by the watcher every
+    # ~2s) must PRUNE well-known generated/non-input subtrees (node_modules, .git, caches)
+    # so a skill carrying a large generated tree does not pound the filesystem every sweep.
+    # The prune must NOT drop any REAL harness input: the skill dir itself, its SKILL.md, and
+    # rules/*.md stay watched (they feed collector globs); only the generated descendants go.
+    root = fake_harness
+    skill = root / "skills" / "gen"
+    (skill / "rules").mkdir(parents=True, exist_ok=True)
+    (skill / "SKILL.md").write_text("---\nname: gen\ndescription: gen skill for prune test.\n---\nBody.\n")
+    (skill / "rules" / "x.md").write_text("# real rule input\n")
+    # a large generated tree with nested dirs + a .md buried inside (must NOT be enumerated)
+    nm_deep = skill / "node_modules" / "pkg" / "sub" / "deeper"
+    nm_deep.mkdir(parents=True, exist_ok=True)
+    (nm_deep / "readme.md").write_text("# generated, not a harness input\n")
+    (skill / "node_modules" / "pkg" / "test_gen.py").write_text("def test_x():\n    assert True\n")
+    # a .git dir too (another generated tree the walk must skip)
+    (skill / ".git" / "objects").mkdir(parents=True, exist_ok=True)
+
+    paths = set(map(str, _collector.iter_input_paths(root)))
+
+    # real inputs still watched
+    assert str(skill) in paths                              # skill dir (membership)
+    assert str(skill / "rules") in paths                    # rules subdir (membership)
+    assert str(skill / "SKILL.md") in paths                 # glob-matched content file
+    assert str(skill / "rules" / "x.md") in paths           # glob-matched rule file
+
+    # generated subtree descendants pruned from the watched set
+    assert str(skill / "node_modules") not in paths
+    assert str(skill / "node_modules" / "pkg") not in paths
+    assert str(nm_deep) not in paths
+    assert str(skill / ".git") not in paths
+    assert str(skill / ".git" / "objects") not in paths
+    assert not any("node_modules" in p for p in paths), \
+        "watched set must not enumerate any node_modules descendant"

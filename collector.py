@@ -1271,25 +1271,42 @@ def build_headline(always_loaded, hooks_section, instruction_length_flags, dupli
     }
 
 
+# Codex r3 FIX 3: well-known generated / non-harness-input subtrees pruned from the per-sweep
+# descendant walk. NONE of the collector's instruction/rule/skill globs ever ingest a
+# *.md / SKILL.md / phases|prompts|agents md / *_eval.* from inside these as an INPUT (they
+# match only fixed-depth paths like skills/*/rules/*.md, never skills/*/node_modules/**), so
+# skipping their descendants cannot drop a real read -- the containing SKILL dir stays yielded,
+# keeping the T3B iter_input_paths-is-a-superset invariant intact -- while sparing the watcher
+# from re-enumerating thousands of generated files (node_modules, caches, .git objects) every
+# ~2s sweep. Membership of the FIRST level (the pruned dir appearing/disappearing under a
+# watched parent) is still caught by that parent's own listdir signal.
+_PRUNED_WALK_DIRS = frozenset({
+    ".git", "node_modules", "__pycache__", ".pytest_cache",
+    ".venv", ".mypy_cache", ".ruff_cache",
+})
+
+
 def _iter_descendant_dirs(base):
-    """Yield `base` and every directory beneath it (each membership-watchable). Mirrors the
-    RECURSIVE reach of _skill_has_test_asset's rglob("test_*.py")/rglob("*_eval.*"): a
-    test/eval file added at ANY depth flips a skill's has_test, so the watcher must be able
-    to snapshot the membership of every level. followlinks=True matches the collector reading
-    THROUGH a deploy-symlinked skill dir into its target; a realpath visited-set breaks any
-    symlink cycle so a self-referential link can never spin the walk forever."""
+    """Yield `base` and every non-pruned directory beneath it (each membership-watchable).
+    Mirrors the RECURSIVE reach of _skill_has_test_asset's rglob("test_*.py")/rglob("*_eval.*"):
+    a test/eval file added at ANY real depth flips a skill's has_test, so the watcher must be
+    able to snapshot the membership of every level.
+
+    followlinks=False (Codex r3 FIX 3): os.walk still ENTERS `base` even when `base` itself is a
+    deploy-symlinked skill dir (the first hop stays -- os.walk always descends into the walk
+    root), so a symlinked skill's own contents remain watched; but a symlink NESTED inside the
+    target is NOT chased into. This matches the collector's own reads -- pathlib rglob does not
+    follow nested directory symlinks either -- so the walked set stays a SUPERSET of what
+    build_document reads while avoiding heavy I/O (and any symlink cycle) on nested external
+    trees. Well-known generated subtrees (_PRUNED_WALK_DIRS) are pruned before descending."""
     try:
         if not base.is_dir():
             return
     except OSError:
         return
-    visited = set()
-    for dirpath, dirnames, _ in os.walk(base, followlinks=True):
-        real = os.path.realpath(dirpath)
-        if real in visited:
-            dirnames[:] = []  # already walked this physical dir via another link — prune
-            continue
-        visited.add(real)
+    for dirpath, dirnames, _ in os.walk(base, followlinks=False):
+        # Prune generated/non-input subtrees IN PLACE so os.walk never descends into them.
+        dirnames[:] = [d for d in dirnames if d not in _PRUNED_WALK_DIRS]
         yield Path(dirpath)
 
 
