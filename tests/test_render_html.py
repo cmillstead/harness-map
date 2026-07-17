@@ -300,7 +300,8 @@ def test_friction_total_empty_is_zero():
 # --- instrument readout (A2/AM-1) ---
 def test_instrument_readout_renders_exactly_the_gauge_specs(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "gauges"; out_dir.mkdir()
+    out_dir = tmp_path / "gauges"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
@@ -327,7 +328,8 @@ def test_instrument_readout_renders_exactly_the_gauge_specs(tmp_path):
 
 def test_friction_gauge_reflects_joined_records(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "fgauge"; out_dir.mkdir()
+    out_dir = tmp_path / "fgauge"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     decisions = out_dir / "d.jsonl"
     decisions.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
@@ -797,7 +799,8 @@ def test_friction_overlay_css_dims_unheated_cells_and_marks_toggle_pressed(tmp_p
 
 def test_friction_view_has_four_stream_cards(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "fcards"; out_dir.mkdir()
+    out_dir = tmp_path / "fcards"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     decisions = out_dir / "d.jsonl"
     decisions.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
@@ -816,7 +819,8 @@ def test_friction_view_total_matches_gauge(tmp_path):
     total and assert they are the SAME, non-zero number. Asserting only that the
     `data-gauge` attribute exists is a false-green — a gauge rendering 0 would pass."""
     doc = _minimal_doc()
-    out_dir = tmp_path / "ftotal"; out_dir.mkdir()
+    out_dir = tmp_path / "ftotal"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     # two decisions on DISTINCT always-loaded components -> >=2 joined records (unambiguous, >1)
     decisions = out_dir / "d.jsonl"
@@ -857,7 +861,8 @@ def test_friction_view_has_per_component_join_table(tmp_path):
         {"path": "rules/alpha.md", "category": "rule", "words": 10, "lines": 2,
          "tokens_est": 10, "evidence": "VERIFIED"},
     ])
-    out_dir = tmp_path / "fcomp"; out_dir.mkdir()
+    out_dir = tmp_path / "fcomp"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     decisions = out_dir / "d.jsonl"
     # z-component FIRST, a-component SECOND (twice) -> node keys join for both; sorted output
@@ -883,7 +888,8 @@ def test_friction_view_has_per_component_join_table(tmp_path):
 
 def test_weight_view_has_treemap_and_ladder_both_prerendered(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "weight"; out_dir.mkdir()
+    out_dir = tmp_path / "weight"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
@@ -905,7 +911,8 @@ def test_weight_heat_lands_on_both_always_and_on_demand(tmp_path):
     duplicated across a single panel's treemap+ladder. Scope to each named panel and
     require a real data-node-key on the heated cell."""
     doc = _minimal_doc()
-    out_dir = tmp_path / "wheat"; out_dir.mkdir()
+    out_dir = tmp_path / "wheat"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     # decisions heats an always-loaded node AND coding-team (on-demand)
     decisions = out_dir / "d.jsonl"
@@ -946,7 +953,8 @@ def test_treemap_uses_value_scaled_opacity(tmp_path):
     an SVG attribute (never style=). Fixture guarantees size variance among always-loaded
     cells. If _minimal_doc lacks size variance, inject two cells of clearly different size."""
     doc = _minimal_doc()
-    out_dir = tmp_path / "tmopac"; out_dir.mkdir()
+    out_dir = tmp_path / "tmopac"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
@@ -1025,7 +1033,8 @@ def test_civc_note_injection_is_escaped(tmp_path, payload):
 
 def test_coverage_matrix_cells_clickable_and_inspectors_prerendered(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "cov"; out_dir.mkdir()
+    out_dir = tmp_path / "cov"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     synth = {"schema_version": 1, "civc": [
         {"verb": "Afford", "surface": "context", "verdict": "covered", "evidence": "V", "note": "n"}],
@@ -1047,7 +1056,8 @@ def test_coverage_matrix_cells_clickable_and_inspectors_prerendered(tmp_path):
 
 def test_coverage_verdict_fill_classes(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "cov2"; out_dir.mkdir()
+    out_dir = tmp_path / "cov2"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     synth = {"schema_version": 1, "civc": [
         {"verb": "Afford", "surface": "context", "verdict": "covered"},
@@ -1082,14 +1092,16 @@ def test_friction_stream_malformed_lines_skip_and_count(tmp_path):
 # ============================================================= 6. IA pivot: 5 views + switcher
 def test_five_views_present_not_six_tabs(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "views"; out_dir.mkdir()
+    out_dir = tmp_path / "views"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     for vid in ("view-overview", "view-coverage", "view-weight", "view-friction", "view-hygiene"):
         assert f'id="{vid}"' in text
-    p = _ExternalRefParser(); p.feed(text)
+    p = _ExternalRefParser()
+    p.feed(text)
     view_btns = text.count('class="view-btn"')
     assert view_btns == 5
     # no leftover 6-tab panel ids
@@ -1107,7 +1119,8 @@ def test_five_views_present_not_six_tabs(tmp_path):
 
 def test_exactly_one_executable_script(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "onescript"; out_dir.mkdir()
+    out_dir = tmp_path / "onescript"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
@@ -1120,7 +1133,8 @@ def test_exactly_one_executable_script(tmp_path):
 
 def test_copy_buttons_and_islands_present(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "copy"; out_dir.mkdir()
+    out_dir = tmp_path / "copy"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
@@ -1134,7 +1148,8 @@ def test_keyboard_activation_wired_for_button_cells(tmp_path):
     """WCAG 2.2 AA: role=button cells (mini-grid + matrix) must be keyboard-operable.
     The static script wires a keydown handler to [data-goto] and .matrix-cell."""
     doc = _minimal_doc()
-    out_dir = tmp_path / "kbd"; out_dir.mkdir()
+    out_dir = tmp_path / "kbd"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
@@ -1147,7 +1162,8 @@ def test_keyboard_activation_wired_for_button_cells(tmp_path):
 # ============================================================= 7. Overview digest + hero + nav
 def test_overview_default_view_and_mini_grid_nav(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "ov"; out_dir.mkdir()
+    out_dir = tmp_path / "ov"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     synth = {"schema_version": 1, "civc": [
         {"verb": "Afford", "surface": "context", "verdict": "covered"}],
@@ -1176,7 +1192,8 @@ def test_overview_default_view_and_mini_grid_nav(tmp_path):
 
 def test_overview_digest_lists_roadmap_gaps_and_drag(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "ov2"; out_dir.mkdir()
+    out_dir = tmp_path / "ov2"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     synth = {"schema_version": 1, "civc": [], "drag_candidates": [
         {"n": 1, "surface": "memory", "evidence": "e", "outcome": "probation",
@@ -1256,7 +1273,8 @@ def test_hygiene_view_folds_dup_phantom_trend_and_wiring(tmp_path):
                            "pairs": [{"a": "rules/x.md", "b": "rules/y.md", "score": 0.9,
                                       "shared_sample": "sample", "evidence": "INFERRED"}]}
     doc["phantom_refs"] = []
-    out_dir = tmp_path / "hyg"; out_dir.mkdir()
+    out_dir = tmp_path / "hyg"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-14", doc)   # 2 sidecars -> trend table
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
@@ -1294,7 +1312,8 @@ def test_provenance_footer_keeps_warning_visible(tmp_path):
     import re
     doc = _minimal_doc()
     doc["inaccessible"] = [{"path": "secret.md", "reason": "denied"}]
-    out_dir = tmp_path / "prov"; out_dir.mkdir()
+    out_dir = tmp_path / "prov"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
@@ -1312,7 +1331,8 @@ def test_provenance_footer_keeps_warning_visible(tmp_path):
 # ============================================================= 8. copy payload content + IA determinism (Task 10, A8/A9)
 def test_copy_payload_coverage_is_markdown_table(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "cpmd"; out_dir.mkdir()
+    out_dir = tmp_path / "cpmd"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     synth = {"schema_version": 1, "civc": [
         {"verb": "Afford", "surface": "context", "verdict": "covered"}], "drag_candidates": []}
@@ -1332,7 +1352,8 @@ def test_all_five_copy_payloads_present_and_nonempty(tmp_path):
     """Finding #9: every view's copy island must carry real, non-empty markdown — not just
     Coverage. Empty/malformed Overview/Weight/Friction/Hygiene payloads must fail here."""
     doc = _minimal_doc()
-    out_dir = tmp_path / "cpall"; out_dir.mkdir()
+    out_dir = tmp_path / "cpall"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     synth = {"schema_version": 1, "civc": [
         {"verb": "Afford", "surface": "context", "verdict": "covered"}], "drag_candidates": []}
@@ -1358,15 +1379,19 @@ def test_all_five_copy_payloads_present_and_nonempty(tmp_path):
     # each view's payload carries a marker unique to that view's builder output
     assert "harness-map" in payload("overview")
     assert payload("coverage").lstrip().startswith("| verb")
-    wp = payload("weight");   assert "tokens" in wp or "always-loaded" in wp.lower()
-    fp = payload("friction"); assert "codex" in fp.lower()          # _codex_sentence always appended
-    hp = payload("hygiene");  assert ("hygiene" in hp.lower() or "dup" in hp.lower()
+    wp = payload("weight")
+    assert "tokens" in wp or "always-loaded" in wp.lower()
+    fp = payload("friction")
+    assert "codex" in fp.lower()          # _codex_sentence always appended
+    hp = payload("hygiene")
+    assert ("hygiene" in hp.lower() or "dup" in hp.lower()
                                       or "phantom" in hp.lower())
 
 
 def test_copy_islands_are_inert_not_executable(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "inert"; out_dir.mkdir()
+    out_dir = tmp_path / "inert"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
@@ -1383,7 +1408,8 @@ def test_copy_islands_are_inert_not_executable(tmp_path):
 
 def test_full_ia_determinism_byte_identical(tmp_path):
     doc = _minimal_doc()
-    out_dir = tmp_path / "detfull"; out_dir.mkdir()
+    out_dir = tmp_path / "detfull"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     synth = {"schema_version": 1, "civc": [
         {"verb": "Afford", "surface": "context", "verdict": "covered", "note": "n"}],
@@ -1411,7 +1437,8 @@ def test_full_ia_determinism_cross_pythonhashseed(tmp_path):
     catch dict/set-ordering nondeterminism; the pre-existing cross-seed fixture had no
     synthesis or friction."""
     doc = _minimal_doc()
-    out_dir = tmp_path / "detseed"; out_dir.mkdir()
+    out_dir = tmp_path / "detseed"
+    out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     synth = {"schema_version": 1, "civc": [
         {"verb": "Afford", "surface": "context", "verdict": "covered", "note": "n"}],
@@ -1437,13 +1464,17 @@ def test_csp_hashes_cover_the_emitted_blocks(tmp_path):
     values to the module constants (rh.STATIC_STYLE / rh.STATIC_SCRIPT) would miss any
     per-render interpolation into the emitted block. Also assert the executable script
     bytes are identical across two materially-different inputs (proves it stays static)."""
-    import re, hashlib, base64
+    import re
+    import hashlib
+    import base64
 
     def emit(out_dir, **kw):
         proc = run_render(out_dir, "--date", "2026-07-15", **kw)
         assert proc.returncode == 0, proc.stderr
         return (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
-    d1 = tmp_path / "csp1"; d1.mkdir(); _write_sidecar(d1, "2026-07-15", _minimal_doc())
+    d1 = tmp_path / "csp1"
+    d1.mkdir()
+    _write_sidecar(d1, "2026-07-15", _minimal_doc())
     text = emit(d1, extra=["--no-friction"])
     # extract the CSP script/style sha256 tokens and the emitted blocks
     meta = re.search(r"script-src 'sha256-([A-Za-z0-9+/=]+)'", text)
@@ -1457,8 +1488,11 @@ def test_csp_hashes_cover_the_emitted_blocks(tmp_path):
     assert got_script == meta.group(1)
     assert got_style == style_meta.group(1)
     # executable script bytes are input-invariant (fully static)
-    d2 = tmp_path / "csp2"; d2.mkdir(); _write_sidecar(d2, "2026-07-15", _minimal_doc())
-    dec = d2 / "d.jsonl"; dec.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    d2 = tmp_path / "csp2"
+    d2.mkdir()
+    _write_sidecar(d2, "2026-07-15", _minimal_doc())
+    dec = d2 / "d.jsonl"
+    dec.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
     text2 = emit(d2, extra=["--decisions-file", str(dec)])
     exe2 = re.search(r'<script(?![^>]*application/json)[^>]*>(.*?)</script>', text2, re.S)
     assert exe.group(1) == exe2.group(1)
