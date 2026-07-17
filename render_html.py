@@ -972,6 +972,12 @@ th{color:var(--muted);font-weight:600}
 .sev-dot.sev-good{background:var(--sem-covered)}
 .sev-dot.sev-warn{background:var(--sem-thin)}
 .sev-dot.sev-bad{background:var(--sem-empty)}
+.stream-cards{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 14px 0}
+.stream-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;flex:1 1 200px}
+.stream-card .count{font-size:1.3rem;font-weight:600;font-family:var(--mono);font-variant-numeric:tabular-nums;margin:0 0 4px 0}
+.stream-card h3{margin:0 0 4px 0;font-size:0.9rem}
+.stream-card p{margin:0 0 6px 0;font-size:0.82rem;color:var(--muted)}
+.stream-card .source{font-size:0.75rem;color:var(--muted);font-family:var(--mono)}
 .sev-dot.sev-neutral{background:var(--muted)}
 svg text{font-family:inherit}
 footer.sources{border-top:1px solid var(--border);padding:10px 20px;color:var(--muted);font-size:0.78rem}
@@ -1594,6 +1600,58 @@ def _render_provenance_footer(doc, skipped, footer):
     )
 
 
+def _stream_event_count(f, codex_aggregate):
+    """A6 headline count for one stream card — the SAME figure `_friction_sentence`
+    already leads with, so the card count and the sentence never disagree. Pure
+    function of the footer dict `f` (from `build_friction_overlay`) + `codex_aggregate`;
+    reuses counters the join functions already computed, never re-derives."""
+    if f["status"] != "loaded":
+        return 0
+    stream = f["stream"]
+    if stream == "decisions":
+        return f.get("segments_joined", 0)
+    if stream == "metrics":
+        return f.get("records_eligible", 0) - f.get("records_aggregate_only", 0)
+    if stream == "interventions":
+        return f.get("records_parsed", 0)
+    return codex_aggregate.get("runs", 0)   # codex — aggregate-only
+
+
+def _render_stream_card(f, codex_aggregate):
+    """A6 stream card: event count, title, plain-English description, source filename."""
+    count = _stream_event_count(f, codex_aggregate)
+    title = STREAM_LABELS[f["stream"]]
+    sentence = _friction_sentence(f, codex_aggregate)
+    return (
+        '<div class="stream-card">'
+        f'<div class="count">{esc_html(count)}</div>'
+        f'<h3>{esc_html(title)}</h3>'
+        f'<p>{esc_html(sentence)}</p>'
+        f'<div class="source">{esc_html(f["path_display"])}</div>'
+        '</div>'
+    )
+
+
+def _render_component_friction_table(joined):
+    """A6 per-component join table (finding #1): which map nodes got heated, and how
+    many friction records each. Reads the SAME `joined` dict `build_friction_overlay`
+    already returns — does not re-derive. `sorted(joined.items())` (node_key ascending)
+    for deterministic, insertion-order-independent output."""
+    if not joined:
+        rows = '<tr class="friction-component-row"><td colspan="2" class="empty-state">no components joined</td></tr>'
+    else:
+        rows = "".join(
+            f'<tr class="friction-component-row"><td>{esc_html(node_key)}</td>'
+            f'<td>{esc_html(len(records))}</td></tr>'
+            for node_key, records in sorted(joined.items())
+        )
+    return (
+        '<div class="overflow-x"><table class="friction-components">'
+        '<tr><th>Component</th><th>Friction records</th></tr>'
+        f'{rows}</table></div>'
+    )
+
+
 def _render_friction_row(f, codex_aggregate):
     sentence = esc_html(_friction_sentence(f, codex_aggregate))
     raw = {k: v for k, v in f.items() if k not in ("stream", "status", "path_display")}
@@ -1604,32 +1662,37 @@ def _render_friction_row(f, codex_aggregate):
             f'<td>{sentence}{raw_html}</td></tr>')
 
 
-def _render_friction_panel(joined, footer, codex_aggregate):
+def _render_friction_panel(joined, footer, codex_aggregate, friction_total_value):
     explainer = (
         '<p class="friction-explainer">Friction = where your harness has seen the most churn. '
         'These local telemetry streams (decisions, review metrics, Codex reviews, interventions) '
         'are matched by name onto the components on the map — a data join, not a judgment.</p>'
     )
+    stream_cards = "".join(_render_stream_card(f, codex_aggregate) for f in footer)
+    component_table = _render_component_friction_table(joined)
     rows = "".join(_render_friction_row(f, codex_aggregate) for f in footer)
-    joined_count = sum(len(v) for v in joined.values())
     codex_html = (
         f'<div class="card"><h2>Codex aggregate (not node-joined)</h2>'
         f'<p>{esc_html(_codex_sentence(codex_aggregate))}</p></div>'
     )
     return (
         '<aside class="card" id="friction-panel">'
-        f'<h2>Friction overlay — joined records: {joined_count}</h2>'
+        f'<h2>Friction events: {esc_html(friction_total_value)}</h2>'
+        f'<div class="stream-cards">{stream_cards}</div>'
         f'{explainer}'
+        f'{component_table}'
         f'<div class="overflow-x"><table><tr><th>Stream</th><th>Status</th><th>Path</th><th>What matched</th></tr>{rows}</table></div>'
         f'{codex_html}</aside>'
     )
 
 
-def _render_friction_view(joined, footer, codex_aggregate, drag):
+def _render_friction_view(joined, footer, codex_aggregate, drag, friction_total_value):
     """Former `_render_friction_panel`, moved verbatim, plus the drag-candidate table
-    half of the former `_render_civc_drag_tab` appended (IA mapping). Header still
-    reads "joined records: N" this task — Task 8 reframes it to `friction_total`."""
-    friction_body = _render_friction_panel(joined, footer, codex_aggregate)
+    half of the former `_render_civc_drag_tab` appended (IA mapping). A6/DECISION 6
+    (Task 8): 4 stream cards + a per-component join table now render above the
+    explainer, and the header reads `friction_total` — the SAME value the AM-1
+    instrument gauge renders — instead of the raw joined-record count."""
+    friction_body = _render_friction_panel(joined, footer, codex_aggregate, friction_total_value)
     if not drag["available"]:
         drag_body = '<p class="empty-state">synthesis sidecar not found — drag-candidate table unavailable this run.</p>'
     elif not drag["rows"]:
@@ -1704,7 +1767,7 @@ def render_html(date, models, friction, notes):
         _render_overview_view(overview_model, models["civc"]),
         _render_coverage_view(models["civc"]),
         _render_weight_view(models["context_weight"], heat),
-        _render_friction_view(joined, footer, codex_aggregate, models["drag"]),
+        _render_friction_view(joined, footer, codex_aggregate, models["drag"], friction_total_value),
         _render_hygiene_view(doc, models),
         "</main>",
         _render_copy_island("overview", copy_payloads["overview"]),

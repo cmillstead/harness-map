@@ -795,6 +795,92 @@ def test_friction_overlay_css_dims_unheated_cells_and_marks_toggle_pressed(tmp_p
     assert '#friction-toggle[aria-pressed="true"]{background:var(--sem-empty)' in text
 
 
+def test_friction_view_has_four_stream_cards(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "fcards"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    decisions = out_dir / "d.jsonl"
+    decisions.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert text.count('class="stream-card"') == 4          # one card per telemetry stream
+    for title in ("Decisions", "Review metrics", "Interventions", "Codex reviews"):
+        assert title in text                                # STREAM_LABELS titles
+    assert "d.jsonl" in text                                # loaded stream's source filename
+    assert "What matched" in text                           # existing join table still below
+
+
+def test_friction_view_total_matches_gauge(tmp_path):
+    """DECISION 6 + finding #3: parse the ACTUAL gauge value AND the Friction-view header
+    total and assert they are the SAME, non-zero number. Asserting only that the
+    `data-gauge` attribute exists is a false-green — a gauge rendering 0 would pass."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "ftotal"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    # two decisions on DISTINCT always-loaded components -> >=2 joined records (unambiguous, >1)
+    decisions = out_dir / "d.jsonl"
+    decisions.write_text(
+        json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n"
+        + json.dumps({"date": "2026-07-02", "component": "CLAUDE.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    # gauge value = the .v inside the friction_total gauge card (order fixed by _render_gauge)
+    gm = re.search(r'data-gauge="friction_total"[^>]*>\s*<div class="v">(\d+)</div>', text)
+    assert gm is not None, "friction_total gauge card missing its .v value"
+    gauge_val = int(gm.group(1))
+    hm = re.search(r'Friction events:\s*(\d+)', text)
+    assert hm is not None
+    header_val = int(hm.group(1))
+    # the DECISION 6 invariant: gauge and view header render ONE identical value ...
+    assert gauge_val == header_val
+    # ... and it is provably non-zero (both injected decisions join) — kills the 0 false-green
+    assert gauge_val >= 2
+
+
+def test_friction_view_has_per_component_join_table(tmp_path):
+    """A6 + finding #1: the per-COMPONENT join table (which node keys got heated, and how
+    many friction records each) must render — not only the per-stream 'What matched' table.
+    round2 #7: inject two components in REVERSE lexical order and assert the rendered rows
+    come out sorted (proves sorted(joined.items()), not insertion order).
+    NOTE (grounding deviation from the plan literal): the plan's fixture text referenced
+    "rules/zeta.md"/"rules/alpha.md" without registering them as always-loaded files, so
+    they would never resolve through `node_index` (join_decisions matches on basenames
+    already present in `build_node_index(models)`, §1.3). Registering both as
+    `extra_files` here so they actually join, per the "adapt fixtures to real shapes"
+    grounding instruction."""
+    doc = _minimal_doc(extra_files=[
+        {"path": "rules/zeta.md", "category": "rule", "words": 10, "lines": 2,
+         "tokens_est": 10, "evidence": "VERIFIED"},
+        {"path": "rules/alpha.md", "category": "rule", "words": 10, "lines": 2,
+         "tokens_est": 10, "evidence": "VERIFIED"},
+    ])
+    out_dir = tmp_path / "fcomp"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    decisions = out_dir / "d.jsonl"
+    # z-component FIRST, a-component SECOND (twice) -> node keys join for both; sorted output
+    # must place the a-key row before the z-key row regardless of insertion order.
+    decisions.write_text(
+        json.dumps({"date": "2026-07-01", "component": "rules/zeta.md"}) + "\n"
+        + json.dumps({"date": "2026-07-02", "component": "rules/alpha.md"}) + "\n"
+        + json.dumps({"date": "2026-07-03", "component": "rules/alpha.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'class="friction-components"' in text          # the per-component table
+    import re
+    rows = re.findall(r'<tr[^>]*class="friction-component-row"[^>]*>(.*?)</tr>', text, re.S)
+    assert len(rows) >= 2
+    # sorted order: alpha row precedes zeta row
+    a_idx = next(i for i, r in enumerate(rows) if "alpha.md" in r)
+    z_idx = next(i for i, r in enumerate(rows) if "zeta.md" in r)
+    assert a_idx < z_idx
+    # alpha joined twice -> count 2; zeta once -> count 1
+    assert ">2<" in rows[a_idx] and ">1<" in rows[z_idx]
+
+
 def test_weight_view_has_treemap_and_ladder_both_prerendered(tmp_path):
     doc = _minimal_doc()
     out_dir = tmp_path / "weight"; out_dir.mkdir()
