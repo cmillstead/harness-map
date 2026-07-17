@@ -567,9 +567,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         on reconnect, while a fresh page (equal generations) never reloads (no reload loop)."""
         state = self.server.state
         heartbeat = getattr(self.server, "heartbeat_seconds", HEARTBEAT_SECONDS)
+        # Register the client queue BEFORE capturing the generation (Codex r2 residual-race
+        # fix). register_client() uses clients_lock; the generation read below uses state.lock;
+        # a publish takes state.lock (bump generation) THEN clients_lock (broadcast). Registering
+        # first makes registration+generation-capture atomic w.r.t. publication: a publish fully
+        # BEFORE registration also bumped the generation before this read -> the connect-time
+        # sync reports it (client reloads iff ahead); a publish AFTER registration reaches this
+        # queue via broadcast (client reloads). Reversing the order (read generation, then
+        # register) leaves a gap where an interleaved publish misses the not-yet-registered queue
+        # AND advances past the already-read generation -> the page stays stale until the next
+        # rebuild. An equal generation on a fresh connect still never reloads (no loop).
+        client_queue = state.register_client()
         with state.lock:
             current_gen = state.generation
-        client_queue = state.register_client()
         # A stuck/slow-reading or disconnected client makes wfile.write/flush raise on the
         # connection socket. Because RequestHandler.timeout sets socket.settimeout(10), a
         # stalled write raises TimeoutError (socket.timeout is now an alias of TimeoutError)
@@ -642,8 +652,11 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     When `watch=True` (main() always passes it; tests opt in and shrink the timings) a
     daemon watcher thread is started and stored as `server._watcher_thread`, with a
     `server._watcher_stop` Event that main()'s shutdown path signals + joins. The watch
-    snapshot is seeded BEFORE the thread starts, so the very first sweep only fires on a
-    genuine post-startup change, never on startup state."""
+    snapshot is seeded from the same source of truth the watcher polls, BEFORE the initial
+    `_rebuild` reads the inputs (so a change concurrent with the first rebuild stays visible
+    as a diff on the first sweep) and BEFORE the thread starts. On a CLEAN startup the
+    baseline equals what the first sweep computes (out_dir is outside root, so the rebuild
+    mutates no watched path), so the first sweep only fires on a genuine post-startup change."""
     host = _validate_host(host)
     out_dir = Path(out_dir)
     root = Path(root)
@@ -651,6 +664,16 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     if streams is None:
         streams = _build_streams(no_friction)
     state = _State(streams=streams, no_friction=no_friction)
+    # Capture the watch baseline BEFORE the initial `_rebuild` reads the inputs (Codex r2
+    # residual-race fix), mirroring the stream-offset PRE-read seeding below: a watched harness
+    # file mutated concurrently with the first rebuild then stays VISIBLE as a diff on the first
+    # watcher sweep (safe direction -- at worst one extra early re-render, never a stale serve).
+    # Seeding AFTER the rebuild would record the mutated fs state as baseline while state.ctx
+    # still holds the pre-mutation render -> the first sweep sees no diff and serves stale until
+    # the next edit. The collector enforces out_dir OUTSIDE root, so the rebuild never mutates a
+    # watched path -> on a CLEAN startup this pre-rebuild baseline still equals what the first
+    # sweep computes (no spurious re-render).
+    state.watch_snapshot = _watched_snapshot(root, project_root)
     # The initial `_rebuild` seeds stream_offsets from the sizes it captured at its START
     # (FIX 1) -- consistent with every subsequent rebuild, no separate post-render re-seed.
     _rebuild(state, out_dir, root, project_root)
@@ -664,8 +687,6 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     server._debounce_seconds = debounce_seconds
     stop_event = threading.Event()
     server._watcher_stop = stop_event
-    # Seed the snapshot from the same source of truth the watcher polls, BEFORE starting it.
-    state.watch_snapshot = _watched_snapshot(root, project_root)
     if watch:
         watcher = threading.Thread(
             target=_watcher_loop,

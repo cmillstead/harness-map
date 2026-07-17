@@ -1169,25 +1169,29 @@ STATIC_SCRIPT = """
   if (views.length){ activate('view-overview'); }
 
   // Live-serve progressive enhancement: when served by serve.py, subscribe to the SSE
-  // /events endpoint and reload on 'refresh'. On file:// there is no server, so this MUST
-  // be a silent no-op with zero behavior change (D4). Gated on an HTTP(S) origin: on a
-  // file:// (or any non-http) origin EventSource still EXISTS and construction still
-  // succeeds, but the request fails and EventSource AUTO-RECONNECTS on error — an empty
-  // error handler does NOT stop that reconnect storm. So we never construct it off http(s).
-  // addEventListener only, no inline handlers, no style writes (CSP model preserved).
+  // /events endpoint and reload on 'refresh'. On file:// (or a STATIC one-shot artifact
+  // served over plain HTTP, e.g. `python -m http.server`) there is no /events endpoint, so
+  // this MUST be a silent no-op with zero behavior change (D4). The AUTHORITATIVE serve-mode
+  // signal is the hm-generation <meta>: ONLY serve.py's live render emits it (a one-shot /
+  // file:// render passes generation=None -> no meta). We gate EventSource construction on
+  // that marker being PRESENT and parsing as an integer -- so a static artifact (which has no
+  // meta) never opens '/events' and never triggers the missing-endpoint reconnect storm
+  // (EventSource AUTO-RECONNECTS on error; an empty error handler does NOT stop it). The
+  // http(s) protocol check is kept as an ADDITIONAL guard. The marker doubles as the
+  // reconnect generation the page was rendered from: on (re)connect the server sends its
+  // current generation and we reload ONLY when it is AHEAD (serverGen > pageGen), so a fresh
+  // page whose gens are equal never loops and a refresh missed during a disconnect is caught
+  // up on reconnect. addEventListener only, no inline handlers, no style writes (CSP preserved).
   try {
-    if (location.protocol === 'http:' || location.protocol === 'https:') {
-      // The generation this page was rendered from (CSP-safe <meta>, read via DOM — no
-      // inline script). On (re)connect the server sends its current generation; we reload
-      // ONLY when the server is AHEAD (serverGen > pageGen), so a fresh page whose gens are
-      // equal never loops, and a refresh missed during a disconnect is caught up on reconnect.
-      var genMeta = document.querySelector('meta[name="hm-generation"]');
-      var pageGen = genMeta ? parseInt(genMeta.getAttribute('content'), 10) : NaN;
+    var genMeta = document.querySelector('meta[name="hm-generation"]');
+    var pageGen = genMeta ? parseInt(genMeta.getAttribute('content'), 10) : NaN;
+    var isHttp = (location.protocol === 'http:' || location.protocol === 'https:');
+    if (genMeta && !isNaN(pageGen) && isHttp) {
       var es = new EventSource('/events');
       es.addEventListener('refresh', function(){ location.reload(); });
       es.addEventListener('sync', function(ev){
         var serverGen = parseInt(ev.data, 10);
-        if (!isNaN(serverGen) && !isNaN(pageGen) && serverGen > pageGen) { location.reload(); }
+        if (!isNaN(serverGen) && serverGen > pageGen) { location.reload(); }
       });
       es.addEventListener('error', function(){ /* transient drop: EventSource auto-reconnects and the sync-on-reconnect catches up any missed refresh */ });
     }

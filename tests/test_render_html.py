@@ -614,6 +614,39 @@ def test_generation_meta_and_sync_reload_guard(tmp_path):
     assert '<meta name="hm-generation"' not in ctx0.html_text
 
 
+def test_eventsource_gated_on_generation_marker(tmp_path):
+    # FIX 1 (Codex r2): the http(s) protocol check ALONE is insufficient. A STATIC one-shot
+    # artifact served over plain HTTP (e.g. `python -m http.server`) has NO hm-generation meta
+    # yet, under a protocol-only gate, would still construct EventSource('/events') — whose
+    # missing endpoint AUTO-RECONNECTS indefinitely (request churn) and could even reload off an
+    # unrelated `/events` on that host. The fix gates construction on the serve-ONLY marker: the
+    # `<meta name="hm-generation">` that only serve.py's live render emits (a one-shot/file://
+    # render passes generation=None -> no meta). Browser runtime isn't unit-testable in pytest,
+    # so assert (a) STATIC_SCRIPT keys construction off the marker's PRESENCE (genMeta) + an
+    # integer pageGen, reading the marker BEFORE `new EventSource`; and (b) the meta-emission
+    # side (the serve-only signal itself) via render_from_out_dir: a render WITH generation
+    # emits the marker, one WITHOUT emits none — so a static artifact's gate stays closed.
+    script = rh.STATIC_SCRIPT
+    assert 'meta[name="hm-generation"]' in script
+    idx_marker = script.index('meta[name="hm-generation"]')
+    idx_es = script.index("new EventSource")
+    assert idx_marker < idx_es, "the hm-generation marker must be read before EventSource construction"
+    # the authoritative serve-mode gate: construction is guarded on the marker's PRESENCE
+    # (genMeta) AND an integer pageGen (a non-integer content parses to NaN -> gate stays shut)
+    assert "genMeta &&" in script, "EventSource construction must be gated on the hm-generation marker presence"
+    assert "isNaN(pageGen)" in script, "the gate must require pageGen to parse as an integer"
+    # (b) meta-emission side, testable via render_from_out_dir(generation=...)
+    doc = _minimal_doc()
+    out_dir = tmp_path / "marker_gate"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    ctx_live = rh.render_from_out_dir(out_dir, date="2026-07-15", no_friction=True, generation=3)
+    assert '<meta name="hm-generation" content="3">' in ctx_live.html_text
+    ctx_static = rh.render_from_out_dir(out_dir, date="2026-07-15", no_friction=True)
+    assert '<meta name="hm-generation"' not in ctx_static.html_text, \
+        "a one-shot/static render (generation=None) must emit NO marker -> its EventSource gate stays closed"
+
+
 # ============================================================= 4. determinism
 def test_self_run_twice_byte_identical(tmp_path):
     doc = _minimal_doc()

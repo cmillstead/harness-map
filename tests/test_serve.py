@@ -777,6 +777,59 @@ def test_reconnect_after_missed_refresh_resyncs(live_server_with_streams):
         conn2.close()
 
 
+def test_reconnect_race_client_registered_before_gen(live_server):
+    # FIX 3 (Codex r2): `_serve_events` must register the SSE client queue BEFORE reading the
+    # generation. If it read the generation first and a rebuild published (bumped generation +
+    # broadcast) in the gap before registration, the broadcast would miss the unregistered
+    # queue AND the stale gen-read would report the OLD generation on `sync` -> a page at that
+    # old generation gets neither the refresh nor an ahead-of-page sync and stays stale.
+    #
+    # Deterministic, mock-free proof via real lock semantics: the generation read happens under
+    # `state.lock`, but `register_client()` uses the SEPARATE clients_lock. Hold `state.lock`
+    # from the test thread so the handler BLOCKS at the generation read; register_client() does
+    # not need state.lock, so with the fix it has already run (state.clients non-empty) while
+    # the gen read is blocked. With the OLD ordering the handler would block at the gen read
+    # BEFORE registering -> state.clients stays empty -> this assertion fails.
+    server, _ = live_server
+    port = server.server_address[1]
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        with server.state.lock:
+            # send the request but do NOT getresponse() (that would block on the held lock):
+            conn.request("GET", "/events")
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline and len(server.state.clients) == 0:
+                time.sleep(0.01)
+            assert len(server.state.clients) >= 1, \
+                "the SSE client queue must be registered BEFORE the generation read " \
+                "(which is blocked here on the held state.lock) — FIX 3 ordering"
+        # lock released: the gen read proceeds, headers + connect-time sync are sent
+        resp = conn.getresponse()
+        gen = _read_sync_generation(resp)
+        assert gen is not None, "the connect-time sync must still be delivered after the gen read"
+    finally:
+        conn.close()
+
+
+def test_clean_startup_no_spurious_recollect(live_server_watching):
+    # FIX 2 (Codex r2) SAFETY: seeding the watch snapshot BEFORE the initial _rebuild must NOT
+    # make the first watcher sweep spuriously re-collect on a CLEAN startup (nothing changed).
+    # The rebuild writes only to out_dir (disjoint from the watched surface), so the pre-rebuild
+    # baseline equals what the first sweep re-computes -> collect_count stays stable.
+    server, out_dir, root = live_server_watching
+    before = server.state.collect_count
+    _wait_settle(server)   # let several poll+debounce cycles run with NO change
+    _wait_settle(server)
+    assert server.state.collect_count == before, \
+        "a clean startup must not spuriously re-collect on the first sweeps (FIX 2 safety)"
+    # The seeded baseline must also EQUAL what the first sweep computes when nothing changed —
+    # i.e. seeding before the rebuild does not diverge from the live filesystem (the collector
+    # enforces out_dir OUTSIDE root, so the rebuild never mutates a watched path). If these
+    # differed, the first sweep would spuriously re-render on a clean startup.
+    assert server.state.watch_snapshot == srv._watched_snapshot(root, root), \
+        "the pre-rebuild watch baseline must match the current watched surface on a clean startup"
+
+
 def test_startup_url_is_flushed(tmp_path):
     # FIX 5 (Codex P2): main() prints the Serving URL then blocks in serve_forever(). When an
     # agent backgrounds the server with stdout piped (block-buffered, not a TTY), an unflushed
