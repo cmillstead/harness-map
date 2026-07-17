@@ -117,6 +117,11 @@ def _rebuild(state, out_dir, root, project_root):
     today = datetime.now().strftime("%Y-%m-%d")
     sidecar_path = out_dir / f"harness-map-{today}.json"
     _run_collector(root, project_root, sidecar_path)
+    # P30 ACCEPTED TOCTOU WINDOW: _run_collector's freshness check reads the sidecar's
+    # inode identity, then render_from_out_dir below re-opens and re-reads the same
+    # sidecar path itself — a co-resident process could swap the file in that narrow gap.
+    # Same accepted-risk class collector.py documents for its own write path (single-user
+    # loopback tool; not fully closed, deliberately not hardened further here).
     ctx = render_html.render_from_out_dir(
         out_dir, date=today, streams=state.streams, no_friction=state.no_friction)
     html_path = out_dir / f"harness-map-{today}.html"
@@ -128,7 +133,34 @@ def _rebuild(state, out_dir, root, project_root):
 
 
 class RequestHandler(BaseHTTPRequestHandler):
+    # Idle-connection read timeout: reaps a connect-but-never-sends-a-request-line socket
+    # after 10s, so a co-resident process cannot pin ThreadingHTTPServer threads forever by
+    # opening sockets and going silent (local DoS). NOTE for the forthcoming SSE /events
+    # handler (a later task): an established SSE stream WRITES rather than reads after its
+    # initial request, so its heartbeat interval MUST stay below this timeout, or an
+    # open, healthy stream will be misclassified as idle and closed.
+    timeout = 10
+
+    def _send_security_headers(self):
+        """Anti-framing headers on EVERY response (200/400/404): this server holds the
+        user's PRIVATE harness dashboard. Loopback binding alone does not stop a
+        malicious external page from framing it in a hidden <iframe> if the user's
+        browser can also reach 127.0.0.1 (clickjacking)."""
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+
     def do_GET(self):
+        # DNS-rebinding guard, checked BEFORE any path dispatch: loopback binding does
+        # not stop a malicious page the user visits from pointing an attacker-controlled
+        # hostname at 127.0.0.1 via DNS, then issuing requests that carry that hostname
+        # in Host. A legitimate client's Host is always the literal "127.0.0.1[:port]".
+        host_header = self.headers.get("Host", "")
+        hostname = host_header.split(":", 1)[0]
+        if hostname != "127.0.0.1":
+            self.send_response(400)
+            self._send_security_headers()
+            self.end_headers()
+            return
         if self.path == "/":
             state = self.server.state
             with state.lock:
@@ -136,10 +168,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(body)
         else:
             self.send_response(404)
+            self._send_security_headers()
             self.end_headers()
 
     def log_message(self, format_str, *args):
