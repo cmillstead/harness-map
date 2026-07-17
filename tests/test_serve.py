@@ -628,3 +628,182 @@ def test_cheap_path_friction_byte_equals_full_recollect(live_server_with_streams
 
     full_section = _friction_section(_get_root_body(port))
     assert cheap_section == full_section
+
+
+# ================================================= Codex P2 fixes (append/existence/reconnect/flush)
+@pytest.fixture
+def streams_server_no_watch(tmp_path):
+    """A friction-enabled streams server with NO watcher thread and NO serving thread, so
+    the test thread is the SOLE mutator of state — offset-classification invariants can be
+    asserted deterministically (no watcher racing on state.stream_offsets)."""
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "rules").mkdir()
+    (root / "rules" / "a.md").write_text("# rule a\n")
+    stream_path = tmp_path / "harness-decisions.jsonl"
+    stream_path.write_text("")
+    streams = {"decisions": stream_path, "metrics": None, "codex": None, "interventions": None}
+    server = srv.build_server(
+        out_dir=out_dir, root=root, project_root=root, host="127.0.0.1", port=0,
+        no_friction=False, streams=streams, watch=False)
+    yield server, out_dir, root, stream_path
+    server.server_close()
+
+
+def test_append_during_render_not_lost(streams_server_no_watch):
+    # FIX 1 (Codex P2): offsets must be seeded from the size observed BEFORE the render
+    # consumes the streams (a lower bound of what was actually consumed), NOT the post-render
+    # size — otherwise an append that lands after the render read but before the seed is
+    # recorded as already-consumed and its record is invisible until another append.
+    # Racing the exact sub-millisecond window deterministically requires a mock (forbidden),
+    # so the observable INVARIANT is asserted: after a rebuild the offset equals the stream
+    # size at rebuild START, and any later append is classified "grown" (never dropped).
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    _append_decision_record(stream_path)
+    size_at_render = stream_path.stat().st_size
+    srv._rebuild(server.state, out_dir, root, root)
+    assert server.state.stream_offsets[key] == size_at_render, \
+        "offset must reflect the PRE-read size captured at rebuild start (FIX 1)"
+    # An append AFTER the render consumed the stream must be seen as growth next sweep —
+    # the safe direction: it triggers a re-render, it is never silently lost.
+    _append_decision_record(stream_path)
+    classification, changed = srv._classify_stream_sweep(server.state)
+    assert classification == "grown"
+    assert key in changed
+
+
+def test_empty_stream_creation_detected(streams_server_no_watch):
+    # FIX 2 (Codex P2): classification must track EXISTENCE, not just size. A previously
+    # ABSENT stream (offset None) that is CREATED — even empty (size 0, which collides with
+    # the old default-0 offset) — must register as a change, and a subsequent append renders.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    stream_path.unlink()
+    srv._rebuild(server.state, out_dir, root, root)  # re-seed with the stream ABSENT
+    assert server.state.stream_offsets.get(key) is None, \
+        "an absent stream must seed to None (existence tracked), not 0 (FIX 2)"
+    stream_path.write_text("")  # create it empty: absent -> present is a tracked transition
+    c1, changed1 = srv._classify_stream_sweep(server.state)
+    assert c1 == "grown" and key in changed1, "empty-stream creation must be detected (FIX 2)"
+    srv._rebuild_friction_only(server.state, out_dir)  # re-seed the offset to 0
+    assert server.state.stream_offsets.get(key) == 0
+    _append_decision_record(stream_path)  # a subsequent append is seen as growth
+    c2, changed2 = srv._classify_stream_sweep(server.state)
+    assert c2 == "grown" and key in changed2
+
+
+def test_stream_deletion_forces_rerender(live_server_with_streams):
+    # FIX 2 (Codex P2): a previously-loaded stream that is DELETED (size -> None) must force
+    # a FULL re-collect so the collector/friction reflect the removed file — otherwise the
+    # dashboard shows the deleted file's records forever.
+    server, out_dir, root, stream_path = live_server_with_streams
+    port = server.server_address[1]
+    _append_decision_record(stream_path)
+    _wait_settle(server)
+    assert "Friction events: 1" in _get_root_body(port)
+    before_count = server.state.collect_count
+    stream_path.unlink()  # delete a loaded stream
+    _wait_settle(server)
+    assert server.state.collect_count > before_count, \
+        "a deleted stream must force a FULL re-collect (FIX 2)"
+    assert server._watcher_thread.is_alive()
+    assert "Friction events: 1" not in _get_root_body(port), \
+        "the deleted stream's records must no longer be served"
+
+
+def _read_sync_generation(resp, timeout=6.0):
+    """Read the SSE stream until the connect-time `event: sync` + its `data:` generation
+    line, returning the int generation (or None on timeout/EOF). The server sends this as
+    the FIRST event on every /events (re)connect so a reconnecting client can compare the
+    server's current generation to the one its page was built from."""
+    deadline = time.monotonic() + timeout
+    saw_sync = False
+    while time.monotonic() < deadline:
+        try:
+            line = resp.fp.readline()
+        except (socket.timeout, TimeoutError, OSError):
+            break
+        if not line:
+            break
+        if b"event: sync" in line:
+            saw_sync = True
+            continue
+        if saw_sync and line.startswith(b"data:"):
+            return int(line.split(b":", 1)[1].strip())
+    return None
+
+
+def test_initial_connect_does_not_loop_reload(live_server_with_streams):
+    # FIX 4 (Codex P2): on the INITIAL connect of a just-loaded page (page-gen == server-gen)
+    # the server sends the current generation as an informational `sync` (NOT an unconditional
+    # `refresh`), and the client reloads ONLY when serverGen > pageGen — so a fresh page never
+    # loops. Server-side we assert the first event is a `sync` carrying the CURRENT generation.
+    server, out_dir, root, stream_path = live_server_with_streams
+    port = server.server_address[1]
+    conn, resp = _open_events(port)
+    try:
+        with server.state.lock:
+            current_gen = server.state.generation
+        gen = _read_sync_generation(resp)
+        assert gen == current_gen, "connect must report the CURRENT generation as sync"
+        # equal generations must NOT reload -> no spurious refresh right after connect
+        assert _drain_refresh_count(resp, quiet_for=1.0) == 0
+    finally:
+        conn.close()
+
+
+def test_reconnect_after_missed_refresh_resyncs(live_server_with_streams):
+    # FIX 4 (Codex P2): if a rebuild broadcasts while the SSE connection is down, the refresh
+    # is lost; on reconnect the server must report its (now higher) generation so the client
+    # catches up. A new /events connection after an intervening rebuild must report gen > the
+    # generation the earlier connection saw.
+    server, out_dir, root, stream_path = live_server_with_streams
+    port = server.server_address[1]
+    conn1, resp1 = _open_events(port)
+    gen1 = _read_sync_generation(resp1)
+    assert gen1 is not None
+    conn1.close()  # "disconnect" while a rebuild happens
+    _append_decision_record(stream_path)
+    _wait_settle(server)  # a cheap re-render advances the generation
+    conn2, resp2 = _open_events(port)
+    try:
+        gen2 = _read_sync_generation(resp2)
+        assert gen2 is not None and gen2 > gen1, \
+            "a reconnecting client must be told the advanced generation (FIX 4)"
+    finally:
+        conn2.close()
+
+
+def test_startup_url_is_flushed(tmp_path):
+    # FIX 5 (Codex P2): main() prints the Serving URL then blocks in serve_forever(). When an
+    # agent backgrounds the server with stdout piped (block-buffered, not a TTY), an unflushed
+    # line never reaches the pipe before the blocking loop — breaking the T7 "background it and
+    # read stdout for the OS-assigned port" workflow. The URL line must be flushed.
+    import subprocess
+    import sys
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "rules").mkdir()
+    (root / "rules" / "a.md").write_text("# rule a\n")
+    proc = subprocess.Popen(
+        [sys.executable, str(SERVE), "--out-dir", str(out_dir), "--root", str(root),
+         "--project-root", str(root), "--no-friction"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 15.0
+        line = ""
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()  # blocks until a flushed line or process exit
+            if line:
+                break
+        assert line.startswith("Serving http://127.0.0.1:"), \
+            f"startup URL not readable from piped stdout while server runs; got {line!r}"
+        assert proc.poll() is None, "server exited instead of blocking in serve_forever()"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)

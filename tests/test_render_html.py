@@ -579,6 +579,41 @@ def test_eventsource_listener_feature_detected_and_guarded():
     assert "onerror=" not in rh.STATIC_SCRIPT  # uses addEventListener('error', ...)
 
 
+def test_eventsource_gated_on_http_origin():
+    # FIX 3 (Codex P2): a file:// static artifact must NOT open EventSource — on file://
+    # construction succeeds, the request fails, and EventSource AUTO-RECONNECTS on error,
+    # so every one-shot report opened in a browser hammers file:///events. The fix gates
+    # construction on an http(s) origin. Browser runtime behavior isn't unit-testable in
+    # pytest, so asserting the protocol gate guards `new EventSource` is the right proxy.
+    script = rh.STATIC_SCRIPT
+    assert "location.protocol" in script
+    assert "'http:'" in script and "'https:'" in script
+    idx_gate = script.index("location.protocol")
+    idx_es = script.index("new EventSource")
+    assert idx_gate < idx_es, "the protocol gate must precede EventSource construction"
+
+
+def test_generation_meta_and_sync_reload_guard(tmp_path):
+    # FIX 4 (Codex P2): the page carries the build generation it was rendered from (a
+    # <meta>, CSP-safe — no inline script), and the client reloads only when the server
+    # reports a HIGHER generation on (re)connect. Equal generations never reload (no loop
+    # on a fresh page); a higher server generation after a missed-during-disconnect refresh
+    # triggers the catch-up reload.
+    assert 'meta[name="hm-generation"]' in rh.STATIC_SCRIPT
+    assert "serverGen > pageGen" in rh.STATIC_SCRIPT
+    doc = _minimal_doc()
+    out_dir = tmp_path / "gen"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    ctx = rh.render_from_out_dir(out_dir, date="2026-07-15", no_friction=True, generation=7)
+    assert '<meta name="hm-generation" content="7">' in ctx.html_text
+    # one-shot report path (no generation) emits NO generation meta -> stays deterministic
+    # (the static script still references the meta by name in its querySelector, so assert on
+    # the emitted <meta> TAG, not the bare substring).
+    ctx0 = rh.render_from_out_dir(out_dir, date="2026-07-15", no_friction=True)
+    assert '<meta name="hm-generation"' not in ctx0.html_text
+
+
 # ============================================================= 4. determinism
 def test_self_run_twice_byte_identical(tmp_path):
     doc = _minimal_doc()

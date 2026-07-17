@@ -1169,16 +1169,29 @@ STATIC_SCRIPT = """
   if (views.length){ activate('view-overview'); }
 
   // Live-serve progressive enhancement: when served by serve.py, subscribe to the SSE
-  // /events endpoint and reload on 'refresh'. On file:// there is no endpoint, so this
-  // MUST be a silent no-op with zero behavior change (D4). Feature-detected + fully
-  // guarded; addEventListener only, no inline handlers, no style writes.
+  // /events endpoint and reload on 'refresh'. On file:// there is no server, so this MUST
+  // be a silent no-op with zero behavior change (D4). Gated on an HTTP(S) origin: on a
+  // file:// (or any non-http) origin EventSource still EXISTS and construction still
+  // succeeds, but the request fails and EventSource AUTO-RECONNECTS on error — an empty
+  // error handler does NOT stop that reconnect storm. So we never construct it off http(s).
+  // addEventListener only, no inline handlers, no style writes (CSP model preserved).
   try {
-    if (window.EventSource) {
+    if (location.protocol === 'http:' || location.protocol === 'https:') {
+      // The generation this page was rendered from (CSP-safe <meta>, read via DOM — no
+      // inline script). On (re)connect the server sends its current generation; we reload
+      // ONLY when the server is AHEAD (serverGen > pageGen), so a fresh page whose gens are
+      // equal never loops, and a refresh missed during a disconnect is caught up on reconnect.
+      var genMeta = document.querySelector('meta[name="hm-generation"]');
+      var pageGen = genMeta ? parseInt(genMeta.getAttribute('content'), 10) : NaN;
       var es = new EventSource('/events');
       es.addEventListener('refresh', function(){ location.reload(); });
-      es.addEventListener('error', function(){ /* file:// or dropped: swallow, no reconnect storm handling needed in v1 */ });
+      es.addEventListener('sync', function(ev){
+        var serverGen = parseInt(ev.data, 10);
+        if (!isNaN(serverGen) && !isNaN(pageGen) && serverGen > pageGen) { location.reload(); }
+      });
+      es.addEventListener('error', function(){ /* transient drop: EventSource auto-reconnects and the sync-on-reconnect catches up any missed refresh */ });
     }
-  } catch (e) { /* EventSource construction failed (file://): no-op */ }
+  } catch (e) { /* no server / construction failed: silent no-op */ }
 })();
 """
 
@@ -1975,7 +1988,7 @@ VIEWS = (("view-overview", "Overview"), ("view-coverage", "Coverage"),
          ("view-weight", "Weight"), ("view-friction", "Friction"), ("view-hygiene", "Hygiene"))
 
 
-def render_html(date, models, friction, notes):
+def render_html(date, models, friction, notes, generation=None):
     """Assembles the final HTML document — a fixed named-section sequence (§4.8),
     never set/dict-driven order. 5-view IA (A1): all views render WITHOUT `hidden`
     server-side (progressive enhancement) — the static script collapses to Overview
@@ -2003,6 +2016,13 @@ def render_html(date, models, friction, notes):
            f"style-src 'sha256-{style_hash}'; script-src 'sha256-{script_hash}'; "
            f"connect-src 'self'; base-uri 'none'; form-action 'none'\">")
 
+    # Live-serve build generation (serve.py's monotonic publish counter, FIX 4). A CSP-safe
+    # <meta> the static script reads via DOM so a reconnecting client can compare it to the
+    # server's current generation and catch up a refresh missed during a disconnect. `None`
+    # (the one-shot report / file:// path) emits NO meta, so that output stays deterministic.
+    gen_meta = (f'<meta name="hm-generation" content="{int(generation)}">'
+                if generation is not None else "")
+
     view_buttons = "".join(
         f'<button class="view-btn" id="view-btn-{vid.split("-", 1)[1]}" role="tab" '
         f'data-target="{vid}" aria-selected="false">{esc_html(label)}</button>'
@@ -2014,6 +2034,7 @@ def render_html(date, models, friction, notes):
         "<!DOCTYPE html>",
         '<html lang="en"><head><meta charset="utf-8">',
         csp,
+        gen_meta,
         f'<title>harness-map {esc_html(date)}</title>',
         f"<style>{STATIC_STYLE}</style>",
         "</head><body>",
@@ -2081,13 +2102,15 @@ def default_streams():
     }
 
 
-def render_from_out_dir(out_dir, date=None, streams=None, no_friction=False):
+def render_from_out_dir(out_dir, date=None, streams=None, no_friction=False, generation=None):
     """Build the HTML IN MEMORY (D3) from the collector sidecar(s) already present in
     `out_dir` — the exact pipeline main() uses, minus the file write. Returns a frozen
     RenderContext (carries date/doc/models/node_index/friction/streams/skipped/html_text/
     html_bytes so the cheap B2 path reuses identical state). Raises RenderError on fatal
-    conditions. Deterministic: same sidecars + streams -> byte-identical html_text
-    (render_html() contract preserved). `streams` None is treated as the no-friction all-None dict."""
+    conditions. Deterministic: same sidecars + streams (+ same `generation`) -> byte-identical
+    html_text (render_html() contract preserved). `generation` None (the one-shot/file:// path)
+    emits NO generation meta, so that output is unchanged. `streams` None is treated as the
+    no-friction all-None dict."""
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
         raise RenderError(f"fatal: --out-dir does not exist or is not a directory: {out_dir}")
@@ -2140,7 +2163,8 @@ def render_from_out_dir(out_dir, date=None, streams=None, no_friction=False):
         streams = {"decisions": None, "metrics": None, "interventions": None, "codex": None}
     friction = build_friction_overlay(doc, streams, node_index, sel_date, no_friction)
 
-    html_text = render_html(sel_date, models, friction, {"doc": doc, "skipped": skipped})
+    html_text = render_html(sel_date, models, friction, {"doc": doc, "skipped": skipped},
+                            generation=generation)
 
     return RenderContext(
         date=sel_date,

@@ -110,10 +110,13 @@ class _State:
     from it, never re-derived). `collect_count` proves whether a FULL re-collect ran.
     `streams`/`no_friction` are carried so every `_rebuild` call uses the identical
     friction configuration the server was started with. `stream_offsets` (B2/T5) is
-    {str(stream_path): last-seen byte size}, the trigger heuristic the watcher uses to
-    tell a pure telemetry append (cheap friction-only re-render) apart from a truncation/
-    rotation (forces a full re-collect) -- it is NEVER used to slice a partial tail, the
-    cheap path always re-reads each stream file in FULL (C18 parity).
+    {str(stream_path): size-or-None}, the trigger heuristic the watcher uses to tell a pure
+    telemetry append (cheap friction-only re-render) apart from a truncation/rotation/deletion
+    (forces a full re-collect) -- it is NEVER used to slice a partial tail, the cheap path
+    always re-reads each stream file in FULL (C18 parity). It is seeded from the size observed
+    BEFORE a render consumes the streams (FIX 1) and carries an existence bit -- None marks an
+    absent stream, distinct from an empty one (size 0) (FIX 2). `generation` is the monotonic
+    publish counter (FIX 4) baked into the served page + reported to SSE clients on connect.
     """
 
     def __init__(self, streams, no_friction):
@@ -122,6 +125,17 @@ class _State:
         self.collect_count = 0
         self.streams = streams
         self.no_friction = no_friction
+        # Monotonic publish counter (FIX 4): bumped under `lock` on EVERY publish (full
+        # `_rebuild` AND cheap `_rebuild_friction_only`). The generation is baked into the
+        # rendered page (a <meta>) and sent to each /events client on (re)connect, so a
+        # client that missed a refresh while disconnected catches up by comparing generations.
+        self.generation = 0
+        # {str(stream_path): size-or-None}, seeded from the PRE-render size of every
+        # configured stream (FIX 1) and carrying the existence bit (None == absent, FIX 2):
+        # the trigger heuristic `_classify_stream_sweep` reads to tell a pure telemetry append
+        # (cheap friction-only re-render) apart from a truncation/rotation/deletion (full
+        # re-collect) -- NEVER used to slice a partial tail (the cheap path always re-reads
+        # each stream file in FULL, C18 parity).
         self.stream_offsets = {}
         # SSE fan-out: bounded per-client queues, mutated ONLY under clients_lock (never
         # the ctx lock, so a slow /events writer cannot block a GET `/` read). The watcher
@@ -165,10 +179,12 @@ def _broadcast_refresh(state):
 
 def _rebuild(state, out_dir, root, project_root):
     """Write-then-publish (publish only AFTER the fallible on-disk write succeeds):
+    0. snapshot each stream's PRE-render size (FIX 1) and the next publish generation (FIX 4)
     1. run the collector (P30-guarded) to produce today's sidecar
-    2. render in memory from that sidecar
+    2. render in memory from that sidecar (baking in the generation as a <meta>)
     3. write the HTML artifact to disk (the operation that can raise OSError)
-    4. ONLY on write success: atomically publish state.ctx + bump collect_count
+    4. ONLY on write success: atomically publish state.ctx + bump collect_count + generation
+       + seed stream_offsets from the step-0 PRE-render sizes
     5. broadcast a `refresh` to every connected SSE client
 
     Any exception raised before step 4 propagates to the caller (the watcher loop catches
@@ -176,6 +192,12 @@ def _rebuild(state, out_dir, root, project_root):
     broadcast) so a mid-serve collect/render/write fault never publishes a broken document.
     """
     out_dir = Path(out_dir)
+    # FIX 1: snapshot each stream's size BEFORE the render consumes it, so a lower bound of
+    # what was actually consumed seeds the offsets. Any append that lands during the render
+    # then leaves size>offset next sweep (a safe redundant re-render), never recorded as
+    # already-consumed (which would drop the last event of a burst until another append).
+    pre_sizes = _snapshot_stream_sizes(state)
+    next_gen = state.generation + 1  # FIX 4: the generation this render is published at
     today = datetime.now().strftime("%Y-%m-%d")
     sidecar_path = out_dir / f"harness-map-{today}.json"
     _run_collector(root, project_root, sidecar_path)
@@ -185,12 +207,15 @@ def _rebuild(state, out_dir, root, project_root):
     # Same accepted-risk class collector.py documents for its own write path (single-user
     # loopback tool; not fully closed, deliberately not hardened further here).
     ctx = render_html.render_from_out_dir(
-        out_dir, date=today, streams=state.streams, no_friction=state.no_friction)
+        out_dir, date=today, streams=state.streams, no_friction=state.no_friction,
+        generation=next_gen)
     html_path = out_dir / f"harness-map-{today}.html"
     render_html.write_html_safely(html_path, ctx.html_text, ctx.doc.get("root"))
     with state.lock:
         state.ctx = ctx
         state.collect_count += 1
+        state.generation = next_gen
+        state.stream_offsets = pre_sizes  # FIX 1: seed from PRE-read sizes, not post-render
     _broadcast_refresh(state)
 
 
@@ -257,17 +282,24 @@ def _rebuild_friction_only(state, out_dir):
     """
     with state.lock:
         ctx = state.ctx
+    # FIX 1: pre-read stream sizes (before build_friction_overlay consumes them) seed the
+    # offsets, so an append during this cheap render is never marked already-consumed.
+    pre_sizes = _snapshot_stream_sizes(state)
+    next_gen = state.generation + 1  # FIX 4: the cheap re-render also advances the generation
     out_dir = Path(out_dir)
     new_friction = render_html.build_friction_overlay(
         ctx.doc, ctx.streams, ctx.node_index, ctx.date, ctx.friction_disabled)
     html_text = render_html.render_html(
-        ctx.date, ctx.models, new_friction, {"doc": ctx.doc, "skipped": ctx.skipped})
+        ctx.date, ctx.models, new_friction, {"doc": ctx.doc, "skipped": ctx.skipped},
+        generation=next_gen)
     html_bytes = html_text.encode("utf-8", "backslashreplace")
     html_path = out_dir / f"harness-map-{ctx.date}.html"
     render_html.write_html_safely(html_path, html_text, ctx.doc.get("root"))
     with state.lock:
         state.ctx = dataclasses.replace(
             state.ctx, friction=new_friction, html_text=html_text, html_bytes=html_bytes)
+        state.generation = next_gen
+        state.stream_offsets = pre_sizes  # FIX 1: seed from PRE-read sizes, not post-render
     _broadcast_refresh(state)
 
 
@@ -308,37 +340,42 @@ def _stream_size(path):
     return st.st_size
 
 
-def _seed_stream_offsets(state):
-    """Rebaselines every configured stream's offset to its CURRENT on-disk size. Called
-    right after any successful full render (initial startup, or a full `_rebuild`) since
-    that render already consumed every stream whole, and after a successful cheap
-    re-render since `build_friction_overlay` also re-reads every stream in full (never a
-    partial tail, C18 parity) -- only bytes appended AFTER this point count as new growth
-    on the next sweep."""
-    offsets = {}
-    for key in _stream_paths_list(state.streams):
-        size = _stream_size(key)
-        if size is not None:
-            offsets[key] = size
-    state.stream_offsets = offsets
+def _snapshot_stream_sizes(state):
+    """{key: size-or-None} for every configured stream, captured to seed `stream_offsets`.
+    Called with the sizes read BEFORE a render consumes the streams (FIX 1): seeding from a
+    PRE-render lower bound means bytes appended during the render leave size>offset next
+    sweep (a safe redundant re-render) rather than being recorded as already-consumed. The
+    value carries the existence bit -- None marks an absent/non-regular stream, kept DISTINCT
+    from an empty one (size 0) so a create/delete transition is detectable (FIX 2)."""
+    return {key: _stream_size(key) for key in _stream_paths_list(state.streams)}
 
 
 def _classify_stream_sweep(state):
-    """(classification, changed_keys) for the CURRENT friction-stream sizes against
-    `state.stream_offsets`. "truncated" (any stream shrank -- rotation/truncation) takes
-    PRIORITY over "grown" (one or more streams grew and none shrank, eligible for the B2
-    cheap path) which takes priority over "none" (nothing moved). A shrunk stream is
-    NEVER treated as growth -- that offset-drift failure mode would read a negative-length
-    tail if the cheap path ever sliced instead of re-reading in full."""
+    """(classification, changed_keys) for the CURRENT friction-stream state against
+    `state.stream_offsets`. Classification tracks EXISTENCE, not just size (FIX 2):
+      * a stream that flipped present->absent (DELETION) -> "truncated" (force a FULL
+        re-collect so the collector/friction drop the removed file's records)
+      * a stream that flipped absent->present (CREATION, even empty) -> "grown" (the cheap
+        path re-reads every stream in full, so it correctly picks up a newly-created file)
+      * a stream that shrank (rotation/truncation) -> "truncated"
+      * a stream that grew (pure append) -> "grown"
+    "truncated" takes PRIORITY over "grown" (a shrink/deletion must force the full path,
+    never a cheap re-render), which takes priority over "none" (nothing moved). A shrunk
+    stream is NEVER treated as growth -- that offset-drift failure mode would read a
+    negative-length tail if the cheap path ever sliced instead of re-reading in full."""
     truncated, grown = [], []
     for key in _stream_paths_list(state.streams):
-        size = _stream_size(key)
-        if size is None:
-            continue
-        offset = state.stream_offsets.get(key, 0)
-        if size < offset:
+        size = _stream_size(key)                 # None == absent now
+        prev = state.stream_offsets.get(key)     # None == absent at seed (or never seeded)
+        if size is None and prev is None:
+            continue                             # still absent: no change
+        if size is None:                         # present -> absent: DELETION
             truncated.append(key)
-        elif size > offset:
+        elif prev is None:                       # absent -> present: CREATION (even empty)
+            grown.append(key)
+        elif size < prev:                        # shrank: rotation/truncation
+            truncated.append(key)
+        elif size > prev:                        # pure append
             grown.append(key)
     if truncated:
         return "truncated", truncated
@@ -417,7 +454,8 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
                 if not _try_full_rebuild(state, out_dir, root, project_root, label="rebuild"):
                     continue  # do NOT advance the snapshot -> the change is retried next sweep
                 state.watch_snapshot = current
-                _seed_stream_offsets(state)  # a full collect just re-read every stream whole
+                # `_rebuild` already re-seeded stream_offsets from the sizes it saw at its
+                # start (FIX 1) -- no separate post-render re-seed here (that was the bug).
                 continue
 
             # No collector-input change this sweep: B2 friction-stream classification.
@@ -425,14 +463,15 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
             if classification == "none":
                 continue
             if classification == "truncated":
-                # Offset-drift guard: reset the shrunk stream(s) to 0 BEFORE the full
-                # re-collect, so a mid-failure retry never computes a negative "grown" delta.
+                # Offset-drift guard: reset the shrunk/deleted stream(s) to 0 BEFORE the full
+                # re-collect, so a mid-failure retry never computes a negative "grown" delta
+                # (a successful `_rebuild` then re-seeds them from its own PRE-read snapshot,
+                # which is None for a deleted stream).
                 for key in changed:
                     state.stream_offsets[key] = 0
             if classification == "truncated" or _FORCE_FULL_RECOLLECT:
                 if not _try_full_rebuild(state, out_dir, root, project_root, label="full recollect"):
                     continue
-                _seed_stream_offsets(state)
                 continue
 
             # classification == "grown": C18 date-rollover check BEFORE taking the cheap
@@ -446,7 +485,6 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
                 if not _try_full_rebuild(state, out_dir, root, project_root,
                                           label="date-rollover recollect"):
                     continue
-                _seed_stream_offsets(state)
                 continue
 
             # classification == "grown", dates match: B2 cheap path -- degrades to a full
@@ -459,7 +497,8 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
                 if not _try_full_rebuild(state, out_dir, root, project_root,
                                           label="full recollect fallback"):
                     continue
-            _seed_stream_offsets(state)
+            # Both the cheap `_rebuild_friction_only` and its full-rebuild fallback re-seed
+            # stream_offsets from their own PRE-read snapshots (FIX 1) -- no re-seed here.
         except Exception as e:  # noqa: BLE001 - deliberate daemon-thread backstop: catches the UNENUMERATED types on purpose; does NOT swallow (logs repr) and does NOT advance the snapshot (retried next sweep).
             print(f"harness-map watcher: unexpected error, keeping last-good render: {e!r}",
                   file=sys.stderr)
@@ -519,9 +558,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         heartbeat interval is < RequestHandler.timeout (10s), otherwise a healthy stream is
         misclassified as idle and reaped. A broken/reset/timed-out socket (on either the
         header write or a streaming write) unregisters the queue and returns; the finally
-        guarantees unregistration on every exit path."""
+        guarantees unregistration on every exit path.
+
+        FIX 4 reconnect resync: on connect the CURRENT build generation is sent immediately as
+        an `event: sync` (before the blocking loop). A client compares it to the generation
+        its page was rendered from and reloads only when the server is AHEAD -- so a refresh
+        that was broadcast to a since-dead queue while the client was disconnected is caught up
+        on reconnect, while a fresh page (equal generations) never reloads (no reload loop)."""
         state = self.server.state
         heartbeat = getattr(self.server, "heartbeat_seconds", HEARTBEAT_SECONDS)
+        with state.lock:
+            current_gen = state.generation
         client_queue = state.register_client()
         # A stuck/slow-reading or disconnected client makes wfile.write/flush raise on the
         # connection socket. Because RequestHandler.timeout sets socket.settimeout(10), a
@@ -542,6 +589,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
             except _client_gone:
                 return  # client vanished during the header write -> nothing to stream
+            try:
+                # FIX 4: report the current generation on (re)connect so a client that missed
+                # a refresh while disconnected can catch up (reload iff serverGen > pageGen).
+                self.wfile.write(f"event: sync\ndata: {current_gen}\n\n".encode("ascii"))
+                self.wfile.flush()
+            except _client_gone:
+                return
             while True:
                 try:
                     client_queue.get(timeout=heartbeat)
@@ -597,8 +651,9 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     if streams is None:
         streams = _build_streams(no_friction)
     state = _State(streams=streams, no_friction=no_friction)
+    # The initial `_rebuild` seeds stream_offsets from the sizes it captured at its START
+    # (FIX 1) -- consistent with every subsequent rebuild, no separate post-render re-seed.
     _rebuild(state, out_dir, root, project_root)
-    _seed_stream_offsets(state)  # baseline B2 offsets to what the initial full render just read
     server = _Server((host, port), RequestHandler)
     server.state = state
     server.out_dir = out_dir
@@ -651,7 +706,11 @@ def main(argv=None):
         print(f"fatal: could not start server: {e}", file=sys.stderr)
         return 1
     bound_host, bound_port = server.server_address[0], server.server_address[1]
-    print(f"Serving http://{bound_host}:{bound_port}/ (Ctrl-C to stop)")
+    # FIX 5: flush explicitly -- when the server is backgrounded with stdout piped (block-
+    # buffered, not a TTY), an unflushed line sits in the buffer and never reaches the reader
+    # before serve_forever() blocks, breaking the "background it and read stdout for the
+    # OS-assigned port" workflow.
+    print(f"Serving http://{bound_host}:{bound_port}/ (Ctrl-C to stop)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
