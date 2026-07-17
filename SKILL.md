@@ -39,6 +39,12 @@ Step A — Run the collector with the Bash tool, writing the sidecar DIRECTLY fr
 
 Step B — Synthesis (this is the skill's model work): consume the collector JSON from stdout, read `~/.claude/skills/harness-map/report-template.md` AND `~/.claude/skills/harness-map/schema.md` by ABSOLUTE path with the Read tool (never cwd-relative), then write the report with the Write tool to the SAME report directory (`OUT_DIR`) as the sidecar: `$OUT_DIR/harness-map-<YYYY-MM-DD>.md` (matching the sidecar's date). The report `.md` plus the collector-written sidecar `.json` are the ONLY two outputs, both in `OUT_DIR` — NEVER write inside `~/.claude`.
 
+## Serve mode (optional — live dashboard v1)
+
+For a live auto-refreshing view, run the sibling server instead of a one-shot render:
+`python3 ~/.claude/skills/harness-map/serve.py --out-dir "$OUT_DIR" --root ~/.claude --project-root ~/.claude`
+It binds `127.0.0.1` ONLY (never `0.0.0.0` — harness/vault content is never network-exposed), re-collects + re-renders on file changes, and pushes a browser refresh over SSE. It writes ONLY the html/sidecar artifacts into `$OUT_DIR` (outside `--root`) — zero writes to `~/.claude`. Action-launcher buttons draft `/coding-team`-ready briefs to the CLIPBOARD; there is NO GUI write path to the harness.
+
 ## Report Contract — 6 Sections
 
 1. **Headline numbers** — always-loaded words, estimated tokens, file count, duplicate-pair count, unchecked-binary count (reserved; always 0 in v1 — no binary scan is performed, the walk reads only `.md`/`.py`/`.sh` via `errors='replace'`; do NOT read this 0 as "clean"), instruction-files-over-200 count, orphan-registration count, orphan-script count.
