@@ -892,6 +892,7 @@ def test_weight_view_has_treemap_and_ladder_both_prerendered(tmp_path):
     out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     assert 'id="weight-mode"' in text
     assert 'data-mode="treemap"' in text and 'data-mode="ladder"' in text
@@ -920,6 +921,7 @@ def test_weight_heat_lands_on_both_always_and_on_demand(tmp_path):
         json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n"
         + json.dumps({"date": "2026-07-01", "component": "coding-team"}) + "\n")
     proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     import re
     # slice out the always-loaded and on-demand treemap panels by their dom ids
@@ -957,6 +959,7 @@ def test_treemap_uses_value_scaled_opacity(tmp_path):
     out_dir.mkdir()
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     import re
     opacities = set(re.findall(r'<rect[^>]*\bfill-opacity="([0-9.]+)"', text))
@@ -1564,6 +1567,21 @@ def test_treemap_badge_renders_even_when_label_suppressed():
     heat = {"always_loaded:tiny.md": 3}
     svg = rh._render_treemap_svg(tree, heat, "t")
     assert 'class="cell-label"' not in svg     # confirms this cell IS below the label threshold
+    assert 'class="friction-badge">3</text>' in svg
+
+
+def test_ladder_badge_renders_on_heated_bar():
+    """Companion to the treemap FIX 3 test above (Codex round-2 P2, ladder residual):
+    the friction legend claims "every heated cell also shows a join-count badge" —
+    that claim was only true for treemap cells. A heated LADDER bar must also carry
+    a VISIBLE `friction-badge` text element with the same join count the hover
+    `<title>` already carries, not only a hover-only title."""
+    tree = {"cells": [{"path": "a.md", "node_key": "always_loaded:a.md",
+                        "size": 10, "fill": "#000"}],
+            "canvas_w": 20.0, "canvas_h": 20.0}
+    heat = {"always_loaded:a.md": 3}
+    svg = rh._render_ladder_svg(tree, heat, "l")
+    assert 'class="ladder-bar heatable fh' in svg
     assert 'class="friction-badge">3</text>' in svg
 
 

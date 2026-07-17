@@ -1275,6 +1275,16 @@ def _render_ladder_svg(tree, heat, dom_id):
             f'<text x="{_fmt_float(_LADDER_LABEL_W + _LADDER_BAR_MAX_W + 8)}" '
             f'y="{text_y}" class="cell-label">{esc_html(c.get("size", 0))}</text>'
         )
+        if heat_n:
+            # FIX (Codex round-2 P2, ladder residual): mirror the treemap's
+            # `friction-badge` fix — a heated ladder bar must show the join count as
+            # VISIBLE text, not only via the hover-only `<title>` above. Anchored at
+            # the bar's own end (like the treemap badge's `x+w-2`) so it reads against
+            # the bar's fill; the shared `.friction-badge` CSS (white fill + black
+            # stroke, §CSS) keeps it legible over any bar color.
+            bx = _fmt_float(_LADDER_LABEL_W + width - 2)
+            parts.append(f'<text x="{bx}" y="{text_y}" text-anchor="end" '
+                          f'class="friction-badge">{heat_n}</text>')
     parts.append("</svg>")
     return "".join(parts)
 
