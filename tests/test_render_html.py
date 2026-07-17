@@ -297,6 +297,47 @@ def test_friction_total_empty_is_zero():
     assert rh.friction_total({}, {"runs": 0}) == 0
 
 
+# --- instrument readout (A2/AM-1) ---
+def test_instrument_readout_renders_exactly_the_gauge_specs(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "gauges"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'class="gauges"' in text
+    # Assert the ACTUAL gauge set (GAUGE_SPECS = 5 headline keys + phantom + friction),
+    # not all 8 HEADLINE_KEYS — the old "iterate HEADLINE_KEYS" check was vacuous because
+    # 3 headline keys (orphans x2, unchecked_binary) are NOT gauges (they live in Hygiene).
+    gauge_keys = [key for _, key, _ in rh.GAUGE_SPECS]
+    assert set(gauge_keys) == {"always_loaded_words", "always_loaded_tokens_est",
+                               "always_loaded_file_count", "instruction_files_over_200",
+                               "duplicate_pair_count", "phantom_ref_count", "friction_total"}
+    for key in gauge_keys:
+        assert f'data-gauge="{key}"' in text          # each intended gauge renders
+    # the three non-gauge headline keys must NOT appear as gauge cards
+    for dropped in ("orphan_registration_count", "orphan_script_count", "unchecked_binary_count"):
+        assert f'data-gauge="{dropped}"' not in text
+    assert 'class="gauge gauge-' in text
+    # the 5 headline-sourced gauge VALUES still render (regression of old headline display)
+    for key in ("always_loaded_words", "always_loaded_tokens_est", "always_loaded_file_count",
+                "instruction_files_over_200", "duplicate_pair_count"):
+        assert str(doc["headline"][key]) in text
+
+
+def test_friction_gauge_reflects_joined_records(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "fgauge"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    decisions = out_dir / "d.jsonl"
+    decisions.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "friction" in text.lower()
+    assert 'data-gauge="friction_total"' in text
+
+
 # --- overview digest model ---
 def test_build_overview_model_enumerates_gaps_weight_and_drag():
     civc = {"available": True, "cells": [

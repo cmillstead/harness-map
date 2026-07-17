@@ -1061,14 +1061,48 @@ def _render_treemap_svg(tree, heat, dom_id):
     return "".join(parts)
 
 
-def _render_tile(key, label, polarity, value):
-    return (f'<div class="tile"><div class="v">{esc_html(value)}</div>'
-            f'<div class="l">{esc_html(label)}</div></div>')
+GAUGE_SPECS = (  # (source_kind, key, label) — source_kind selects where the value comes from
+    ("headline", "always_loaded_words", "Always-loaded words"),
+    ("headline", "always_loaded_tokens_est", "Est. tokens / turn"),
+    ("headline", "always_loaded_file_count", "Always-loaded files"),
+    ("headline", "instruction_files_over_200", "Files > 200 lines"),
+    ("headline", "duplicate_pair_count", "Duplicate pairs"),
+    ("phantom", "phantom_ref_count", "Phantom refs"),
+    ("friction", "friction_total", "Friction events"),
+)
 
 
-def _render_headline(headline):
-    tiles = "".join(_render_tile(k, label, pol, headline.get(k, 0)) for k, label, pol in HEADLINE_KEYS)
-    return f'<div class="tiles">{tiles}</div>'
+def _render_gauge(key, label, value, delta=None):
+    band, semantic = _gauge_band(key, value)
+    band_html = f'<div class="band">{esc_html(band)}</div>' if band else ""
+    delta_html = f'<div class="delta">{esc_html(delta)}</div>' if delta else ""
+    return (f'<div class="gauge gauge-{esc_html(semantic)}" data-gauge="{esc_html(key)}">'
+            f'<div class="v">{esc_html(value)}</div><div class="l">{esc_html(label)}</div>'
+            f'{band_html}{delta_html}</div>')
+
+
+def _trend_delta(trend_model, key):
+    """Polarity-aware delta arrow vs the previous sidecar, or None on first run."""
+    if trend_model.get("first_run"):
+        return None
+    series = next((s for s in trend_model["series"] if s["key"] == key), None)
+    if not series or len(series["values"]) < 2:
+        return None
+    cur, prev = series["values"][-1], series["values"][-2]
+    if cur == prev:
+        return "= 0"
+    arrow = "▲" if cur > prev else "▼"   # ▲ / ▼
+    return f"{arrow} {abs(cur - prev)}"
+
+
+def _render_instrument_readout(headline, phantom_ref_count, friction_total_value, trend_model):
+    values = {"phantom_ref_count": phantom_ref_count, "friction_total": friction_total_value}
+    cards = []
+    for kind, key, label in GAUGE_SPECS:
+        value = values[key] if kind in ("phantom", "friction") else headline.get(key, 0)
+        delta = _trend_delta(trend_model, key) if kind == "headline" else None
+        cards.append(_render_gauge(key, label, value, delta))
+    return f'<div class="gauges">{"".join(cards)}</div>'
 
 
 def _render_context_weight_tab(model, heat):
@@ -1252,6 +1286,8 @@ def render_html(date, models, friction, notes):
     skipped = notes["skipped"]
     headline = doc.get("headline", {}) or {}
     heat, joined, footer, codex_aggregate = friction
+    phantom_ref_count = len(doc.get("phantom_refs", []) or [])
+    friction_total_value = friction_total(joined, codex_aggregate)
 
     warn_count = len(doc.get("inaccessible", []) or []) + len(doc.get("errors", []) or [])
     warn_badge = (f'<a class="warn-badge" href="#panel-6" data-target="panel-6">'
@@ -1283,7 +1319,7 @@ def render_html(date, models, friction, notes):
         "<header><h1>harness-map</h1>",
         f'<div class="subtitle">root: {esc_html(doc.get("root",""))} | date: {esc_html(date)} '
         f'| generated_at: {esc_html(doc.get("generated_at",""))} {warn_badge}</div></header>',
-        _render_headline(headline),
+        _render_instrument_readout(headline, phantom_ref_count, friction_total_value, models["trend"]),
         '<div class="controls" role="tablist">',
         tab_buttons,
         '<button class="action-btn" id="friction-toggle" aria-pressed="false">Show friction overlay</button>',
