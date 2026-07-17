@@ -471,8 +471,12 @@ def test_shared_sample_injection_is_escaped(tmp_path, payload):
     assert "&lt;" in text or "&quot;" in text or "&amp;" in text
     p = _ExternalRefParser()
     p.feed(text)
-    assert p.tag_counts.get("script", 0) == 1
     assert p.tag_counts.get("style", 0) == 1
+    # A8: JSON data islands are inert `<script type="application/json">` tags — only
+    # the ONE executable script (no type attr) counts toward the CSP script-hash budget.
+    import re
+    exe_scripts = re.findall(r'<script(?![^>]*type="application/json")[^>]*>', text)
+    assert len(exe_scripts) == 1
 
 
 @pytest.mark.parametrize("payload", XSS_PAYLOADS)
@@ -488,8 +492,10 @@ def test_hook_command_injection_is_escaped(tmp_path, payload):
     assert payload not in text
     p = _ExternalRefParser()
     p.feed(text)
-    assert p.tag_counts.get("script", 0) == 1
     assert p.tag_counts.get("style", 0) == 1
+    import re
+    exe_scripts = re.findall(r'<script(?![^>]*type="application/json")[^>]*>', text)
+    assert len(exe_scripts) == 1
 
 
 @pytest.mark.parametrize("payload", XSS_PAYLOADS)
@@ -650,7 +656,7 @@ def test_corrupt_sidecar_excluded_from_trend_and_listed_in_skipped(tmp_path):
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
-    assert "2026-07-13" in text  # listed in Notes & Blind Spots skipped section
+    assert "2026-07-13" in text  # listed in the provenance footer's skipped-sidecars section
 
 
 def test_corrupt_sidecar_at_explicit_date_is_fatal(tmp_path):
@@ -870,6 +876,71 @@ def test_friction_stream_malformed_lines_skip_and_count(tmp_path):
     assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     assert '"records_invalid":1' in text.replace(" ", "") or "records_invalid" in text
+
+
+# ============================================================= 6. IA pivot: 5 views + switcher
+def test_five_views_present_not_six_tabs(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "views"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    for vid in ("view-overview", "view-coverage", "view-weight", "view-friction", "view-hygiene"):
+        assert f'id="{vid}"' in text
+    p = _ExternalRefParser(); p.feed(text)
+    view_btns = text.count('class="view-btn"')
+    assert view_btns == 5
+    # no leftover 6-tab panel ids
+    assert 'id="panel-6"' not in text
+    # progressive enhancement (finding #2): NO view is server-hidden — with JS off,
+    # every view is visible/scrollable; the static script collapses to Overview on load.
+    # Parse each of the 5 view <section> start tags; assert `hidden` absent regardless of
+    # attribute order (round2: a `hidden class="view"` ordering must also fail).
+    import re
+    view_tags = re.findall(r'<section[^>]*\bclass="view"[^>]*>', text)
+    assert len(view_tags) == 5
+    for tag in view_tags:
+        assert "hidden" not in tag
+
+
+def test_exactly_one_executable_script(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "onescript"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    # exactly one executable script (data islands are type=application/json)
+    import re
+    exe = re.findall(r'<script(?![^>]*type="application/json")[^>]*>', text)
+    assert len(exe) == 1
+
+
+def test_copy_buttons_and_islands_present(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "copy"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    for vid in ("overview", "coverage", "weight", "friction", "hygiene"):
+        assert f'<script type="application/json" id="copy-{vid}">' in text
+        assert f'data-copy-target="copy-{vid}"' in text
+
+
+def test_keyboard_activation_wired_for_button_cells(tmp_path):
+    """WCAG 2.2 AA: role=button cells (mini-grid + matrix) must be keyboard-operable.
+    The static script wires a keydown handler to [data-goto] and .matrix-cell."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "kbd"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "addEventListener('keydown'" in text
+    assert "[data-goto], .matrix-cell" in text
+    assert "e.preventDefault()" in text          # Space must not scroll
 
 
 # ================================================================== contract layer (real collector)

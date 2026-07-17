@@ -930,12 +930,13 @@ h1{font-size:1.25rem;margin:0 0 4px 0}
 .warn-badge{background:var(--sem-empty);color:#fff;border-radius:6px;padding:2px 8px;font-size:0.75rem;text-decoration:none}
 .controls{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border);padding:8px 20px;display:flex;gap:8px;flex-wrap:wrap;z-index:5}
 .view-switch,.seg{display:inline-flex;gap:6px;flex-wrap:wrap;border:1px solid var(--border);border-radius:6px;padding:2px}
-button.tab-btn,button.action-btn,button.view-btn,button.seg-btn,button.copy-btn{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 12px;cursor:pointer;font-size:0.85rem}
-button.tab-btn[aria-selected="true"],button.view-btn[aria-selected="true"]{border-color:var(--accent);color:var(--accent)}
+button.action-btn,button.view-btn,button.seg-btn,button.copy-btn{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 12px;cursor:pointer;font-size:0.85rem}
+button.view-btn[aria-selected="true"]{border-color:var(--accent);color:var(--accent)}
 button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
 button.seg-btn[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);background:var(--bg)}
 main{padding:16px 20px}
-.tab-panel[hidden],.view[hidden]{display:none}
+.view[hidden]{display:none}
+.view-toolbar{display:flex;justify-content:flex-end;margin-bottom:8px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:14px}
 .digest{color:var(--muted);font-size:0.85rem;margin:0 0 10px 0}
 .hero-friction{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:14px}
@@ -997,31 +998,93 @@ STATIC_STYLE = STATIC_STYLE + _HEAT_CSS
 
 STATIC_SCRIPT = """
 (function(){
-  var buttons = document.querySelectorAll('.tab-btn');
-  var panels = document.querySelectorAll('.tab-panel');
+  var views = document.querySelectorAll('.view');
+  var vbtns = document.querySelectorAll('.view-btn');
   function activate(id){
-    panels.forEach(function(p){ p.hidden = (p.id !== id); });
-    buttons.forEach(function(b){
-      b.setAttribute('aria-selected', b.dataset.target === id ? 'true' : 'false');
-    });
+    views.forEach(function(v){ v.hidden = (v.id !== id); });
+    vbtns.forEach(function(b){ b.setAttribute('aria-selected', b.dataset.target === id ? 'true':'false'); });
   }
-  buttons.forEach(function(b){
-    b.addEventListener('click', function(){ activate(b.dataset.target); });
+  vbtns.forEach(function(b){ b.addEventListener('click', function(){ activate(b.dataset.target); }); });
+
+  // cross-view nav: any element with data-goto (+ optional data-cell-id) switches view & selects
+  document.querySelectorAll('[data-goto]').forEach(function(el){
+    el.addEventListener('click', function(){
+      activate(el.dataset.goto);
+      var cid = el.dataset.cellId;
+      if (cid) { selectCell(cid); }
+    });
   });
-  var overlayToggle = document.getElementById('friction-toggle');
-  if (overlayToggle) {
-    overlayToggle.addEventListener('click', function(){
-      var on = document.body.classList.toggle('friction-on');
-      overlayToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
+
+  // coverage inspector selection
+  var cells = document.querySelectorAll('.matrix-cell');
+  var panels = document.querySelectorAll('.inspector-panel');
+  function selectCell(cid){
+    cells.forEach(function(c){ c.classList.toggle('sel', c.dataset.cellId === cid); });
+    panels.forEach(function(p){ p.hidden = (p.dataset.cellId !== cid); });
+  }
+  cells.forEach(function(c){ c.addEventListener('click', function(){ selectCell(c.dataset.cellId); }); });
+
+  // weight mode toggle (treemap <-> ladder)
+  var segRoot = document.getElementById('weight-mode');
+  if (segRoot){
+    segRoot.querySelectorAll('.seg-btn').forEach(function(b){
+      b.addEventListener('click', function(){
+        var ladder = b.dataset.mode === 'ladder';
+        var panel = document.getElementById('view-weight');
+        panel.classList.toggle('mode-ladder', ladder);
+        segRoot.querySelectorAll('.seg-btn').forEach(function(x){
+          x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+      });
     });
   }
-  var expandAll = document.getElementById('expand-all');
-  if (expandAll) {
-    expandAll.addEventListener('click', function(){
-      panels.forEach(function(p){ p.hidden = false; });
+
+  // friction overlay toggle (local to weight view)
+  var ov = document.getElementById('friction-toggle');
+  if (ov){ ov.addEventListener('click', function(){
+    var on = document.body.classList.toggle('friction-on');
+    ov.setAttribute('aria-pressed', on ? 'true':'false'); }); }
+
+  // copy buttons -> read JSON island -> clipboard, textarea fallback for file://
+  document.querySelectorAll('.copy-btn').forEach(function(b){
+    b.addEventListener('click', function(){
+      var island = document.getElementById(b.dataset.copyTarget);
+      if (!island) return;
+      var md;
+      try { md = JSON.parse(island.textContent); } catch (e) { return; }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(md).then(function(){ flash(b); },
+          function(){ fallbackCopy(md, b); });
+      } else { fallbackCopy(md, b); }
     });
+  });
+  function fallbackCopy(md, b){
+    var ta = document.createElement('textarea');
+    ta.className = 'visually-hidden'; ta.value = md;
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); flash(b); } catch (e) {}
+    document.body.removeChild(ta);
   }
-  if (panels.length) { activate(panels[0].id); }
+  function flash(b){ b.setAttribute('aria-pressed', 'true');
+    setTimeout(function(){ b.setAttribute('aria-pressed', 'false'); }, 600); }
+
+  // WCAG 2.2 AA keyboard access: Enter/Space activate the role="button" cells
+  // (mini-grid data-goto cells + coverage matrix cells) that only had click handlers.
+  function keyActivate(e){
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar'){
+      if (e.key !== 'Enter'){ e.preventDefault(); }   // Space would scroll the page
+      e.currentTarget.click();
+    }
+  }
+  document.querySelectorAll('[data-goto], .matrix-cell').forEach(function(el){
+    el.addEventListener('keydown', keyActivate);
+  });
+
+  // expand-all (print view) preserved
+  var expand = document.getElementById('expand-all');
+  if (expand){ expand.addEventListener('click', function(){
+    views.forEach(function(v){ v.hidden = false; }); }); }
+
+  if (views.length){ activate('view-overview'); }
 })();
 """
 
@@ -1105,80 +1168,45 @@ def _render_instrument_readout(headline, phantom_ref_count, friction_total_value
     return f'<div class="gauges">{"".join(cards)}</div>'
 
 
-def _render_context_weight_tab(model, heat):
-    always_svg = _render_treemap_svg(model["always"], heat, "always-treemap")
-    ondemand_svg = _render_treemap_svg(model["on_demand"], heat, "ondemand-treemap")
+def _render_copy_controls(view_id):
+    """A8 per-view copy button — clicking reads the sibling JSON island's markdown
+    payload via `.textContent` + `JSON.parse` (executable script never embeds the
+    payload directly, §9-R C)."""
+    return f'<button class="copy-btn action-btn" data-copy-target="copy-{view_id}">Copy</button>'
+
+
+def _render_copy_island(view_id, payload):
+    """A8 inert data island — `type="application/json"` so it is never counted as an
+    executable `<script>` (CSP §9-R C); the payload is a plain markdown string."""
+    return f'<script type="application/json" id="copy-{view_id}">{esc_json_script(payload)}</script>'
+
+
+def _render_overview_view(civc, doc, date):
+    """A1 skeleton — mini-grid of verdict-colored cells (no heat, no nav yet: RESOLVED
+    DECISION 1) + a placeholder digest line. Enriched (friction hero, drag/roadmap
+    summaries) in Task 7."""
+    if civc["available"]:
+        cells_html = "".join(
+            f'<span class="mini-cell verdict-{esc_html(c["verdict"])}" '
+            f'title="{esc_html(c["verb"])} / {esc_html(c["surface"])}: {esc_html(c["verdict"])}"></span>'
+            for c in civc["cells"])
+        mini_grid = f'<div class="mini-grid">{cells_html}</div>'
+    else:
+        mini_grid = '<p class="empty-state">synthesis sidecar not found — Coverage Matrix unavailable this run.</p>'
     return (
-        '<section id="panel-1" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-1" hidden>'
-        '<div class="card"><h2>Always-loaded (by category, sized by est. tokens)</h2>'
-        f'{always_svg}</div>'
-        '<div class="card"><h2>On-demand (skills / phases / prompts / agents / memory, sized by words)</h2>'
-        f'{ondemand_svg}</div></section>'
+        '<section id="view-overview" class="view" role="tabpanel" aria-labelledby="view-btn-overview">'
+        f'<div class="view-toolbar">{_render_copy_controls("overview")}</div>'
+        '<div class="card"><h2>Coverage at a glance</h2>'
+        f'{mini_grid}</div>'
+        '<div class="card"><h2>Digest</h2>'
+        f'<p class="digest">harness-map — root: {esc_html(doc.get("root",""))}, date: {esc_html(date)}</p></div>'
+        '</section>'
     )
 
 
-def _render_bipartite_tab(model):
-    def _row(n, side):
-        badge = ""
-        if side == "right":
-            cls = {"direct": "direct", "dispatcher": "dispatcher", "none": "orphan"}[n["registered_via"]]
-            badge = f'<span class="badge {cls}">{esc_html(n["registered_via"])}</span>'
-        label = esc_html(n.get("name") or n.get("command") or n.get("script", ""))
-        return f'<li data-node-key="{esc_html(n["node_key"])}">{label} {badge}</li>'
-
-    left_html = "".join(_row(n, "left") for n in model["left"]) or '<li class="empty-state">none</li>'
-    orphan_html = "".join(
-        f'<li class="badge orphan">{esc_html(n["script"])} ({esc_html(n["target_status"])})</li>'
-        for n in model["left_orphans"]) or '<li class="empty-state">none</li>'
-    right_html = "".join(_row(n, "right") for n in model["right"]) or '<li class="empty-state">none</li>'
-    return (
-        '<section id="panel-2" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-2" hidden>'
-        '<div class="card"><h2>Registered hooks (settings.json)</h2><ul>' + left_html + '</ul></div>'
-        '<div class="card"><h2>Orphan registrations</h2><ul>' + orphan_html + '</ul></div>'
-        '<div class="card"><h2>Scripts on disk (registration/reachability status)</h2><ul>'
-        + right_html + '</ul></div></section>'
-    )
-
-
-def _render_trend_tab(model):
-    if model["first_run"]:
-        body = '<p class="empty-state">first run — no baseline</p>'
-    else:
-        rows = "".join(
-            f'<tr><td>{esc_html(s["label"])}</td>'
-            + "".join(f'<td>{esc_html(v)}</td>' for v in s["values"]) + '</tr>'
-            for s in model["series"])
-        header = "".join(f'<th>{esc_html(d)}</th>' for d in model["dates"])
-        body = f'<div class="overflow-x"><table><tr><th>Metric</th>{header}</tr>{rows}</table></div>'
-    return f'<section id="panel-3" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-3" hidden><div class="card"><h2>Trend (8 headline metrics)</h2>{body}</div></section>'
-
-
-def _render_dupweb_tab(model):
-    if model["edges"]:
-        rows = "".join(
-            f'<tr><td>{esc_html(e["a"])}</td><td>{esc_html(e["b"])}</td>'
-            f'<td>{esc_html(round(e["score"], 3))}</td><td>{esc_html(e["shared_sample"])}</td></tr>'
-            for e in model["edges"])
-        dup_body = f'<div class="overflow-x"><table><tr><th>File A</th><th>File B</th><th>Score</th><th>Shared sample</th></tr>{rows}</table></div>'
-    else:
-        dup_body = '<p class="empty-state">no duplicate pairs above threshold</p>'
-    if model["phantom_refs"]:
-        prows = "".join(
-            f'<tr><td>{esc_html(r.get("source",""))}</td><td>{esc_html(r.get("ref",""))}</td>'
-            f'<td>{esc_html(r.get("kind",""))}</td><td>{esc_html(r.get("resolved"))}</td></tr>'
-            for r in model["phantom_refs"])
-        phantom_body = f'<div class="overflow-x"><table><tr><th>Source</th><th>Ref</th><th>Kind</th><th>Resolved</th></tr>{prows}</table></div>'
-    else:
-        phantom_body = '<p class="empty-state">no phantom refs</p>'
-    return (
-        '<section id="panel-4" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-4" hidden>'
-        f'<div class="card"><h2>Duplication pairs (threshold {esc_html(model["threshold"])}, '
-        f'{esc_html(model["metric"])})</h2>{dup_body}</div>'
-        f'<div class="card"><h2>Phantom refs</h2>{phantom_body}</div></section>'
-    )
-
-
-def _render_civc_drag_tab(civc, drag):
+def _render_coverage_view(civc):
+    """Verbatim matrix half of the former `_render_civc_drag_tab` — the drag half now
+    lives in `_render_friction_view` (IA mapping)."""
     if not civc["available"]:
         civc_body = '<p class="empty-state">synthesis sidecar not found — Coverage Matrix unavailable this run.</p>'
     else:
@@ -1204,27 +1232,117 @@ def _render_civc_drag_tab(civc, drag):
             rows.append(f"<tr><th>{esc_html(verb)}</th>{''.join(cell_html)}</tr>")
         civc_body = (legend + f'<div class="overflow-x"><table><tr><th></th>{header}</tr>'
                      f'{"".join(rows)}</table></div>')
-    if not drag["available"]:
-        drag_body = '<p class="empty-state">synthesis sidecar not found — drag-candidate table unavailable this run.</p>'
-    elif not drag["rows"]:
-        drag_body = '<p class="empty-state">no drag candidates</p>'
-    else:
-        rows = "".join(
-            f'<tr><td>{esc_html(r.get("n",""))}</td><td>{esc_html(r.get("surface",""))}</td>'
-            f'<td>{esc_html(r.get("evidence",""))}</td><td class="badge">{esc_html(r.get("outcome",""))}</td></tr>'
-            for r in drag["rows"])
-        drag_body = f'<div class="overflow-x"><table><tr><th>#</th><th>Surface</th><th>Evidence</th><th>Outcome</th></tr>{rows}</table></div>'
     return (
-        '<section id="panel-5" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-5" hidden>'
+        '<section id="view-coverage" class="view" role="tabpanel" aria-labelledby="view-btn-coverage">'
+        f'<div class="view-toolbar">{_render_copy_controls("coverage")}</div>'
         '<div class="card"><h2>Coverage Matrix</h2>'
         '<p class="subtitle">six verbs (what the harness does to behavior) '
         '× six surfaces (what it’s made of)</p>'
-        f'{civc_body}</div>'
-        f'<div class="card"><h2>Drag candidates</h2>{drag_body}</div></section>'
+        f'{civc_body}</div></section>'
     )
 
 
-def _render_notes_tab(doc, skipped):
+def _render_weight_view(model, heat):
+    """Verbatim body of the former `_render_context_weight_tab`, now also carrying the
+    friction legend + overlay toggle (moved here — heat only ever lands on these two
+    treemaps, RESOLVED DECISION 1)."""
+    always_svg = _render_treemap_svg(model["always"], heat, "always-treemap")
+    ondemand_svg = _render_treemap_svg(model["on_demand"], heat, "ondemand-treemap")
+    return (
+        '<section id="view-weight" class="view" role="tabpanel" aria-labelledby="view-btn-weight">'
+        '<div class="view-toolbar">'
+        '<button class="action-btn" id="friction-toggle" aria-pressed="false">Show friction overlay</button>'
+        f'{_render_copy_controls("weight")}'
+        '</div>'
+        '<div class="friction-legend" id="friction-legend">'
+        '<span>Friction heat, once the overlay is on:</span>'
+        '<span class="legend-entry"><span class="legend-swatch fh0"></span>none</span>'
+        '<span class="legend-entry"><span class="legend-swatch fh1"></span>some</span>'
+        '<span class="legend-entry"><span class="legend-swatch fh4"></span>most-active</span>'
+        '<span class="legend-note">every heated cell also shows a join-count '
+        'badge in the corner (color is never the only signal)</span></div>'
+        '<div class="card"><h2>Always-loaded (by category, sized by est. tokens)</h2>'
+        f'{always_svg}</div>'
+        '<div class="card"><h2>On-demand (skills / phases / prompts / agents / memory, sized by words)</h2>'
+        f'{ondemand_svg}</div></section>'
+    )
+
+
+def _render_bipartite_body(model):
+    def _row(n, side):
+        badge = ""
+        if side == "right":
+            cls = {"direct": "direct", "dispatcher": "dispatcher", "none": "orphan"}[n["registered_via"]]
+            badge = f'<span class="badge {cls}">{esc_html(n["registered_via"])}</span>'
+        label = esc_html(n.get("name") or n.get("command") or n.get("script", ""))
+        return f'<li data-node-key="{esc_html(n["node_key"])}">{label} {badge}</li>'
+
+    left_html = "".join(_row(n, "left") for n in model["left"]) or '<li class="empty-state">none</li>'
+    orphan_html = "".join(
+        f'<li class="badge orphan">{esc_html(n["script"])} ({esc_html(n["target_status"])})</li>'
+        for n in model["left_orphans"]) or '<li class="empty-state">none</li>'
+    right_html = "".join(_row(n, "right") for n in model["right"]) or '<li class="empty-state">none</li>'
+    return (
+        '<div class="card"><h2>Registered hooks (settings.json)</h2><ul>' + left_html + '</ul></div>'
+        '<div class="card"><h2>Orphan registrations</h2><ul>' + orphan_html + '</ul></div>'
+        '<div class="card"><h2>Scripts on disk (registration/reachability status)</h2><ul>'
+        + right_html + '</ul></div>'
+    )
+
+
+def _render_trend_body(model):
+    if model["first_run"]:
+        body = '<p class="empty-state">first run — no baseline</p>'
+    else:
+        rows = "".join(
+            f'<tr><td>{esc_html(s["label"])}</td>'
+            + "".join(f'<td>{esc_html(v)}</td>' for v in s["values"]) + '</tr>'
+            for s in model["series"])
+        header = "".join(f'<th>{esc_html(d)}</th>' for d in model["dates"])
+        body = f'<div class="overflow-x"><table><tr><th>Metric</th>{header}</tr>{rows}</table></div>'
+    return f'<div class="card"><h2>Trend (8 headline metrics)</h2>{body}</div>'
+
+
+def _render_dupweb_body(model):
+    if model["edges"]:
+        rows = "".join(
+            f'<tr><td>{esc_html(e["a"])}</td><td>{esc_html(e["b"])}</td>'
+            f'<td>{esc_html(round(e["score"], 3))}</td><td>{esc_html(e["shared_sample"])}</td></tr>'
+            for e in model["edges"])
+        dup_body = f'<div class="overflow-x"><table><tr><th>File A</th><th>File B</th><th>Score</th><th>Shared sample</th></tr>{rows}</table></div>'
+    else:
+        dup_body = '<p class="empty-state">no duplicate pairs above threshold</p>'
+    if model["phantom_refs"]:
+        prows = "".join(
+            f'<tr><td>{esc_html(r.get("source",""))}</td><td>{esc_html(r.get("ref",""))}</td>'
+            f'<td>{esc_html(r.get("kind",""))}</td><td>{esc_html(r.get("resolved"))}</td></tr>'
+            for r in model["phantom_refs"])
+        phantom_body = f'<div class="overflow-x"><table><tr><th>Source</th><th>Ref</th><th>Kind</th><th>Resolved</th></tr>{prows}</table></div>'
+    else:
+        phantom_body = '<p class="empty-state">no phantom refs</p>'
+    return (
+        f'<div class="card"><h2>Duplication pairs (threshold {esc_html(model["threshold"])}, '
+        f'{esc_html(model["metric"])})</h2>{dup_body}</div>'
+        f'<div class="card"><h2>Phantom refs</h2>{phantom_body}</div>'
+    )
+
+
+def _render_hygiene_view(doc, models):
+    """Composes the former bipartite/trend/dupweb tab bodies under ONE view (RESOLVED
+    DECISION 2 — hook wiring folded here, never dropped)."""
+    return (
+        '<section id="view-hygiene" class="view" role="tabpanel" aria-labelledby="view-btn-hygiene">'
+        f'<div class="view-toolbar">{_render_copy_controls("hygiene")}</div>'
+        f'{_render_bipartite_body(models["bipartite"])}'
+        f'{_render_trend_body(models["trend"])}'
+        f'{_render_dupweb_body(models["dupweb"])}'
+        '</section>'
+    )
+
+
+def _render_provenance_footer(doc, skipped, footer):
+    """Former `_render_notes_tab`, relocated to a `<footer>` (never `<main>`) — the
+    data-sources line stays always-visible; the rest collapses behind `<details>`."""
     def _list(items, empty_msg):
         if not items:
             return f'<p class="empty-state">{esc_html(empty_msg)}</p>'
@@ -1239,12 +1357,16 @@ def _render_notes_tab(doc, skipped):
     skipped_html = ("<ul>" + "".join(
         f'<li>{esc_html(s.get("date",""))}: {esc_html(s.get("reason",""))}</li>' for s in skipped)
         + "</ul>") if skipped else '<p class="empty-state">none</p>'
+    footer_line = " | ".join(f'{f["stream"]}: {f["status"]}' for f in footer) or "friction disabled"
     return (
-        '<section id="panel-6" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-6" hidden>'
+        '<footer class="sources" id="provenance">'
+        f'<div>data sources: {esc_html(footer_line)}</div>'
+        '<details><summary>Provenance & notes</summary>'
         f'<div class="card"><h2>Inaccessible ({len(inaccessible)})</h2>{inacc_html}</div>'
         f'<div class="card"><h2>Blind spots ({len(blind_spots)})</h2>{_list(blind_spots, "none")}</div>'
         f'<div class="card"><h2>Errors ({len(errors)})</h2>{_list(errors, "none")}</div>'
-        f'<div class="card"><h2>Skipped sidecars ({len(skipped)})</h2>{skipped_html}</div></section>'
+        f'<div class="card"><h2>Skipped sidecars ({len(skipped)})</h2>{skipped_html}</div>'
+        '</details></footer>'
     )
 
 
@@ -1279,9 +1401,39 @@ def _render_friction_panel(joined, footer, codex_aggregate):
     )
 
 
+def _render_friction_view(joined, footer, codex_aggregate, drag):
+    """Former `_render_friction_panel`, moved verbatim, plus the drag-candidate table
+    half of the former `_render_civc_drag_tab` appended (IA mapping). Header still
+    reads "joined records: N" this task — Task 8 reframes it to `friction_total`."""
+    friction_body = _render_friction_panel(joined, footer, codex_aggregate)
+    if not drag["available"]:
+        drag_body = '<p class="empty-state">synthesis sidecar not found — drag-candidate table unavailable this run.</p>'
+    elif not drag["rows"]:
+        drag_body = '<p class="empty-state">no drag candidates</p>'
+    else:
+        rows = "".join(
+            f'<tr><td>{esc_html(r.get("n",""))}</td><td>{esc_html(r.get("surface",""))}</td>'
+            f'<td>{esc_html(r.get("evidence",""))}</td><td class="badge">{esc_html(r.get("outcome",""))}</td></tr>'
+            for r in drag["rows"])
+        drag_body = f'<div class="overflow-x"><table><tr><th>#</th><th>Surface</th><th>Evidence</th><th>Outcome</th></tr>{rows}</table></div>'
+    return (
+        '<section id="view-friction" class="view" role="tabpanel" aria-labelledby="view-btn-friction">'
+        f'<div class="view-toolbar">{_render_copy_controls("friction")}</div>'
+        f'{friction_body}'
+        f'<div class="card"><h2>Drag candidates</h2>{drag_body}</div>'
+        '</section>'
+    )
+
+
+VIEWS = (("view-overview", "Overview"), ("view-coverage", "Coverage"),
+         ("view-weight", "Weight"), ("view-friction", "Friction"), ("view-hygiene", "Hygiene"))
+
+
 def render_html(date, models, friction, notes):
     """Assembles the final HTML document — a fixed named-section sequence (§4.8),
-    never set/dict-driven order."""
+    never set/dict-driven order. 5-view IA (A1): all views render WITHOUT `hidden`
+    server-side (progressive enhancement) — the static script collapses to Overview
+    on load."""
     doc = notes["doc"]
     skipped = notes["skipped"]
     headline = doc.get("headline", {}) or {}
@@ -1290,7 +1442,7 @@ def render_html(date, models, friction, notes):
     friction_total_value = friction_total(joined, codex_aggregate)
 
     warn_count = len(doc.get("inaccessible", []) or []) + len(doc.get("errors", []) or [])
-    warn_badge = (f'<a class="warn-badge" href="#panel-6" data-target="panel-6">'
+    warn_badge = (f'<a class="warn-badge" href="#provenance" data-target="provenance">'
                   f'{warn_count} warning(s)</a>') if warn_count else ""
 
     style_hash = _csp_hash(STATIC_STYLE)
@@ -1299,15 +1451,12 @@ def render_html(date, models, friction, notes):
            f"style-src 'sha256-{style_hash}'; script-src 'sha256-{script_hash}'; "
            f"connect-src 'none'; base-uri 'none'; form-action 'none'\">")
 
-    tabs = [("panel-1", "Context Weight"), ("panel-2", "Hook Wiring"), ("panel-3", "Trends"),
-            ("panel-4", "Duplication & Phantom Refs"), ("panel-5", "Coverage Matrix"),
-            ("panel-6", "Notes & Blind Spots")]
-    tab_buttons = "".join(
-        f'<button class="tab-btn" id="tab-btn-{i+1}" role="tab" data-target="{pid}" '
-        f'aria-selected="false">{esc_html(label)}</button>'
-        for i, (pid, label) in enumerate(tabs))
+    view_buttons = "".join(
+        f'<button class="view-btn" id="view-btn-{vid.split("-", 1)[1]}" role="tab" '
+        f'data-target="{vid}" aria-selected="false">{esc_html(label)}</button>'
+        for vid, label in VIEWS)
 
-    footer_line = " | ".join(f'{f["stream"]}: {f["status"]}' for f in footer) or "friction disabled"
+    copy_payloads = build_copy_payloads(date, models, friction, doc)
 
     parts = [
         "<!DOCTYPE html>",
@@ -1320,28 +1469,25 @@ def render_html(date, models, friction, notes):
         f'<div class="subtitle">root: {esc_html(doc.get("root",""))} | date: {esc_html(date)} '
         f'| generated_at: {esc_html(doc.get("generated_at",""))} {warn_badge}</div></header>',
         _render_instrument_readout(headline, phantom_ref_count, friction_total_value, models["trend"]),
-        '<div class="controls" role="tablist">',
-        tab_buttons,
-        '<button class="action-btn" id="friction-toggle" aria-pressed="false">Show friction overlay</button>',
+        '<div class="controls">',
+        '<nav class="view-switch" role="tablist">',
+        view_buttons,
+        '</nav>',
         '<button class="action-btn" id="expand-all">Expand all / print view</button>',
         "</div>",
-        '<div class="friction-legend" id="friction-legend">'
-        '<span>Friction heat, once the overlay is on:</span>'
-        '<span class="legend-entry"><span class="legend-swatch fh0"></span>none</span>'
-        '<span class="legend-entry"><span class="legend-swatch fh1"></span>some</span>'
-        '<span class="legend-entry"><span class="legend-swatch fh4"></span>most-active</span>'
-        '<span class="legend-note">every heated cell also shows a join-count '
-        'badge in the corner (color is never the only signal)</span></div>',
         "<main>",
-        _render_context_weight_tab(models["context_weight"], heat),
-        _render_bipartite_tab(models["bipartite"]),
-        _render_trend_tab(models["trend"]),
-        _render_dupweb_tab(models["dupweb"]),
-        _render_civc_drag_tab(models["civc"], models["drag"]),
-        _render_notes_tab(doc, skipped),
-        _render_friction_panel(joined, footer, codex_aggregate),
+        _render_overview_view(models["civc"], doc, date),
+        _render_coverage_view(models["civc"]),
+        _render_weight_view(models["context_weight"], heat),
+        _render_friction_view(joined, footer, codex_aggregate, models["drag"]),
+        _render_hygiene_view(doc, models),
         "</main>",
-        f'<footer class="sources">data sources: {esc_html(footer_line)}</footer>',
+        _render_copy_island("overview", copy_payloads["overview"]),
+        _render_copy_island("coverage", copy_payloads["coverage"]),
+        _render_copy_island("weight", copy_payloads["weight"]),
+        _render_copy_island("friction", copy_payloads["friction"]),
+        _render_copy_island("hygiene", copy_payloads["hygiene"]),
+        _render_provenance_footer(doc, skipped, footer),
         f"<script>{STATIC_SCRIPT}</script>",
         "</body></html>",
     ]
