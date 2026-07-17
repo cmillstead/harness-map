@@ -1755,3 +1755,112 @@ def test_friction_toggle_hidden_under_no_friction_shown_when_enabled(tmp_path):
     text_on = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     assert 'id="friction-toggle"' in text_on
     assert 'id="friction-legend"' in text_on
+
+
+# ============================================================= 6. B3/D6 action-launcher briefs
+def test_consolidation_brief_is_deterministic_and_coding_team_ready():
+    pair = {"a": "rules/a.md", "b": "rules/b.md", "score": 0.9, "shared_sample": "shared words"}
+    md1 = rh.build_consolidation_brief(pair)
+    md2 = rh.build_consolidation_brief(pair)
+    assert md1 == md2
+    assert md1.startswith("#") or "## " in md1
+    assert "rules/a.md" in md1 and "rules/b.md" in md1
+    assert "/coding-team" in md1
+
+
+def test_refactor_brief_deterministic():
+    flag = {"path": "skills/x/SKILL.md", "lines": 240}
+    assert rh.build_refactor_brief(flag) == rh.build_refactor_brief(flag)
+    md = rh.build_refactor_brief(flag)
+    assert "240" in md
+    assert "skills/x/SKILL.md" in md
+    assert "/coding-team" in md
+
+
+def test_gap_stub_brief_deterministic():
+    md1 = rh.build_gap_stub_brief("Constrain", "memory")
+    md2 = rh.build_gap_stub_brief("Constrain", "memory")
+    assert md1 == md2
+    assert md1.startswith("#") or "## " in md1
+    assert "Constrain" in md1 and "memory" in md1
+    assert "/coding-team" in md1
+
+
+def test_brief_islands_and_buttons_render_for_findings(tmp_path):
+    doc = _minimal_doc()   # has 1 dup pair + phantom ref
+    doc["instruction_length_flags"] = [{"path": "skills/x/SKILL.md", "lines": 240, "evidence": "VERIFIED"}]
+    out_dir = tmp_path / "briefs"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered"},
+    ], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+
+    # dup pair (index 0) -> brief-dup-0
+    assert 'data-copy-target="brief-dup-0"' in text
+    assert '<script type="application/json" id="brief-dup-0">' in text
+
+    # over-cap flag (index 0 in the sorted length-flag table) -> brief-overcap-0
+    assert 'data-copy-target="brief-overcap-0"' in text
+    assert '<script type="application/json" id="brief-overcap-0">' in text
+
+    # 35 of the 36 Coverage Matrix cells are empty (only Afford x context is covered)
+    # -> at least one gap-stub island/button, indexed brief-gap-0
+    assert 'data-copy-target="brief-gap-0"' in text
+    assert '<script type="application/json" id="brief-gap-0">' in text
+
+    # still no inline handlers / style attrs (CSP model intact)
+    p = _ExternalRefParser()
+    p.feed(text)
+    assert p.on_handlers == []
+    assert p.style_attrs == []
+    # STATIC_SCRIPT stays the ONE executable <script> — every brief island is inert
+    import re
+    exe_scripts = re.findall(r'<script(?![^>]*type="application/json")[^>]*>', text)
+    assert len(exe_scripts) == 1
+
+
+def test_no_brief_islands_or_buttons_when_no_actionable_findings(tmp_path):
+    doc = _minimal_doc()
+    doc["duplication"]["pairs"] = []
+    doc["instruction_length_flags"] = []
+    out_dir = tmp_path / "no_briefs"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    # no synthesis sidecar written -> Coverage Matrix unavailable, zero cells, zero gap briefs
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "brief-dup-" not in text
+    assert "brief-overcap-" not in text
+    assert "brief-gap-" not in text
+
+
+def test_brief_payload_is_the_pure_builder_markdown(tmp_path):
+    """The island payload is JSON-encoded so it's inert inside the script tag —
+    decoding it must yield exactly what the pure builder produces for the same input."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "brief_payload"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    m = re.search(r'<script type="application/json" id="brief-dup-0">(.*?)</script>', text, re.S)
+    assert m is not None
+    payload = json.loads(m.group(1))
+    expected = rh.build_consolidation_brief(doc["duplication"]["pairs"][0])
+    assert payload == expected
+
+
+def test_static_script_byte_unchanged_by_action_launcher_briefs():
+    """B3/D6 spec: the brief buttons reuse the EXISTING `.copy-btn` machinery — the
+    generic click handler already reads `data-copy-target` for ANY `.copy-btn`, so
+    STATIC_SCRIPT itself carries no brief-specific code and its hash never moves."""
+    assert "brief-" not in rh.STATIC_SCRIPT
+    assert "build_consolidation_brief" not in rh.STATIC_SCRIPT

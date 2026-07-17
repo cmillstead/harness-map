@@ -1375,6 +1375,84 @@ def _render_copy_island(view_id, payload):
     return f'<script type="application/json" id="copy-{view_id}">{esc_json_script(payload)}</script>'
 
 
+# --------------------------------------------------------------------------- B3/D6 action-launcher briefs
+# Clipboard-only `/coding-team`-ready markdown briefs for actionable findings (dup
+# pairs, over-cap files, empty Coverage Matrix cells). Each builder is a PURE
+# function of its inputs — byte-identical output for the same input, never a file
+# write, never a network call. They reuse the A8 `.copy-btn` + inert JSON-island
+# machinery (below) so `STATIC_SCRIPT` is untouched and the script CSP hash never
+# moves; only the JSON-island payload differs from the A8 per-view digest islands.
+def build_consolidation_brief(pair):
+    """dup pair -> `/coding-team`-ready consolidation brief. Pure function of `pair`
+    (`a`, `b`, `score`, `shared_sample`) — same pair, same markdown, every call."""
+    a, b = pair.get("a", ""), pair.get("b", "")
+    score = pair.get("score", 0.0)
+    shared = pair.get("shared_sample", "")
+    pct = f"{score * 100:.0f}"
+    return (
+        "# Consolidate duplicate instruction pair\n\n"
+        "## Finding\n"
+        f"`{a}` and `{b}` overlap {pct}% (containment score {score}).\n\n"
+        "## Shared content sample\n"
+        f"> {shared}\n\n"
+        "## Action\n"
+        "Route this through `/coding-team`: review both files, merge the shared "
+        "guidance into one canonical location, and update the other file to reference "
+        "it (or delete it) so the harness carries the rule exactly once.\n"
+    )
+
+
+def build_refactor_brief(flag):
+    """over-cap instruction file -> `/coding-team`-ready refactor brief. Pure function
+    of `flag` (`path`, `lines`)."""
+    path = flag.get("path", "")
+    lines = flag.get("lines", 0)
+    return (
+        "# Refactor oversized instruction file\n\n"
+        "## Finding\n"
+        f"`{path}` is {lines} lines — over the 200-line instruction cap.\n\n"
+        "## Action\n"
+        f"Route this through `/coding-team`: split `{path}` into focused, "
+        "single-purpose files, or move on-demand detail behind a reference doc, "
+        "until it is back under the cap.\n"
+    )
+
+
+def build_gap_stub_brief(verb, surface):
+    """empty Coverage Matrix cell -> `/coding-team`-ready gap-fill brief. Pure
+    function of `verb` and `surface` (the VERBS x SURFACES cell key)."""
+    return (
+        f"# Fill roadmap gap: {verb} × {surface}\n\n"
+        "## Finding\n"
+        f"The Coverage Matrix cell for **{verb}** × **{surface}** is empty — no "
+        f"harness component currently {verb.lower()}s behavior via the {surface} "
+        "surface.\n\n"
+        "## Action\n"
+        "Route this through `/coding-team`: design and implement a minimal component "
+        "that closes this gap, then record it in the harness-synthesis sidecar's "
+        "Coverage Matrix entry for this cell (verdict `thin` or `covered`) with "
+        "evidence.\n"
+    )
+
+
+def _render_brief_island(kind, index, markdown):
+    """B3/D6 inert data island for one action-launcher brief — same `type=
+    "application/json"` + `esc_json_script` pattern as `_render_copy_island`, keyed
+    `brief-{kind}-{index}` so each finding's island id is derived deterministically
+    from its position in the finding's own (already-deterministic) render order."""
+    island_id = f"brief-{kind}-{index}"
+    return f'<script type="application/json" id="{island_id}">{esc_json_script(markdown)}</script>'
+
+
+def _render_brief_button(kind, index):
+    """B3/D6 per-finding copy button — reuses the EXISTING `.copy-btn` control (and
+    therefore the existing generic click handler in `STATIC_SCRIPT`, which reads
+    `data-copy-target` for any `.copy-btn`, not just the A8 per-view ones); no new
+    CSS, no `STATIC_SCRIPT` change, no inline handler."""
+    island_id = f"brief-{kind}-{index}"
+    return f'<button class="copy-btn action-btn" data-copy-target="{island_id}">Copy brief</button>'
+
+
 # Hygiene digest rows: (overview_model["hygiene"] key, GAUGE_BANDS key for severity, label).
 _HYGIENE_DIGEST_SPECS = (
     ("over_cap", "instruction_files_over_200", "Files over 200 lines"),
@@ -1508,6 +1586,9 @@ def _render_coverage_view(civc):
     by_key = {(c["verb"], c["surface"]): c for c in civc["cells"]}
     rows = []
     panels = []
+    gap_index = 0   # B3/D6: brief index for empty cells, incremented in the SAME
+                     # fixed VERBS x SURFACES traversal order the grid itself uses —
+                     # deterministic regardless of which cells the synthesis provided.
     for verb in VERBS:
         cell_html = []
         for surface in SURFACES:
@@ -1530,13 +1611,19 @@ def _render_coverage_view(civc):
                               else '<p class="evidence empty-state">no evidence recorded</p>')
             note_html = (f'<details><summary>note</summary>{esc_html(note)}</details>' if note
                          else '<p class="empty-state">no note</p>')
+            if verdict == "empty":
+                brief_html = (_render_brief_button("gap", gap_index)
+                              + _render_brief_island("gap", gap_index, build_gap_stub_brief(verb, surface)))
+                gap_index += 1
+            else:
+                brief_html = ""
             hidden_attr = "" if preselect else " hidden"
             panels.append(
                 f'<div class="inspector-panel" data-cell-id="{esc_html(cell_id)}"{hidden_attr}>'
                 f'<p class="surface-tag">{esc_html(surface)}</p>'
                 f'<p class="verb-tag">{esc_html(verb)}</p>'
                 f'<span class="badge verdict-{esc_html(verdict)}">{esc_html(verdict)}</span>'
-                f'{evidence_html}{note_html}</div>'
+                f'{evidence_html}{note_html}{brief_html}</div>'
             )
         rows.append(f"<tr><th>{esc_html(verb)}</th>{''.join(cell_html)}</tr>")
     civc_body = (
@@ -1641,17 +1728,25 @@ def _render_trend_body(model):
     return f'<div class="card"><h2>Trend (8 headline metrics)</h2>{body}</div>'
 
 
-def _render_dupweb_body(model):
+def _render_dupweb_body(model, raw_pairs):
     """A6 duplication presentation (finding #5b): one row per pair as `{a} ⇄ {b}` …
     `{pct}% shared` — the arrow between the two node keys and a percent, never the
-    old separate node-key columns + a raw decimal score."""
+    old separate node-key columns + a raw decimal score.
+
+    B3/D6: each row also gets an action-launcher brief button. `raw_pairs` is the
+    UNPREFIXED `doc["duplication"]["pairs"]` list (`build_dupweb_model` builds
+    `model["edges"]` from this exact list, in the same order, only prefixing `a`/`b`
+    into node-keys for the arrow display) — `build_consolidation_brief` needs the
+    real paths, not the display node-keys, so the brief is index-aligned to it."""
     if model["edges"]:
         rows = "".join(
             f'<tr><td>{esc_html(e["a"])} ⇄ {esc_html(e["b"])}</td>'
             f'<td class="tabular-nums">{_fmt_float(e["score"] * 100)}% shared</td>'
-            f'<td>{esc_html(e["shared_sample"])}</td></tr>'
-            for e in model["edges"])
-        dup_body = f'<div class="overflow-x"><table><tr><th>Pair</th><th>Overlap</th><th>Sample</th></tr>{rows}</table></div>'
+            f'<td>{esc_html(e["shared_sample"])}</td>'
+            f'<td>{_render_brief_button("dup", i)}{_render_brief_island("dup", i, build_consolidation_brief(raw_pairs[i]))}</td>'
+            '</tr>'
+            for i, e in enumerate(model["edges"]))
+        dup_body = f'<div class="overflow-x"><table><tr><th>Pair</th><th>Overlap</th><th>Sample</th><th>Action</th></tr>{rows}</table></div>'
     else:
         dup_body = '<p class="empty-state">no duplicate pairs above threshold</p>'
     if model["phantom_refs"]:
@@ -1672,18 +1767,26 @@ def _render_dupweb_body(model):
 def _render_length_flags_body(doc):
     """A6 length-flag table (finding #5b): a CRITICAL pill at >600 lines, a plain
     'over' pill otherwise. Iterated sorted by `(-lines, path)` — a total key, so
-    output stays deterministic regardless of the flag list's original order."""
+    output stays deterministic regardless of the flag list's original order.
+
+    B3/D6: each row also gets an action-launcher refactor-brief button, indexed by
+    its position in this same sorted order (the row's own deterministic identity)."""
     flags = doc.get("instruction_length_flags", []) or []
     if flags:
+        sorted_flags = sorted(flags, key=lambda f: (-f.get("lines", 0), f["path"]))
         rows = "".join(
             (f'<tr><td>{esc_html(f["path"])}</td><td class="tabular-nums">{esc_html(f["lines"])}</td>'
-             f'<td><span class="pill pill-critical">critical</span></td></tr>')
+             f'<td><span class="pill pill-critical">critical</span></td>'
+             f'<td>{_render_brief_button("overcap", i)}{_render_brief_island("overcap", i, build_refactor_brief(f))}</td>'
+             '</tr>')
             if f.get("lines", 0) > 600 else
             (f'<tr><td>{esc_html(f["path"])}</td><td class="tabular-nums">{esc_html(f["lines"])}</td>'
-             f'<td><span class="pill">over</span></td></tr>')
-            for f in sorted(flags, key=lambda f: (-f.get("lines", 0), f["path"]))
+             f'<td><span class="pill">over</span></td>'
+             f'<td>{_render_brief_button("overcap", i)}{_render_brief_island("overcap", i, build_refactor_brief(f))}</td>'
+             '</tr>')
+            for i, f in enumerate(sorted_flags)
         )
-        body = f'<div class="overflow-x"><table><tr><th>Path</th><th>Lines</th><th>Flag</th></tr>{rows}</table></div>'
+        body = f'<div class="overflow-x"><table><tr><th>Path</th><th>Lines</th><th>Flag</th><th>Action</th></tr>{rows}</table></div>'
     else:
         body = '<p class="empty-state">no instruction files over cap</p>'
     return f'<div class="card"><h2>Length flags</h2>{body}</div>'
@@ -1708,7 +1811,7 @@ def _render_hygiene_view(doc, models):
         'aria-labelledby="view-btn-hygiene" tabindex="-1">'
         f'<div class="view-toolbar">{_render_copy_controls("hygiene")}</div>'
         f'{_render_length_flags_body(doc)}'
-        f'{_render_dupweb_body(models["dupweb"])}'
+        f'{_render_dupweb_body(models["dupweb"], doc.get("duplication", {}).get("pairs", []) or [])}'
         f'{_render_unchecked_binaries_body(doc)}'
         f'{_render_trend_body(models["trend"])}'
         '<h2>Wiring integrity</h2>'
