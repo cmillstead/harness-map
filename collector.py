@@ -895,10 +895,9 @@ def scan_duplication(root, blind_spots):
     not something this collector decides."""
     # Generalized skills/coding-team/rules -> skills/*/rules for release portability; the
     # seen_physical dedup below still collapses a rule reachable via multiple glob paths.
-    patterns = _DUP_GLOBS
     seen_physical = set()
     corpus = []  # [(rel_path, shingle_set), ...]
-    for pattern in patterns:
+    for pattern in _DUP_GLOBS:
         try:
             candidates = sorted(root.glob(pattern))
         except OSError:
