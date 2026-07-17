@@ -1496,3 +1496,184 @@ def test_csp_hashes_cover_the_emitted_blocks(tmp_path):
     text2 = emit(d2, extra=["--decisions-file", str(dec)])
     exe2 = re.search(r'<script(?![^>]*application/json)[^>]*>(.*?)</script>', text2, re.S)
     assert exe.group(1) == exe2.group(1)
+
+
+# ============================================================= 10. Codex+QA gate follow-ups
+def test_build_civc_model_rejects_unallowlisted_verdict():
+    """FIX 1 (P1): a crafted synthesis `verdict` must not pass through unallowlisted —
+    only {"covered","thin","empty"} survive; anything else normalizes to "empty"."""
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered fh1 heatable"},
+        {"verb": "Evolve", "surface": "observability", "verdict": "thin"},
+    ], "drag_candidates": []}
+    model = rh.build_civc_model(synth)
+    afford = next(c for c in model["cells"] if c["verb"] == "Afford" and c["surface"] == "context")
+    assert afford["verdict"] == "empty"
+    evolve = next(c for c in model["cells"] if c["verb"] == "Evolve" and c["surface"] == "observability")
+    assert evolve["verdict"] == "thin"
+
+
+def test_civc_verdict_injection_normalized_in_overview_and_coverage(tmp_path):
+    """FIX 1: full-render proof the class-injection is neutralized — the mini-cell AND
+    the matrix-cell must carry NO `fh1`/`heatable` token, and must render as
+    `verdict-empty` (normalized), never the raw crafted string."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "civc_verdict_xss"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered fh1 heatable"},
+    ], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    ov = re.search(r'<section id="view-overview".*?</section>', text, re.S)
+    assert ov is not None
+    assert "fh1" not in ov.group(0) and "heatable" not in ov.group(0)
+    assert 'class="mini-cell verdict-empty"' in ov.group(0)
+    assert re.search(r'class="matrix-cell verdict-empty[ "]', text)
+
+
+def test_render_survives_lone_surrogate_path_without_crash(tmp_path):
+    """FIX 2 (P1): a sidecar path carrying a lone UTF-16 surrogate must never crash the
+    final UTF-8 write — the renderer must always emit a complete, valid-UTF-8 file."""
+    doc = _minimal_doc(extra_files=[
+        {"path": "bad\ud800.md", "category": "rule", "words": 1, "lines": 1,
+         "tokens_est": 5, "evidence": "VERIFIED"},
+    ])
+    out_dir = tmp_path / "surrogate"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    out_file = out_dir / "harness-map-2026-07-15.html"
+    file_bytes = out_file.read_bytes()
+    text = file_bytes.decode("utf-8")   # must not raise UnicodeDecodeError
+    assert "bad" in text
+
+
+def test_treemap_badge_renders_even_when_label_suppressed():
+    """FIX 3 (P2): the friction legend claims "color is never the only signal" — that
+    claim is only true if EVERY heated cell shows a join-count badge, even a cell whose
+    text label is suppressed for being below TREEMAP_LABEL_MIN_W/H."""
+    tree = {"cells": [{"path": "tiny.md", "node_key": "always_loaded:tiny.md",
+                        "x": "0.00", "y": "0.00", "w": "10.00", "h": "10.00", "fill": "#000"}],
+            "canvas_w": 20.0, "canvas_h": 20.0}
+    heat = {"always_loaded:tiny.md": 3}
+    svg = rh._render_treemap_svg(tree, heat, "t")
+    assert 'class="cell-label"' not in svg     # confirms this cell IS below the label threshold
+    assert 'class="friction-badge">3</text>' in svg
+
+
+def test_trend_delta_bad_direction_when_metric_increases():
+    """FIX 4 (P3): _trend_delta must consult the series' own polarity, not render every
+    change identically. `always_loaded_words` is polarity="up" (growth is the BAD
+    direction) — an increase must resolve to the "bad" semantic."""
+    trend = {"first_run": False, "series": [
+        {"key": "always_loaded_words", "label": "Always-loaded words", "polarity": "up",
+         "values": [100, 150]},
+    ]}
+    assert rh._trend_delta(trend, "always_loaded_words") == ("▲ 50", "bad")
+
+
+def test_trend_delta_good_direction_when_bad_polarity_metric_decreases():
+    trend = {"first_run": False, "series": [
+        {"key": "always_loaded_words", "label": "Always-loaded words", "polarity": "up",
+         "values": [150, 100]},
+    ]}
+    assert rh._trend_delta(trend, "always_loaded_words") == ("▼ 50", "good")
+
+
+def test_trend_delta_neutral_for_none_polarity():
+    trend = {"first_run": False, "series": [
+        {"key": "always_loaded_file_count", "label": "x", "polarity": "none", "values": [5, 6]},
+    ]}
+    assert rh._trend_delta(trend, "always_loaded_file_count") == ("▲ 1", "neutral")
+
+
+def test_trend_delta_none_on_first_run():
+    assert rh._trend_delta({"first_run": True, "series": []}, "always_loaded_words") is None
+
+
+def test_trend_delta_renders_polarity_aware_class_in_gauge_card(tmp_path):
+    """FIX 8: a 2-sidecar render must exercise the `first_run=False` delta path — the
+    tokens gauge card must show the arrow+magnitude AND (FIX 4) the bad-direction
+    semantic class, since growth in always-loaded tokens is the BAD direction."""
+    doc1 = _minimal_doc(tokens_a=100, tokens_b=50)
+    doc2 = _minimal_doc(tokens_a=200, tokens_b=50)
+    out_dir = tmp_path / "trenddelta"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-14", doc1)
+    _write_sidecar(out_dir, "2026-07-15", doc2)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    gauge = re.search(r'data-gauge="always_loaded_tokens_est".*?</div>\s*</div>', text, re.S)
+    assert gauge is not None
+    assert 'class="delta delta-bad"' in gauge.group(0)
+    assert "▲" in gauge.group(0) and "100" in gauge.group(0)
+
+
+def test_data_goto_focus_move_wired_in_static_script():
+    """FIX 5 (P3, WCAG 2.2 AA): activating a data-goto element must move keyboard focus
+    into the target view instead of dropping to <body> once the source view is hidden."""
+    idx = rh.STATIC_SCRIPT.index("data-goto")
+    goto_handler = rh.STATIC_SCRIPT[idx:idx + 1100]
+    assert ".focus()" in goto_handler
+
+
+def test_view_sections_are_focusable_targets(tmp_path):
+    """FIX 5: `.focus()` only works if the target view is itself focusable — every view
+    section must carry `tabindex="-1"` as a programmatic-focus target."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "focusable"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    for vid in ("view-overview", "view-coverage", "view-weight", "view-friction", "view-hygiene"):
+        tag = re.search(rf'<section id="{vid}"[^>]*>', text)
+        assert tag is not None
+        assert 'tabindex="-1"' in tag.group(0)
+
+
+def test_view_tablist_arrow_key_navigation_wired(tmp_path):
+    """FIX 6 (P3, WCAG APG tablist pattern): ArrowLeft/ArrowRight must traverse the
+    `.view-btn` group, not just click/Enter/Space."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "arrownav"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "ArrowRight" in text and "ArrowLeft" in text
+    assert 'role="tablist"' in text
+
+
+def test_friction_toggle_hidden_under_no_friction_shown_when_enabled(tmp_path):
+    """FIX 7 (P3): `#friction-toggle` + `#friction-legend` must not render under
+    `--no-friction` (there is nothing for the toggle to reveal); a friction-ON render
+    (via `--decisions-file`) must still carry them — Task 6's heat tests rely on this."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "toggle_gate"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc_off = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc_off.returncode == 0, proc_off.stderr
+    text_off = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="friction-toggle"' not in text_off
+    assert 'id="friction-legend"' not in text_off
+
+    decisions = out_dir / "d.jsonl"
+    decisions.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    proc_on = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    assert proc_on.returncode == 0, proc_on.stderr
+    text_on = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="friction-toggle"' in text_on
+    assert 'id="friction-legend"' in text_on

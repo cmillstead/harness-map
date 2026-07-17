@@ -52,6 +52,7 @@ HEADLINE_KEYS = (
 )
 VERBS = ("Afford", "Inform", "Constrain", "Verify", "Correct", "Evolve")
 SURFACES = ("context", "tools", "memory", "permissions", "orchestration", "observability")
+VERDICTS = ("covered", "thin", "empty")
 
 # §9-R E — CLOSED allowlists, verified against skills/coding-team/ on 2026-07-15.
 PHASE_ALIAS = {
@@ -409,7 +410,11 @@ def build_dupweb_model(doc):
 
 def build_civc_model(synth):
     """CIVC 6x6 grid. Absent synthesis -> graceful empty-state (`available=False`,
-    §6). A malformed cell set never crashes: missing cells fall back to 'empty'."""
+    §6). A malformed cell set never crashes: missing cells fall back to 'empty'.
+    `verdict` is allowlisted to VERDICTS here — the ONE normalization point every
+    consumer (Overview mini-cells, Coverage cells, copy payloads) reads from — so an
+    unallowlisted synthesis value (e.g. a crafted `"covered fh1 heatable"`) can never
+    ride through as an extra CSS class (Codex P1 class-injection finding)."""
     if synth is None:
         return {"available": False, "cells": []}
     by_key = {}
@@ -420,8 +425,11 @@ def build_civc_model(synth):
     for verb in VERBS:
         for surface in SURFACES:
             c = by_key.get((verb, surface), {})
+            verdict = c.get("verdict", "empty")
+            if verdict not in VERDICTS:
+                verdict = "empty"
             cells.append({"verb": verb, "surface": surface,
-                           "verdict": c.get("verdict", "empty"),
+                           "verdict": verdict,
                            "evidence": c.get("evidence"), "note": c.get("note", "")})
     return {"available": True, "cells": cells}
 
@@ -891,7 +899,15 @@ def write_html_safely(out_path, text, harness_root):
     tmp_name = None
     try:
         fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        # errors="backslashreplace" (Codex P1): a lone UTF-16 surrogate anywhere in `text`
+        # (a non-UTF-8 filename the collector preserved via surrogateescape, reaching
+        # esc_json_script's ensure_ascii=False copy islands, or esc_html's own
+        # pre-html.escape substitution) must never raise UnicodeEncodeError here and
+        # abort the write with no report produced — it deterministically becomes a
+        # literal `\udNNN` escape instead, so the output file is always complete,
+        # always valid UTF-8. This changes ONLY the encoding error mode, never the
+        # write-safety/path-security logic above.
+        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
@@ -927,6 +943,9 @@ h1{font-size:1.25rem;margin:0 0 4px 0}
 .gauge-neutral{border-left-color:var(--border)}
 .gauge .band{color:var(--muted);font-size:0.72rem}
 .gauge .delta{font-size:0.75rem;font-weight:600}
+.gauge .delta-good{color:var(--sem-covered)}
+.gauge .delta-bad{color:var(--sem-empty)}
+.gauge .delta-neutral{color:var(--muted)}
 .warn-badge{background:var(--sem-empty);color:#fff;border-radius:6px;padding:2px 8px;font-size:0.75rem;text-decoration:none}
 .controls{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border);padding:8px 20px;display:flex;gap:8px;flex-wrap:wrap;z-index:5}
 .view-switch,.seg{display:inline-flex;gap:6px;flex-wrap:wrap;border:1px solid var(--border);border-radius:6px;padding:2px}
@@ -1039,12 +1058,41 @@ STATIC_SCRIPT = """
   }
   vbtns.forEach(function(b){ b.addEventListener('click', function(){ activate(b.dataset.target); }); });
 
+  // WCAG APG tablist pattern: ArrowLeft/ArrowRight (+ Home/End) traverse the view-btn
+  // group and activate the newly-focused tab — click/Enter/Space alone left the
+  // tablist incomplete (finding P3-6).
+  var viewSwitch = document.querySelector('.view-switch');
+  if (viewSwitch){
+    viewSwitch.addEventListener('keydown', function(e){
+      if (['ArrowRight', 'ArrowLeft', 'Home', 'End'].indexOf(e.key) === -1) { return; }
+      e.preventDefault();
+      var btns = Array.prototype.slice.call(vbtns);
+      var idx = btns.indexOf(document.activeElement);
+      if (idx === -1) { idx = 0; }
+      var next;
+      if (e.key === 'ArrowRight') { next = (idx + 1) % btns.length; }
+      else if (e.key === 'ArrowLeft') { next = (idx - 1 + btns.length) % btns.length; }
+      else if (e.key === 'Home') { next = 0; }
+      else { next = btns.length - 1; }
+      btns[next].focus();
+      activate(btns[next].dataset.target);
+    });
+  }
+
   // cross-view nav: any element with data-goto (+ optional data-cell-id) switches view & selects
   document.querySelectorAll('[data-goto]').forEach(function(el){
     el.addEventListener('click', function(){
       activate(el.dataset.goto);
       var cid = el.dataset.cellId;
+      var target = document.getElementById(el.dataset.goto);
       if (cid) { selectCell(cid); }
+      // WCAG 2.2 AA: the source element's view is now hidden, so move keyboard focus
+      // INTO the target view instead of letting it drop to <body>. Prefer the exact
+      // selected cell (already focusable, tabindex="0"); fall back to the view itself
+      // (each `.view` section carries tabindex="-1" for this).
+      var selEl = cid && target ? target.querySelector('[data-cell-id="' + cid + '"]') : null;
+      if (selEl && selEl.focus) { selEl.focus(); }
+      else if (target && target.focus) { target.focus(); }
     });
   });
 
@@ -1170,13 +1218,17 @@ def _render_treemap_svg(tree, heat, dom_id):
             f'fill="{esc_html(c.get("fill", "#56b4e9"))}" fill-opacity="{opacity}" '
             f'class="{rect_cls}" data-node-key="{esc_html(c["node_key"])}">'
             f'<title>{esc_html(c["path"])} (friction: {heat_n})</title></rect>')
+        tx, ty = _fmt_float(float(c["x"]) + 2), _fmt_float(float(c["y"]) + 13)
         if float(c["w"]) > TREEMAP_LABEL_MIN_W and float(c["h"]) > TREEMAP_LABEL_MIN_H:
-            tx, ty = _fmt_float(float(c["x"]) + 2), _fmt_float(float(c["y"]) + 13)
             parts.append(f'<text x="{tx}" y="{ty}" class="cell-label">{label}</text>')
-            if heat_n:
-                bx = _fmt_float(float(c["x"]) + float(c["w"]) - 2)
-                parts.append(f'<text x="{bx}" y="{ty}" text-anchor="end" '
-                              f'class="friction-badge">{heat_n}</text>')
+        if heat_n:
+            # FIX (Codex P2): the badge renders for EVERY heated cell, independent of the
+            # text-label threshold above — otherwise a sub-threshold cell is heat-colored
+            # with no other signal, breaking the legend's "color is never the only
+            # signal" claim (and WCAG use-of-color).
+            bx = _fmt_float(float(c["x"]) + float(c["w"]) - 2)
+            parts.append(f'<text x="{bx}" y="{ty}" text-anchor="end" '
+                          f'class="friction-badge">{heat_n}</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -1241,14 +1293,22 @@ GAUGE_SPECS = (  # (source_kind, key, label) — source_kind selects where the v
 def _render_gauge(key, label, value, delta=None):
     band, semantic = _gauge_band(key, value)
     band_html = f'<div class="band">{esc_html(band)}</div>' if band else ""
-    delta_html = f'<div class="delta">{esc_html(delta)}</div>' if delta else ""
+    delta_html = ""
+    if delta:
+        delta_text, delta_semantic = delta
+        delta_html = (f'<div class="delta delta-{esc_html(delta_semantic)}">'
+                      f'{esc_html(delta_text)}</div>')
     return (f'<div class="gauge gauge-{esc_html(semantic)}" data-gauge="{esc_html(key)}">'
             f'<div class="v">{esc_html(value)}</div><div class="l">{esc_html(label)}</div>'
             f'{band_html}{delta_html}</div>')
 
 
 def _trend_delta(trend_model, key):
-    """Polarity-aware delta arrow vs the previous sidecar, or None on first run."""
+    """Polarity-aware delta vs the previous sidecar: (text, semantic) tuple where
+    `semantic` is one of "good"/"bad"/"neutral", or None on first run / no comparable
+    series. The series' own `polarity` (HEADLINE_KEYS, via build_trend_model) decides
+    which arrow direction is good vs bad — Codex P3: a bad-direction change (e.g.
+    `always_loaded_words` growing) must not render identically to a good one."""
     if trend_model.get("first_run"):
         return None
     series = next((s for s in trend_model["series"] if s["key"] == key), None)
@@ -1256,9 +1316,17 @@ def _trend_delta(trend_model, key):
         return None
     cur, prev = series["values"][-1], series["values"][-2]
     if cur == prev:
-        return "= 0"
+        return ("= 0", "neutral")
     arrow = "▲" if cur > prev else "▼"   # ▲ / ▼
-    return f"{arrow} {abs(cur - prev)}"
+    text = f"{arrow} {abs(cur - prev)}"
+    polarity = series.get("polarity", "none")
+    if polarity == "up":            # increasing this metric is the BAD direction
+        semantic = "bad" if cur > prev else "good"
+    elif polarity == "down":        # increasing this metric is the GOOD direction
+        semantic = "good" if cur > prev else "bad"
+    else:
+        semantic = "neutral"
+    return (text, semantic)
 
 
 def _render_instrument_readout(headline, phantom_ref_count, friction_total_value, trend_model):
@@ -1373,7 +1441,8 @@ def _render_overview_view(overview_model, civc):
     else:
         mini_grid = '<p class="empty-state">synthesis sidecar not found — Coverage Matrix unavailable this run.</p>'
     return (
-        '<section id="view-overview" class="view" role="tabpanel" aria-labelledby="view-btn-overview">'
+        '<section id="view-overview" class="view" role="tabpanel" '
+        'aria-labelledby="view-btn-overview" tabindex="-1">'
         f'<div class="view-toolbar">{_render_copy_controls("overview")}</div>'
         '<div class="overview-grid">'
         f'<div class="card"><h2>Coverage at a glance</h2>{mini_grid}</div>'
@@ -1397,7 +1466,8 @@ def _render_coverage_view(civc):
     if not civc["available"]:
         civc_body = '<p class="empty-state">synthesis sidecar not found — Coverage Matrix unavailable this run.</p>'
         return (
-            '<section id="view-coverage" class="view" role="tabpanel" aria-labelledby="view-btn-coverage">'
+            '<section id="view-coverage" class="view" role="tabpanel" '
+            'aria-labelledby="view-btn-coverage" tabindex="-1">'
             f'<div class="view-toolbar">{_render_copy_controls("coverage")}</div>'
             '<div class="card"><h2>Coverage Matrix</h2>'
             '<p class="subtitle">six verbs (what the harness does to behavior) '
@@ -1453,7 +1523,8 @@ def _render_coverage_view(civc):
         f'<aside class="inspector">{"".join(panels)}</aside></div>'
     )
     return (
-        '<section id="view-coverage" class="view" role="tabpanel" aria-labelledby="view-btn-coverage">'
+        '<section id="view-coverage" class="view" role="tabpanel" '
+        'aria-labelledby="view-btn-coverage" tabindex="-1">'
         f'<div class="view-toolbar">{_render_copy_controls("coverage")}</div>'
         '<div class="card"><h2>Coverage Matrix</h2>'
         '<p class="subtitle">six verbs (what the harness does to behavior) '
@@ -1462,27 +1533,24 @@ def _render_coverage_view(civc):
     )
 
 
-def _render_weight_view(model, heat):
+def _render_weight_view(model, heat, friction_enabled):
     """Verbatim body of the former `_render_context_weight_tab`, now also carrying the
     friction legend + overlay toggle (moved here — heat only ever lands on these two
     treemaps, RESOLVED DECISION 1) and the A5/AM-3 treemap<->ladder toggle: both
     representations are pre-rendered for both panels so the client just flips a CSS
-    class (§ progressive-enhancement pattern) — no re-render at click time."""
+    class (§ progressive-enhancement pattern) — no re-render at click time.
+    `friction_enabled=False` (i.e. `--no-friction`) omits the toggle button + legend
+    entirely (Codex P3): with `heat={}` there is nothing for the toggle to reveal, so
+    toggling `friction-on` would only dim every cell to 0.25 with nothing highlighted."""
     always_treemap = _render_treemap_svg(model["always"], heat, "treemap-always")
     always_ladder = _render_ladder_svg(model["always"], heat, "ladder-always")
     ondemand_treemap = _render_treemap_svg(model["on_demand"], heat, "treemap-ondemand")
     ondemand_ladder = _render_ladder_svg(model["on_demand"], heat, "ladder-ondemand")
-    return (
-        '<section id="view-weight" class="view" role="tabpanel" aria-labelledby="view-btn-weight">'
-        '<div class="view-toolbar">'
-        '<div class="seg" id="weight-mode" role="group" aria-label="weight representation">'
-        '<button class="seg-btn" data-mode="treemap" aria-pressed="true">▦ Treemap</button>'
-        '<button class="seg-btn" data-mode="ladder" aria-pressed="false">▤ Ladder</button>'
-        '</div>'
+    toggle_html = (
         '<button class="action-btn" id="friction-toggle" aria-pressed="false">'
         'Show friction heat on treemap + ladder cells</button>'
-        f'{_render_copy_controls("weight")}'
-        '</div>'
+    ) if friction_enabled else ""
+    legend_html = (
         '<div class="friction-legend" id="friction-legend">'
         '<span>Friction heat, once the overlay is on:</span>'
         '<span class="legend-entry"><span class="legend-swatch fh0"></span>none</span>'
@@ -1490,6 +1558,19 @@ def _render_weight_view(model, heat):
         '<span class="legend-entry"><span class="legend-swatch fh4"></span>most-active</span>'
         '<span class="legend-note">every heated cell also shows a join-count '
         'badge in the corner (color is never the only signal)</span></div>'
+    ) if friction_enabled else ""
+    return (
+        '<section id="view-weight" class="view" role="tabpanel" '
+        'aria-labelledby="view-btn-weight" tabindex="-1">'
+        '<div class="view-toolbar">'
+        '<div class="seg" id="weight-mode" role="group" aria-label="weight representation">'
+        '<button class="seg-btn" data-mode="treemap" aria-pressed="true">▦ Treemap</button>'
+        '<button class="seg-btn" data-mode="ladder" aria-pressed="false">▤ Ladder</button>'
+        '</div>'
+        f'{toggle_html}'
+        f'{_render_copy_controls("weight")}'
+        '</div>'
+        f'{legend_html}'
         '<p class="subtitle">On-demand skills cost only when invoked; MEMORY.md + '
         'CLAUDE.md are the real per-turn tax — the treemap/ladder toggle shows the '
         'same weights two ways.</p>'
@@ -1600,7 +1681,8 @@ def _render_hygiene_view(doc, models):
     (RESOLVED DECISION 2 — hook wiring folded here as 'Wiring integrity', never
     dropped)."""
     return (
-        '<section id="view-hygiene" class="view" role="tabpanel" aria-labelledby="view-btn-hygiene">'
+        '<section id="view-hygiene" class="view" role="tabpanel" '
+        'aria-labelledby="view-btn-hygiene" tabindex="-1">'
         f'<div class="view-toolbar">{_render_copy_controls("hygiene")}</div>'
         f'{_render_length_flags_body(doc)}'
         f'{_render_dupweb_body(models["dupweb"])}'
@@ -1751,7 +1833,8 @@ def _render_friction_view(joined, footer, codex_aggregate, drag, friction_total_
             for r in drag["rows"])
         drag_body = f'<div class="overflow-x"><table><tr><th>#</th><th>Surface</th><th>Evidence</th><th>Outcome</th></tr>{rows}</table></div>'
     return (
-        '<section id="view-friction" class="view" role="tabpanel" aria-labelledby="view-btn-friction">'
+        '<section id="view-friction" class="view" role="tabpanel" '
+        'aria-labelledby="view-btn-friction" tabindex="-1">'
         f'<div class="view-toolbar">{_render_copy_controls("friction")}</div>'
         f'{friction_body}'
         f'<div class="card"><h2>Drag candidates</h2>{drag_body}</div>'
@@ -1772,6 +1855,11 @@ def render_html(date, models, friction, notes):
     skipped = notes["skipped"]
     headline = doc.get("headline", {}) or {}
     heat, joined, footer, codex_aggregate = friction
+    # every footer entry is "disabled" iff `--no-friction` was passed (build_friction_overlay's
+    # `disabled` short-circuit sets ALL 4 streams to "disabled"; an enabled-but-absent stream
+    # is "absent"/"inaccessible", never "disabled") — the single derivation the Weight view's
+    # toggle gate (Codex P3) reads from.
+    friction_enabled = any(f["status"] != "disabled" for f in footer)
     phantom_ref_count = len(doc.get("phantom_refs", []) or [])
     friction_total_value = friction_total(joined, codex_aggregate)
     overview_model = build_overview_model(models, headline, phantom_ref_count, friction_total_value)
@@ -1813,7 +1901,7 @@ def render_html(date, models, friction, notes):
         "<main>",
         _render_overview_view(overview_model, models["civc"]),
         _render_coverage_view(models["civc"]),
-        _render_weight_view(models["context_weight"], heat),
+        _render_weight_view(models["context_weight"], heat, friction_enabled),
         _render_friction_view(joined, footer, codex_aggregate, models["drag"], friction_total_value),
         _render_hygiene_view(doc, models),
         "</main>",
