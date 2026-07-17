@@ -1306,20 +1306,25 @@ def iter_input_paths(root, project_root=None):
     though a plain os.walk(--root) would miss it — that missed-target case is the whole reason
     this function, not a hand-kept list in serve.py, is the source of truth.
 
-    GUARANTEE: a true SUPERSET of every path build_document stats/opens/globs/iterdirs. Each
-    group below names the collector read it corresponds to. Add a future collector input HERE
-    (or to a shared _*_GLOBS constant that both this and the scan consume) or the dashboard
-    serves stale data.
+    GUARANTEE: a SUPERSET of every STATICALLY-enumerable path build_document stats/opens/globs/
+    iterdirs, PLUS every hook-script path resolvable UNDER root from a registered settings.json
+    command (reconcile_hooks stat()s exactly those — mirrored here via _script_from_command, and
+    hooks/ is watched RECURSIVELY so a nested hook script is covered by container membership).
+    Each group below names the collector read it corresponds to. Add a future collector input
+    HERE (or to a shared _*_GLOBS constant that both this and the scan consume) or the dashboard
+    serves stale data. NOT covered are the two honest, content-derived residuals below.
 
-    KNOWN watcher blind spots (documented for T4 — inherent, NOT statically enumerable here):
+    KNOWN watcher blind spots (documented for T4 — content-derived, NOT statically enumerable):
+      * A registered hook command may resolve to an ABSOLUTE path OUTSIDE root (case c). A root
+        walk cannot watch a file outside root, so its own create/delete is unobserved — but the
+        settings.json EDIT that registers (or de-registers) such a command IS watched, so a
+        re-render still fires on the registration change itself. Nested and relative-under-root
+        hook scripts ARE now covered (recursive hooks/ + resolved-command yield above).
       * check_phantom_refs stats `root / <token>` for backtick path tokens parsed out of prose
-        — an unbounded, content-derived set. Creating a referenced file OUTSIDE the dirs below
+        — an unbounded, content-derived set. Creating a referenced file OUTSIDE the dirs above
         can flip a phantom-ref verdict without a watched signal. In practice almost every
         referenced path already lives under a watched dir (rules/, skills/, agents/, commands/,
-        hooks/); a settings.json/rule EDIT that changes the ref itself IS watched.
-      * reconcile_hooks stat()s each registered hook command's resolved script; a command may
-        resolve to an ABSOLUTE path outside root/hooks. settings.json content IS watched, but
-        the external target file's own create/delete is not."""
+        hooks/); the instruction-file EDIT that introduces the ref itself IS watched."""
     root = Path(root)
     paths = set()
 
@@ -1382,6 +1387,31 @@ def iter_input_paths(root, project_root=None):
     for skill_dir in skill_dirs:
         for sub in _iter_descendant_dirs(skill_dir):
             paths.add(sub)
+
+    # -- hooks/ dir + ALL descendant dirs (membership): reconcile_hooks stat()s the resolved
+    #    script for each registered command, and _script_from_command can resolve to a script
+    #    NESTED under hooks/<subdir>/. The shallow hooks/*.py|*.sh globs above miss that depth,
+    #    so watch hooks/ recursively — the same _iter_descendant_dirs mechanism used for skills. --
+    for sub in _iter_descendant_dirs(root / "hooks"):
+        paths.add(sub)
+
+    # -- resolved hook-script paths from REGISTERED settings.json commands: reconcile_hooks
+    #    stat()s exactly these. Reuse _script_from_command (its resolution logic is the single
+    #    source of truth) and yield each script that resolves UNDER root — a command may point
+    #    OUTSIDE hooks/ (e.g. "./scripts/x.py"). A command resolving to an ABSOLUTE path outside
+    #    root is un-watchable via a root walk (disclosed in the docstring's blind-spot list); the
+    #    settings.json edit that registers it IS watched (settings.json is yielded above). --
+    settings, _parsed_ok = parse_settings(root, [], [])
+    root_resolved = root.resolve()
+    for command in _iter_hook_commands(settings):
+        script_path, _note = _script_from_command(command, root)
+        if script_path is None:
+            continue
+        try:
+            script_path.resolve().relative_to(root_resolved)
+        except (ValueError, OSError):
+            continue  # resolves outside root (case c) — genuinely un-watchable via a root walk
+        paths.add(script_path)
 
     return sorted(paths, key=str)
 

@@ -1041,3 +1041,32 @@ def test_iter_input_paths_is_deterministic_and_deduped(fake_harness):
     second = list(map(str, _collector.iter_input_paths(root, proj)))
     assert first == second                               # stable ordering across calls
     assert len(first) == len(set(first))                 # no duplicate paths
+
+
+def test_iter_input_paths_covers_nested_hook_dir(fake_harness):
+    # FIX 1: a hook script nested under hooks/<subdir>/ must be covered via the containing
+    # dir's membership — hooks/ is watched recursively (same mechanism as skill dirs), not
+    # shallow. reconcile_hooks stat()s such a nested script, so the watcher must see it.
+    root = fake_harness
+    sub = root / "hooks" / "sub"
+    sub.mkdir(parents=True, exist_ok=True)
+    (sub / "deep.py").write_text("# nested hook script\n")
+    paths = set(map(str, _collector.iter_input_paths(root)))
+    assert str(sub) in paths                             # containing dir -> membership watch
+
+
+def test_iter_input_paths_covers_registered_offhooks_script(fake_harness):
+    # FIX 2: a hook command registered in settings.json pointing at a script OUTSIDE hooks/
+    # but UNDER root is stat()'d by reconcile_hooks; iter_input_paths must yield that resolved
+    # script path so the watcher fires when the off-hooks script changes.
+    root = fake_harness
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    offhooks = scripts / "x.py"
+    offhooks.write_text("# an off-hooks registered hook script\n")
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 ./scripts/x.py"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    paths = set(map(str, _collector.iter_input_paths(root)))
+    assert str(offhooks) in paths                        # resolved under-root script watched
