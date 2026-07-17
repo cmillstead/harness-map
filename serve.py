@@ -232,9 +232,17 @@ def main(argv=None):
     except ValueError as e:
         ap.error(str(e))
 
-    server = build_server(
-        out_dir=Path(args.out_dir), root=Path(args.root), project_root=Path(args.project_root),
-        host=host, port=args.port, no_friction=args.no_friction)
+    try:
+        server = build_server(
+            out_dir=Path(args.out_dir), root=Path(args.root), project_root=Path(args.project_root),
+            host=host, port=args.port, no_friction=args.no_friction)
+    except (CollectorError, render_html.RenderError, OSError, SystemExit) as e:
+        # SystemExit here can ONLY come from write_html_safely's inside-root guard inside
+        # build_server's startup _rebuild call (argparse's own --host SystemExit already
+        # happened above, before this try, and is deliberately NOT caught here) — treat it
+        # as a clean startup failure like the other three, not a bare traceback.
+        print(f"fatal: could not start server: {e}", file=sys.stderr)
+        return 1
     bound_host, bound_port = server.server_address[0], server.server_address[1]
     print(f"Serving http://{bound_host}:{bound_port}/ (Ctrl-C to stop)")
     try:
