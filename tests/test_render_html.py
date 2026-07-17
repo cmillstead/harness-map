@@ -1058,6 +1058,55 @@ def test_keyboard_activation_wired_for_button_cells(tmp_path):
     assert "e.preventDefault()" in text          # Space must not scroll
 
 
+# ============================================================= 7. Overview digest + hero + nav
+def test_overview_default_view_and_mini_grid_nav(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "ov"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered"}],
+        "drag_candidates": [{"n": 1, "surface": "memory", "evidence": "e", "outcome": "keep",
+                             "what_must_survive": "", "risk_if_wrong": ""}]}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    # overview visible by default (not hidden)
+    assert '<section id="view-overview" class="view"' in text
+    assert 'class="mini-grid"' in text
+    # mini-cell navigates to coverage with a target cell id
+    assert 'data-goto="view-coverage"' in text
+    assert 'class="hero-friction' in text
+    # RESOLVED DECISION 1 + finding #4 NEGATIVE contract: the Overview view must carry NO
+    # friction heat — slice the whole view-overview <section> and assert no heat markers.
+    import re
+    ov = re.search(r'<section id="view-overview".*?</section>', text, re.S)
+    assert ov is not None
+    ov_html = ov.group(0)
+    assert "heatable" not in ov_html
+    assert re.search(r'\bfh\d\b', ov_html) is None
+    assert "data-node-key" not in ov_html
+
+
+def test_overview_digest_lists_roadmap_gaps_and_drag(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "ov2"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [], "drag_candidates": [
+        {"n": 1, "surface": "memory", "evidence": "e", "outcome": "probation",
+         "what_must_survive": "", "risk_if_wrong": ""}]}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Needs attention" in text
+    # finding #8: scope to the Overview section — a global "probation" match could be
+    # satisfied by Friction's (moved) drag table even if the Overview digest omitted it.
+    import re
+    ov = re.search(r'<section id="view-overview".*?</section>', text, re.S)
+    assert ov is not None and "probation" in ov.group(0)   # drag candidate in the Overview digest
+
+
 # ================================================================== contract layer (real collector)
 def test_contract_layer_real_collector_output_renders(tmp_path, fake_harness):
     collector_doc = run_collector(fake_harness)

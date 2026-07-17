@@ -952,11 +952,27 @@ th{color:var(--muted);font-weight:600}
 .cell-label{font-size:12px;fill:var(--text);font-family:var(--mono);font-variant-numeric:tabular-nums}
 .legend-swatch{display:inline-block;width:10px;height:10px;margin-right:4px;border-radius:2px;vertical-align:middle}
 .mini-grid{display:flex;flex-wrap:wrap;gap:2px}
-.mini-cell{width:10px;height:10px;border-radius:2px;background:var(--border)}
+.mini-cell{width:10px;height:10px;border-radius:2px;background:var(--border);cursor:pointer}
 .mini-cell.sel{outline:2px solid var(--accent)}
 .mini-cell.verdict-covered{background:var(--sem-covered)}
 .mini-cell.verdict-thin{background:var(--sem-thin)}
 .mini-cell.verdict-empty{background:var(--sem-empty)}
+.mini-cell:focus-visible{outline:2px solid var(--accent)}
+.overview-grid{display:grid;grid-template-columns:1fr 340px;gap:14px;align-items:start}
+.hero-friction-good{border-left:4px solid var(--sem-covered)}
+.hero-friction-warn{border-left:4px solid var(--sem-thin)}
+.hero-friction-bad{border-left:4px solid var(--sem-empty)}
+.hero-friction-neutral{border-left:4px solid var(--border)}
+.hero-friction .count{font-size:1.2rem;font-weight:600;font-family:var(--mono);font-variant-numeric:tabular-nums;margin:4px 0}
+.digest-group{margin-bottom:10px}
+.digest-group h3{font-size:0.82rem;margin:0 0 4px 0;color:var(--muted)}
+.digest-group ul{margin:0;padding:0;list-style:none}
+.digest-group li{font-size:0.82rem;margin:2px 0;display:flex;align-items:center;gap:6px}
+.sev-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+.sev-dot.sev-good{background:var(--sem-covered)}
+.sev-dot.sev-warn{background:var(--sem-thin)}
+.sev-dot.sev-bad{background:var(--sem-empty)}
+.sev-dot.sev-neutral{background:var(--muted)}
 svg text{font-family:inherit}
 footer.sources{border-top:1px solid var(--border);padding:10px 20px;color:var(--muted);font-size:0.78rem}
 .overflow-x{overflow-x:auto}
@@ -1258,14 +1274,90 @@ def _render_copy_island(view_id, payload):
     return f'<script type="application/json" id="copy-{view_id}">{esc_json_script(payload)}</script>'
 
 
-def _render_overview_view(civc, doc, date):
-    """A1 skeleton — mini-grid of verdict-colored cells (no heat, no nav yet: RESOLVED
-    DECISION 1) + a placeholder digest line. Enriched (friction hero, drag/roadmap
-    summaries) in Task 7."""
+# Hygiene digest rows: (overview_model["hygiene"] key, GAUGE_BANDS key for severity, label).
+_HYGIENE_DIGEST_SPECS = (
+    ("over_cap", "instruction_files_over_200", "Files over 200 lines"),
+    ("dup_pairs", "duplicate_pair_count", "Duplicate pairs"),
+    ("phantom_refs", "phantom_ref_count", "Phantom refs"),
+)
+
+
+def _sev_dot(semantic):
+    """Severity dot for a digest row — color via the same `sem-*` CSS custom
+    properties as gauges/verdicts (Task-2 CSS), no inline `style=` (CSP §9-R C)."""
+    return f'<span class="sev-dot sev-{esc_html(semantic)}" aria-hidden="true"></span>'
+
+
+def _render_overview_digest(overview_model):
+    """A3 'Needs attention' digest — severity-dotted roadmap gaps, weight tax, hygiene
+    counts, and drag candidates. Pure render over `build_overview_model`'s output."""
+    gaps = overview_model["roadmap_gaps"]
+    if gaps:
+        gaps_html = "".join(
+            f'<li>{_sev_dot("warn")}{esc_html(verb)} × {esc_html(surface)}</li>'
+            for verb, surface in gaps)
+    else:
+        gaps_html = f'<li>{_sev_dot("good")}no roadmap gaps — full coverage</li>'
+    tax = overview_model["weight_tax"]
+    if tax:
+        tax_html = "".join(
+            f'<li>{_sev_dot("neutral")}<code>{esc_html(c.get("path",""))}</code> '
+            f'— {esc_html(c.get("size",0))} tokens</li>' for c in tax)
+    else:
+        tax_html = f'<li>{_sev_dot("good")}no always-loaded files</li>'
+    hyg = overview_model["hygiene"]
+    hyg_html = "".join(
+        f'<li>{_sev_dot(_gauge_band(band_key, hyg[mkey])[1])}{esc_html(label)}: {esc_html(hyg[mkey])}</li>'
+        for mkey, band_key, label in _HYGIENE_DIGEST_SPECS)
+    drag_rows = overview_model["drag_candidates"]
+    if drag_rows:
+        drag_html = "".join(
+            f'<li>{_sev_dot("bad" if r.get("outcome") == "probation" else "warn")}'
+            f'#{esc_html(r.get("n",""))} {esc_html(r.get("surface",""))} '
+            f'<span class="badge">{esc_html(r.get("outcome",""))}</span></li>'
+            for r in drag_rows)
+    else:
+        drag_html = f'<li>{_sev_dot("good")}no drag candidates flagged</li>'
+    return (
+        '<div class="card"><h2>Needs attention</h2>'
+        f'<div class="digest-group"><h3>Roadmap gaps ({len(gaps)})</h3><ul>{gaps_html}</ul></div>'
+        f'<div class="digest-group"><h3>Weight tax (top always-loaded)</h3><ul>{tax_html}</ul></div>'
+        f'<div class="digest-group"><h3>Hygiene</h3><ul>{hyg_html}</ul></div>'
+        f'<div class="digest-group"><h3>Drag candidates ({len(drag_rows)})</h3><ul>{drag_html}</ul></div>'
+        '</div>'
+    )
+
+
+def _render_friction_hero(friction_model):
+    """AM-2 hero card — friction COUNT + band + top drag candidates. Color-coded via
+    `hero-friction-{semantic}` (Task-2 CSS) only — no `node_key`/heat markers here
+    (RESOLVED DECISION 1: friction on Overview is a count, not node-keyed heat)."""
+    top_drag = friction_model["top_drag"]
+    top_drag_html = "".join(
+        f'<li>#{esc_html(r.get("n",""))} {esc_html(r.get("surface",""))}</li>' for r in top_drag
+    ) or '<li class="empty-state">none</li>'
+    return (
+        f'<div class="hero-friction hero-friction-{esc_html(friction_model["semantic"])}">'
+        '<h2>Friction</h2>'
+        f'<p class="count">{esc_html(friction_model["count"])} events '
+        f'<span class="badge">{esc_html(friction_model["band"])}</span></p>'
+        f'<h3>Top drag candidates</h3><ul>{top_drag_html}</ul>'
+        '</div>'
+    )
+
+
+def _render_overview_view(overview_model, civc):
+    """A3/AM-2 — left: `.mini-grid` of verdict-colored, keyboard-operable mini-cells
+    that navigate to Coverage + preselect the matching inspector cell (shared
+    `[data-goto]` handler, Task 4). Right: the friction hero card + "Needs attention"
+    digest. RESOLVED DECISION 1: mini-cells carry verdict color ONLY — no friction
+    heat, no `node_key`, no `heatable`/`fhN` classes anywhere in this view."""
     if civc["available"]:
         cells_html = "".join(
-            f'<span class="mini-cell verdict-{esc_html(c["verdict"])}" '
-            f'title="{esc_html(c["verb"])} / {esc_html(c["surface"])}: {esc_html(c["verdict"])}"></span>'
+            f'<div class="mini-cell verdict-{esc_html(c["verdict"])}" '
+            f'data-goto="view-coverage" data-cell-id="{esc_html(c["verb"])}-{esc_html(c["surface"])}" '
+            f'role="button" tabindex="0" '
+            f'aria-label="{esc_html(c["verb"])} × {esc_html(c["surface"])}: {esc_html(c["verdict"])}"></div>'
             for c in civc["cells"])
         mini_grid = f'<div class="mini-grid">{cells_html}</div>'
     else:
@@ -1273,10 +1365,10 @@ def _render_overview_view(civc, doc, date):
     return (
         '<section id="view-overview" class="view" role="tabpanel" aria-labelledby="view-btn-overview">'
         f'<div class="view-toolbar">{_render_copy_controls("overview")}</div>'
-        '<div class="card"><h2>Coverage at a glance</h2>'
-        f'{mini_grid}</div>'
-        '<div class="card"><h2>Digest</h2>'
-        f'<p class="digest">harness-map — root: {esc_html(doc.get("root",""))}, date: {esc_html(date)}</p></div>'
+        '<div class="overview-grid">'
+        f'<div class="card"><h2>Coverage at a glance</h2>{mini_grid}</div>'
+        f'<div>{_render_friction_hero(overview_model["friction"])}{_render_overview_digest(overview_model)}</div>'
+        '</div>'
         '</section>'
     )
 
@@ -1572,6 +1664,7 @@ def render_html(date, models, friction, notes):
     heat, joined, footer, codex_aggregate = friction
     phantom_ref_count = len(doc.get("phantom_refs", []) or [])
     friction_total_value = friction_total(joined, codex_aggregate)
+    overview_model = build_overview_model(models, headline, phantom_ref_count, friction_total_value)
 
     warn_count = len(doc.get("inaccessible", []) or []) + len(doc.get("errors", []) or [])
     warn_badge = (f'<a class="warn-badge" href="#provenance" data-target="provenance">'
@@ -1608,7 +1701,7 @@ def render_html(date, models, friction, notes):
         '<button class="action-btn" id="expand-all">Expand all / print view</button>',
         "</div>",
         "<main>",
-        _render_overview_view(models["civc"], doc, date),
+        _render_overview_view(overview_model, models["civc"]),
         _render_coverage_view(models["civc"]),
         _render_weight_view(models["context_weight"], heat),
         _render_friction_view(joined, footer, codex_aggregate, models["drag"]),
