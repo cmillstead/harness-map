@@ -272,6 +272,76 @@ def test_build_dragcandidate_model_absent_synthesis_empty_state():
     assert model == {"available": False, "rows": []}
 
 
+# --- severity bands ---
+def test_gauge_band_thresholds():
+    assert rh._gauge_band("duplicate_pair_count", 0) == ("CLEAN", "good")
+    assert rh._gauge_band("duplicate_pair_count", 2) == ("SOME", "warn")
+    assert rh._gauge_band("duplicate_pair_count", 9) == ("MANY", "bad")
+    assert rh._gauge_band("phantom_ref_count", 0) == ("CLEAN", "good")
+    assert rh._gauge_band("phantom_ref_count", 1) == ("BROKEN", "bad")
+    assert rh._gauge_band("instruction_files_over_200", 0) == ("COMPLIANT", "good")
+
+
+def test_gauge_band_unknown_key_is_neutral():
+    assert rh._gauge_band("always_loaded_file_count", 42) == ("", "neutral")
+
+
+# --- friction total (drives the AM-1 gauge) ---
+def test_friction_total_counts_joined_records_plus_codex_runs():
+    joined = {"n1": [{}, {}], "n2": [{}]}          # 3 joined records
+    codex = {"runs": 4, "by_mode": {}, "by_verdict": {}, "max_revise_round": 0}
+    assert rh.friction_total(joined, codex) == 7
+
+
+def test_friction_total_empty_is_zero():
+    assert rh.friction_total({}, {"runs": 0}) == 0
+
+
+# --- overview digest model ---
+def test_build_overview_model_enumerates_gaps_weight_and_drag():
+    civc = {"available": True, "cells": [
+        {"verb": "Constrain", "surface": "memory", "verdict": "empty"},
+        {"verb": "Afford", "surface": "context", "verdict": "covered"},
+    ]}
+    ctx = {"always": {"cells": [
+        {"path": "CLAUDE.md", "size": 900, "node_key": "always_loaded:CLAUDE.md"},
+        {"path": "rules/a.md", "size": 100, "node_key": "always_loaded:rules/a.md"},
+    ]}}
+    drag = {"available": True, "rows": [{"n": 1, "surface": "memory", "outcome": "keep"}]}
+    headline = {"instruction_files_over_200": 2, "duplicate_pair_count": 1}
+    m = rh.build_overview_model({"civc": civc, "context_weight": ctx, "drag": drag},
+                                headline, phantom_ref_count=3, friction_total_value=5)
+    assert ("Constrain", "memory") in m["roadmap_gaps"]
+    assert ("Afford", "context") not in m["roadmap_gaps"]
+    assert m["weight_tax"][0]["path"] == "CLAUDE.md"       # top by size
+    assert m["hygiene"] == {"over_cap": 2, "dup_pairs": 1, "phantom_refs": 3}
+    assert m["friction"]["count"] == 5
+    assert m["drag_candidates"][0]["n"] == 1
+
+
+# --- copy payloads (pure function) ---
+def test_build_copy_payloads_are_pure_and_have_all_views():
+    doc = _minimal_doc()
+    # reuse the same models render_html builds; construct minimal ones inline
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered"}], "drag_candidates": []}
+    models = {
+        "context_weight": rh.build_contextweight_model(doc),
+        "bipartite": rh.build_bipartite_model(doc),
+        "trend": rh.build_trend_model([("2026-07-15", doc)]),
+        "dupweb": rh.build_dupweb_model(doc),
+        "civc": rh.build_civc_model(synth),
+        "drag": rh.build_dragcandidate_model(synth),
+    }
+    friction = ({}, {}, [], {"runs": 0, "by_mode": {}, "by_verdict": {}, "max_revise_round": 0})
+    p1 = rh.build_copy_payloads("2026-07-15", models, friction, doc)
+    p2 = rh.build_copy_payloads("2026-07-15", models, friction, doc)
+    assert p1 == p2                                          # deterministic
+    assert set(p1) == {"overview", "coverage", "weight", "friction", "hygiene"}
+    assert p1["coverage"].startswith("| ")                  # markdown table
+    assert "|" in p1["coverage"]
+
+
 def test_squarify_geometry_fills_bounding_box():
     items = [{"size": 30, "id": "a"}, {"size": 20, "id": "b"}, {"size": 10, "id": "c"}]
     cells = rh.squarify(items, 0.0, 0.0, 100.0, 60.0)

@@ -435,6 +435,111 @@ def build_dragcandidate_model(synth):
     return {"available": True, "rows": rows}
 
 
+# ---------------------------------------------------------------------- gauges / overview
+# Deterministic severity bands (tunable constants). Ordered tuples: (upper_inclusive|None,
+# band_label, semantic). semantic ∈ {"good","warn","bad","neutral"} -> stripe class.
+GAUGE_BANDS = {
+    "always_loaded_words":        ((8000, "LEAN", "good"), (20000, "MODERATE", "warn"), (None, "HEAVY", "bad")),
+    "always_loaded_tokens_est":   ((6000, "LEAN", "good"), (15000, "MODERATE", "warn"), (None, "HEAVY", "bad")),
+    "instruction_files_over_200": ((0, "COMPLIANT", "good"), (4, "FLAGGED", "warn"), (None, "OVER", "bad")),
+    "duplicate_pair_count":       ((0, "CLEAN", "good"), (3, "SOME", "warn"), (None, "MANY", "bad")),
+    "phantom_ref_count":          ((0, "CLEAN", "good"), (None, "BROKEN", "bad")),
+    "friction_total":             ((0, "CLEAN", "good"), (5, "LOW", "warn"), (None, "HIGH", "bad")),
+}
+
+
+def _gauge_band(key, value):
+    """(band_label, semantic) for a gauge value. Unknown key -> neutral (informational,
+    no severity). First band whose `upper` is None or value <= upper wins."""
+    bands = GAUGE_BANDS.get(key)
+    if not bands:
+        return ("", "neutral")
+    for upper, label, semantic in bands:
+        if upper is None or value <= upper:
+            return (label, semantic)
+    return bands[-1][1], bands[-1][2]
+
+
+def friction_total(joined, codex_aggregate):
+    """AM-1 gauge value: total friction events across the 4 streams = joined telemetry
+    records (decisions/metrics/interventions) + codex runs. This is a JOIN-EVENT count:
+    a basename-ambiguous record that heats N nodes counts N. That is INTENTIONAL
+    (DECISION 6) — this same value is rendered as the Friction view's headline total
+    (Task 8), so the header gauge and the Friction view show ONE consistent friction
+    number rather than two disagreeing totals. Do NOT dedupe to unique source records."""
+    return sum(len(v) for v in joined.values()) + codex_aggregate.get("runs", 0)
+
+
+def build_overview_model(models, headline, phantom_ref_count, friction_total_value):
+    """A3/AM-2 digest — pure aggregation over already-built models. No new data derived:
+    roadmap gaps = empty civc cells; weight tax = top always-loaded files by size;
+    hygiene = headline counts; drag = synthesis rows; friction hero = count + band + top drag."""
+    civc = models["civc"]
+    roadmap_gaps = ([(c["verb"], c["surface"]) for c in civc["cells"] if c["verdict"] == "empty"]
+                    if civc.get("available") else [])
+    always_cells = models["context_weight"]["always"]["cells"]
+    weight_tax = sorted(always_cells, key=lambda c: (-c.get("size", 0), c.get("path", "")))[:3]
+    drag = models["drag"]
+    drag_rows = drag["rows"] if drag.get("available") else []
+    band_label, band_semantic = _gauge_band("friction_total", friction_total_value)
+    return {
+        "roadmap_gaps": roadmap_gaps,
+        "weight_tax": weight_tax,
+        "hygiene": {"over_cap": headline.get("instruction_files_over_200", 0),
+                    "dup_pairs": headline.get("duplicate_pair_count", 0),
+                    "phantom_refs": phantom_ref_count},
+        "drag_candidates": drag_rows,
+        "friction": {"count": friction_total_value, "band": band_label,
+                     "semantic": band_semantic, "top_drag": drag_rows[:3]},
+    }
+
+
+def build_copy_payloads(date, models, friction, doc):
+    """A8: per-view clean-markdown copy payload. Pure function of inputs (deterministic).
+    Rendered into inert <script type='application/json'> islands; read via textContent +
+    JSON.parse at click time."""
+    heat, joined, footer, codex_aggregate = friction
+    civc = models["civc"]
+    # --- coverage: markdown table ---
+    header = "| verb \\ surface | " + " | ".join(SURFACES) + " |"
+    divider = "|" + "---|" * (len(SURFACES) + 1)
+    by_verb = {}
+    for c in civc["cells"]:
+        by_verb.setdefault(c["verb"], {})[c["surface"]] = c["verdict"]
+    cov_rows = ["| " + verb + " | "
+                + " | ".join(by_verb.get(verb, {}).get(s, "empty") for s in SURFACES) + " |"
+                for verb in VERBS]
+    coverage_md = "\n".join([header, divider] + cov_rows) if civc.get("available") \
+        else "_Coverage Matrix unavailable (no synthesis sidecar)._"
+    # --- friction: sentences ---
+    friction_md = "\n".join(f"- {_friction_sentence(f, codex_aggregate)}" for f in footer) \
+        or "_Friction overlay disabled._"
+    friction_md += "\n\n" + _codex_sentence(codex_aggregate)
+    # --- weight: top files per always-loaded category ---
+    weight_lines = [f"- `{c['path']}` — {c.get('size', 0)} tokens"
+                    for c in sorted(models["context_weight"]["always"]["cells"],
+                                    key=lambda c: (-c.get("size", 0), c.get("path", "")))[:10]]
+    weight_md = "\n".join(weight_lines) or "_No always-loaded files._"
+    # --- hygiene: dup pairs + phantom refs ---
+    dup = models["dupweb"]
+    hyg_lines = [f"- dup: `{e['a']}` <-> `{e['b']}` ({_fmt_float(e['score'])})" for e in dup["edges"]]
+    hyg_lines += [f"- phantom: `{r.get('source','')}` -> `{r.get('ref','')}` ({r.get('kind','')})"
+                  for r in dup["phantom_refs"]]
+    hygiene_md = "\n".join(hyg_lines) or "_No hygiene flags._"
+    # --- overview: digest summary ---
+    over = build_overview_model(models, doc.get("headline", {}) or {},
+                                len(doc.get("phantom_refs", []) or []),
+                                friction_total(joined, codex_aggregate))
+    overview_md = (f"# harness-map {date}\n\n"
+                   f"- roadmap gaps: {len(over['roadmap_gaps'])}\n"
+                   f"- friction events: {over['friction']['count']} ({over['friction']['band']})\n"
+                   f"- over-cap files: {over['hygiene']['over_cap']}, "
+                   f"dup pairs: {over['hygiene']['dup_pairs']}, "
+                   f"phantom refs: {over['hygiene']['phantom_refs']}")
+    return {"overview": overview_md, "coverage": coverage_md, "weight": weight_md,
+            "friction": friction_md, "hygiene": hygiene_md}
+
+
 # ---------------------------------------------------------------------------- node index
 def _collect_node_keys(models):
     keys = []
