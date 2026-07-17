@@ -1,3 +1,4 @@
+import dataclasses
 import datetime
 import http.client
 import importlib.util
@@ -526,6 +527,25 @@ def test_truncated_jsonl_resets_offset_and_full_recollects(live_server_with_stre
         "a shrunk/rotated stream must force a FULL re-collect, never a cheap re-render"
 
 
+def test_date_rollover_forces_full_recollect(live_server_with_streams):
+    # C18 PARITY-OR-DEGRADE: the cheap path re-renders friction using the CACHED ctx.date;
+    # across a local midnight, `build_friction_overlay`'s `d > current_date` filter would
+    # EXCLUDE a new-day-dated record under a stale cached date but INCLUDE it under a full
+    # recollect's `today` -- a real divergence, not hypothetical. Force that mismatch with a
+    # REAL dataclasses.replace on the REAL served ctx (no clock mock, no mock of any kind)
+    # and confirm the watcher takes the FULL rebuild path (collect_count increments) rather
+    # than the cheap path (which would leave collect_count unchanged).
+    server, out_dir, root, stream_path = live_server_with_streams
+    with server.state.lock:
+        server.state.ctx = dataclasses.replace(server.state.ctx, date="2000-01-01")
+    before_count = server.state.collect_count
+    _append_decision_record(stream_path)
+    _wait_settle(server)
+    assert server.state.collect_count > before_count, \
+        "a ctx.date/today mismatch must force a full recollect, not the cheap path " \
+        "(C18 PARITY-OR-DEGRADE)"
+
+
 def test_cheap_path_failure_degrades_to_full_recollect(live_server_with_streams_slow_root):
     # Real (no-mock) fault injection: swap the html artifact for a non-empty directory so
     # write_html_safely's os.replace() raises a real OSError -- but ONLY block the cheap
@@ -536,6 +556,10 @@ def test_cheap_path_failure_degrades_to_full_recollect(live_server_with_streams_
     # (present from server startup, so they are baseline state, never a mid-test
     # collector-input change) widen collector.main()'s real wall-clock walk time enough for
     # the watchdog to reliably win the removal race before the fallback's own write.
+    # WALL-CLOCK MARGIN ASSUMPTION: this margin is a fault-injection TEST-ONLY dependency --
+    # the product's own degrade-to-full-rebuild path is race-free regardless of timing; only
+    # this test's watchdog-vs-fallback-write race could flake if a future CI-speed change
+    # erodes the 300-file walk's margin over the rmtree.
     server, out_dir, root, stream_path = live_server_with_streams_slow_root
     port = server.server_address[1]
     today = datetime.date.today().strftime("%Y-%m-%d")

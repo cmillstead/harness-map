@@ -294,7 +294,11 @@ def _stream_paths_list(streams):
 
 def _stream_size(path):
     """Current byte size of one friction-stream path, or None if it does not exist or is
-    not a regular file (an absent/inaccessible stream has nothing to grow from)."""
+    not a regular file (an absent/inaccessible stream has nothing to grow from).
+
+    APPEND-ONLY ASSUMPTION: all four telemetry JSONL streams are written append-only, so a
+    size delta is a sufficient change signal here -- an in-place same-size rewrite would be
+    missed, but cannot occur under an append-only writer."""
     try:
         st = os.stat(path)
     except OSError:
@@ -343,6 +347,22 @@ def _classify_stream_sweep(state):
     return "none", []
 
 
+def _try_full_rebuild(state, out_dir, root, project_root, label):
+    """Runs one full `_rebuild`, containing a failure (CollectorError / RenderError /
+    OSError) HERE -- logs "{label} failed, keeping last-good render" to stderr and returns
+    False -- instead of letting it propagate. Extracted so every full-rebuild call site in
+    `_watcher_loop` (the collector-input-change path, the truncated/force-full path, the
+    C18 date-rollover degrade, and the cheap-path failure degrade) shares the identical
+    keep-last-good/don't-advance-snapshot semantics behind one implementation."""
+    try:
+        _rebuild(state, out_dir, root, project_root)
+    except (CollectorError, render_html.RenderError, OSError) as exc:
+        print(f"harness-map watcher: {label} failed, keeping last-good render: {exc}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, debounce_seconds):
     """Daemon poll loop: every `poll_seconds` build a fresh collector-input snapshot; on any
     difference enter a debounce that keeps re-sweeping until `debounce_seconds` pass with NO
@@ -362,7 +382,14 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
     it is cheap enough to run every settled sweep, and `collect_count` is NEVER bumped by
     it); a shrink/rotation ("truncated") resets that stream's offset to 0 and forces a FULL
     `_rebuild` instead (D5) so the offset never drifts negative. Any exception from the
-    cheap path degrades to a full `_rebuild` (D5) rather than propagating."""
+    cheap path degrades to a full `_rebuild` (D5) rather than propagating.
+
+    C18 PARITY-OR-DEGRADE: the cheap path re-renders using the CACHED `state.ctx.date` (set
+    at the last full rebuild), but `build_friction_overlay` filters telemetry records
+    against the CURRENT date -- across a local midnight, a cached yesterday's-date would
+    exclude a new-day-dated record that a full recollect (today's date) would include. So
+    BEFORE taking the "grown" cheap path, the loop compares today's date to `ctx.date`; on a
+    mismatch it forces a full `_rebuild` instead, exactly like the "truncated" case."""
     while not stop_event.is_set():
         if stop_event.wait(poll_seconds):
             return
@@ -387,11 +414,7 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
                     current = settled
                 if stop_event.is_set():
                     return
-                try:
-                    _rebuild(state, out_dir, root, project_root)
-                except (CollectorError, render_html.RenderError, OSError) as exc:
-                    print(f"harness-map watcher: rebuild failed, keeping last-good render: {exc}",
-                          file=sys.stderr)
+                if not _try_full_rebuild(state, out_dir, root, project_root, label="rebuild"):
                     continue  # do NOT advance the snapshot -> the change is retried next sweep
                 state.watch_snapshot = current
                 _seed_stream_offsets(state)  # a full collect just re-read every stream whole
@@ -407,27 +430,34 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
                 for key in changed:
                     state.stream_offsets[key] = 0
             if classification == "truncated" or _FORCE_FULL_RECOLLECT:
-                try:
-                    _rebuild(state, out_dir, root, project_root)
-                except (CollectorError, render_html.RenderError, OSError) as exc:
-                    print(f"harness-map watcher: full recollect failed, keeping last-good "
-                          f"render: {exc}", file=sys.stderr)
+                if not _try_full_rebuild(state, out_dir, root, project_root, label="full recollect"):
                     continue
                 _seed_stream_offsets(state)
                 continue
 
-            # classification == "grown": B2 cheap path -- degrades to a full recollect (D5)
-            # on ANY failure, never publishing a partial/broken cheap render.
+            # classification == "grown": C18 date-rollover check BEFORE taking the cheap
+            # path -- the cheap path reuses the CACHED ctx.date, which diverges from a full
+            # recollect's `today` across a local midnight (see the docstring above). On a
+            # mismatch, force a full rebuild instead of the cheap path.
+            with state.lock:
+                ctx_date = state.ctx.date
+            today = datetime.now().strftime("%Y-%m-%d")
+            if ctx_date != today:
+                if not _try_full_rebuild(state, out_dir, root, project_root,
+                                          label="date-rollover recollect"):
+                    continue
+                _seed_stream_offsets(state)
+                continue
+
+            # classification == "grown", dates match: B2 cheap path -- degrades to a full
+            # recollect (D5) on ANY failure, never publishing a partial/broken cheap render.
             try:
                 _rebuild_friction_only(state, out_dir)
-            except (OSError, render_html.RenderError) as exc:
+            except Exception as exc:  # noqa: BLE001 - deliberate degrade-to-full-rebuild fallback, NOT a swallow: an unenumerated cheap-render fault (e.g. TypeError/KeyError/ValueError from an unexpected friction-stream shape) falls back to the strictly-more-complete full rebuild path below; any failure THERE is handled by _try_full_rebuild's own error handling plus the outer per-iteration backstop.
                 print(f"harness-map watcher: cheap friction re-render failed ({exc}), "
                       f"degrading to full recollect", file=sys.stderr)
-                try:
-                    _rebuild(state, out_dir, root, project_root)
-                except (CollectorError, render_html.RenderError, OSError) as exc2:
-                    print(f"harness-map watcher: full recollect fallback also failed, "
-                          f"keeping last-good render: {exc2}", file=sys.stderr)
+                if not _try_full_rebuild(state, out_dir, root, project_root,
+                                          label="full recollect fallback"):
                     continue
             _seed_stream_offsets(state)
         except Exception as e:  # noqa: BLE001 - deliberate daemon-thread backstop: catches the UNENUMERATED types on purpose; does NOT swallow (logs repr) and does NOT advance the snapshot (retried next sweep).
