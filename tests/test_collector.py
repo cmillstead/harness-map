@@ -1092,6 +1092,49 @@ def test_iter_input_paths_covers_registered_offhooks_script(fake_harness):
     assert str(offhooks) in paths                        # resolved under-root script watched
 
 
+def test_iter_input_paths_watches_symlinked_test_dir(fake_harness):
+    # Codex r5 FIX 1: a skill whose tests/ dir is a SYMLINK to an external target flips
+    # has_test via _skill_has_test_asset (which FOLLOWS the link with is_dir()/glob), but
+    # os.walk(followlinks=False) never revisits the link as its own dirpath. iter_input_paths
+    # must still yield the symlink PATH so the watcher snapshots it for membership — otherwise
+    # deleting/recreating the target flips has_test with no watcher signal.
+    root = fake_harness
+    target = root.parent / "external-tests"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "test_x.py").write_text("def test_x():\n    assert True\n")
+    link = root / "skills" / "demo" / "tests"
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("platform cannot create directory symlinks")
+    paths = set(map(str, _collector.iter_input_paths(root)))
+    assert str(link) in paths                            # symlinked tests/ dir is membership-watched
+
+
+def test_iter_input_paths_watches_lexical_inroot_hook_symlink(fake_harness):
+    # Codex r5 FIX 2: a registered hook command "./scripts/x.py" whose leaf LIVES under root
+    # but is a SYMLINK to an external target is stat()'d by reconcile_hooks at the lexical
+    # in-root path (root/scripts/x.py) — .resolve() would push it outside root and drop it.
+    # iter_input_paths must yield that lexical path so a target change fires a re-render.
+    root = fake_harness
+    external = root.parent / "external-script.py"
+    external.write_text("# external hook target\n")
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    lexical = scripts / "x.py"
+    try:
+        os.symlink(external, lexical)
+    except (OSError, NotImplementedError):
+        pytest.skip("platform cannot create symlinks")
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 ./scripts/x.py"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    paths = set(map(str, _collector.iter_input_paths(root)))
+    # reconcile_hooks stat()s root/scripts/x.py (the lexical path); the watched path must equal it.
+    assert str(lexical) in paths
+
+
 def test_iter_input_paths_is_superset_of_real_build_document_reads(fake_harness):
     # FIX 4: instrumented proof — run a REAL build_document pass while RECORDING every
     # filesystem path actually read (stat/open/glob/rglob/scandir wrapped to record-then-

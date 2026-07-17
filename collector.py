@@ -1306,10 +1306,19 @@ def _iter_descendant_dirs(base):
     followlinks=False (Codex r3 FIX 3): os.walk still ENTERS `base` even when `base` itself is a
     deploy-symlinked skill dir (the first hop stays -- os.walk always descends into the walk
     root), so a symlinked skill's own contents remain watched; but a symlink NESTED inside the
-    target is NOT chased into. This matches the collector's own reads -- pathlib rglob does not
+    target is NOT chased INTO. This matches the collector's own reads -- pathlib rglob does not
     follow nested directory symlinks either -- so the walked set stays a SUPERSET of what
     build_document reads while avoiding heavy I/O (and any symlink cycle) on nested external
-    trees. Well-known generated subtrees (_PRUNED_WALK_DIRS) are pruned before descending."""
+    trees. Well-known generated subtrees (_PRUNED_WALK_DIRS) are pruned before descending.
+
+    Directory symlinks (Codex r5 FIX 1): os.walk(followlinks=False) LISTS a nested directory
+    symlink in `dirnames` but never revisits it as its own `dirpath`, so it would never be
+    yielded — yet _skill_has_test_asset FOLLOWS such a link (its `(skill_dir/"tests").is_dir()`
+    and `d.glob(...)` both chase the target), making has_test depend on the link TARGET. So
+    each retained directory symlink is yielded HERE by its own path (membership-watchable) but
+    NOT traversed into, mirroring _skill_has_test_asset's is_dir()/glob follow. Only the
+    symlinked children are yielded from `dirnames` — a plain subdir is already yielded when
+    os.walk descends into it as `dirpath`, so this avoids a double-yield."""
     try:
         if not base.is_dir():
             return
@@ -1319,6 +1328,16 @@ def _iter_descendant_dirs(base):
         # Prune generated/non-input subtrees IN PLACE so os.walk never descends into them.
         dirnames[:] = [d for d in dirnames if d not in _PRUNED_WALK_DIRS]
         yield Path(dirpath)
+        # Yield retained directory symlinks WITHOUT following them: os.walk(followlinks=False)
+        # never revisits them as `dirpath`, but the collector's has_test check reads through
+        # them, so the watcher must snapshot the link path for membership (keeps the superset).
+        for name in dirnames:
+            child = Path(dirpath) / name
+            try:
+                if child.is_symlink() and child.is_dir():
+                    yield child
+            except OSError:
+                continue
 
 
 def iter_input_paths(root, project_root=None):
@@ -1434,10 +1453,18 @@ def iter_input_paths(root, project_root=None):
         script_path, _note = _script_from_command(command, root)
         if script_path is None:
             continue
+        # Root-containment is decided LEXICALLY (Codex r5 FIX 2): resolve only the DIRECTORY
+        # chain (so root-matching is correct through deploy-symlinked parents) and KEEP the
+        # leaf name unresolved, so a leaf like ./scripts/x.py that LIVES under root but is a
+        # symlink to an external target still counts as in-root. reconcile_hooks stat()s the
+        # SAME lexical path (script_path.stat() follows the leaf symlink to that target), so the
+        # watched path added below EQUALS what reconcile_hooks reads. A truly-external absolute
+        # path still fails relative_to and stays un-watchable (documented blind spot, case c).
         try:
-            script_path.resolve().relative_to(root_resolved)
+            lexical = script_path.parent.resolve() / script_path.name
+            lexical.relative_to(root_resolved)
         except (ValueError, OSError):
-            continue  # resolves outside root (case c) — genuinely un-watchable via a root walk
+            continue  # genuinely outside root (case c) — un-watchable via a root walk
         paths.add(script_path)
 
     return sorted(paths, key=str)
