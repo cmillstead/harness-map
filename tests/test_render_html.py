@@ -726,7 +726,7 @@ def test_friction_overlay_legend_and_heat_classes_render(tmp_path):
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     assert 'id="friction-legend"' in text
     assert "most-active" in text
-    assert 'class="cell-rect fh1"' in text
+    assert 'class="cell-rect heatable fh1"' in text
     assert 'class="friction-badge"' in text
 
 
@@ -742,10 +742,24 @@ def test_friction_overlay_css_dims_unheated_cells_and_marks_toggle_pressed(tmp_p
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
-    assert "body.friction-on .cell-rect:not(.fh1):not(.fh2):not(.fh3):not(.fh4){opacity:0.25}" in text
+    assert "body.friction-on .heatable:not(.fh1):not(.fh2):not(.fh3):not(.fh4){opacity:0.25}" in text
     assert "body.friction-on .fh1,body.friction-on .fh2,body.friction-on .fh3,body.friction-on .fh4{opacity:1}" in text
     assert "stroke-width:4" in text
-    assert '#friction-toggle[aria-pressed="true"]{background:var(--crit)' in text
+    assert '#friction-toggle[aria-pressed="true"]{background:var(--sem-empty)' in text
+
+
+def test_design_tokens_define_both_themes_and_semantic_trio(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "tokens"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "@media (prefers-color-scheme: light)" in text
+    assert "--sem-covered" in text and "--sem-thin" in text and "--sem-empty" in text
+    assert "tabular-nums" in text
+    assert "ui-monospace" in text
 
 
 def test_civc_notes_and_legend_render(tmp_path):
