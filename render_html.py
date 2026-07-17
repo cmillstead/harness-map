@@ -1017,6 +1017,10 @@ td.verdict-empty{color:var(--muted);border:2px dashed var(--sem-empty);backgroun
 .mode-ladder .ladder-panel{display:block}
 .copy-btn{font-size:0.78rem;padding:4px 10px}
 .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.pill{display:inline-block;border-radius:5px;padding:1px 6px;font-size:0.72rem;border:1px solid var(--sem-thin);color:var(--sem-thin)}
+.pill-critical{border-color:var(--sem-empty);color:var(--sem-empty);font-weight:600}
+.hygiene-unchecked{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600}
+.warn-count{font-weight:600;color:var(--sem-empty)}
 """
 _HEAT_CSS = "".join(
     f"body.friction-on .fh{i}{{stroke:{color};stroke-width:4}}"
@@ -1534,12 +1538,16 @@ def _render_trend_body(model):
 
 
 def _render_dupweb_body(model):
+    """A6 duplication presentation (finding #5b): one row per pair as `{a} ⇄ {b}` …
+    `{pct}% shared` — the arrow between the two node keys and a percent, never the
+    old separate node-key columns + a raw decimal score."""
     if model["edges"]:
         rows = "".join(
-            f'<tr><td>{esc_html(e["a"])}</td><td>{esc_html(e["b"])}</td>'
-            f'<td>{esc_html(round(e["score"], 3))}</td><td>{esc_html(e["shared_sample"])}</td></tr>'
+            f'<tr><td>{esc_html(e["a"])} ⇄ {esc_html(e["b"])}</td>'
+            f'<td class="tabular-nums">{_fmt_float(e["score"] * 100)}% shared</td>'
+            f'<td>{esc_html(e["shared_sample"])}</td></tr>'
             for e in model["edges"])
-        dup_body = f'<div class="overflow-x"><table><tr><th>File A</th><th>File B</th><th>Score</th><th>Shared sample</th></tr>{rows}</table></div>'
+        dup_body = f'<div class="overflow-x"><table><tr><th>Pair</th><th>Overlap</th><th>Sample</th></tr>{rows}</table></div>'
     else:
         dup_body = '<p class="empty-state">no duplicate pairs above threshold</p>'
     if model["phantom_refs"]:
@@ -1557,22 +1565,57 @@ def _render_dupweb_body(model):
     )
 
 
+def _render_length_flags_body(doc):
+    """A6 length-flag table (finding #5b): a CRITICAL pill at >600 lines, a plain
+    'over' pill otherwise. Iterated sorted by `(-lines, path)` — a total key, so
+    output stays deterministic regardless of the flag list's original order."""
+    flags = doc.get("instruction_length_flags", []) or []
+    if flags:
+        rows = "".join(
+            (f'<tr><td>{esc_html(f["path"])}</td><td class="tabular-nums">{esc_html(f["lines"])}</td>'
+             f'<td><span class="pill pill-critical">critical</span></td></tr>')
+            if f.get("lines", 0) > 600 else
+            (f'<tr><td>{esc_html(f["path"])}</td><td class="tabular-nums">{esc_html(f["lines"])}</td>'
+             f'<td><span class="pill">over</span></td></tr>')
+            for f in sorted(flags, key=lambda f: (-f.get("lines", 0), f["path"]))
+        )
+        body = f'<div class="overflow-x"><table><tr><th>Path</th><th>Lines</th><th>Flag</th></tr>{rows}</table></div>'
+    else:
+        body = '<p class="empty-state">no instruction files over cap</p>'
+    return f'<div class="card"><h2>Length flags</h2>{body}</div>'
+
+
+def _render_unchecked_binaries_body(doc):
+    """finding #5a: `unchecked_binary_count` moved off the gauge readout (Task 3) —
+    it MUST resurface here in a dedicated element so it is never silently dropped.
+    Kept out of the folded Trend table's reach (a stray digit there can't false-green
+    this element's own class scope)."""
+    n = (doc.get("headline", {}) or {}).get("unchecked_binary_count", 0)
+    return f'<div class="card"><p>Unchecked binaries: <span class="hygiene-unchecked">{esc_html(n)}</span></p></div>'
+
+
 def _render_hygiene_view(doc, models):
-    """Composes the former bipartite/trend/dupweb tab bodies under ONE view (RESOLVED
-    DECISION 2 — hook wiring folded here, never dropped)."""
+    """Composes the former bipartite/trend/dupweb tab bodies plus length flags
+    (finding #5b) and the unchecked-binary count (finding #5a) under ONE view
+    (RESOLVED DECISION 2 — hook wiring folded here as 'Wiring integrity', never
+    dropped)."""
     return (
         '<section id="view-hygiene" class="view" role="tabpanel" aria-labelledby="view-btn-hygiene">'
         f'<div class="view-toolbar">{_render_copy_controls("hygiene")}</div>'
-        f'{_render_bipartite_body(models["bipartite"])}'
-        f'{_render_trend_body(models["trend"])}'
+        f'{_render_length_flags_body(doc)}'
         f'{_render_dupweb_body(models["dupweb"])}'
+        f'{_render_unchecked_binaries_body(doc)}'
+        f'{_render_trend_body(models["trend"])}'
+        '<h2>Wiring integrity</h2>'
+        f'{_render_bipartite_body(models["bipartite"])}'
         '</section>'
     )
 
 
-def _render_provenance_footer(doc, skipped, footer):
+def _render_provenance_footer(doc, skipped, footer, date):
     """Former `_render_notes_tab`, relocated to a `<footer>` (never `<main>`) — the
-    data-sources line stays always-visible; the rest collapses behind `<details>`."""
+    root/date/generated_at + data-sources + warning-count lines stay always-visible;
+    the rest collapses behind `<details>`."""
     def _list(items, empty_msg):
         if not items:
             return f'<p class="empty-state">{esc_html(empty_msg)}</p>'
@@ -1581,6 +1624,7 @@ def _render_provenance_footer(doc, skipped, footer):
     inaccessible = doc.get("inaccessible", []) or []
     blind_spots = doc.get("blind_spots", []) or []
     errors = doc.get("errors", []) or []
+    warn_count = len(inaccessible) + len(errors)
     inacc_html = ("<ul>" + "".join(
         f'<li>{esc_html(i.get("path",""))} ({esc_html(i.get("reason",""))})</li>' for i in inaccessible)
         + "</ul>") if inaccessible else '<p class="empty-state">none</p>'
@@ -1590,8 +1634,11 @@ def _render_provenance_footer(doc, skipped, footer):
     footer_line = " | ".join(f'{f["stream"]}: {f["status"]}' for f in footer) or "friction disabled"
     return (
         '<footer class="sources" id="provenance">'
+        f'<div>root: {esc_html(doc.get("root",""))} | date: {esc_html(date)} '
+        f'| generated_at: {esc_html(doc.get("generated_at",""))}</div>'
         f'<div>data sources: {esc_html(footer_line)}</div>'
-        '<details><summary>Provenance & notes</summary>'
+        f'<div class="warn-count">{warn_count} warning(s)</div>'
+        '<details><summary>provenance detail</summary>'
         f'<div class="card"><h2>Inaccessible ({len(inaccessible)})</h2>{inacc_html}</div>'
         f'<div class="card"><h2>Blind spots ({len(blind_spots)})</h2>{_list(blind_spots, "none")}</div>'
         f'<div class="card"><h2>Errors ({len(errors)})</h2>{_list(errors, "none")}</div>'
@@ -1775,7 +1822,7 @@ def render_html(date, models, friction, notes):
         _render_copy_island("weight", copy_payloads["weight"]),
         _render_copy_island("friction", copy_payloads["friction"]),
         _render_copy_island("hygiene", copy_payloads["hygiene"]),
-        _render_provenance_footer(doc, skipped, footer),
+        _render_provenance_footer(doc, skipped, footer, date),
         f"<script>{STATIC_SCRIPT}</script>",
         "</body></html>",
     ]

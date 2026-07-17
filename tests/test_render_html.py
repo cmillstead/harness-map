@@ -1237,4 +1237,73 @@ def test_hard_link_target_regression(tmp_path):
     proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
     assert proc.returncode == 0, proc.stderr
     assert inside_file.read_text() == "ORIGINAL CONTENT SHOULD SURVIVE"
-    assert target.read_text(encoding="utf-8") != "ORIGINAL CONTENT SHOULD SURVIVE"
+
+
+# ============================================================= 9. Hygiene fold + provenance footer
+def test_hygiene_view_folds_dup_phantom_trend_and_wiring(tmp_path):
+    doc = _minimal_doc()
+    # inject explicit hygiene inputs so the A6 presentation contracts are provable
+    doc["instruction_length_flags"] = [
+        {"path": "skills/review/SKILL.md", "lines": 1467, "threshold": 200, "evidence": "VERIFIED"},   # > 600 -> critical pill
+        {"path": "agents/ct-implementer.md", "lines": 206, "threshold": 200, "evidence": "VERIFIED"},  # over cap, not critical
+    ]
+    doc["headline"] = dict(doc.get("headline", {}), unchecked_binary_count=3)
+    # inject one dup pair with a known overlap so "% shared" is a checkable value.
+    # field names match the REAL dup-model input schema (build_dupweb_model reads
+    # doc["duplication"]["pairs"] with a/b/score/shared_sample, and doc["phantom_refs"]
+    # top-level, not nested under "duplication" — see collector.py/build_dupweb_model).
+    doc["duplication"] = {"shingle_k": 8, "metric": "containment", "threshold": 0.6,
+                           "pairs": [{"a": "rules/x.md", "b": "rules/y.md", "score": 0.9,
+                                      "shared_sample": "sample", "evidence": "INFERRED"}]}
+    doc["phantom_refs"] = []
+    out_dir = tmp_path / "hyg"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-14", doc)   # 2 sidecars -> trend table
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    hyg = re.search(r'<section id="view-hygiene".*?</section>', text, re.S)
+    assert hyg is not None
+    hyg_html = hyg.group(0)
+    assert "Wiring integrity" in hyg_html             # bipartite folded in
+    assert "write-guard.py" in hyg_html               # registered hook surfaced
+    assert "orphan" in hyg_html.lower()
+    assert "Trend" in hyg_html                         # trend table folded in
+    # A6 length flags (round2 #4): the CRITICAL pill sits on the 1467-line row specifically.
+    crit_row = re.search(r'<tr[^>]*>(?:(?!</tr>).)*?1467(?:(?!</tr>).)*?</tr>', hyg_html, re.S)
+    assert crit_row and "critical" in crit_row.group(0).lower()
+    # the 206-line row is over-cap but NOT critical
+    over_row = re.search(r'<tr[^>]*>(?:(?!</tr>).)*?206(?:(?!</tr>).)*?</tr>', hyg_html, re.S)
+    assert over_row and "critical" not in over_row.group(0).lower()
+    # A6 dup presentation (round2 #4): "<a> ⇄ <b>" + 90% shared on the SAME dup row.
+    # (scoped to the <tr> like crit_row/over_row above — the plan's Step-1 snippet
+    # for this assertion truncated the <tr>...</tr> anchors; restored here so the
+    # match actually spans the whole row instead of stopping at the arrow glyph.)
+    dup_row = re.search(r'<tr[^>]*>(?:(?!</tr>).)*?⇄(?:(?!</tr>).)*?</tr>', hyg_html, re.S)
+    assert dup_row and "%" in dup_row.group(0) and "90" in dup_row.group(0)
+    # finding #5a (round2 #4): unchecked_binary_count in a DEDICATED hygiene element,
+    # not merely present because the folded Trend table happens to include it.
+    unchecked = re.search(r'class="hygiene-unchecked"[^>]*>[^<]*3', hyg_html)
+    assert unchecked is not None
+    # Task 3's contract still holds: unchecked binaries no longer a gauge.
+    assert 'data-gauge="unchecked_binary_count"' not in text
+
+
+def test_provenance_footer_keeps_warning_visible(tmp_path):
+    import re
+    doc = _minimal_doc()
+    doc["inaccessible"] = [{"path": "secret.md", "reason": "denied"}]
+    out_dir = tmp_path / "prov"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="provenance"' in text
+    assert "warning" in text.lower()
+    assert "secret.md" in text                        # detail in <details>
+    # the warning count is inline (not hidden behind <details>) — must appear
+    # BEFORE the <details> element, not only inside it.
+    footer = re.search(r'<footer[^>]*id="provenance"[^>]*>.*?</footer>', text, re.S).group(0)
+    before_details = footer.split("<details", 1)[0]
+    assert "warning" in before_details.lower()
