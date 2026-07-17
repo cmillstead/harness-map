@@ -1101,13 +1101,36 @@ def _csp_hash(block):
 
 
 # --------------------------------------------------------------------------- HTML render
+# A5 fidelity (finding #6): approved label auto-hide threshold — a tile smaller than
+# this in either dimension can't fit a readable label, so its `<text>` is skipped.
+# Module-level so the test can pin the approved value (a 56x18 regression must fail).
+TREEMAP_LABEL_MIN_W = 58
+TREEMAP_LABEL_MIN_H = 30
+# Value-scaled fill-opacity ramp (bigger tax = more opaque). Module-level for
+# determinism; MIN keeps the smallest cell visibly on-canvas rather than near-invisible.
+_OPACITY_MIN = 0.35
+_OPACITY_MAX = 1.0
+
+
+def _scaled_opacity(size, max_size):
+    """Map a cell's size onto the `[_OPACITY_MIN, _OPACITY_MAX]` ramp relative to the
+    largest cell in the same tree, so opacity communicates relative weight (A5).
+    `max_size<=0` (degenerate/empty tree) falls back to full opacity."""
+    if max_size <= 0:
+        return _OPACITY_MAX
+    ratio = max(0.0, min(1.0, float(size) / float(max_size)))
+    return _OPACITY_MIN + (_OPACITY_MAX - _OPACITY_MIN) * ratio
+
+
 def _render_treemap_svg(tree, heat, dom_id):
     """Heat is shown two ways once the friction overlay toggle is on (never color
     alone, §UI): a CSS-class-driven stroke ramp on the cell, AND a text join-count
     badge in the corner. Both are hidden-by-default via `body.friction-on` CSS so the
-    toggle button has a visible, demonstrable effect."""
+    toggle button has a visible, demonstrable effect. Fill opacity is value-scaled
+    (A5) via the SVG `fill-opacity` attribute — never `style=`."""
     w, h = tree["canvas_w"], tree["canvas_h"]
-    parts = [f'<svg viewBox="0 0 {_fmt_float(w)} {_fmt_float(h)}" '
+    max_size = max((float(c.get("size", 0)) for c in tree["cells"]), default=0.0)
+    parts = [f'<svg id="{esc_html(dom_id)}" viewBox="0 0 {_fmt_float(w)} {_fmt_float(h)}" '
              f'width="100%" height="360" role="img" aria-labelledby="{esc_html(dom_id)}-title">']
     parts.append(f'<title id="{esc_html(dom_id)}-title">Context-weight treemap</title>')
     for c in tree["cells"]:
@@ -1115,18 +1138,65 @@ def _render_treemap_svg(tree, heat, dom_id):
         bucket = min(heat_n, len(HEAT_RAMP)) if heat_n else 0
         rect_cls = f"cell-rect heatable fh{bucket}" if bucket else "cell-rect heatable"
         label = esc_html(Path(c["path"]).name)
+        opacity = _fmt_float(_scaled_opacity(c.get("size", 0), max_size))
         parts.append(
             f'<rect x="{c["x"]}" y="{c["y"]}" width="{c["w"]}" height="{c["h"]}" '
-            f'fill="{esc_html(c.get("fill", "#56b4e9"))}" class="{rect_cls}" '
-            f'data-node-key="{esc_html(c["node_key"])}"><title>{esc_html(c["path"])} '
-            f'(friction: {heat_n})</title></rect>')
-        if float(c["w"]) > 56 and float(c["h"]) > 18:
+            f'fill="{esc_html(c.get("fill", "#56b4e9"))}" fill-opacity="{opacity}" '
+            f'class="{rect_cls}" data-node-key="{esc_html(c["node_key"])}">'
+            f'<title>{esc_html(c["path"])} (friction: {heat_n})</title></rect>')
+        if float(c["w"]) > TREEMAP_LABEL_MIN_W and float(c["h"]) > TREEMAP_LABEL_MIN_H:
             tx, ty = _fmt_float(float(c["x"]) + 2), _fmt_float(float(c["y"]) + 13)
             parts.append(f'<text x="{tx}" y="{ty}" class="cell-label">{label}</text>')
             if heat_n:
                 bx = _fmt_float(float(c["x"]) + float(c["w"]) - 2)
                 parts.append(f'<text x="{bx}" y="{ty}" text-anchor="end" '
                               f'class="friction-badge">{heat_n}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+# Ladder layout constants (module-level for determinism — §4.6).
+_LADDER_ROW_H = 22.0
+_LADDER_LABEL_W = 220.0
+_LADDER_BAR_MAX_W = 300.0
+_LADDER_COUNT_W = 50.0
+
+
+def _render_ladder_svg(tree, heat, dom_id):
+    """A5 alternative representation: one horizontal bar per cell instead of nested
+    rectangles — same cells as the matching treemap (`tree["cells"]`), sorted by
+    descending size (path as the tie-break, for a total-order determinism key, §4.4).
+    Reuses the treemap's `fhN` heat-bucket logic (AM-3) so ladder bars heat too; bar
+    width is the SVG `width` attribute, value-scaled to the row's max size — never
+    `style=`."""
+    cells = sorted(tree["cells"], key=lambda c: (-float(c.get("size", 0)), c["path"]))
+    max_size = max((float(c.get("size", 0)) for c in cells), default=0.0)
+    row_h = _LADDER_ROW_H
+    canvas_w = _LADDER_LABEL_W + _LADDER_BAR_MAX_W + _LADDER_COUNT_W
+    canvas_h = max(row_h * len(cells), row_h)
+    parts = [f'<svg id="{esc_html(dom_id)}" viewBox="0 0 {_fmt_float(canvas_w)} {_fmt_float(canvas_h)}" '
+             f'width="100%" height="{_fmt_float(canvas_h)}" role="img" '
+             f'aria-labelledby="{esc_html(dom_id)}-title">']
+    parts.append(f'<title id="{esc_html(dom_id)}-title">Context-weight ladder</title>')
+    for i, c in enumerate(cells):
+        heat_n = heat.get(c["node_key"], 0)
+        bucket = min(heat_n, len(HEAT_RAMP)) if heat_n else 0
+        bar_cls = f"ladder-bar heatable fh{bucket}" if bucket else "ladder-bar heatable"
+        size = float(c.get("size", 0))
+        width = _LADDER_BAR_MAX_W * (size / max_size) if max_size > 0 else 0.0
+        y = row_h * i
+        label = esc_html(Path(c["path"]).name)
+        text_y = _fmt_float(y + row_h - 7)
+        parts.append(
+            f'<text x="0" y="{text_y}" class="cell-label">{label}</text>'
+            f'<rect x="{_fmt_float(_LADDER_LABEL_W)}" y="{_fmt_float(y + 3)}" '
+            f'width="{_fmt_float(width)}" height="{_fmt_float(row_h - 6)}" '
+            f'fill="{esc_html(c.get("fill", "#56b4e9"))}" class="{bar_cls}" '
+            f'data-node-key="{esc_html(c["node_key"])}">'
+            f'<title>{esc_html(c["path"])} (friction: {heat_n})</title></rect>'
+            f'<text x="{_fmt_float(_LADDER_LABEL_W + _LADDER_BAR_MAX_W + 8)}" '
+            f'y="{text_y}" class="cell-label">{esc_html(c.get("size", 0))}</text>'
+        )
     parts.append("</svg>")
     return "".join(parts)
 
@@ -1293,13 +1363,22 @@ def _render_coverage_view(civc):
 def _render_weight_view(model, heat):
     """Verbatim body of the former `_render_context_weight_tab`, now also carrying the
     friction legend + overlay toggle (moved here — heat only ever lands on these two
-    treemaps, RESOLVED DECISION 1)."""
-    always_svg = _render_treemap_svg(model["always"], heat, "always-treemap")
-    ondemand_svg = _render_treemap_svg(model["on_demand"], heat, "ondemand-treemap")
+    treemaps, RESOLVED DECISION 1) and the A5/AM-3 treemap<->ladder toggle: both
+    representations are pre-rendered for both panels so the client just flips a CSS
+    class (§ progressive-enhancement pattern) — no re-render at click time."""
+    always_treemap = _render_treemap_svg(model["always"], heat, "treemap-always")
+    always_ladder = _render_ladder_svg(model["always"], heat, "ladder-always")
+    ondemand_treemap = _render_treemap_svg(model["on_demand"], heat, "treemap-ondemand")
+    ondemand_ladder = _render_ladder_svg(model["on_demand"], heat, "ladder-ondemand")
     return (
         '<section id="view-weight" class="view" role="tabpanel" aria-labelledby="view-btn-weight">'
         '<div class="view-toolbar">'
-        '<button class="action-btn" id="friction-toggle" aria-pressed="false">Show friction overlay</button>'
+        '<div class="seg" id="weight-mode" role="group" aria-label="weight representation">'
+        '<button class="seg-btn" data-mode="treemap" aria-pressed="true">▦ Treemap</button>'
+        '<button class="seg-btn" data-mode="ladder" aria-pressed="false">▤ Ladder</button>'
+        '</div>'
+        '<button class="action-btn" id="friction-toggle" aria-pressed="false">'
+        'Show friction heat on treemap + ladder cells</button>'
         f'{_render_copy_controls("weight")}'
         '</div>'
         '<div class="friction-legend" id="friction-legend">'
@@ -1309,10 +1388,15 @@ def _render_weight_view(model, heat):
         '<span class="legend-entry"><span class="legend-swatch fh4"></span>most-active</span>'
         '<span class="legend-note">every heated cell also shows a join-count '
         'badge in the corner (color is never the only signal)</span></div>'
+        '<p class="subtitle">On-demand skills cost only when invoked; MEMORY.md + '
+        'CLAUDE.md are the real per-turn tax — the treemap/ladder toggle shows the '
+        'same weights two ways.</p>'
         '<div class="card"><h2>Always-loaded (by category, sized by est. tokens)</h2>'
-        f'{always_svg}</div>'
+        f'<div class="treemap-panel">{always_treemap}</div>'
+        f'<div class="ladder-panel">{always_ladder}</div></div>'
         '<div class="card"><h2>On-demand (skills / phases / prompts / agents / memory, sized by words)</h2>'
-        f'{ondemand_svg}</div></section>'
+        f'<div class="treemap-panel">{ondemand_treemap}</div>'
+        f'<div class="ladder-panel">{ondemand_ladder}</div></div></section>'
     )
 
 

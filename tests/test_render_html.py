@@ -795,6 +795,81 @@ def test_friction_overlay_css_dims_unheated_cells_and_marks_toggle_pressed(tmp_p
     assert '#friction-toggle[aria-pressed="true"]{background:var(--sem-empty)' in text
 
 
+def test_weight_view_has_treemap_and_ladder_both_prerendered(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "weight"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="weight-mode"' in text
+    assert 'data-mode="treemap"' in text and 'data-mode="ladder"' in text
+    assert 'aria-pressed="true"' in text            # treemap default pressed
+    assert 'class="treemap-panel"' in text and 'class="ladder-panel"' in text
+    assert "real per-turn tax" in text               # A5 "story" note present (finding #6)
+    assert 'id="treemap-always"' in text and 'id="treemap-ondemand"' in text
+    # ladder is SVG bars (no style= for width). Bars always carry `heatable` (structural);
+    # fhN is added only when heated, so match the class PREFIX (finding #4: an exact
+    # 'class="ladder-bar"' with trailing quote can never match 'ladder-bar heatable ...').
+    assert 'class="ladder-bar heatable' in text
+
+
+def test_weight_heat_lands_on_both_always_and_on_demand(tmp_path):
+    """Finding #4: prove heat reaches the always-loaded AND the on-demand treemap
+    separately — a global `count('heatable fh') >= 2` can be satisfied by ONE node
+    duplicated across a single panel's treemap+ladder. Scope to each named panel and
+    require a real data-node-key on the heated cell."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "wheat"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    # decisions heats an always-loaded node AND coding-team (on-demand)
+    decisions = out_dir / "d.jsonl"
+    decisions.write_text(
+        json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n"
+        + json.dumps({"date": "2026-07-01", "component": "coding-team"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    # slice out the always-loaded and on-demand treemap panels by their dom ids
+    always = re.search(r'id="treemap-always".*?(?=id="treemap-ondemand"|class="ladder-panel")', text, re.S)
+    ondemand = re.search(r'id="treemap-ondemand".*?(?=class="ladder-panel"|</section>)', text, re.S)
+    assert always and ondemand
+    # each panel independently carries a heated, node-keyed cell. Real keys are
+    # `always_loaded:...a.md` and `on_demand:coding-team` (round2 #1) -> match by substring.
+    assert re.search(r'heatable fh\d"[^>]*data-node-key="[^"]*a\.md"', always.group(0)) \
+        or re.search(r'data-node-key="[^"]*a\.md"[^>]*heatable fh', always.group(0))
+    assert re.search(r'heatable fh\d"[^>]*data-node-key="[^"]*coding-team"', ondemand.group(0)) \
+        or re.search(r'data-node-key="[^"]*coding-team"[^>]*heatable fh', ondemand.group(0))
+    # AM-3: a HEATED, node-keyed LADDER bar must also carry fhN (not just structural heatable)
+    ladder = re.search(r'class="ladder-panel".*?</section>', text, re.S)
+    assert ladder and re.search(r'ladder-bar heatable fh\d"[^>]*data-node-key="[^"]*a\.md"',
+                                ladder.group(0))
+    assert 'id="friction-toggle"' in text            # overlay control local to weight view
+
+
+def test_treemap_label_threshold_constants_are_approved_values():
+    """A5 + finding #6 (round2): pin the label auto-hide threshold to the approved ~58x30 —
+    exposing it as module constants makes the test threshold-sensitive (a 56x18 constant
+    FAILS here), instead of the earlier vacuous 'a fill-opacity exists' check."""
+    assert rh.TREEMAP_LABEL_MIN_W >= 58
+    assert rh.TREEMAP_LABEL_MIN_H >= 30
+
+
+def test_treemap_uses_value_scaled_opacity(tmp_path):
+    """A5 + finding #6 (round2): opacity must be VALUE-SCALED — assert the treemap emits at
+    least TWO DISTINCT fill-opacity values (a constant opacity would collapse to one), via
+    an SVG attribute (never style=). Fixture guarantees size variance among always-loaded
+    cells. If _minimal_doc lacks size variance, inject two cells of clearly different size."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "tmopac"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    opacities = set(re.findall(r'<rect[^>]*\bfill-opacity="([0-9.]+)"', text))
+    assert len(opacities) >= 2, f"opacity not value-scaled (distinct values: {opacities})"
+    assert 'style=' not in text                      # opacity via attribute, never inline style
+
+
 def test_design_tokens_define_both_themes_and_semantic_trio(tmp_path):
     doc = _minimal_doc()
     out_dir = tmp_path / "tokens"
