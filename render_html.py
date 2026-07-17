@@ -1369,10 +1369,17 @@ def _render_copy_controls(view_id):
     return f'<button class="copy-btn action-btn" data-copy-target="copy-{view_id}">Copy</button>'
 
 
+def _render_json_island(island_id, payload):
+    """Shared inert data-island builder — `type="application/json"` so it is never
+    counted as an executable `<script>` (CSP §9-R C); the payload is a plain markdown
+    string. Both the A8 per-view copy islands and the B3/D6 per-finding brief islands
+    delegate here, differing only in their id-string format."""
+    return f'<script type="application/json" id="{island_id}">{esc_json_script(payload)}</script>'
+
+
 def _render_copy_island(view_id, payload):
-    """A8 inert data island — `type="application/json"` so it is never counted as an
-    executable `<script>` (CSP §9-R C); the payload is a plain markdown string."""
-    return f'<script type="application/json" id="copy-{view_id}">{esc_json_script(payload)}</script>'
+    """A8 inert data island — see `_render_json_island`."""
+    return _render_json_island(f"copy-{view_id}", payload)
 
 
 # --------------------------------------------------------------------------- B3/D6 action-launcher briefs
@@ -1436,12 +1443,10 @@ def build_gap_stub_brief(verb, surface):
 
 
 def _render_brief_island(kind, index, markdown):
-    """B3/D6 inert data island for one action-launcher brief — same `type=
-    "application/json"` + `esc_json_script` pattern as `_render_copy_island`, keyed
-    `brief-{kind}-{index}` so each finding's island id is derived deterministically
+    """B3/D6 inert data island for one action-launcher brief — see `_render_json_island`,
+    keyed `brief-{kind}-{index}` so each finding's island id is derived deterministically
     from its position in the finding's own (already-deterministic) render order."""
-    island_id = f"brief-{kind}-{index}"
-    return f'<script type="application/json" id="{island_id}">{esc_json_script(markdown)}</script>'
+    return _render_json_island(f"brief-{kind}-{index}", markdown)
 
 
 def _render_brief_button(kind, index):
@@ -1774,18 +1779,16 @@ def _render_length_flags_body(doc):
     flags = doc.get("instruction_length_flags", []) or []
     if flags:
         sorted_flags = sorted(flags, key=lambda f: (-f.get("lines", 0), f["path"]))
-        rows = "".join(
-            (f'<tr><td>{esc_html(f["path"])}</td><td class="tabular-nums">{esc_html(f["lines"])}</td>'
-             f'<td><span class="pill pill-critical">critical</span></td>'
-             f'<td>{_render_brief_button("overcap", i)}{_render_brief_island("overcap", i, build_refactor_brief(f))}</td>'
-             '</tr>')
-            if f.get("lines", 0) > 600 else
-            (f'<tr><td>{esc_html(f["path"])}</td><td class="tabular-nums">{esc_html(f["lines"])}</td>'
-             f'<td><span class="pill">over</span></td>'
-             f'<td>{_render_brief_button("overcap", i)}{_render_brief_island("overcap", i, build_refactor_brief(f))}</td>'
-             '</tr>')
-            for i, f in enumerate(sorted_flags)
-        )
+
+        def _row(i, f):
+            pill = ('<span class="pill pill-critical">critical</span>'
+                    if f.get("lines", 0) > 600 else '<span class="pill">over</span>')
+            return (f'<tr><td>{esc_html(f["path"])}</td><td class="tabular-nums">{esc_html(f["lines"])}</td>'
+                    f'<td>{pill}</td>'
+                    f'<td>{_render_brief_button("overcap", i)}{_render_brief_island("overcap", i, build_refactor_brief(f))}</td>'
+                    '</tr>')
+
+        rows = "".join(_row(i, f) for i, f in enumerate(sorted_flags))
         body = f'<div class="overflow-x"><table><tr><th>Path</th><th>Lines</th><th>Flag</th><th>Action</th></tr>{rows}</table></div>'
     else:
         body = '<p class="empty-state">no instruction files over cap</p>'
@@ -1811,7 +1814,7 @@ def _render_hygiene_view(doc, models):
         'aria-labelledby="view-btn-hygiene" tabindex="-1">'
         f'<div class="view-toolbar">{_render_copy_controls("hygiene")}</div>'
         f'{_render_length_flags_body(doc)}'
-        f'{_render_dupweb_body(models["dupweb"], doc.get("duplication", {}).get("pairs", []) or [])}'
+        f'{_render_dupweb_body(models["dupweb"], (doc.get("duplication") or {}).get("pairs", []) or [])}'
         f'{_render_unchecked_binaries_body(doc)}'
         f'{_render_trend_body(models["trend"])}'
         '<h2>Wiring integrity</h2>'

@@ -1864,3 +1864,23 @@ def test_static_script_byte_unchanged_by_action_launcher_briefs():
     STATIC_SCRIPT itself carries no brief-specific code and its hash never moves."""
     assert "brief-" not in rh.STATIC_SCRIPT
     assert "build_consolidation_brief" not in rh.STATIC_SCRIPT
+
+
+def test_dupweb_renders_when_duplication_is_null(tmp_path):
+    """T6 audit FIX 1: a hand-edited/corrupted sidecar with `"duplication": null`
+    (structurally valid top-level dict + schema_version, malformed nested value) must
+    not crash the whole render. `_render_hygiene_view` mirrors the existing
+    `build_dupweb_model` guard (`doc.get("duplication", {}) or {}`) rather than a bare
+    `doc.get("duplication", {}).get("pairs", [])`, which raises AttributeError when the
+    key is present with value `None` (the `.get` default only covers a MISSING key)."""
+    doc = _minimal_doc()
+    doc["duplication"] = None
+    out_dir = tmp_path / "null_duplication"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    assert "AttributeError" not in proc.stderr
+    assert "Traceback" not in proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "no duplicate pairs above threshold" in text
