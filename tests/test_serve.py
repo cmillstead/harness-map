@@ -260,8 +260,11 @@ def _open_events(port):
     return conn, resp
 
 
-def _await_refresh(resp, timeout):
-    deadline = time.monotonic() + timeout
+def _iter_refresh_lines(resp, deadline):
+    """Shared SSE read loop: yield once per `event: refresh` line until `deadline`,
+    stopping on a socket timeout or EOF (heartbeat comment lines are skipped). Both
+    _await_refresh (first hit) and _drain_refresh_count (count) reuse this so the read
+    loop + exception handling live in exactly one place."""
     while time.monotonic() < deadline:
         try:
             line = resp.fp.readline()
@@ -270,25 +273,19 @@ def _await_refresh(resp, timeout):
         if not line:
             break
         if b"event: refresh" in line:
-            return True
+            yield line
+
+
+def _await_refresh(resp, timeout):
+    for _ in _iter_refresh_lines(resp, time.monotonic() + timeout):
+        return True
     return False
 
 
 def _drain_refresh_count(resp, quiet_for):
     """Read the stream for `quiet_for` seconds, counting `event: refresh` lines
     (heartbeat comment lines are ignored)."""
-    deadline = time.monotonic() + quiet_for
-    count = 0
-    while time.monotonic() < deadline:
-        try:
-            line = resp.fp.readline()
-        except (socket.timeout, TimeoutError, OSError):
-            break
-        if not line:
-            break
-        if b"event: refresh" in line:
-            count += 1
-    return count
+    return sum(1 for _ in _iter_refresh_lines(resp, time.monotonic() + quiet_for))
 
 
 def test_sse_refresh_on_file_change(live_server_watching):
@@ -408,3 +405,31 @@ def test_watched_set_equals_collector_iter_input_paths(live_server_watching_proj
     snap = srv._watched_snapshot(root, proj)
     from_iter = srv.collector.iter_input_paths(root, proj)
     assert set(map(str, snap.keys())) == set(map(str, from_iter))
+
+
+def test_watcher_survives_uncaught_exception(live_server_watching):
+    # HIGH: the watcher must survive an exception that is NOT one of the enumerated
+    # (CollectorError / RenderError / OSError) types, or the daemon thread dies and the
+    # dashboard silently freezes on last-good forever. Real injection (no mocks): drop a
+    # TODAY-dated synthesis sidecar whose JSON is VALID but whose shape makes render raise
+    # deep inside render_from_out_dir — build_dragcandidate_model sorts drag_candidates by
+    # r["n"], so mixed int/str "n" values raise a TypeError (confirmed: not RenderError,
+    # not OSError). The collector regenerates the MAP sidecar on each rebuild but never the
+    # synthesis file, so this poison persists across the triggered rebuild.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    before_body = _get_root_body(port)
+    before_count = server.state.collect_count
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    synth = out_dir / f"harness-synthesis-{today}.json"
+    # schema_version present so load_sidecar accepts the file (else it is skipped as
+    # invalid and never reaches the model builders); the mixed-type "n" is what raises.
+    synth.write_text('{"schema_version": 1, "drag_candidates": [{"n": 1}, {"n": "not-a-number"}]}')
+    # Trigger a rebuild by touching a WATCHED input under --root (out_dir is not watched).
+    (root / "rules" / "trigger_uncaught.md").write_text("x\n")
+    _wait_settle(server)
+    # Without the outer backstop the TypeError kills the thread; with it the thread survives,
+    # last-good is still served, and no successful recollect happened (snapshot not advanced).
+    assert server._watcher_thread.is_alive(), "watcher thread died on an unenumerated exception"
+    assert _get_root_body(port) == before_body
+    assert server.state.collect_count == before_count

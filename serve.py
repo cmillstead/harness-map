@@ -231,30 +231,45 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
     (CollectorError / RenderError / OSError) is contained HERE — logged, last-good ctx kept,
     no broadcast, loop continues — so a transient collect/render/write fault never kills the
     thread or serves a broken document. The stored snapshot advances only after a successful
-    settled rebuild, so a persistent fault is retried on the next sweep rather than swallowed."""
+    settled rebuild, so a persistent fault is retried on the next sweep rather than swallowed.
+    An outer catch-all backstop (see the inline comment) additionally guarantees the thread
+    survives any UNENUMERATED exception, so no unexpected fault can silently freeze the dashboard."""
     while not stop_event.is_set():
         if stop_event.wait(poll_seconds):
             return
-        current = _watched_snapshot(root, project_root)
-        if current == state.watch_snapshot:
-            continue
-        # Change detected: debounce until the snapshot holds steady for one full window.
-        while not stop_event.is_set():
-            if stop_event.wait(debounce_seconds):
-                return
-            settled = _watched_snapshot(root, project_root)
-            if settled == current:
-                break
-            current = settled
-        if stop_event.is_set():
-            return
+        # OUTER BACKSTOP: the enumerated (CollectorError/RenderError/OSError) tuple below
+        # cannot cover every fault -- _watched_snapshot runs before it, and render_from_out_dir
+        # can raise UNENUMERATED types (e.g. TypeError/KeyError/ValueError from an unexpected
+        # sidecar/synthesis shape). An escape would kill this daemon thread and freeze the
+        # dashboard on last-good FOREVER while SSE keeps heartbeating (browser looks healthy,
+        # never refreshes). So the WHOLE per-iteration body is wrapped to log repr(e) and
+        # continue WITHOUT advancing the snapshot. The stop-Event `return`s are not exceptions,
+        # so the clean-shutdown path passes straight through this backstop untouched.
         try:
-            _rebuild(state, out_dir, root, project_root)
-        except (CollectorError, render_html.RenderError, OSError) as exc:
-            print(f"harness-map watcher: rebuild failed, keeping last-good render: {exc}",
+            current = _watched_snapshot(root, project_root)
+            if current == state.watch_snapshot:
+                continue
+            # Change detected: debounce until the snapshot holds steady for one full window.
+            while not stop_event.is_set():
+                if stop_event.wait(debounce_seconds):
+                    return
+                settled = _watched_snapshot(root, project_root)
+                if settled == current:
+                    break
+                current = settled
+            if stop_event.is_set():
+                return
+            try:
+                _rebuild(state, out_dir, root, project_root)
+            except (CollectorError, render_html.RenderError, OSError) as exc:
+                print(f"harness-map watcher: rebuild failed, keeping last-good render: {exc}",
+                      file=sys.stderr)
+                continue  # do NOT advance the snapshot -> the change is retried next sweep
+            state.watch_snapshot = current
+        except Exception as e:  # noqa: BLE001 - deliberate daemon-thread backstop: catches the UNENUMERATED types on purpose; does NOT swallow (logs repr) and does NOT advance the snapshot (retried next sweep).
+            print(f"harness-map watcher: unexpected error, keeping last-good render: {e!r}",
                   file=sys.stderr)
             continue  # do NOT advance the snapshot -> the change is retried next sweep
-        state.watch_snapshot = current
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -308,18 +323,31 @@ class RequestHandler(BaseHTTPRequestHandler):
         forward each `refresh` token as an SSE event. On an empty get (no refresh within one
         HEARTBEAT) write a `: keepalive` comment so the connection stays established — the
         heartbeat interval is < RequestHandler.timeout (10s), otherwise a healthy stream is
-        misclassified as idle and reaped. A broken/reset socket unregisters the queue and
-        returns; the finally guarantees unregistration on every exit path."""
+        misclassified as idle and reaped. A broken/reset/timed-out socket (on either the
+        header write or a streaming write) unregisters the queue and returns; the finally
+        guarantees unregistration on every exit path."""
         state = self.server.state
         heartbeat = getattr(self.server, "heartbeat_seconds", HEARTBEAT_SECONDS)
         client_queue = state.register_client()
+        # A stuck/slow-reading or disconnected client makes wfile.write/flush raise on the
+        # connection socket. Because RequestHandler.timeout sets socket.settimeout(10), a
+        # stalled write raises TimeoutError (socket.timeout is now an alias of TimeoutError)
+        # after 10s; a hard disconnect raises BrokenPipeError/ConnectionResetError; other
+        # socket faults surface as a bare OSError. All four are expected client-side end
+        # states, NOT server bugs -- catch them and return cleanly (the finally unregisters)
+        # so socketserver never prints a traceback to stderr. This is a specific, minimal
+        # tuple (the first three are OSError subclasses), NOT a broad `except Exception`.
+        _client_gone = (BrokenPipeError, ConnectionResetError, TimeoutError, OSError)
         try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self._send_security_headers()
-            self.end_headers()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self._send_security_headers()
+                self.end_headers()
+            except _client_gone:
+                return  # client vanished during the header write -> nothing to stream
             while True:
                 try:
                     client_queue.get(timeout=heartbeat)
@@ -329,7 +357,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 try:
                     self.wfile.write(payload)
                     self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except _client_gone:
                     return
         finally:
             state.unregister_client(client_queue)
