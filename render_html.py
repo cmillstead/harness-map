@@ -981,6 +981,13 @@ td.verdict-thin{background:rgba(230,159,0,0.15)}
 td.verdict-empty{color:var(--muted);border:2px dashed var(--sem-empty);background:repeating-linear-gradient(135deg,rgba(209,36,47,0.12) 0,rgba(209,36,47,0.12) 4px,transparent 4px,transparent 8px)}
 .badge.verdict-thin{border-color:var(--sem-thin);color:var(--sem-thin)}
 .badge.verdict-covered{border-color:var(--sem-covered);color:var(--sem-covered)}
+.coverage-grid{display:grid;grid-template-columns:1fr 320px;gap:14px;align-items:start}
+.matrix-cell{cursor:pointer}
+.matrix-cell.sel{outline:2px solid var(--accent);outline-offset:-2px}
+.matrix-cell:focus-visible{outline:2px solid var(--accent)}
+.inspector-panel .surface-tag{color:var(--muted);font-size:0.72rem;text-transform:uppercase;margin:0}
+.inspector-panel .verb-tag{font-weight:600;margin:2px 0 6px 0}
+.inspector-panel .evidence{margin:6px 0}
 .seg .seg-btn{border:none}
 .treemap-panel{display:block}
 .ladder-panel{display:none}
@@ -1204,34 +1211,75 @@ def _render_overview_view(civc, doc, date):
     )
 
 
+# A4: the cell selected by default on first render — also the nav TARGET clicked from
+# the Overview mini-cell (Task 7). Must exist in VERBS x SURFACES.
+COVERAGE_PRESELECT = ("Constrain", "memory")
+
+
 def _render_coverage_view(civc):
-    """Verbatim matrix half of the former `_render_civc_drag_tab` — the drag half now
-    lives in `_render_friction_view` (IA mapping)."""
+    """Sticky-inspector rework of the former `_render_civc_drag_tab` matrix half — the
+    drag half now lives in `_render_friction_view` (IA mapping). Every one of the 36
+    verb x surface cells is pre-rendered as a clickable `.matrix-cell` plus a matching
+    `.inspector-panel`; client-side selection (Task 4's shared script) just toggles the
+    `sel` class / `hidden` attribute — no data is computed or fetched at click time."""
     if not civc["available"]:
         civc_body = '<p class="empty-state">synthesis sidecar not found — Coverage Matrix unavailable this run.</p>'
-    else:
-        legend = (
-            '<p class="civc-legend">Coverage scale (empty cells are intentional roadmap, not blanks): '
-            '<span class="badge verdict-empty">empty</span> → '
-            '<span class="badge verdict-thin">thin</span> → '
-            '<span class="badge verdict-covered">covered</span>. '
-            'Cells with a "note" expose it via a details toggle.</p>'
+        return (
+            '<section id="view-coverage" class="view" role="tabpanel" aria-labelledby="view-btn-coverage">'
+            f'<div class="view-toolbar">{_render_copy_controls("coverage")}</div>'
+            '<div class="card"><h2>Coverage Matrix</h2>'
+            '<p class="subtitle">six verbs (what the harness does to behavior) '
+            '× six surfaces (what it’s made of)</p>'
+            f'{civc_body}</div></section>'
         )
-        header = "".join(f"<th>{esc_html(s)}</th>" for s in SURFACES)
-        rows = []
-        by_verb = {}
-        for c in civc["cells"]:
-            by_verb.setdefault(c["verb"], []).append(c)
-        for verb in VERBS:
-            cell_html = []
-            for c in by_verb.get(verb, []):
-                note_html = (f'<details><summary>note</summary>{esc_html(c["note"])}</details>'
-                             if c.get("note") else "")
-                cell_html.append(
-                    f'<td class="verdict-{esc_html(c["verdict"])}">{esc_html(c["verdict"])}{note_html}</td>')
-            rows.append(f"<tr><th>{esc_html(verb)}</th>{''.join(cell_html)}</tr>")
-        civc_body = (legend + f'<div class="overflow-x"><table><tr><th></th>{header}</tr>'
-                     f'{"".join(rows)}</table></div>')
+    legend = (
+        '<p class="civc-legend">Coverage scale (empty cells are intentional roadmap, not blanks): '
+        '<span class="badge verdict-empty">empty</span> → '
+        '<span class="badge verdict-thin">thin</span> → '
+        '<span class="badge verdict-covered">covered</span>. '
+        'Cells with a "note" expose it via a details toggle.</p>'
+    )
+    header = "".join(f"<th>{esc_html(s)}</th>" for s in SURFACES)
+    by_key = {(c["verb"], c["surface"]): c for c in civc["cells"]}
+    rows = []
+    panels = []
+    for verb in VERBS:
+        cell_html = []
+        for surface in SURFACES:
+            c = by_key.get((verb, surface), {"verdict": "empty", "evidence": None, "note": ""})
+            verdict = c.get("verdict", "empty")
+            cell_id = f"{verb}-{surface}"
+            preselect = (verb, surface) == COVERAGE_PRESELECT
+            sel_token = " sel" if preselect else ""
+            # Fixed attribute order — `class` FIRST, `sel` token AFTER the verdict
+            # token, then `data-cell-id` — the A4 preselect test asserts this exact
+            # string; do not reorder.
+            cell_html.append(
+                f'<td class="matrix-cell verdict-{esc_html(verdict)}{sel_token}" '
+                f'data-cell-id="{esc_html(cell_id)}" role="button" tabindex="0">'
+                f'<span class="badge verdict-{esc_html(verdict)}">{esc_html(verdict)}</span></td>'
+            )
+            evidence = c.get("evidence")
+            note = c.get("note") or ""
+            evidence_html = (f'<p class="evidence">{esc_html(evidence)}</p>' if evidence
+                              else '<p class="evidence empty-state">no evidence recorded</p>')
+            note_html = (f'<details><summary>note</summary>{esc_html(note)}</details>' if note
+                         else '<p class="empty-state">no note</p>')
+            hidden_attr = "" if preselect else " hidden"
+            panels.append(
+                f'<div class="inspector-panel" data-cell-id="{esc_html(cell_id)}"{hidden_attr}>'
+                f'<p class="surface-tag">{esc_html(surface)}</p>'
+                f'<p class="verb-tag">{esc_html(verb)}</p>'
+                f'<span class="badge verdict-{esc_html(verdict)}">{esc_html(verdict)}</span>'
+                f'{evidence_html}{note_html}</div>'
+            )
+        rows.append(f"<tr><th>{esc_html(verb)}</th>{''.join(cell_html)}</tr>")
+    civc_body = (
+        legend + '<div class="coverage-grid">'
+        f'<div class="overflow-x"><table><tr><th></th>{header}</tr>'
+        f'{"".join(rows)}</table></div>'
+        f'<aside class="inspector">{"".join(panels)}</aside></div>'
+    )
     return (
         '<section id="view-coverage" class="view" role="tabpanel" aria-labelledby="view-btn-coverage">'
         f'<div class="view-toolbar">{_render_copy_controls("coverage")}</div>'

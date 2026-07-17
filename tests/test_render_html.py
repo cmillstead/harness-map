@@ -862,6 +862,46 @@ def test_civc_note_injection_is_escaped(tmp_path, payload):
     assert payload not in text
 
 
+def test_coverage_matrix_cells_clickable_and_inspectors_prerendered(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "cov"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered", "evidence": "V", "note": "n"}],
+        "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert text.count('class="matrix-cell') == 36
+    assert text.count('class="inspector-panel"') == 36
+    assert 'data-cell-id="Afford-context"' in text
+    # preselect Constrain-memory: verdict token sits BETWEEN matrix-cell and sel
+    # (impl class order is fixed: `matrix-cell verdict-<v> sel`, then data-cell-id).
+    # Constrain-memory has no synth cell -> verdict "empty", so the class is exact:
+    assert 'class="matrix-cell verdict-empty sel" data-cell-id="Constrain-memory"' in text
+    # empty cells get dashed+hatch verdict class
+    assert "verdict-empty" in text
+
+
+def test_coverage_verdict_fill_classes(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "cov2"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered"},
+        {"verb": "Evolve", "surface": "observability", "verdict": "thin"}], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    # finding #8: assert the NEW combined matrix-cell class (bare "verdict-covered" already
+    # exists pre-rework -> a false-green). The reworked Coverage view fills the CELL itself.
+    import re
+    assert re.search(r'class="matrix-cell verdict-covered[ "]', text)
+    assert re.search(r'class="matrix-cell verdict-thin[ "]', text)
+
+
 def test_friction_stream_malformed_lines_skip_and_count(tmp_path):
     doc = _minimal_doc()
     out_dir = tmp_path / "malformed"
