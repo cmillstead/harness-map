@@ -668,6 +668,19 @@ def test_render_from_out_dir_raises_on_missing_sidecar(tmp_path):
         rh.render_from_out_dir(empty, date=None, streams=None, no_friction=True)
 
 
+def test_default_streams_keys_and_paths():
+    # §9-R D: resolved through the (fake, session-scoped) $HOME at CALL time, matching
+    # main()'s own default-path construction exactly (serve.py's _build_streams delegates
+    # to this same helper, so the two can never drift).
+    streams = rh.default_streams()
+    assert set(streams) == {"decisions", "metrics", "codex", "interventions"}
+    home = Path(os.environ["HOME"])
+    assert streams["decisions"] == home / ".claude" / "harness-decisions.jsonl"
+    assert streams["metrics"] == home / ".claude" / "harness-metrics.jsonl"
+    assert streams["codex"] == home / ".claude" / "harness-codex.jsonl"
+    assert streams["interventions"] is None
+
+
 # ============================================================= 5. degradation / edge matrix
 def test_missing_out_dir_is_fatal(tmp_path):
     proc = run_render(tmp_path / "does-not-exist", "--no-friction")

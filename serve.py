@@ -187,18 +187,13 @@ class _Server(ThreadingHTTPServer):
 
 
 def _build_streams(no_friction):
-    """Mirrors render_html.main's --no-friction branching exactly: real ~/.claude
-    JSONL paths unless friction is disabled, in which case None (render_from_out_dir
-    treats a None streams value as the all-None/disabled dict)."""
+    """Mirrors render_html.main's --no-friction branching exactly: delegates to the
+    shared render_html.default_streams() helper (real ~/.claude JSONL paths) unless
+    friction is disabled, in which case None (render_from_out_dir treats a None streams
+    value as the all-None/disabled dict)."""
     if no_friction:
         return None
-    home = Path.home()
-    return {
-        "decisions": home / ".claude" / "harness-decisions.jsonl",
-        "metrics": home / ".claude" / "harness-metrics.jsonl",
-        "codex": home / ".claude" / "harness-codex.jsonl",
-        "interventions": None,
-    }
+    return render_html.default_streams()
 
 
 def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,

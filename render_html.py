@@ -1961,6 +1961,20 @@ class RenderContext:
     html_bytes: bytes        # html_text.encode("utf-8", "backslashreplace") — the served bytes
 
 
+def default_streams():
+    """The default friction-telemetry stream paths: real ~/.claude JSONL paths, resolved
+    through $HOME at CALL time (never frozen at import — §9-R D hermeticity contract).
+    Shared by main()'s CLI-override branch and serve.py's _build_streams so the two
+    default-path sets can never drift apart."""
+    home = Path.home()
+    return {
+        "decisions": home / ".claude" / "harness-decisions.jsonl",
+        "metrics": home / ".claude" / "harness-metrics.jsonl",
+        "codex": home / ".claude" / "harness-codex.jsonl",
+        "interventions": None,
+    }
+
+
 def render_from_out_dir(out_dir, date=None, streams=None, no_friction=False):
     """Build the HTML IN MEMORY (D3) from the collector sidecar(s) already present in
     `out_dir` — the exact pipeline main() uses, minus the file write. Returns a frozen
@@ -2051,13 +2065,15 @@ def main(argv=None):
     if args.no_friction:
         streams = None
     else:
-        home = Path.home()
-        streams = {
-            "decisions": Path(args.decisions_file) if args.decisions_file else home / ".claude" / "harness-decisions.jsonl",
-            "metrics": Path(args.metrics_file) if args.metrics_file else home / ".claude" / "harness-metrics.jsonl",
-            "codex": Path(args.codex_file) if args.codex_file else home / ".claude" / "harness-codex.jsonl",
-            "interventions": Path(args.interventions_file) if args.interventions_file else None,
-        }
+        streams = default_streams()
+        if args.decisions_file:
+            streams["decisions"] = Path(args.decisions_file)
+        if args.metrics_file:
+            streams["metrics"] = Path(args.metrics_file)
+        if args.codex_file:
+            streams["codex"] = Path(args.codex_file)
+        if args.interventions_file:
+            streams["interventions"] = Path(args.interventions_file)
 
     try:
         ctx = render_from_out_dir(
