@@ -1167,6 +1167,18 @@ STATIC_SCRIPT = """
     views.forEach(function(v){ v.hidden = false; }); }); }
 
   if (views.length){ activate('view-overview'); }
+
+  // Live-serve progressive enhancement: when served by serve.py, subscribe to the SSE
+  // /events endpoint and reload on 'refresh'. On file:// there is no endpoint, so this
+  // MUST be a silent no-op with zero behavior change (D4). Feature-detected + fully
+  // guarded; addEventListener only, no inline handlers, no style writes.
+  try {
+    if (window.EventSource) {
+      var es = new EventSource('/events');
+      es.addEventListener('refresh', function(){ location.reload(); });
+      es.addEventListener('error', function(){ /* file:// or dropped: swallow, no reconnect storm handling needed in v1 */ });
+    }
+  } catch (e) { /* EventSource construction failed (file://): no-op */ }
 })();
 """
 
@@ -1883,7 +1895,7 @@ def render_html(date, models, friction, notes):
     script_hash = _csp_hash(STATIC_SCRIPT)
     csp = (f'<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
            f"style-src 'sha256-{style_hash}'; script-src 'sha256-{script_hash}'; "
-           f"connect-src 'none'; base-uri 'none'; form-action 'none'\">")
+           f"connect-src 'self'; base-uri 'none'; form-action 'none'\">")
 
     view_buttons = "".join(
         f'<button class="view-btn" id="view-btn-{vid.split("-", 1)[1]}" role="tab" '

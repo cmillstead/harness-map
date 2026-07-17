@@ -559,6 +559,26 @@ def test_csp_hashes_match_recomputed_static_blocks(tmp_path):
     assert m.group(2) == rh._csp_hash(rh.STATIC_SCRIPT)
 
 
+def test_csp_has_connect_src_self_not_none(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "csp_connect"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "connect-src 'self'" in text
+    assert "connect-src 'none'" not in text
+
+
+def test_eventsource_listener_feature_detected_and_guarded():
+    # progressive enhancement: gated on window.EventSource, wrapped so file:// is a no-op
+    assert "EventSource" in rh.STATIC_SCRIPT
+    assert "/events" in rh.STATIC_SCRIPT
+    # no inline handler / style injection introduced (CSP model preserved)
+    assert "onerror=" not in rh.STATIC_SCRIPT  # uses addEventListener('error', ...)
+
+
 # ============================================================= 4. determinism
 def test_self_run_twice_byte_identical(tmp_path):
     doc = _minimal_doc()
