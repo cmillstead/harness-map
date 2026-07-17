@@ -37,9 +37,9 @@ def _fake_home_for_render_html_tests(tmp_path_factory):
         os.environ["HOME"] = original
 
 
-def run_render(out_dir, *args):
-    cmd = [sys.executable, str(RENDER), "--out-dir", str(out_dir)] + list(args)
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+def run_render(out_dir, *args, env=None, extra=None):
+    cmd = [sys.executable, str(RENDER), "--out-dir", str(out_dir)] + list(args) + list(extra or [])
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
     return proc
 
 
@@ -1307,3 +1307,158 @@ def test_provenance_footer_keeps_warning_visible(tmp_path):
     footer = re.search(r'<footer[^>]*id="provenance"[^>]*>.*?</footer>', text, re.S).group(0)
     before_details = footer.split("<details", 1)[0]
     assert "warning" in before_details.lower()
+
+
+# ============================================================= 8. copy payload content + IA determinism (Task 10, A8/A9)
+def test_copy_payload_coverage_is_markdown_table(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "cpmd"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered"}], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    m = re.search(r'<script type="application/json" id="copy-coverage">(.*?)</script>', text, re.S)
+    assert m is not None
+    payload = json.loads(m.group(1))          # island stores a JSON string
+    assert payload.startswith("| verb")
+    assert "covered" in payload
+
+
+def test_all_five_copy_payloads_present_and_nonempty(tmp_path):
+    """Finding #9: every view's copy island must carry real, non-empty markdown — not just
+    Coverage. Empty/malformed Overview/Weight/Friction/Hygiene payloads must fail here."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "cpall"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered"}], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    decisions = out_dir / "d.jsonl"
+    decisions.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    # round2 #5: assert VIEW-SPECIFIC content per island (a generic stub must fail), and
+    # require exactly 5 islands (a set() would mask duplicate ids).
+    islands = re.findall(r'<script type="application/json" id="copy-(\w+)">', text)
+    assert len(islands) == 5 and sorted(islands) == \
+        ["coverage", "friction", "hygiene", "overview", "weight"]
+
+    def payload(vid):
+        m = re.search(rf'<script type="application/json" id="copy-{vid}">(.*?)</script>', text, re.S)
+        assert m is not None, f"copy-{vid} island missing"
+        p = json.loads(m.group(1))                       # each island is a JSON string
+        assert isinstance(p, str) and p.strip(), f"copy-{vid} payload empty"
+        return p
+    # each view's payload carries a marker unique to that view's builder output
+    assert "harness-map" in payload("overview")
+    assert payload("coverage").lstrip().startswith("| verb")
+    wp = payload("weight");   assert "tokens" in wp or "always-loaded" in wp.lower()
+    fp = payload("friction"); assert "codex" in fp.lower()          # _codex_sentence always appended
+    hp = payload("hygiene");  assert ("hygiene" in hp.lower() or "dup" in hp.lower()
+                                      or "phantom" in hp.lower())
+
+
+def test_copy_islands_are_inert_not_executable(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "inert"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    exe = re.findall(r'<script(?![^>]*type="application/json")[^>]*>', text)
+    assert len(exe) == 1
+    # finding #8: a zero-island output would ALSO pass the count above — so require the 5
+    # inert islands to be present. This ties the "one executable script" contract to the
+    # islands actually existing.
+    islands = re.findall(r'<script type="application/json" id="copy-(\w+)">', text)
+    assert set(islands) == {"overview", "coverage", "weight", "friction", "hygiene"}
+
+
+def test_full_ia_determinism_byte_identical(tmp_path):
+    doc = _minimal_doc()
+    out_dir = tmp_path / "detfull"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered", "note": "n"}],
+        "drag_candidates": [{"n": 1, "surface": "memory", "evidence": "e", "outcome": "keep",
+                             "what_must_survive": "", "risk_if_wrong": ""}]}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    decisions = out_dir / "d.jsonl"
+    decisions.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    a = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    assert a.returncode == 0, a.stderr
+    b1 = (out_dir / "harness-map-2026-07-15.html").read_bytes()
+    b = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions))
+    assert b.returncode == 0, b.stderr
+    b2 = (out_dir / "harness-map-2026-07-15.html").read_bytes()
+    assert b1 == b2
+    # finding #8: prove this fixture actually exercises the NEW IA (else it false-greens
+    # against pre-rework code, which is already deterministic).
+    assert b'class="gauges"' in b1 and b'id="view-overview"' in b1
+    assert b'<script type="application/json" id="copy-coverage">' in b1
+
+
+def test_full_ia_determinism_cross_pythonhashseed(tmp_path):
+    """Finding #10: run the ENRICHED fixture (synthesis + friction, exercising every new
+    helper) under TWO different PYTHONHASHSEED values — the same-seed test above cannot
+    catch dict/set-ordering nondeterminism; the pre-existing cross-seed fixture had no
+    synthesis or friction."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "detseed"; out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered", "note": "n"}],
+        "drag_candidates": [{"n": 1, "surface": "memory", "evidence": "e", "outcome": "keep",
+                             "what_must_survive": "", "risk_if_wrong": ""}]}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    decisions = out_dir / "d.jsonl"
+    decisions.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    outs = []
+    for seed in ("0", "1"):
+        p = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions),
+                       env={**os.environ, "PYTHONHASHSEED": seed})
+        # round2 #6: assert the render SUCCEEDED before reading — else a failed 2nd render
+        # leaves the 1st render's file in place and the byte compare false-passes.
+        assert p.returncode == 0, p.stderr
+        outs.append((out_dir / "harness-map-2026-07-15.html").read_bytes())
+    assert outs[0] == outs[1]
+
+
+def test_csp_hashes_cover_the_emitted_blocks(tmp_path):
+    """Finding #7: recompute the sha256 of the ACTUAL emitted <style> and executable
+    <script> block bytes and assert each matches the CSP meta hash — comparing the CSP
+    values to the module constants (rh.STATIC_STYLE / rh.STATIC_SCRIPT) would miss any
+    per-render interpolation into the emitted block. Also assert the executable script
+    bytes are identical across two materially-different inputs (proves it stays static)."""
+    import re, hashlib, base64
+
+    def emit(out_dir, **kw):
+        proc = run_render(out_dir, "--date", "2026-07-15", **kw)
+        assert proc.returncode == 0, proc.stderr
+        return (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    d1 = tmp_path / "csp1"; d1.mkdir(); _write_sidecar(d1, "2026-07-15", _minimal_doc())
+    text = emit(d1, extra=["--no-friction"])
+    # extract the CSP script/style sha256 tokens and the emitted blocks
+    meta = re.search(r"script-src 'sha256-([A-Za-z0-9+/=]+)'", text)
+    style_meta = re.search(r"style-src 'sha256-([A-Za-z0-9+/=]+)'", text)
+    assert meta and style_meta
+    exe = re.search(r'<script(?![^>]*application/json)[^>]*>(.*?)</script>', text, re.S)
+    sty = re.search(r'<style>(.*?)</style>', text, re.S)
+    assert exe and sty
+    got_script = base64.b64encode(hashlib.sha256(exe.group(1).encode()).digest()).decode()
+    got_style = base64.b64encode(hashlib.sha256(sty.group(1).encode()).digest()).decode()
+    assert got_script == meta.group(1)
+    assert got_style == style_meta.group(1)
+    # executable script bytes are input-invariant (fully static)
+    d2 = tmp_path / "csp2"; d2.mkdir(); _write_sidecar(d2, "2026-07-15", _minimal_doc())
+    dec = d2 / "d.jsonl"; dec.write_text(json.dumps({"date": "2026-07-01", "component": "rules/a.md"}) + "\n")
+    text2 = emit(d2, extra=["--decisions-file", str(dec)])
+    exe2 = re.search(r'<script(?![^>]*application/json)[^>]*>(.*?)</script>', text2, re.S)
+    assert exe.group(1) == exe2.group(1)
