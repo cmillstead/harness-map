@@ -2037,7 +2037,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.no_friction:
-        streams = {"decisions": None, "metrics": None, "interventions": None, "codex": None}
+        streams = None
     else:
         home = Path.home()
         streams = {
