@@ -1070,3 +1070,89 @@ def test_iter_input_paths_covers_registered_offhooks_script(fake_harness):
         "permissions": {"allow": [], "deny": []}}))
     paths = set(map(str, _collector.iter_input_paths(root)))
     assert str(offhooks) in paths                        # resolved under-root script watched
+
+
+def test_iter_input_paths_is_superset_of_real_build_document_reads(fake_harness):
+    # FIX 4: instrumented proof — run a REAL build_document pass while RECORDING every
+    # filesystem path actually read (stat/open/glob/rglob/scandir wrapped to record-then-
+    # delegate to the REAL method, restored in finally), then assert every recorded path
+    # under root is either yielded by iter_input_paths OR is a descendant of a yielded
+    # container dir. This is instrumentation of REAL functions (no behavior mocked).
+    root = fake_harness
+    proj, _slug = _active_slug(root)
+    # give the pass a nested hook + an off-hooks registered script so the audit exercises
+    # exactly the surfaces Fixes 1 & 2 close.
+    (root / "hooks" / "sub").mkdir(parents=True, exist_ok=True)
+    (root / "hooks" / "sub" / "deep.py").write_text("# nested\n")
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
+    (root / "scripts" / "x.py").write_text("# off-hooks\n")
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 ./scripts/x.py"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+
+    recorded = []
+    real_stat = Path.stat
+    real_open = Path.open
+    real_glob = Path.glob
+    real_rglob = Path.rglob
+    real_scandir = os.scandir
+
+    def rec_stat(self, *a, **k):
+        recorded.append(Path(self))
+        return real_stat(self, *a, **k)
+
+    def rec_open(self, *a, **k):
+        recorded.append(Path(self))
+        return real_open(self, *a, **k)
+
+    def rec_glob(self, pattern, *a, **k):
+        result = list(real_glob(self, pattern, *a, **k))
+        recorded.extend(Path(p) for p in result)
+        return iter(result)
+
+    def rec_rglob(self, pattern, *a, **k):
+        result = list(real_rglob(self, pattern, *a, **k))
+        recorded.extend(Path(p) for p in result)
+        return iter(result)
+
+    def rec_scandir(path, *a, **k):
+        recorded.append(Path(path))
+        return real_scandir(path, *a, **k)
+
+    try:
+        Path.stat = rec_stat
+        Path.open = rec_open
+        Path.glob = rec_glob
+        Path.rglob = rec_rglob
+        os.scandir = rec_scandir
+        _collector.build_document(str(root), str(proj))
+    finally:
+        Path.stat = real_stat
+        Path.open = real_open
+        Path.glob = real_glob
+        Path.rglob = real_rglob
+        os.scandir = real_scandir
+
+    root_resolved = Path(root).resolve()
+    yielded = [Path(p) for p in _collector.iter_input_paths(root, proj)]
+    yielded_resolved = {p.resolve() for p in yielded}
+
+    def _covered(candidate):
+        cand = candidate.resolve()
+        if cand in yielded_resolved:
+            return True
+        return any(cand == y or y in cand.parents for y in yielded_resolved)
+
+    uncovered = []
+    for path in recorded:
+        try:
+            rel = path.resolve().relative_to(root_resolved)  # only audit paths under root
+        except (ValueError, OSError):
+            continue
+        if rel == Path("."):
+            continue  # the root walk-base itself (resolve()/is_dir() plumbing) is not an input
+        if not _covered(path):
+            uncovered.append(str(path))
+
+    assert not uncovered, f"paths read by build_document but not watched: {sorted(set(uncovered))}"
