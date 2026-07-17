@@ -1199,22 +1199,31 @@ def _skill_has_test_asset(skill_dir):
     _safe_exists, Path.is_dir() does NOT swallow PermissionError (only ENOENT-family
     errors) — a permission-denied skill dir is already surfaced as inaccessible by
     collect_descriptions()/collect_on_demand(); this function must only avoid crashing
-    the whole run, not duplicate that reporting."""
+    the whole run, not duplicate that reporting.
+
+    The recursive test_*.py / *_eval.* search walks _iter_descendant_dirs(skill_dir) — the
+    SAME pruned descendant walk the watcher uses (Codex r4 fix) — rather than
+    Path.rglob(), which would descend into generated subtrees like node_modules/.venv that
+    the watcher does not observe. This keeps the two walks equal BY CONSTRUCTION: a
+    test/eval file this function can see is always inside a directory the watcher also
+    yields, and a test/eval file planted under a pruned dir (e.g. node_modules) is
+    intentionally excluded from BOTH signals."""
     try:
         if (skill_dir / "tests").is_dir() or (skill_dir / "evals").is_dir():
             return True
     except OSError:
         pass
-    try:
-        if next(skill_dir.rglob("test_*.py"), None) is not None:
-            return True
-    except OSError:
-        pass
-    try:
-        if next(skill_dir.rglob("*_eval.*"), None) is not None:
-            return True
-    except OSError:
-        pass
+    for d in _iter_descendant_dirs(skill_dir):
+        try:
+            if next(d.glob("test_*.py"), None) is not None:
+                return True
+        except OSError:
+            pass
+        try:
+            if next(d.glob("*_eval.*"), None) is not None:
+                return True
+        except OSError:
+            pass
     return False
 
 
@@ -1288,9 +1297,11 @@ _PRUNED_WALK_DIRS = frozenset({
 
 def _iter_descendant_dirs(base):
     """Yield `base` and every non-pruned directory beneath it (each membership-watchable).
-    Mirrors the RECURSIVE reach of _skill_has_test_asset's rglob("test_*.py")/rglob("*_eval.*"):
-    a test/eval file added at ANY real depth flips a skill's has_test, so the watcher must be
-    able to snapshot the membership of every level.
+    _skill_has_test_asset (Codex r4 fix) now SHARES this exact walk for its recursive
+    test_*.py / *_eval.* glob search instead of Path.rglob() — the two are equal BY
+    CONSTRUCTION, not by a duplicated constant that could drift: a test/eval file added at
+    ANY non-pruned depth flips a skill's has_test AND is watched, while one planted under a
+    pruned dir (node_modules, .venv, caches, ...) is intentionally invisible to BOTH.
 
     followlinks=False (Codex r3 FIX 3): os.walk still ENTERS `base` even when `base` itself is a
     deploy-symlinked skill dir (the first hop stays -- os.walk always descends into the walk

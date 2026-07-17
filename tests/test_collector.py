@@ -1034,6 +1034,26 @@ def test_iter_input_paths_covers_deep_test_file_membership(fake_harness):
     assert str(nested) in paths
 
 
+def test_skill_has_test_asset_ignores_pruned_dirs(fake_harness):
+    # Codex r4 fix: a test_*.py planted under a PRUNED dir (node_modules) must NOT flip
+    # has_test, and its containing dir must NOT be watched -- the collector's recursive
+    # search and the watcher's walk must cover the exact same non-pruned directory set.
+    root = fake_harness
+    pruned = root / "skills" / "demo" / "node_modules" / "somepkg"
+    pruned.mkdir(parents=True, exist_ok=True)
+    (pruned / "test_planted.py").write_text("def test_x():\n    assert True\n")
+
+    assert _collector._skill_has_test_asset(root / "skills" / "demo") is False
+    watched = set(map(str, _collector.iter_input_paths(root)))
+    assert str(root / "skills" / "demo" / "node_modules") not in watched
+
+    # Contrast: a NON-pruned deep test_*.py still flips has_test, proving the prune is
+    # targeted rather than a blanket disable of the recursive search.
+    nested = root / "skills" / "demo" / "phases"           # existing subdir of skills/demo
+    (nested / "test_real.py").write_text("def test_y():\n    assert True\n")
+    assert _collector._skill_has_test_asset(root / "skills" / "demo") is True
+
+
 def test_iter_input_paths_is_deterministic_and_deduped(fake_harness):
     root = fake_harness
     proj, _slug = _active_slug(root)
