@@ -1,7 +1,9 @@
 import datetime
 import http.client
 import importlib.util
+import json
 import os
+import shutil
 import socket
 import threading
 import time
@@ -433,3 +435,172 @@ def test_watcher_survives_uncaught_exception(live_server_watching):
     assert server._watcher_thread.is_alive(), "watcher thread died on an unenumerated exception"
     assert _get_root_body(port) == before_body
     assert server.state.collect_count == before_count
+
+
+# ================================================================= T5: B2 incremental tail
+def _friction_section(html_text):
+    """Slice the self-contained friction-panel block (`<aside id="friction-panel">` ..
+    `</aside>`) out of a served document -- a pure function of joined/footer/codex_aggregate/
+    friction_total_value only (never doc/headline fields), so it is the stable C18-parity
+    comparison unit between a cheap-path render and a full-recollect render."""
+    start = html_text.index('<aside class="card" id="friction-panel">')
+    end = html_text.index("</aside>", start) + len("</aside>")
+    return html_text[start:end]
+
+
+def _start_streams_server(tmp_path, extra_root_files=0):
+    # Friction ENABLED (not no_friction) with a real temp JSONL "decisions" stream, so a
+    # pure append can be observed by the B2 cheap path. `root/rules/a.md` gives the stream's
+    # "component": "rules/a.md" records a real map node to join onto. `extra_root_files`
+    # (real, on-disk collector inputs present from the START, so they never register as a
+    # mid-test collector-input CHANGE) widens collector.main()'s real wall-clock walk time
+    # for tests that need a deterministic window between two rebuild attempts.
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "rules").mkdir()
+    (root / "rules" / "a.md").write_text("# rule a\n")
+    for i in range(extra_root_files):
+        (root / "rules" / f"slow{i}.md").write_text(f"# slow rule {i}\n")
+    stream_path = tmp_path / "harness-decisions.jsonl"
+    stream_path.write_text("")
+    streams = {"decisions": stream_path, "metrics": None, "codex": None, "interventions": None}
+    server = srv.build_server(
+        out_dir=out_dir, root=root, project_root=root, host="127.0.0.1", port=0,
+        no_friction=False, streams=streams, watch=True,
+        poll_seconds=_POLL, debounce_seconds=_DEBOUNCE, heartbeat=_HEARTBEAT)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, out_dir, root, stream_path
+
+
+@pytest.fixture
+def live_server_with_streams(tmp_path):
+    server, out_dir, root, stream_path = _start_streams_server(tmp_path)
+    yield server, out_dir, root, stream_path
+    _teardown_watching_server(server)
+
+
+@pytest.fixture
+def live_server_with_streams_slow_root(tmp_path):
+    server, out_dir, root, stream_path = _start_streams_server(tmp_path, extra_root_files=300)
+    yield server, out_dir, root, stream_path
+    _teardown_watching_server(server)
+
+
+def _append_decision_record(stream_path, component="rules/a.md"):
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    with open(stream_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"date": today, "component": component}) + "\n")
+
+
+def test_jsonl_append_updates_friction_via_cheap_path(live_server_with_streams):
+    server, out_dir, root, stream_path = live_server_with_streams
+    port = server.server_address[1]
+    before_count = server.state.collect_count
+    _append_decision_record(stream_path)
+    _wait_settle(server)
+    assert server.state.collect_count == before_count, \
+        "a pure JSONL append must NOT run a full re-collect (B2/T5 counter contract)"
+    body = _get_root_body(port)
+    assert "Friction events: 1" in body
+
+
+def test_truncated_jsonl_resets_offset_and_full_recollects(live_server_with_streams):
+    server, out_dir, root, stream_path = live_server_with_streams
+    port = server.server_address[1]
+    stream_path.write_text("x\n" * 50)
+    _wait_settle(server)
+    before_count = server.state.collect_count
+    stream_path.write_text("y\n")
+    _wait_settle(server)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/")
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 200
+    assert server.state.stream_offsets[str(stream_path)] == stream_path.stat().st_size
+    assert server.state.collect_count > before_count, \
+        "a shrunk/rotated stream must force a FULL re-collect, never a cheap re-render"
+
+
+def test_cheap_path_failure_degrades_to_full_recollect(live_server_with_streams_slow_root):
+    # Real (no-mock) fault injection: swap the html artifact for a non-empty directory so
+    # write_html_safely's os.replace() raises a real OSError -- but ONLY block the cheap
+    # path's attempt. A watchdog thread self-heals the blocker the moment it observes the
+    # SIDECAR's identity change, a real, state-based signal that the D5 full-recollect
+    # fallback's _run_collector has just run (never a sleep-based timing guess), so the
+    # fallback's OWN html write lands on a clear path. The fixture's 300 extra ROOT files
+    # (present from server startup, so they are baseline state, never a mid-test
+    # collector-input change) widen collector.main()'s real wall-clock walk time enough for
+    # the watchdog to reliably win the removal race before the fallback's own write.
+    server, out_dir, root, stream_path = live_server_with_streams_slow_root
+    port = server.server_address[1]
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    html_path = out_dir / f"harness-map-{today}.html"
+    sidecar_path = out_dir / f"harness-map-{today}.json"
+    pre_sidecar_stat = sidecar_path.stat()
+    pre_identity = (pre_sidecar_stat.st_ino, pre_sidecar_stat.st_mtime_ns)
+
+    if html_path.exists():
+        html_path.unlink()
+    html_path.mkdir()
+    (html_path / "keep").write_text("x")
+
+    unblocked = threading.Event()
+
+    def _watchdog():
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            try:
+                st = sidecar_path.stat()
+                identity = (st.st_ino, st.st_mtime_ns)
+            except OSError:
+                identity = None
+            if identity is not None and identity != pre_identity:
+                if html_path.is_dir():
+                    shutil.rmtree(html_path)
+                unblocked.set()
+                return
+            time.sleep(0.001)
+
+    watchdog = threading.Thread(target=_watchdog, daemon=True)
+    watchdog.start()
+    try:
+        before_count = server.state.collect_count
+        _append_decision_record(stream_path)
+        _wait_settle(server)
+        assert unblocked.wait(timeout=1.0), \
+            "watchdog never observed the full-recollect fallback's collector run"
+        assert server.state.collect_count > before_count, \
+            "a cheap-path write failure must degrade to a full re-collect (D5)"
+        body = _get_root_body(port)
+        assert "Friction events: 1" in body
+    finally:
+        if html_path.is_dir():
+            shutil.rmtree(html_path)
+
+
+def test_cheap_path_friction_byte_equals_full_recollect(live_server_with_streams):
+    # C18 PARITY: compares the served friction section produced by the cheap incremental
+    # path against the friction section produced by a subsequent full `_rebuild` over the
+    # SAME (now-settled) stream file -- exact served-HTML parity is practical here because
+    # the friction-panel block is a pure function of joined/footer/codex_aggregate/
+    # friction_total_value only (never doc/headline fields the collector-input trigger
+    # below also changes), see `_friction_section`'s docstring.
+    server, out_dir, root, stream_path = live_server_with_streams
+    port = server.server_address[1]
+    _append_decision_record(stream_path)
+    _wait_settle(server)
+    cheap_section = _friction_section(_get_root_body(port))
+
+    before_count = server.state.collect_count
+    (root / "rules" / "force_full.md").write_text("# force full\n")
+    _wait_settle(server)
+    assert server.state.collect_count > before_count, \
+        "a collector-input change must have triggered the FULL recollect path for this comparison"
+
+    full_section = _friction_section(_get_root_body(port))
+    assert cheap_section == full_section

@@ -13,6 +13,7 @@ queue.Queue (coalesced to <=1 pending, so a stalled client cannot grow memory un
 """
 import argparse
 import contextlib
+import dataclasses
 import importlib.util
 import io
 import os
@@ -50,6 +51,12 @@ _ALLOWED_HOSTS = {"127.0.0.1"}
 POLL_SECONDS = 2.0
 DEBOUNCE_SECONDS = 1.0
 HEARTBEAT_SECONDS = 3.0
+
+# B2/D5 degrade switch: when True, EVERY sweep that would otherwise take the cheap
+# friction-only path instead runs a full `_rebuild`. The tool stays fully correct with
+# this flipped True (just slower, no incremental optimization) -- it exists so the cheap
+# path can be disabled wholesale without touching the classification logic itself.
+_FORCE_FULL_RECOLLECT = False
 
 
 class CollectorError(Exception):
@@ -102,7 +109,11 @@ class _State:
     `ctx` is the SINGLE source of served state (html_bytes/doc/models/etc. all read
     from it, never re-derived). `collect_count` proves whether a FULL re-collect ran.
     `streams`/`no_friction` are carried so every `_rebuild` call uses the identical
-    friction configuration the server was started with.
+    friction configuration the server was started with. `stream_offsets` (B2/T5) is
+    {str(stream_path): last-seen byte size}, the trigger heuristic the watcher uses to
+    tell a pure telemetry append (cheap friction-only re-render) apart from a truncation/
+    rotation (forces a full re-collect) -- it is NEVER used to slice a partial tail, the
+    cheap path always re-reads each stream file in FULL (C18 parity).
     """
 
     def __init__(self, streams, no_friction):
@@ -111,6 +122,7 @@ class _State:
         self.collect_count = 0
         self.streams = streams
         self.no_friction = no_friction
+        self.stream_offsets = {}
         # SSE fan-out: bounded per-client queues, mutated ONLY under clients_lock (never
         # the ctx lock, so a slow /events writer cannot block a GET `/` read). The watcher
         # compares fresh snapshots against watch_snapshot to decide when a rebuild is due.
@@ -224,21 +236,138 @@ def _watched_snapshot(root, project_root=None):
             for path in collector.iter_input_paths(root, project_root)}
 
 
+def _rebuild_friction_only(state, out_dir):
+    """B2/T5 cheap path: re-renders ONLY the friction overlay from the CACHED collector
+    doc/models/node_index already in `state.ctx` -- no collector run, no re-selection of
+    sidecars. Used when a sweep sees ONLY a friction-telemetry JSONL stream grow (a pure
+    append), never a collector-input change. `build_friction_overlay` and `render_html`
+    always re-read/re-render over the FULL current file contents (never a partial tail),
+    so this is byte-parity-equivalent to what a full `_rebuild` would produce for the
+    same on-disk state (C18).
+
+    Follows the identical write-then-publish ordering as `_rebuild`: write the on-disk
+    HTML artifact FIRST, and ONLY on success swap in the new context (via
+    dataclasses.replace, so date/doc/models/node_index/streams/friction_disabled/skipped
+    are carried over UNCHANGED) under the lock, then broadcast. Any exception here
+    propagates to the caller UNPUBLISHED (no swap, no broadcast, `ctx` untouched) -- the
+    caller is responsible for the D5 degrade-to-full-recollect.
+
+    `collect_count` is deliberately NEVER touched here (the T5 counter contract): only a
+    full `_rebuild` proves a collector run happened.
+    """
+    with state.lock:
+        ctx = state.ctx
+    out_dir = Path(out_dir)
+    new_friction = render_html.build_friction_overlay(
+        ctx.doc, ctx.streams, ctx.node_index, ctx.date, ctx.friction_disabled)
+    html_text = render_html.render_html(
+        ctx.date, ctx.models, new_friction, {"doc": ctx.doc, "skipped": ctx.skipped})
+    html_bytes = html_text.encode("utf-8", "backslashreplace")
+    html_path = out_dir / f"harness-map-{ctx.date}.html"
+    render_html.write_html_safely(html_path, html_text, ctx.doc.get("root"))
+    with state.lock:
+        state.ctx = dataclasses.replace(
+            state.ctx, friction=new_friction, html_text=html_text, html_bytes=html_bytes)
+    _broadcast_refresh(state)
+
+
+def _stream_paths_list(streams):
+    """[str(path), ...] (deduplicated, insertion order) for every CONFIGURED, non-None
+    friction stream path -- the surface the B2 incremental path stats for append-only
+    growth. `collector.iter_input_paths` deliberately excludes these four telemetry
+    streams (they are friction inputs, not collector inputs), so this is a SEPARATE,
+    parallel per-sweep check the watcher runs alongside `_watched_snapshot`. `stream_path`
+    (not the friction-stream name like "decisions") is `state.stream_offsets`'s key, per
+    the B2 design. A `no_friction` run's all-None streams dict, or a bare `None`, yields
+    []."""
+    if not streams:
+        return []
+    seen = []
+    for path in streams.values():
+        if path is None:
+            continue
+        key = str(path)
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def _stream_size(path):
+    """Current byte size of one friction-stream path, or None if it does not exist or is
+    not a regular file (an absent/inaccessible stream has nothing to grow from)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return st.st_size
+
+
+def _seed_stream_offsets(state):
+    """Rebaselines every configured stream's offset to its CURRENT on-disk size. Called
+    right after any successful full render (initial startup, or a full `_rebuild`) since
+    that render already consumed every stream whole, and after a successful cheap
+    re-render since `build_friction_overlay` also re-reads every stream in full (never a
+    partial tail, C18 parity) -- only bytes appended AFTER this point count as new growth
+    on the next sweep."""
+    offsets = {}
+    for key in _stream_paths_list(state.streams):
+        size = _stream_size(key)
+        if size is not None:
+            offsets[key] = size
+    state.stream_offsets = offsets
+
+
+def _classify_stream_sweep(state):
+    """(classification, changed_keys) for the CURRENT friction-stream sizes against
+    `state.stream_offsets`. "truncated" (any stream shrank -- rotation/truncation) takes
+    PRIORITY over "grown" (one or more streams grew and none shrank, eligible for the B2
+    cheap path) which takes priority over "none" (nothing moved). A shrunk stream is
+    NEVER treated as growth -- that offset-drift failure mode would read a negative-length
+    tail if the cheap path ever sliced instead of re-reading in full."""
+    truncated, grown = [], []
+    for key in _stream_paths_list(state.streams):
+        size = _stream_size(key)
+        if size is None:
+            continue
+        offset = state.stream_offsets.get(key, 0)
+        if size < offset:
+            truncated.append(key)
+        elif size > offset:
+            grown.append(key)
+    if truncated:
+        return "truncated", truncated
+    if grown:
+        return "grown", grown
+    return "none", []
+
+
 def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, debounce_seconds):
-    """Daemon poll loop: every `poll_seconds` build a fresh snapshot; on any difference enter a
-    debounce that keeps re-sweeping until `debounce_seconds` pass with NO further change, then
-    run ONE `_rebuild` (coalescing a burst of N writes into one refresh). A rebuild failure
-    (CollectorError / RenderError / OSError) is contained HERE — logged, last-good ctx kept,
-    no broadcast, loop continues — so a transient collect/render/write fault never kills the
-    thread or serves a broken document. The stored snapshot advances only after a successful
-    settled rebuild, so a persistent fault is retried on the next sweep rather than swallowed.
-    An outer catch-all backstop (see the inline comment) additionally guarantees the thread
-    survives any UNENUMERATED exception, so no unexpected fault can silently freeze the dashboard."""
+    """Daemon poll loop: every `poll_seconds` build a fresh collector-input snapshot; on any
+    difference enter a debounce that keeps re-sweeping until `debounce_seconds` pass with NO
+    further change, then run ONE `_rebuild` (coalescing a burst of N writes into one refresh).
+    A rebuild failure (CollectorError / RenderError / OSError) is contained HERE — logged,
+    last-good ctx kept, no broadcast, loop continues — so a transient collect/render/write
+    fault never kills the thread or serves a broken document. The stored snapshot advances
+    only after a successful settled rebuild, so a persistent fault is retried on the next
+    sweep rather than swallowed. An outer catch-all backstop (see the inline comment)
+    additionally guarantees the thread survives any UNENUMERATED exception, so no unexpected
+    fault can silently freeze the dashboard.
+
+    B2/T5: when a sweep sees NO collector-input change, it separately classifies the four
+    friction-telemetry JSONL streams (`_classify_stream_sweep`, since `_watched_snapshot`
+    deliberately does not cover them — they are friction inputs, not collector inputs):
+    a pure append ("grown") takes the cheap `_rebuild_friction_only` path (no debounce —
+    it is cheap enough to run every settled sweep, and `collect_count` is NEVER bumped by
+    it); a shrink/rotation ("truncated") resets that stream's offset to 0 and forces a FULL
+    `_rebuild` instead (D5) so the offset never drifts negative. Any exception from the
+    cheap path degrades to a full `_rebuild` (D5) rather than propagating."""
     while not stop_event.is_set():
         if stop_event.wait(poll_seconds):
             return
-        # OUTER BACKSTOP: the enumerated (CollectorError/RenderError/OSError) tuple below
-        # cannot cover every fault -- _watched_snapshot runs before it, and render_from_out_dir
+        # OUTER BACKSTOP: the enumerated (CollectorError/RenderError/OSError) tuples below
+        # cannot cover every fault -- _watched_snapshot runs before them, and render_from_out_dir
         # can raise UNENUMERATED types (e.g. TypeError/KeyError/ValueError from an unexpected
         # sidecar/synthesis shape). An escape would kill this daemon thread and freeze the
         # dashboard on last-good FOREVER while SSE keeps heartbeating (browser looks healthy,
@@ -247,25 +376,60 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
         # so the clean-shutdown path passes straight through this backstop untouched.
         try:
             current = _watched_snapshot(root, project_root)
-            if current == state.watch_snapshot:
-                continue
-            # Change detected: debounce until the snapshot holds steady for one full window.
-            while not stop_event.is_set():
-                if stop_event.wait(debounce_seconds):
+            if current != state.watch_snapshot:
+                # Change detected: debounce until the snapshot holds steady for one full window.
+                while not stop_event.is_set():
+                    if stop_event.wait(debounce_seconds):
+                        return
+                    settled = _watched_snapshot(root, project_root)
+                    if settled == current:
+                        break
+                    current = settled
+                if stop_event.is_set():
                     return
-                settled = _watched_snapshot(root, project_root)
-                if settled == current:
-                    break
-                current = settled
-            if stop_event.is_set():
-                return
+                try:
+                    _rebuild(state, out_dir, root, project_root)
+                except (CollectorError, render_html.RenderError, OSError) as exc:
+                    print(f"harness-map watcher: rebuild failed, keeping last-good render: {exc}",
+                          file=sys.stderr)
+                    continue  # do NOT advance the snapshot -> the change is retried next sweep
+                state.watch_snapshot = current
+                _seed_stream_offsets(state)  # a full collect just re-read every stream whole
+                continue
+
+            # No collector-input change this sweep: B2 friction-stream classification.
+            classification, changed = _classify_stream_sweep(state)
+            if classification == "none":
+                continue
+            if classification == "truncated":
+                # Offset-drift guard: reset the shrunk stream(s) to 0 BEFORE the full
+                # re-collect, so a mid-failure retry never computes a negative "grown" delta.
+                for key in changed:
+                    state.stream_offsets[key] = 0
+            if classification == "truncated" or _FORCE_FULL_RECOLLECT:
+                try:
+                    _rebuild(state, out_dir, root, project_root)
+                except (CollectorError, render_html.RenderError, OSError) as exc:
+                    print(f"harness-map watcher: full recollect failed, keeping last-good "
+                          f"render: {exc}", file=sys.stderr)
+                    continue
+                _seed_stream_offsets(state)
+                continue
+
+            # classification == "grown": B2 cheap path -- degrades to a full recollect (D5)
+            # on ANY failure, never publishing a partial/broken cheap render.
             try:
-                _rebuild(state, out_dir, root, project_root)
-            except (CollectorError, render_html.RenderError, OSError) as exc:
-                print(f"harness-map watcher: rebuild failed, keeping last-good render: {exc}",
-                      file=sys.stderr)
-                continue  # do NOT advance the snapshot -> the change is retried next sweep
-            state.watch_snapshot = current
+                _rebuild_friction_only(state, out_dir)
+            except (OSError, render_html.RenderError) as exc:
+                print(f"harness-map watcher: cheap friction re-render failed ({exc}), "
+                      f"degrading to full recollect", file=sys.stderr)
+                try:
+                    _rebuild(state, out_dir, root, project_root)
+                except (CollectorError, render_html.RenderError, OSError) as exc2:
+                    print(f"harness-map watcher: full recollect fallback also failed, "
+                          f"keeping last-good render: {exc2}", file=sys.stderr)
+                    continue
+            _seed_stream_offsets(state)
         except Exception as e:  # noqa: BLE001 - deliberate daemon-thread backstop: catches the UNENUMERATED types on purpose; does NOT swallow (logs repr) and does NOT advance the snapshot (retried next sweep).
             print(f"harness-map watcher: unexpected error, keeping last-good render: {e!r}",
                   file=sys.stderr)
@@ -404,6 +568,7 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
         streams = _build_streams(no_friction)
     state = _State(streams=streams, no_friction=no_friction)
     _rebuild(state, out_dir, root, project_root)
+    _seed_stream_offsets(state)  # baseline B2 offsets to what the initial full render just read
     server = _Server((host, port), RequestHandler)
     server.state = state
     server.out_dir = out_dir
