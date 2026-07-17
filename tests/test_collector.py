@@ -1000,3 +1000,44 @@ def test_headline_snapshot_matches_fixture(fake_harness):
         "orphan_script_count": 0,
     }
     assert not any("skills/coding-team/rules/*.md reflects" in b for b in doc["blind_spots"])
+
+
+def test_iter_input_paths_covers_known_inputs(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    root = fake_harness
+    paths = set(map(str, _collector.iter_input_paths(root, proj)))
+    assert str(root / "settings.json") in paths
+    assert str(root / "CLAUDE.md") in paths
+    assert str(proj / "CLAUDE.md") in paths             # project-root input (outside --root)
+    assert any(p.endswith("plugins/known_marketplaces.json") for p in paths)
+    assert str(root / "skills") in paths                # container dir whose membership is watched
+
+
+def test_iter_input_paths_matches_collector_read_surface(fake_harness):
+    # guard against drift: a skill carrying an evals/ dir (a rglob has_test signal in
+    # _skill_has_test_asset) must have its containing skill dir in the watched set.
+    root = fake_harness
+    proj, _slug = _active_slug(root)
+    (root / "skills" / "demo" / "evals").mkdir(parents=True, exist_ok=True)
+    paths = set(map(str, _collector.iter_input_paths(root, proj)))
+    assert str(root / "skills" / "demo") in paths
+    assert str(root / "skills" / "demo" / "evals") in paths   # deep membership -> has_test flip
+
+
+def test_iter_input_paths_covers_deep_test_file_membership(fake_harness):
+    # a test_*.py buried below a skill dir flips has_test via rglob; the watcher catches it
+    # through the membership of the (yielded) directory that contains it.
+    root = fake_harness
+    nested = root / "skills" / "demo" / "phases"          # existing subdir of skills/demo
+    (nested / "test_deep.py").write_text("def test_x():\n    assert True\n")
+    paths = set(map(str, _collector.iter_input_paths(root)))
+    assert str(nested) in paths
+
+
+def test_iter_input_paths_is_deterministic_and_deduped(fake_harness):
+    root = fake_harness
+    proj, _slug = _active_slug(root)
+    first = list(map(str, _collector.iter_input_paths(root, proj)))
+    second = list(map(str, _collector.iter_input_paths(root, proj)))
+    assert first == second                               # stable ordering across calls
+    assert len(first) == len(set(first))                 # no duplicate paths

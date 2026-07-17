@@ -806,6 +806,21 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
 INSTRUCTION_LINE_LIMIT = 200
 
 
+# --- Task 3B: watched-input glob sets — single source of truth shared between each
+# collector scan and iter_input_paths(), so the live-dashboard filesystem watcher (T4)
+# cannot drift out of sync with what the collector actually reads. Each tuple is consumed
+# BOTH by the collector function named in its comment AND by iter_input_paths(); add a new
+# collector input glob HERE (never inline it in a scan) so the watcher automatically sees it.
+_INSTRUCTION_GLOBS = ("rules/*.md", "skills/*/rules/*.md", "skills/*/SKILL.md",
+                      "skills/*/*/SKILL.md", "skills/*/phases/*.md", "skills/*/prompts/*.md",
+                      "skills/*/agents/*.md", "commands/*.md", "agents/*.md")  # flag_long_instructions
+_DUP_GLOBS = ("rules/*.md", "skills/*/rules/*.md", "skills/*/SKILL.md",
+              "skills/*/phases/*.md", "agents/*.md", "commands/*.md")  # scan_duplication
+_STALENESS_RULE_GLOBS = ("rules/*.md", "skills/*/rules/*.md")  # _staleness_corpus (+ CLAUDE.md)
+_HOOK_SCRIPT_GLOBS = ("hooks/*.py", "hooks/*.sh")  # mirrors _hook_disk_files / _hooks_body_corpus
+_HOOK_TEST_GLOBS = ("hooks/tests/*.py", "skills/*/hooks/tests/*.py")  # mirrors _hook_test_stems
+
+
 def flag_long_instructions(root):
     flags = []
     # `seen` dedupes a file reachable via multiple glob paths (a deploy symlink under
@@ -818,9 +833,7 @@ def flag_long_instructions(root):
     # matching walk_always_loaded/scan_duplication/_staleness_corpus); listed right after
     # rules/*.md so a physically-symlinked rule is seen/reported under its rules/*.md path
     # first, same precedence as those three scans.
-    for pattern in ("rules/*.md", "skills/*/rules/*.md", "skills/*/SKILL.md", "skills/*/*/SKILL.md",
-                     "skills/*/phases/*.md", "skills/*/prompts/*.md", "skills/*/agents/*.md",
-                     "commands/*.md", "agents/*.md"):
+    for pattern in _INSTRUCTION_GLOBS:
         for fp in root.glob(pattern):
             key = _physical_key(fp)
             if key in seen:
@@ -882,8 +895,7 @@ def scan_duplication(root, blind_spots):
     not something this collector decides."""
     # Generalized skills/coding-team/rules -> skills/*/rules for release portability; the
     # seen_physical dedup below still collapses a rule reachable via multiple glob paths.
-    patterns = ("rules/*.md", "skills/*/rules/*.md", "skills/*/SKILL.md",
-                "skills/*/phases/*.md", "agents/*.md", "commands/*.md")
+    patterns = _DUP_GLOBS
     seen_physical = set()
     corpus = []  # [(rel_path, shingle_set), ...]
     for pattern in patterns:
@@ -976,7 +988,7 @@ def _staleness_corpus(root, inaccessible):
     paths = []
     # Generalized skills/coding-team/rules -> skills/*/rules for release portability; deduped by
     # physical identity so a symlinked rule (deploy path + sub-skill source) is scanned once.
-    for pattern in ("rules/*.md", "skills/*/rules/*.md"):
+    for pattern in _STALENESS_RULE_GLOBS:
         try:
             paths.extend(sorted(root.glob(pattern)))
         except OSError:
@@ -1258,6 +1270,120 @@ def build_headline(always_loaded, hooks_section, instruction_length_flags, dupli
         "orphan_registration_count": len(hooks_section["orphan_registrations"]),
         "orphan_script_count": len(hooks_section["orphan_scripts"]),
     }
+
+
+def _iter_descendant_dirs(base):
+    """Yield `base` and every directory beneath it (each membership-watchable). Mirrors the
+    RECURSIVE reach of _skill_has_test_asset's rglob("test_*.py")/rglob("*_eval.*"): a
+    test/eval file added at ANY depth flips a skill's has_test, so the watcher must be able
+    to snapshot the membership of every level. followlinks=True matches the collector reading
+    THROUGH a deploy-symlinked skill dir into its target; a realpath visited-set breaks any
+    symlink cycle so a self-referential link can never spin the walk forever."""
+    try:
+        if not base.is_dir():
+            return
+    except OSError:
+        return
+    visited = set()
+    for dirpath, dirnames, _ in os.walk(base, followlinks=True):
+        real = os.path.realpath(dirpath)
+        if real in visited:
+            dirnames[:] = []  # already walked this physical dir via another link — prune
+            continue
+        visited.add(real)
+        yield Path(dirpath)
+
+
+def iter_input_paths(root, project_root=None):
+    """SINGLE SOURCE OF TRUTH for the complete filesystem input surface build_document reads
+    — the set a live-dashboard filesystem watcher (T4) must observe to know when a re-render
+    is due. Returns a deterministic, de-duplicated, string-sorted list of Path.
+
+    Contract for the watcher: snapshot each yielded FILE by mtime (content change) and each
+    yielded DIR by membership (a skill / hook / rule / agent / project added or removed).
+    Entries are yielded by their root-relative path; the watcher stats them FOLLOWING symlinks,
+    so a change to a deploy-symlink TARGET that lives OUTSIDE --root is still observed even
+    though a plain os.walk(--root) would miss it — that missed-target case is the whole reason
+    this function, not a hand-kept list in serve.py, is the source of truth.
+
+    GUARANTEE: a true SUPERSET of every path build_document stats/opens/globs/iterdirs. Each
+    group below names the collector read it corresponds to. Add a future collector input HERE
+    (or to a shared _*_GLOBS constant that both this and the scan consume) or the dashboard
+    serves stale data.
+
+    KNOWN watcher blind spots (documented for T4 — inherent, NOT statically enumerable here):
+      * check_phantom_refs stats `root / <token>` for backtick path tokens parsed out of prose
+        — an unbounded, content-derived set. Creating a referenced file OUTSIDE the dirs below
+        can flip a phantom-ref verdict without a watched signal. In practice almost every
+        referenced path already lives under a watched dir (rules/, skills/, agents/, commands/,
+        hooks/); a settings.json/rule EDIT that changes the ref itself IS watched.
+      * reconcile_hooks stat()s each registered hook command's resolved script; a command may
+        resolve to an ABSOLUTE path outside root/hooks. settings.json content IS watched, but
+        the external target file's own create/delete is not."""
+    root = Path(root)
+    paths = set()
+
+    # -- concrete top-level files (content matters) --
+    #   CLAUDE.md              walk_always_loaded + _staleness_corpus
+    #   settings.json          parse_settings -> permissions, config, hook registrations
+    #   memory/MEMORY.md       walk_always_loaded (root stub index)
+    #   plugins/*.json         collect_config._read_json_name_list (two fixed names)
+    paths.add(root / "CLAUDE.md")
+    paths.add(root / "settings.json")
+    paths.add(root / "memory" / "MEMORY.md")
+    paths.add(root / "plugins" / "known_marketplaces.json")
+    paths.add(root / "plugins" / "installed_plugins.json")
+
+    # -- active project's own CLAUDE.md (lives OUTSIDE --root); walk_always_loaded gates it on
+    #    the projects/<slug>/memory dir. Yielded unconditionally when given: a harmless superset. --
+    if project_root is not None:
+        paths.add(Path(project_root) / "CLAUDE.md")
+
+    # -- container dirs whose MEMBERSHIP changes collector output --
+    #   skills   : new/removed skill -> descriptions, on_demand, rules, test coverage
+    #   projects : new project      -> conditional_variants (each */memory/MEMORY.md)
+    #   agents/hooks/hooks-tests/rules/commands : globbed membership below
+    for d in ("skills", "projects", "agents", "hooks", "hooks/tests", "rules", "commands"):
+        paths.add(root / d)
+
+    # -- glob-based content files: the SAME pattern tuples the collector scans consume, so the
+    #    read surface and the watched surface are one definition (see _*_GLOBS above). Covers
+    #    rules, skills/*/rules, skills SKILL.md (top + nested), phases/prompts/agents md,
+    #    commands, agents, hooks/*.py|*.sh, and hooks/tests + skills/*/hooks/tests scripts. --
+    for pattern in set(_INSTRUCTION_GLOBS + _DUP_GLOBS + _STALENESS_RULE_GLOBS
+                       + _HOOK_SCRIPT_GLOBS + _HOOK_TEST_GLOBS):
+        try:
+            paths.update(root.glob(pattern))
+        except OSError:
+            continue
+
+    # -- projects/*/memory: MEMORY.md index (walk_always_loaded / conditional_variants) plus,
+    #    for the active project, memory bodies (collect_on_demand). Yield each memory dir
+    #    (membership) + every *.md (content); MEMORY.md matches the *.md glob. --
+    try:
+        slug_dirs = sorted(p for p in (root / "projects").iterdir() if p.is_dir())
+    except OSError:
+        slug_dirs = []
+    for slug_dir in slug_dirs:
+        mem_dir = slug_dir / "memory"
+        paths.add(mem_dir)
+        try:
+            paths.update(mem_dir.glob("*.md"))
+        except OSError:
+            pass
+
+    # -- per-skill dirs: each skill dir + ALL descendant dirs (membership) so a test_*.py /
+    #    *_eval.* added at any depth flips has_test (_skill_has_test_asset rglob). The skill's
+    #    concrete CONTENT files are already covered by the _*_GLOBS union above. --
+    try:
+        skill_dirs = sorted(p for p in (root / "skills").iterdir() if p.is_dir())
+    except OSError:
+        skill_dirs = []
+    for skill_dir in skill_dirs:
+        for sub in _iter_descendant_dirs(skill_dir):
+            paths.add(sub)
+
+    return sorted(paths, key=str)
 
 
 def build_document(root, project_root):
