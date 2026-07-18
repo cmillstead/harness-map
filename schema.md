@@ -50,7 +50,8 @@ Top-level keys are ALL present on every run. When a category has no data, its ar
                       "registration_evidence": "VERIFIED", "target_evidence": "VERIFIED|INFERRED"}],
       "orphan_registrations": [{"script": "rel", "target_status": "missing", "registration_evidence": "VERIFIED"}],
       "scripts_on_disk": [{"name": "", "is_symlink": false, "target": null,
-                           "registered_via": "direct|dispatcher|none", "evidence": "VERIFIED|INFERRED"}],
+                           "registered_via": "direct|dispatcher|none",
+                           "description": "", "evidence": "VERIFIED|INFERRED"}],
       "orphan_scripts": [{"name": "", "evidence": "INFERRED"}]
     },
     "permissions": {"allow_count": 0, "deny_count": 0, "ask_count": 0, "evidence": "VERIFIED|INACCESSIBLE"}
@@ -83,6 +84,7 @@ Top-level keys are ALL present on every run. When a category has no data, its ar
 - **`always_loaded`** — everything paid for on every conversation turn regardless of whether the skill/rule is invoked: root and project `CLAUDE.md` files, memory files, `rules/*.md`, coding-team rules, plus the *description* text of every skill and agent (their bodies are NOT always-loaded — only the frontmatter description shown in the picker). `conditional_variants` covers per-project `CLAUDE.md` variants that load only when that project is the cwd. The rule scan is generalized to `skills/*/rules/*.md` (any sub-skill's rules dir), scanned AFTER `rules/*.md` so a rule reachable via both a `rules/` deploy symlink and a sub-skill source is deduped by physical identity and counted once under `rules/` (category `rule`). A sub-skill's own rule files carry category `coding_team_rule` when the sub-skill is `coding-team` (retained for baseline continuity) and `skill_rule` for every other sub-skill. Hook test detection is likewise generalized to `hooks/tests` + `skills/*/hooks/tests`.
 - **`on_demand`** — content that loads only when a skill/agent is actually invoked: skill `SKILL.md` files, their internal `phases/`, `prompts/`, `agents/` bodies, and memory file bodies (as opposed to the memory index entry, which is always-loaded).
 - **`enforcement.hooks`** — see Note 3 (registration vs target status) below; this is the section that distinction governs.
+- **`enforcement.hooks.scripts_on_disk[].description`** — a one-line, read-only summary auto-extracted from the script header (precedence: `# summary:` marker > `.py` module docstring first line > first leading `#` comment > `""`). Extracted verbatim as DATA (never executed/followed); empty when no header is present. Additive optional field — `schema_version` stays `1`; readers tolerate its absence via `.get('description', '')`.
 - **`config`** — a snapshot of `settings.json` / `.claude.json`-level configuration. `env_keys` is names only (see Note 2). `evidence` at the `config` level covers whether `settings.json` itself was readable.
 - **`instruction_length_flags`** — any instruction file (SKILL.md, phase, prompt, agent, rule) whose line count exceeds `threshold` (200).
 - **`duplication`** — near-duplicate content pairs across instruction files. See Note 2 for the metric and Note 3 for determinism of the output ordering.
@@ -100,6 +102,46 @@ The synthesis pass is a model pass over (A)'s output. It produces judgments — 
 - **CIVC matrix cell** — a table, rows = verbs `[Afford, Inform, Constrain, Verify, Correct, Evolve]`, columns = surfaces `[context, tools, memory, permissions, orchestration, observability]`, each cell ∈ `{covered, thin, empty}`. Produced by the model from `always_loaded`, `enforcement`, `on_demand`, and `test_coverage`.
 - **Drag-candidate record** — `{ n, surface, evidence (V/I/IA), outcome ∈ {keep, give it one home, load it later, turn it into a check, probation, retire safely}, what_must_survive, risk_if_wrong }`. Per D8, `retire safely` is disallowed in v1 (no-usage) runs — cap the outcome at `probation`.
 - **Diff snapshot** — the `headline` block IS the diff unit. Synthesis compares the current run's `headline` against the most-recent prior sidecar's `headline`, field by field.
+
+## (C) Synthesis sidecar file contract
+
+The synthesis pass (B) is not just a report — it also writes a machine-readable sidecar, `harness-synthesis-<date>.json`, into `OUT_DIR` (the report directory, OUTSIDE `--root`) alongside that run's `.md` report. The `<date>` must match the report's own date so `render_html.py` can pair them. `render_html.py` (`load_synthesis`/`load_sidecar`) simply `json.loads()`s this file: absent file degrades gracefully to an empty-state (`available: False` in the CIVC and drag-candidate view models); a present-but-invalid file is an explicit "unavailable" state — it is never silently substituted with defaults.
+
+### Shape
+
+```jsonc
+{
+  "schema_version": 1,
+  "civc": [
+    {"verb": "<VERB>", "surface": "<surface>", "verdict": "<verdict>",
+     "evidence": "VERIFIED|INFERRED|INACCESSIBLE", "note": "<prose>"}
+    // ... all 36 verb×surface cells ...
+  ],
+  "drag_candidates": [
+    {"n": 0, "surface": "<surface>", "evidence": "V|I|IA",
+     "outcome": "keep|give it one home|load it later|turn it into a check|probation",
+     "what_must_survive": "<prose>", "risk_if_wrong": "<prose>"}
+  ]
+}
+```
+
+`schema_version` is REQUIRED — `render_html.py`'s `load_sidecar` (the same loader used for the collector sidecar) rejects a synthesis sidecar missing it (`"missing schema_version"` → Coverage matrix renders unavailable); keep it in sync with the collector's `schema_version` in (A).
+
+### Enums (verbatim from `render_html.py:55-57`)
+
+- `VERBS = ("Afford", "Inform", "Constrain", "Verify", "Correct", "Evolve")` — **TitleCase**
+- `SURFACES = ("context", "tools", "memory", "permissions", "orchestration", "observability")` — **lowercase**
+- `VERDICTS = ("covered", "thin", "empty")` — **lowercase**
+
+**CASING WARNING:** `build_civc_model` (`render_html.py:413-436`) allowlists a `civc` cell on EXACT membership — `c["verb"] in VERBS and c["surface"] in SURFACES` — before it is ever placed in the grid; `verdict` is separately re-checked against `VERDICTS` and falls back to `"empty"` if not a match. This is the ONE normalization point in the render path. A casing mismatch (`"Context"`, `"afford"`, `"Covered"`) does not error and does not get coerced — the cell is silently dropped, and the corresponding grid cell renders as the same visual "empty" as a genuinely-absent judgment. There is no warning surfaced to the operator when this happens; get the casing right at write time.
+
+### Completeness
+
+`civc` should carry all 36 verb×surface cells (6 verbs × 6 surfaces). A missing cell degrades to `verdict: "empty"` with no error — the same failure mode as a casing mismatch — so the sidecar-writer must emit the full skeleton to make gaps in coverage *intentional* (a real "empty" judgment) rather than *accidental* (an omitted cell that merely looks like one). `synthesis-template.json` in this skill directory is that full 36-cell skeleton, ready to fill in.
+
+### D8 constraint
+
+Per Note (B) above, `retire safely` is disallowed in v1 (no-usage) runs — cap `outcome` at `probation` for any drag candidate that would otherwise warrant retirement.
 
 ## Notes
 

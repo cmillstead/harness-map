@@ -113,10 +113,98 @@ def _physical_key(path):
 
 
 def _read_text(path):
+    """Read `path` as utf-8 text (errors="replace"). Returns `(text, "VERIFIED")` on
+    success or `(None, "INACCESSIBLE")` on failure. The `is_file()` guard matches
+    `_read_head`'s "no blocking open() on a FIFO" invariant: an in-root, registered
+    `*-dispatcher.py` (or any of the other `_read_checked` call sites) that is actually
+    a FIFO/socket/dir must not block the collector. `is_file()` follows symlinks (True
+    for a regular file or a symlink to one; False for FIFO/dir/socket/broken symlink),
+    so regular-file behavior is unchanged — no false negatives."""
+    if not path.is_file():
+        return None, "INACCESSIBLE"
     try:
         return path.read_text(encoding="utf-8", errors="replace"), "VERIFIED"
     except OSError:
         return None, "INACCESSIBLE"
+
+
+_DESC_MAX_BYTES = 65536      # ONE byte-bounded read; serves BOTH the header/comment scan
+                             # and the ast-docstring parse (no second read to drop status)
+_DESCRIPTION_MAX = 120
+
+
+def _read_head(path, max_bytes):
+    """Read at most `max_bytes` BYTES of `path`, decoded utf-8 (errors='replace'); None on
+    OSError or if `path` is not a regular file. BYTE-bounded (binary read then decode — a
+    text-mode `read(n)` caps CHARACTERS, not bytes). The `is_file()` guard rejects a FIFO/
+    dir/socket/broken-symlink named `*.py` so a blocking `open()` on a FIFO is not reached.
+    Best-effort: the is_file()->open() window is NOT race-proof against concurrent path
+    replacement, which is acceptable for a read-only mapper over the self-owned harness dir
+    (TOCTOU here is not a threat; no O_NONBLOCK needed)."""
+    try:
+        if not path.is_file():          # follows symlinks; False for FIFO/dir/socket/broken
+            return None
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes)
+    except OSError:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _script_description(path, skip_read=False):
+    """Read-only, best-effort one-line description for the 'Scripts on disk' list. Returns
+    `(description, status)`, status in {"OK", "SKIPPED", "INACCESSIBLE"}:
+      * SKIPPED  — `skip_read=True` (out-of-root / unresolvable target): "", no read; the
+                   caller records a blind-spot, NOT an inaccessible entry.
+      * INACCESSIBLE — the read failed (perm/FIFO/etc.): ""; the CALLER records the
+                   inaccessible entry ONCE (deduped) — this fn never mutates it.
+      * OK       — read succeeded (description may still be "" for a headerless file).
+    Precedence: `# summary: X` marker > .py module docstring first line
+    (ast.get_docstring(ast.parse) — PARSES only, never imports/executes) > first non-shebang
+    leading `# ...` comment > "". Does a SINGLE bounded `_read_head` — the same buffer feeds
+    the comment scan AND the ast parse, so there is no second read whose failure could drop
+    the status. Scanned bytes are untrusted DATA: extracted verbatim, esc_html'd at render,
+    never executed."""
+    if skip_read:
+        return "", "SKIPPED"
+    raw = _read_head(path, _DESC_MAX_BYTES)
+    if raw is None:
+        return "", "INACCESSIBLE"
+    lines = raw.splitlines()[:60]
+    # 1. explicit `# summary:` marker
+    for line in lines:
+        s = line.strip()
+        if s.lower().startswith("# summary:"):
+            return s.split(":", 1)[1].strip()[:_DESCRIPTION_MAX], "OK"
+    # 2. .py module docstring first line (parse the SAME bounded buffer; never execute).
+    #    A >64KB file yields a truncated prefix -> SyntaxError -> comment fallback below.
+    if path.suffix == ".py":
+        try:
+            doc = ast.get_docstring(ast.parse(raw))
+        except (SyntaxError, ValueError, RecursionError):
+            doc = None
+        if doc:
+            first = doc.strip().splitlines()[0].strip()
+            if first:
+                return first[:_DESCRIPTION_MAX], "OK"
+    # 3. first non-shebang leading comment line
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#!"):
+            continue
+        if s.startswith("#"):
+            return s.lstrip("#").strip()[:_DESCRIPTION_MAX], "OK"
+        break   # first real code/content line ends the leading-comment scan
+    return "", "OK"
+
+
+def _append_inaccessible_once(inaccessible, rel):
+    """Record an unreadable path exactly once (schema.md:92 requires reporting every
+    attempted-but-unreadable path; dedupe so a file read twice isn't double-listed).
+    `_rel`/`_rel_safe` produce identical strings for an in-root path, so this dedupes
+    against an entry a dispatcher read may already have produced for the same path."""
+    if not any(e.get("path") == rel for e in inaccessible):
+        inaccessible.append({"path": rel, "reason": "unreadable"})
 
 
 def _safe_exists(path):
@@ -560,34 +648,49 @@ def collect_on_demand(root, project_root, inaccessible):
 
 
 def parse_settings(root, errors, blind_spots):
-    """Read + parse root/settings.json. Two distinct outcomes, both NON-fatal —
+    """Read + parse root/settings.json. Three distinct outcomes, all NON-fatal —
     build_document always continues and populates every settings-INDEPENDENT section
     (always_loaded, hooks, duplication, phantom_refs, ...), because `headline` is the
     run-to-run diff unit and a one-file settings problem must never fabricate a false
     "everything vanished" diff:
-    - Genuinely ABSENT (FileNotFoundError, and settings_path is NOT a symlink): the
+    - Genuinely ABSENT (settings_path does not exist, and is NOT a symlink): the
       common, expected case — nothing wrong. Silent: ({}, False) plus a blind_spot note,
       no errors[] entry.
-    - PRESENT but unreadable-as-a-file (any other OSError — IsADirectoryError,
-      PermissionError, ELOOP — or JSONDecodeError; OR a FileNotFoundError where
-      settings_path IS a symlink, i.e. a PRESENT-but-BROKEN symlink whose target does
-      not exist — is_symlink() is True even for a dangling target, so this is
-      distinguished from genuine absence): a real anomaly, symmetric handling across all
-      these cases — record a descriptive errors[] entry and return ({}, False) so the
-      run continues with config evidence INACCESSIBLE, same shape as the absent case,
-      just LOUD instead of silent. (main()'s top-level `except Exception` guard remains
-      a defense-in-depth backstop for anything unanticipated; it no longer has an
-      organic trigger via settings.json specifically — the intended, more robust
-      outcome.) Returns (settings_dict, parsed_ok)."""
+    - PRESENT but NOT a regular file (a FIFO, socket, directory, or a symlink to one of
+      those): an is_file() gate — matching `_read_text`/`_read_head`'s "no blocking
+      open() on a FIFO" invariant — rejects it BEFORE any read_text() call, so a FIFO at
+      this path can never block the collector forever (open()-for-read on a FIFO with no
+      writer waits indefinitely; it never raises). Distinguished from genuine absence via
+      a guarded exists() (True for a symlink-to-non-regular; OSError on stat is treated
+      conservatively as present). LOUD: a descriptive errors[] entry, return ({}, False).
+    - PRESENT but unreadable-as-a-regular-file (any OSError post-gate — PermissionError,
+      ELOOP — or JSONDecodeError; OR a FileNotFoundError where settings_path IS a
+      symlink, i.e. a PRESENT-but-BROKEN symlink whose target does not exist —
+      is_symlink() is True even for a dangling target, so this is distinguished from
+      genuine absence): a real anomaly, symmetric handling across all these cases —
+      record a descriptive errors[] entry and return ({}, False) so the run continues
+      with config evidence INACCESSIBLE, same shape as the absent case, just LOUD
+      instead of silent. (main()'s top-level `except Exception` guard remains a
+      defense-in-depth backstop for anything unanticipated; it no longer has an organic
+      trigger via settings.json specifically — the intended, more robust outcome.)
+      Returns (settings_dict, parsed_ok)."""
     settings_path = root / "settings.json"
-    try:
-        text = settings_path.read_text(encoding="utf-8", errors="replace")
-    except FileNotFoundError:
-        if settings_path.is_symlink():
+    if not settings_path.is_file():   # follows symlinks; False for FIFO/socket/dir/broken-symlink/absent
+        try:
+            present = settings_path.exists()   # follows symlinks; True for a symlink to a FIFO/socket/dir
+        except OSError:
+            present = True   # stat failed unexpectedly; treat conservatively as present-anomaly
+        if present:
+            errors.append("settings.json exists but is not a regular file (FIFO/socket/directory); "
+                           "refusing to open it to avoid blocking on a special file.")
+            return {}, False
+        if settings_path.is_symlink():   # exists() False + is_symlink() True == a broken (dangling) symlink
             errors.append("settings.json is a broken symlink (target does not exist)")
             return {}, False
         blind_spots.append("settings.json not found; permissions/config/hooks reflect defaults.")
         return {}, False
+    try:
+        text = settings_path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         errors.append(f"settings.json unreadable: {e!r}")
         return {}, False
@@ -724,14 +827,34 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
             "target_evidence": "VERIFIED",
         })
 
-    # See the outside-root symlink check below for the symlinked-hook-FILE handling note.
     disk_files = _hook_disk_files(root)
     disk_names = {p.name for p in disk_files}
+
+    # Containment decision per disk file, computed ONCE. A file whose real path escapes root
+    # (leaf symlink, symlinked ANCESTOR dir e.g. `hooks/` itself, or a symlink loop) must not
+    # have its bytes read — NOT for dispatcher reachability analysis NOR for description
+    # extraction. Catches OSError (broken/perm) and RuntimeError (symlink loop). Records the
+    # outside-root blind-spot here so the two downstream loops don't duplicate it.
+    try:
+        root_stat = os.stat(root)
+    except OSError:
+        root_stat = None
+    fp_inside = {}
+    for fp in disk_files:
+        try:
+            fp_inside[fp] = (root_stat is not None
+                             and _resolves_inside_root(fp.resolve(), root, root_stat))
+        except (OSError, RuntimeError):
+            fp_inside[fp] = False
+        if not fp_inside[fp]:
+            blind_spots.append(f"hook {fp.name} resolves outside the harness root — not read")
 
     dispatcher_reached_names = set()
     for disp in (p for p in disk_files if p.name.endswith("-dispatcher.py")):
         if disp.name not in direct_registered_names:
             continue  # a dispatcher confers reachability only if it is itself registered
+        if not fp_inside[disp]:
+            continue  # out-of-root dispatcher: never read for reachability (bypass closed)
         text = _read_checked(root, disp, inaccessible)
         if text is None:
             continue
@@ -752,7 +875,6 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
 
     scripts_on_disk = []
     orphan_scripts = []
-    root_resolved = root.resolve()
     for fp in disk_files:
         name = fp.name
         present, ok = _safe_exists(fp)
@@ -765,14 +887,9 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
         target = None
         if is_link:
             try:
-                target = os.readlink(fp)
-                resolved = fp.resolve()
-                if resolved != root_resolved and root_resolved not in resolved.parents:
-                    blind_spots.append(
-                        f"hook {name} is a symlink whose target resolves outside the "
-                        f"harness root: {target}")
+                target = os.readlink(fp)        # keep the raw link string for the `target` field
             except OSError:
-                inaccessible.append({"path": _rel_safe(root, fp), "reason": "unreadable"})
+                _append_inaccessible_once(inaccessible, _rel_safe(root, fp))
 
         if name in direct_registered_names:
             registered_via, evidence = "direct", "VERIFIED"
@@ -781,9 +898,14 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
         else:
             registered_via, evidence = "none", "INFERRED"
 
+        desc, desc_status = _script_description(fp, skip_read=not fp_inside[fp])
+        if desc_status == "INACCESSIBLE":
+            _append_inaccessible_once(inaccessible, _rel_safe(root, fp))
+
         scripts_on_disk.append({
             "name": name, "is_symlink": is_link, "target": target,
             "registered_via": registered_via, "evidence": evidence,
+            "description": desc,
         })
         if registered_via == "none":
             # A script may still be reached via dynamic dispatch we cannot statically see

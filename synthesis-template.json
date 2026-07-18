@@ -1,0 +1,267 @@
+{
+  "schema_version": 1,
+  "civc": [
+    {
+      "verb": "Afford",
+      "surface": "context",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Afford",
+      "surface": "tools",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Afford",
+      "surface": "memory",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Afford",
+      "surface": "permissions",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Afford",
+      "surface": "orchestration",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Afford",
+      "surface": "observability",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Inform",
+      "surface": "context",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Inform",
+      "surface": "tools",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Inform",
+      "surface": "memory",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Inform",
+      "surface": "permissions",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Inform",
+      "surface": "orchestration",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Inform",
+      "surface": "observability",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Constrain",
+      "surface": "context",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Constrain",
+      "surface": "tools",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Constrain",
+      "surface": "memory",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Constrain",
+      "surface": "permissions",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Constrain",
+      "surface": "orchestration",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Constrain",
+      "surface": "observability",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Verify",
+      "surface": "context",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Verify",
+      "surface": "tools",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Verify",
+      "surface": "memory",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Verify",
+      "surface": "permissions",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Verify",
+      "surface": "orchestration",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Verify",
+      "surface": "observability",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Correct",
+      "surface": "context",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Correct",
+      "surface": "tools",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Correct",
+      "surface": "memory",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Correct",
+      "surface": "permissions",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Correct",
+      "surface": "orchestration",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Correct",
+      "surface": "observability",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Evolve",
+      "surface": "context",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Evolve",
+      "surface": "tools",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Evolve",
+      "surface": "memory",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Evolve",
+      "surface": "permissions",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Evolve",
+      "surface": "orchestration",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    },
+    {
+      "verb": "Evolve",
+      "surface": "observability",
+      "verdict": "empty",
+      "evidence": null,
+      "note": ""
+    }
+  ],
+  "drag_candidates": [
+    {
+      "n": 1,
+      "surface": "context",
+      "evidence": "V",
+      "outcome": "probation",
+      "what_must_survive": "<example: the specific behavior/guarantee this surface currently provides that must not be lost if demoted>",
+      "risk_if_wrong": "<example: what breaks, silently or loudly, if this candidate is demoted and the judgment turns out to be wrong>"
+    }
+  ]
+}

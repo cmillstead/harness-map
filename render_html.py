@@ -15,6 +15,7 @@ import dataclasses
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import stat
@@ -55,6 +56,10 @@ HEADLINE_KEYS = (
 VERBS = ("Afford", "Inform", "Constrain", "Verify", "Correct", "Evolve")
 SURFACES = ("context", "tools", "memory", "permissions", "orchestration", "observability")
 VERDICTS = ("covered", "thin", "empty")
+# Single source of truth for the Hygiene tab's `critical` pill threshold — the
+# treemap's length-criticality outline (B-t3 follow-up) reuses this SAME constant
+# via `_length_critical_node_keys` so the two views can never silently disagree.
+LENGTH_CRITICAL_LINES = 600
 
 # §9-R E — CLOSED allowlists, verified against skills/coding-team/ on 2026-07-15.
 PHASE_ALIAS = {
@@ -69,7 +74,6 @@ AGENT_ALIAS = {
     "plan_review": "ct-plan-doc-reviewer.md",
 }
 
-CATEGORICAL_PALETTE = ("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00")
 HEAT_RAMP = ("#FCAE91", "#FB6A4A", "#DE2D26", "#A50F15")
 STREAM_ORDER = ("decisions", "metrics", "interventions", "codex")
 STREAM_LABELS = {"decisions": "Decisions", "metrics": "Review metrics",
@@ -206,6 +210,26 @@ def _basename_of_node_key(node_key):
     return Path(rel or node_key).name.lower()
 
 
+def _length_critical_node_keys(doc):
+    """`{node_key: lines}` for files hygiene's OWN length-flag table classifies as
+    `critical` (lines > LENGTH_CRITICAL_LINES) — the SAME per-file classification
+    `_render_length_flags_body` renders as the pill-critical row, reused (never a
+    new threshold) so the treemap's length-crit outline and the Hygiene tab's
+    critical pill can never silently disagree. The `lines` value lets the
+    treemap/ladder `<title>` explain WHY a cell is ringed (a plain node_key set
+    can't); membership tests (`c["node_key"] in length_crit_keys`) still work
+    unchanged against a dict's keys. v1 scope is deliberately CRITICAL-only, not
+    the lesser `over`-cap tier — a blanket outline on every over-cap file would be
+    noisy; the point is the standout. Reuses `_dup_node_key` (built for the same
+    repo-relative path format the dup-web corpus uses) — a path outside its known
+    patterns (rules/, skills/*/SKILL.md, skills/*/{phases,prompts,agents}/*) falls
+    back to a `dup:`-prefixed key that won't match any real treemap cell, a silent
+    no-op rather than a crash."""
+    flags = doc.get("instruction_length_flags", []) or []
+    return {_dup_node_key(f["path"]): f.get("lines", 0)
+            for f in flags if f.get("lines", 0) > LENGTH_CRITICAL_LINES}
+
+
 # ------------------------------------------------------------------------- squarify
 def _worst_ratio(row, side):
     total = sum(row)
@@ -292,16 +316,19 @@ def _tokens_treemap(files, canvas_w=960.0, canvas_h=420.0):
         group_items.append({"size": tokens, "category": cat, "label": label, "file_count": len(cat_files)})
     group_rects = squarify(sorted(group_items, key=lambda g: (-g["size"], g["category"])),
                             0.0, 0.0, canvas_w, canvas_h)
-    color_by_cat = {cat: CATEGORICAL_PALETTE[i % len(CATEGORICAL_PALETTE)]
-                     for i, (cat, _) in enumerate(ALWAYS_CATEGORIES)}
     for g in group_rects:
         groups.append(g)
         cat_files = sorted(by_cat.get(g["category"], []), key=lambda f: (-f.get("tokens_est", 0), f["path"]))
-        cell_items = [{"size": f.get("tokens_est", 0), "path": f["path"], "node_key": _al_node_key(f["path"])}
+        cell_items = [{"size": f.get("tokens_est", 0), "words": f.get("words", 0),
+                       "path": f["path"], "node_key": _al_node_key(f["path"])}
                       for f in cat_files]
         cells = squarify(cell_items, float(g["x"]), float(g["y"]), float(g["w"]), float(g["h"]))
         for c in cells:
-            c["fill"] = color_by_cat[g["category"]]
+            # Demo parity #5 (B-t3 follow-up): one hue per SECTION, not per category —
+            # depth (size->fill-opacity, unchanged) is now the only within-section
+            # differentiator. `var(--accent)` tracks the light/dark theme token
+            # automatically (inline SVG honors CSS custom properties under file://).
+            c["fill"] = "var(--accent)"
             c["category"] = g["category"]
         all_cells.extend(cells)
     return {"groups": groups, "cells": all_cells,
@@ -330,14 +357,15 @@ def _on_demand_treemap(doc, canvas_w=960.0, canvas_h=420.0):
         group_items.append({"size": total, "category": g, "label": label, "file_count": len(items_by_group[g])})
     group_rects = squarify(sorted(group_items, key=lambda g: (-g["size"], g["category"])),
                             0.0, 0.0, canvas_w, canvas_h)
-    color_by_group = {g: CATEGORICAL_PALETTE[i % len(CATEGORICAL_PALETTE)]
-                       for i, (g, _) in enumerate(ON_DEMAND_GROUPS)}
     all_cells = []
     for g in group_rects:
         cell_items = sorted(items_by_group[g["category"]], key=lambda i: (-i["size"], i["path"]))
         cells = squarify(cell_items, float(g["x"]), float(g["y"]), float(g["w"]), float(g["h"]))
         for c in cells:
-            c["fill"] = color_by_group[g["category"]]
+            # Demo parity #5 (B-t3 follow-up): a distinct but still COOL hue from the
+            # always-loaded section (never crit-red/good-green — the friction-heat
+            # overlay's red stroke ramp needs the base fill to stay out of its way).
+            c["fill"] = "var(--accent-2)"
             c["category"] = g["category"]
         all_cells.extend(cells)
     return {"groups": group_rects, "cells": all_cells, "canvas_w": canvas_w, "canvas_h": canvas_h}
@@ -376,7 +404,8 @@ def build_bipartite_model(doc):
     right = sorted(
         [{"node_key": _hook_node_key(s["name"]), "name": s.get("name", ""),
           "registered_via": s.get("registered_via", "none"),
-          "is_symlink": bool(s.get("is_symlink", False))} for s in scripts_on_disk],
+          "is_symlink": bool(s.get("is_symlink", False)),
+          "description": s.get("description", "")} for s in scripts_on_disk],
         key=lambda n: n["node_key"])
     edges = sorted(
         [{"from": _hook_node_key(r["script"]), "to": _hook_node_key(r["script"])}
@@ -414,9 +443,9 @@ def build_civc_model(synth):
     """CIVC 6x6 grid. Absent synthesis -> graceful empty-state (`available=False`,
     §6). A malformed cell set never crashes: missing cells fall back to 'empty'.
     `verdict` is allowlisted to VERDICTS here — the ONE normalization point every
-    consumer (Overview mini-cells, Coverage cells, copy payloads) reads from — so an
-    unallowlisted synthesis value (e.g. a crafted `"covered fh1 heatable"`) can never
-    ride through as an extra CSS class (Codex P1 class-injection finding)."""
+    consumer (Coverage matrix cells, copy payloads) reads from — so an unallowlisted
+    synthesis value (e.g. a crafted `"covered fh1 heatable"`) can never ride through
+    as an extra CSS class (Codex P1 class-injection finding)."""
     if synth is None:
         return {"available": False, "cells": []}
     by_key = {}
@@ -470,14 +499,39 @@ def _gauge_band(key, value):
     return bands[-1][1], bands[-1][2]
 
 
-def friction_total(joined, codex_aggregate):
+def friction_total(joined, codex_aggregate, metrics_aggregate_only=0):
     """AM-1 gauge value: total friction events across the 4 streams = joined telemetry
-    records (decisions/metrics/interventions) + codex runs. This is a JOIN-EVENT count:
-    a basename-ambiguous record that heats N nodes counts N. That is INTENTIONAL
-    (DECISION 6) — this same value is rendered as the Friction view's headline total
-    (Task 8), so the header gauge and the Friction view show ONE consistent friction
-    number rather than two disagreeing totals. Do NOT dedupe to unique source records."""
-    return sum(len(v) for v in joined.values()) + codex_aggregate.get("runs", 0)
+    records (decisions/metrics/interventions) + codex runs + metrics-eligible records
+    that resolved to NO node (`metrics_aggregate_only`). This is a JOIN-EVENT count, not
+    a unique-source-record count — do NOT dedupe. UPDATED SEMANTICS (§C1): a basename- or
+    path-ambiguous ref now heats NONE (DECISION 6 is superseded — ambiguity used to fan
+    out heat to every matching node and count N; it no longer does, since that was the
+    subtree-smear bug). To keep the eligible-but-unattributed signal from silently
+    disappearing when its record joins no node, `join_metrics`'s `records_aggregate_only`
+    count is folded in here — this same value is rendered as the Friction view's headline
+    total (Task 8), so the header gauge and the Friction view show ONE consistent friction
+    number rather than two disagreeing totals."""
+    return sum(len(v) for v in joined.values()) + codex_aggregate.get("runs", 0) + metrics_aggregate_only
+
+
+def _metrics_aggregate_only(footer):
+    """Pulls `join_metrics`'s aggregate-only count back out of the friction footer (the
+    single place it's already computed, §C1 change 3) — never re-derived independently."""
+    return next((f.get("records_aggregate_only", 0) for f in footer if f["stream"] == "metrics"), 0)
+
+
+def _friction_contributions(joined, footer, codex_aggregate):
+    """Friction-gauge drill breakdown that PROVABLY reconciles: the returned counts sum
+    EXACTLY to friction_total(joined, codex_aggregate, _metrics_aggregate_only(footer)).
+    We split by the three terms friction_total itself adds — NOT by stream, because the
+    `joined` records carry no stream tag and join_metrics appends per-alias (so a per-
+    stream split would not sum to the joined total). Deterministic fixed order."""
+    return [
+        ("Telemetry events joined to a component", sum(len(v) for v in joined.values())),
+        ("Metrics events not attributed to a component (aggregate-only)",
+         _metrics_aggregate_only(footer)),
+        ("Codex review runs (not node-joined)", codex_aggregate.get("runs", 0)),
+    ]
 
 
 def build_overview_model(models, headline, phantom_ref_count, friction_total_value):
@@ -507,10 +561,11 @@ def build_overview_model(models, headline, phantom_ref_count, friction_total_val
 def build_copy_payloads(date, models, friction, doc):
     """A8: per-view clean-markdown copy payload. Pure function of inputs (deterministic).
     Rendered into inert <script type='application/json'> islands; read via textContent +
-    JSON.parse at click time."""
+    JSON.parse at click time. Task B-t2 tab merge: the former standalone "coverage"
+    payload is now folded into "overview" (one merged tab, one copy button)."""
     heat, joined, footer, codex_aggregate = friction
     civc = models["civc"]
-    # --- coverage: markdown table ---
+    # --- coverage matrix: markdown table (folded into the "overview" payload below) ---
     header = "| verb \\ surface | " + " | ".join(SURFACES) + " |"
     divider = "|" + "---|" * (len(SURFACES) + 1)
     by_verb = {}
@@ -520,7 +575,8 @@ def build_copy_payloads(date, models, friction, doc):
                 + " | ".join(by_verb.get(verb, {}).get(s, "empty") for s in SURFACES) + " |"
                 for verb in VERBS]
     coverage_md = "\n".join([header, divider] + cov_rows) if civc.get("available") \
-        else "_Coverage Matrix unavailable (no synthesis sidecar)._"
+        else (f"_Coverage Matrix unavailable — no `harness-synthesis-{date}.json` in this "
+              f"report directory. Re-run `/harness-map` Step B to generate it._")
     # --- friction: sentences ---
     friction_md = "\n".join(f"- {_friction_sentence(f, codex_aggregate)}" for f in footer) \
         or "_Friction overlay disabled._"
@@ -539,14 +595,15 @@ def build_copy_payloads(date, models, friction, doc):
     # --- overview: digest summary ---
     over = build_overview_model(models, doc.get("headline", {}) or {},
                                 len(doc.get("phantom_refs", []) or []),
-                                friction_total(joined, codex_aggregate))
+                                friction_total(joined, codex_aggregate, _metrics_aggregate_only(footer)))
     overview_md = (f"# harness-map {date}\n\n"
                    f"- roadmap gaps: {len(over['roadmap_gaps'])}\n"
                    f"- friction events: {over['friction']['count']} ({over['friction']['band']})\n"
                    f"- over-cap files: {over['hygiene']['over_cap']}, "
                    f"dup pairs: {over['hygiene']['dup_pairs']}, "
-                   f"phantom refs: {over['hygiene']['phantom_refs']}")
-    return {"overview": overview_md, "coverage": coverage_md, "weight": weight_md,
+                   f"phantom refs: {over['hygiene']['phantom_refs']}\n\n"
+                   f"## Coverage Matrix\n\n{coverage_md}")
+    return {"overview": overview_md, "weight": weight_md,
             "friction": friction_md, "hygiene": hygiene_md}
 
 
@@ -575,12 +632,53 @@ def build_node_index(models):
 
 
 # ------------------------------------------------------------------------------ friction
-def extract_basename(ref):
-    """Shared basename normalizer (§2.3) for loose telemetry text refs."""
+def _normalize_ref_token(ref):
+    """Strips the `:symbol` suffix and ` --flag` tail off a loose telemetry text ref,
+    WITHOUT collapsing it to a basename — kept on the full string so a path-bearing ref
+    can still be resolved exactly (§C1 change 2) instead of basename-fanning-out."""
     token = ref.split(":")[0].strip()
-    token = re.split(r"\s+--", token)[0].strip()
-    return (Path(token).name if ("/" in token or token.endswith((".py", ".sh", ".md")))
-            else token).lower()
+    return re.split(r"\s+--", token)[0].strip()
+
+
+def _valid_node_keys(node_index):
+    """The flat set of every rendered node_key (union of `build_node_index`'s
+    basename -> [node_key,...] values) — the membership test an exact-path or exact-alias
+    resolution must pass before it is allowed to heat anything (§C1)."""
+    return {k for keys in node_index.values() for k in keys}
+
+
+def _canonical_ref_candidates(rel):
+    """Every canonical node_key a path-bearing telemetry ref could map to, tried via the
+    SAME per-view resolvers real nodes are keyed by (§C1 change 2) — never a basename
+    fan-out. Sorted for byte-determinism; the caller intersects with the rendered node
+    set and requires exactly one survivor."""
+    return sorted({_al_node_key(rel), _od_node_key(rel), _hook_node_key(rel), _dup_node_key(rel)})
+
+
+def _resolve_ref(token, root, node_index, valid_keys):
+    """Exact join resolution (§C1 change 2) for ONE already `_normalize_ref_token`-ed
+    telemetry ref. Returns ('matched', node_key) | ('ambiguous', None) | ('unmatched',
+    None). A path-bearing ref (contains '/') is normalized LEXICALLY against `root`
+    (string prefix strip — never filesystem resolve()/realpath) and resolved via the
+    canonical per-view node-key resolvers; a bare name still resolves via `node_index`
+    (basename -> [node_key,...]). Either way >1 candidate is ambiguous (heats nothing),
+    0 candidates is unmatched (heats nothing), exactly 1 is a match."""
+    if "/" in token:
+        rel = token
+        if root:
+            root_norm = root.rstrip("/")
+            if rel == root_norm:
+                rel = ""
+            elif rel.startswith(root_norm + "/"):
+                rel = rel[len(root_norm) + 1:]
+        hits = [k for k in _canonical_ref_candidates(rel) if k in valid_keys]
+    else:
+        hits = node_index.get(token.lower(), [])
+    if not hits:
+        return "unmatched", None
+    if len(hits) > 1:
+        return "ambiguous", None
+    return "matched", hits[0]
 
 
 def _split_component(component):
@@ -667,9 +765,10 @@ def _record_date(rec):
     return None
 
 
-def join_decisions(records, node_index, current_date):
+def join_decisions(records, node_index, current_date, root=""):
     heat, joined = {}, {}
-    segments_total = segments_joined = segments_ambiguous = dated_in_window = 0
+    valid_keys = _valid_node_keys(node_index)
+    segments_total = segments_joined = segments_ambiguous = segments_unmatched = dated_in_window = 0
     for rec in records:
         d = _record_date(rec)
         if d is not None:
@@ -681,17 +780,19 @@ def join_decisions(records, node_index, current_date):
             continue
         for seg in _split_component(component):
             segments_total += 1
-            keys = node_index.get(extract_basename(seg))
-            if not keys:
+            status, key = _resolve_ref(_normalize_ref_token(seg), root, node_index, valid_keys)
+            if status == "ambiguous":
+                segments_ambiguous += 1
+                continue
+            if status == "unmatched":
+                segments_unmatched += 1
                 continue
             segments_joined += 1
-            if len(keys) > 1:
-                segments_ambiguous += 1
-            for k in keys:
-                heat[k] = heat.get(k, 0) + 1
-                joined.setdefault(k, []).append(rec)
+            heat[key] = heat.get(key, 0) + 1
+            joined.setdefault(key, []).append(rec)
     return heat, joined, {"segments_total": segments_total, "segments_joined": segments_joined,
-                           "segments_ambiguous": segments_ambiguous, "records_dated_in_window": dated_in_window}
+                           "segments_ambiguous": segments_ambiguous, "segments_unmatched": segments_unmatched,
+                           "records_dated_in_window": dated_in_window}
 
 
 def _metrics_eligible(rec):
@@ -702,9 +803,16 @@ def _metrics_eligible(rec):
 
 
 def join_metrics(records, node_index, current_date):
+    """§C1 change 1: the blanket 'coding-team' base-node heat is GONE — an eligible
+    record with no resolvable phase/agent alias no longer reattaches to the skill node
+    (that was the smear: every eligible record, no matter which phase/agent it named,
+    also always heated the single coding-team node). Phase/agent aliases now resolve
+    DIRECTLY to their canonical `on_demand:skills/coding-team/{phases,agents}/<file>` key
+    and heat only if that EXACT key is a rendered node — never a basename lookup (a
+    future second `planning.md` elsewhere in the tree would otherwise re-smear)."""
     heat, joined = {}, {}
+    valid_keys = _valid_node_keys(node_index)
     records_eligible = records_aggregate_only = dated_in_window = 0
-    base_keys = node_index.get("coding-team", [])
     for rec in records:
         d = _record_date(rec)
         if d is not None:
@@ -715,17 +823,16 @@ def join_metrics(records, node_index, current_date):
             continue
         records_eligible += 1
         attributed = False
-        for k in base_keys:
-            heat[k] = heat.get(k, 0) + 1
-            joined.setdefault(k, []).append(rec)
-            attributed = True
         phases = rec.get("phases_used")
         if isinstance(phases, list):
             for p in phases:
                 fname = PHASE_ALIAS.get(p) if isinstance(p, str) else None
-                for k in (node_index.get(fname.lower(), []) if fname else []):
-                    heat[k] = heat.get(k, 0) + 1
-                    joined.setdefault(k, []).append(rec)
+                if not fname:
+                    continue
+                key = _od_node_key(f"skills/coding-team/phases/{fname}")
+                if key in valid_keys:
+                    heat[key] = heat.get(key, 0) + 1
+                    joined.setdefault(key, []).append(rec)
                     attributed = True
         agents = rec.get("agents_dispatched")
         if isinstance(agents, dict):
@@ -733,9 +840,12 @@ def join_metrics(records, node_index, current_date):
                 if not (isinstance(count, (int, float)) and not isinstance(count, bool) and count > 0):
                     continue
                 fname = AGENT_ALIAS.get(a) if isinstance(a, str) else None
-                for k in (node_index.get(fname.lower(), []) if fname else []):
-                    heat[k] = heat.get(k, 0) + 1
-                    joined.setdefault(k, []).append(rec)
+                if not fname:
+                    continue
+                key = _od_node_key(f"skills/coding-team/agents/{fname}")
+                if key in valid_keys:
+                    heat[key] = heat.get(key, 0) + 1
+                    joined.setdefault(key, []).append(rec)
                     attributed = True
         if not attributed:
             records_aggregate_only += 1
@@ -744,9 +854,10 @@ def join_metrics(records, node_index, current_date):
                            "records_dated_in_window": dated_in_window}
 
 
-def join_interventions(records, node_index, current_date):
+def join_interventions(records, node_index, current_date, root=""):
     heat, joined = {}, {}
-    dated_in_window = 0
+    valid_keys = _valid_node_keys(node_index)
+    dated_in_window = segments_joined = segments_ambiguous = segments_unmatched = 0
     for rec in records:
         d = _record_date(rec)
         if d is not None:
@@ -756,13 +867,18 @@ def join_interventions(records, node_index, current_date):
         mem = rec.get("memory_file")
         if not isinstance(mem, str) or not mem.strip():
             continue
-        keys = node_index.get(extract_basename(mem))
-        if not keys:
+        status, key = _resolve_ref(_normalize_ref_token(mem), root, node_index, valid_keys)
+        if status == "ambiguous":
+            segments_ambiguous += 1
             continue
-        for k in keys:
-            heat[k] = heat.get(k, 0) + 1
-            joined.setdefault(k, []).append(rec)
-    return heat, joined, {"records_dated_in_window": dated_in_window}
+        if status == "unmatched":
+            segments_unmatched += 1
+            continue
+        segments_joined += 1
+        heat[key] = heat.get(key, 0) + 1
+        joined.setdefault(key, []).append(rec)
+    return heat, joined, {"records_dated_in_window": dated_in_window, "segments_joined": segments_joined,
+                           "segments_ambiguous": segments_ambiguous, "segments_unmatched": segments_unmatched}
 
 
 def aggregate_codex(records, current_date):
@@ -869,6 +985,7 @@ def build_friction_overlay(doc, streams, node_index, current_date, disabled):
     judgment, §2.2). Returns (heat, joined_records, sources_footer, codex_aggregate)."""
     heat, joined = {}, {}
     footer = []
+    root = doc.get("root") or ""
 
     def _merge(h, j):
         for k, v in h.items():
@@ -888,7 +1005,7 @@ def build_friction_overlay(doc, streams, node_index, current_date, disabled):
             counters["records_parsed"] = len(records)
             counters["records_invalid"] = malformed
             if stream == "decisions":
-                h, j, extra = join_decisions(records, node_index, current_date)
+                h, j, extra = join_decisions(records, node_index, current_date, root)
                 _merge(h, j)
                 counters.update(extra)
             elif stream == "metrics":
@@ -896,7 +1013,7 @@ def build_friction_overlay(doc, streams, node_index, current_date, disabled):
                 _merge(h, j)
                 counters.update(extra)
             elif stream == "interventions":
-                h, j, extra = join_interventions(records, node_index, current_date)
+                h, j, extra = join_interventions(records, node_index, current_date, root)
                 _merge(h, j)
                 counters.update(extra)
             elif stream == "codex":
@@ -961,109 +1078,131 @@ def write_html_safely(out_path, text, harness_root):
 
 # ---------------------------------------------------------------------------------- CSS/JS
 STATIC_STYLE = """
-:root{--bg:#0b0f14;--panel:#121824;--text:#e6edf3;--muted:#8b98a5;--border:#2a3341;--accent:#6366f1;--sem-covered:#009e73;--sem-thin:#e69f00;--sem-empty:#d1242f;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
-:root[data-theme="dark"]{--bg:#0b0f14;--panel:#121824;--text:#e6edf3;--muted:#8b98a5;--border:#2a3341;--accent:#6366f1;--sem-covered:#009e73;--sem-thin:#e69f00;--sem-empty:#d1242f}
-@media (prefers-color-scheme: light){:root{--bg:#f6f8fa;--panel:#ffffff;--text:#1b1f24;--muted:#57606a;--border:#d0d7de;--accent:#4f46e5;--sem-covered:#036a52;--sem-thin:#9a6700;--sem-empty:#b3261e}}
-:root[data-theme="light"]{--bg:#f6f8fa;--panel:#ffffff;--text:#1b1f24;--muted:#57606a;--border:#d0d7de;--accent:#4f46e5;--sem-covered:#036a52;--sem-thin:#9a6700;--sem-empty:#b3261e}
+:root{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05);--r:10px;--mono:ui-monospace,"SF Mono","JetBrains Mono","Menlo",monospace}
+@media (prefers-color-scheme: dark){:root{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35)}}
+:root[data-theme="dark"]{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35)}
+:root[data-theme="light"]{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05)}
 *{box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:0;padding:0}
-header{padding:16px 20px;border-bottom:1px solid var(--border)}
+body{background:var(--paper);color:var(--ink);font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:0;padding:0}
+header{padding:16px 20px;border-bottom:1px solid var(--line)}
 h1{font-size:1.25rem;margin:0 0 4px 0}
 .subtitle{color:var(--muted);font-size:0.85rem}
 .tiles,.gauges{display:flex;flex-wrap:wrap;gap:10px;padding:12px 20px}
-.tile,.gauge{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 14px;min-width:150px}
-.tile .v,.gauge .v{font-size:1.4rem;font-weight:600;font-family:var(--mono);font-variant-numeric:tabular-nums}
-.tile .l,.gauge .l{color:var(--muted);font-size:0.75rem}
-.gauge{border-left:4px solid var(--border)}
-.gauge-good{border-left-color:var(--sem-covered)}
-.gauge-warn{border-left-color:var(--sem-thin)}
-.gauge-bad{border-left-color:var(--sem-empty)}
-.gauge-neutral{border-left-color:var(--border)}
-.gauge .band{color:var(--muted);font-size:0.72rem}
+.tile,.gauge{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:10px 14px 12px;min-width:150px}
+.tile .v,.gauge .v{font-size:1.625rem;font-weight:700;font-family:var(--mono);font-variant-numeric:tabular-nums;line-height:1.15}
+.tile .l,.gauge .l{color:var(--muted);font-size:0.72rem;margin-top:2px}
+.gauge{border-left:3px solid var(--line)}
+.gauge-good{border-left-color:var(--good)}
+.gauge-good .v{color:var(--good)}
+.gauge-warn{border-left-color:var(--warn)}
+.gauge-warn .v{color:var(--warn)}
+.gauge-bad{border-left-color:var(--crit)}
+.gauge-bad .v{color:var(--crit)}
+.gauge-neutral{border-left-color:var(--line)}
+.gauge .band{color:var(--muted);font-size:0.65rem;text-transform:uppercase;letter-spacing:.04em;margin-top:2px}
 .gauge .delta{font-size:0.75rem;font-weight:600}
-.gauge .delta-good{color:var(--sem-covered)}
-.gauge .delta-bad{color:var(--sem-empty)}
+.gauge .delta-good{color:var(--good)}
+.gauge .delta-bad{color:var(--crit)}
 .gauge .delta-neutral{color:var(--muted)}
-.warn-badge{background:var(--sem-empty);color:#fff;border-radius:6px;padding:2px 8px;font-size:0.75rem;text-decoration:none}
-.controls{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border);padding:8px 20px;display:flex;gap:8px;flex-wrap:wrap;z-index:5}
-.view-switch,.seg{display:inline-flex;gap:6px;flex-wrap:wrap;border:1px solid var(--border);border-radius:6px;padding:2px}
-button.action-btn,button.view-btn,button.seg-btn,button.copy-btn{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 12px;cursor:pointer;font-size:0.85rem}
-button.view-btn[aria-selected="true"]{border-color:var(--accent);color:var(--accent)}
+.warn-badge{background:var(--crit);color:#fff;border-radius:6px;padding:2px 8px;font-size:0.75rem;text-decoration:none}
+.controls{position:sticky;top:0;background:var(--paper);border-bottom:1px solid var(--line);padding:8px 20px;display:flex;gap:8px;flex-wrap:wrap;z-index:5}
+.seg{display:inline-flex;gap:6px;flex-wrap:wrap;border:1px solid var(--line);border-radius:6px;padding:2px}
+.view-switch{display:inline-flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid var(--line)}
+button.action-btn,button.view-btn,button.seg-btn,button.copy-btn{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px 12px;cursor:pointer;font-size:0.85rem}
+button.view-btn{background:transparent;border:none;border-bottom:2px solid transparent;border-radius:0;padding:8px 14px;color:var(--muted)}
+button.view-btn[aria-selected="true"]{border-bottom-color:var(--accent);color:var(--accent);font-weight:600}
 button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
-button.seg-btn[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);background:var(--bg)}
+button.seg-btn[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);background:var(--paper)}
+button:focus-visible,a:focus-visible,summary:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 main{padding:16px 20px}
 .view[hidden]{display:none}
+@media (prefers-reduced-motion: no-preference){.view:not([hidden]){animation:fade .18s ease-out}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
 .view-toolbar{display:flex;justify-content:flex-end;margin-bottom:8px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:14px}
+.card{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;margin-bottom:14px}
 .digest{color:var(--muted);font-size:0.85rem;margin:0 0 10px 0}
-.hero-friction{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:14px}
-.inspector{position:sticky;top:52px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;max-height:70vh;overflow-y:auto}
+.hero-friction{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;margin-bottom:14px}
+.inspector{position:sticky;top:52px;background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;max-height:70vh;overflow-y:auto}
 .empty-state{color:var(--muted);font-style:italic}
+.script-desc{display:block;color:var(--muted);font-size:0.78rem;margin-top:2px}
 table{border-collapse:collapse;width:100%;font-size:0.85rem}
-th,td{border:1px solid var(--border);padding:6px 8px;text-align:left;font-family:var(--mono);font-variant-numeric:tabular-nums}
+th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;font-family:var(--mono);font-variant-numeric:tabular-nums}
 th{color:var(--muted);font-weight:600}
-.badge{display:inline-block;border-radius:5px;padding:1px 6px;font-size:0.72rem;border:1px solid var(--border)}
-.badge.orphan{border-color:var(--sem-empty);color:var(--sem-empty)}
-.badge.direct{border-color:var(--sem-covered);color:var(--sem-covered)}
+.badge{display:inline-block;border-radius:5px;padding:1px 6px;font-size:0.72rem;border:1px solid var(--line)}
+.badge.orphan{border-color:var(--crit);color:var(--crit)}
+.badge.direct{border-color:var(--good);color:var(--good)}
 .badge.dispatcher{border-color:var(--accent);color:var(--accent)}
-.cell-label{font-size:12px;fill:var(--text);font-family:var(--mono);font-variant-numeric:tabular-nums}
+.cell-label{font-size:12px;fill:var(--ink);font-family:var(--mono);font-variant-numeric:tabular-nums;paint-order:stroke;stroke:var(--paper);stroke-width:3;stroke-linejoin:round}
 .legend-swatch{display:inline-block;width:10px;height:10px;margin-right:4px;border-radius:2px;vertical-align:middle}
-.mini-grid{display:flex;flex-wrap:wrap;gap:2px}
-.mini-cell{width:10px;height:10px;border-radius:2px;background:var(--border);cursor:pointer}
-.mini-cell.sel{outline:2px solid var(--accent)}
-.mini-cell.verdict-covered{background:var(--sem-covered)}
-.mini-cell.verdict-thin{background:var(--sem-thin)}
-.mini-cell.verdict-empty{background:var(--sem-empty)}
-.mini-cell:focus-visible{outline:2px solid var(--accent)}
 .overview-grid{display:grid;grid-template-columns:1fr 340px;gap:14px;align-items:start}
-.hero-friction-good{border-left:4px solid var(--sem-covered)}
-.hero-friction-warn{border-left:4px solid var(--sem-thin)}
-.hero-friction-bad{border-left:4px solid var(--sem-empty)}
-.hero-friction-neutral{border-left:4px solid var(--border)}
+.hero-friction-good{border-left:4px solid var(--good)}
+.hero-friction-warn{border-left:4px solid var(--warn)}
+.hero-friction-bad{border-left:4px solid var(--crit)}
+.hero-friction-neutral{border-left:4px solid var(--line)}
 .hero-friction .count{font-size:1.2rem;font-weight:600;font-family:var(--mono);font-variant-numeric:tabular-nums;margin:4px 0}
 .digest-group{margin-bottom:10px}
-.digest-group h3{font-size:0.82rem;margin:0 0 4px 0;color:var(--muted)}
+.digest-group h3{font-size:0.7rem;margin:0 0 6px 0;color:var(--muted);font-family:var(--mono);text-transform:uppercase;letter-spacing:.03em}
 .digest-group ul{margin:0;padding:0;list-style:none}
 .digest-group li{font-size:0.82rem;margin:2px 0;display:flex;align-items:center;gap:6px}
 .sev-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:0 0 auto}
-.sev-dot.sev-good{background:var(--sem-covered)}
-.sev-dot.sev-warn{background:var(--sem-thin)}
-.sev-dot.sev-bad{background:var(--sem-empty)}
+.sev-dot.sev-good{background:var(--good)}
+.sev-dot.sev-warn{background:var(--warn)}
+.sev-dot.sev-bad{background:var(--crit)}
 .stream-cards{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 14px 0}
-.stream-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;flex:1 1 200px}
-.stream-card .count{font-size:1.3rem;font-weight:600;font-family:var(--mono);font-variant-numeric:tabular-nums;margin:0 0 4px 0}
-.stream-card h3{margin:0 0 4px 0;font-size:0.9rem}
+.stream-card{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:12px 14px;flex:1 1 200px}
+.stream-card .count{font-size:1.75rem;font-weight:700;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--accent);margin:0 0 4px 0}
+.stream-card h3{margin:0 0 4px 0;font-size:0.9rem;font-weight:700}
 .stream-card p{margin:0 0 6px 0;font-size:0.82rem;color:var(--muted)}
-.stream-card .source{font-size:0.75rem;color:var(--muted);font-family:var(--mono)}
+.stream-card .source{font-size:0.75rem;color:var(--faint);font-family:var(--mono)}
 .sev-dot.sev-neutral{background:var(--muted)}
 svg text{font-family:inherit}
-footer.sources{border-top:1px solid var(--border);padding:10px 20px;color:var(--muted);font-size:0.78rem}
+footer.sources{border-top:1px solid var(--line);padding:10px 20px;color:var(--muted);font-size:0.78rem}
 .overflow-x{overflow-x:auto}
 @media (prefers-reduced-motion: no-preference){button{transition:border-color .15s}}
-.cell-rect{stroke:var(--border);stroke-width:0.5}
+.cell-rect{stroke:var(--line);stroke-width:0.5}
+.ladder-track{fill:var(--surface-2)}
 body.friction-on .heatable:not(.fh1):not(.fh2):not(.fh3):not(.fh4){opacity:0.25}
-body.friction-on .fh1,body.friction-on .fh2,body.friction-on .fh3,body.friction-on .fh4{opacity:1}
-.friction-badge{display:none;font-size:10px;font-weight:700;fill:#fff;paint-order:stroke;stroke:#000;stroke-width:2}
+.friction-badge{display:none;font-size:13px;font-weight:700;fill:#fff;paint-order:stroke;stroke:#000;stroke-width:2.5}
 body.friction-on .friction-badge{display:inline}
-#friction-toggle[aria-pressed="true"]{background:var(--sem-empty);border-color:var(--sem-empty);color:#fff;font-weight:600}
+/* Length-criticality outline (honest, separate from friction heat — hygiene's own
+   >600-line `critical` classification, never fabricated churn). `--warn` (amber),
+   deliberately NOT `--crit` (red) — red is friction heat's own fh1-4 ramp, and a
+   crit-colored ring on a zero-friction tile read as a false friction claim.
+   Rendered as sibling elements OUTSIDE the `.heatable` class entirely, so the
+   friction-overlay dimming rule above structurally cannot touch them: always-on,
+   in every lens, in both themes (`--warn`/`--paper` already theme). */
+.length-crit-ring{fill:none;stroke:var(--warn);stroke-width:2.5;pointer-events:none}
+.length-crit-marker{fill:var(--warn);stroke:var(--paper);stroke-width:1.5;pointer-events:none}
+.legend-swatch.length-crit-swatch{background:transparent;border:2px solid var(--warn)}
+#friction-toggle[aria-pressed="true"]{background:var(--crit);border-color:var(--crit);color:#fff;font-weight:600}
 .friction-legend{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:0.75rem;padding:4px 20px 0}
 .legend-entry{display:inline-flex;align-items:center;gap:4px}
-.legend-swatch.fh0{background:var(--panel);border:1px solid var(--border)}
+.legend-swatch.fh0{background:var(--surface);border:1px solid var(--line)}
 .legend-note{color:var(--muted)}
 .friction-explainer{color:var(--muted);font-size:0.85rem;margin:0 0 10px 0}
 .friction-row-detail{display:block;color:var(--muted);font-size:0.78rem;margin-top:2px}
 details{color:var(--muted)}
 details > summary{cursor:pointer;color:var(--accent)}
 .civc-legend{color:var(--muted);font-size:0.8rem;margin:0 0 10px 0}
-td.verdict-covered{background:rgba(0,158,115,0.18)}
-td.verdict-thin{background:rgba(230,159,0,0.15)}
-td.verdict-empty{color:var(--muted);border:2px dashed var(--sem-empty);background:repeating-linear-gradient(135deg,rgba(209,36,47,0.12) 0,rgba(209,36,47,0.12) 4px,transparent 4px,transparent 8px)}
-.badge.verdict-thin{border-color:var(--sem-thin);color:var(--sem-thin)}
-.badge.verdict-covered{border-color:var(--sem-covered);color:var(--sem-covered)}
+.badge.verdict-thin{border-color:var(--warn);color:var(--warn)}
+.badge.verdict-covered{border-color:var(--good);color:var(--good)}
+.badge.verdict-empty{border-color:var(--crit);color:var(--crit)}
 .coverage-grid{display:grid;grid-template-columns:1fr 320px;gap:14px;align-items:start}
-.matrix-cell{cursor:pointer}
-.matrix-cell.sel{outline:2px solid var(--accent);outline-offset:-2px}
-.matrix-cell:focus-visible{outline:2px solid var(--accent)}
+.matrix{display:grid;grid-template-columns:88px repeat(6,1fr);gap:6px}
+.matrix .mhead{font-family:var(--mono);font-size:0.72rem;color:var(--muted);display:flex;align-items:center;padding:4px 6px}
+.matrix .mhead.mhead-row{justify-content:flex-end;text-align:right}
+.matrix .cell{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;aspect-ratio:1/.74;border-radius:8px;border:1px solid var(--line);background:var(--surface);cursor:pointer;transition:transform .15s ease,box-shadow .15s ease}
+.matrix .cell:hover,.matrix .cell:focus-visible{transform:translateY(-2px);box-shadow:var(--shadow)}
+.matrix .cell.verdict-covered{background:var(--good-bg);border-color:var(--good-line)}
+.matrix .cell.verdict-thin{background:var(--warn-bg);border-color:var(--warn-line)}
+.matrix .cell.verdict-empty{border:1px dashed var(--crit-line);background-color:var(--surface);background-image:repeating-linear-gradient(135deg,var(--crit-bg) 0,var(--crit-bg) 4px,transparent 4px,transparent 8px)}
+.matrix .cell.sel{outline:2px solid var(--accent);outline-offset:-2px}
+.matrix .cell:focus-visible{outline:2px solid var(--accent)}
+.matrix .cell .cv{font-family:var(--mono);font-size:0.66rem;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}
+.matrix .cell .dot{width:8px;height:8px;border-radius:50%;background:var(--line)}
+.matrix .cell.verdict-covered .dot{background:var(--good)}
+.matrix .cell.verdict-thin .dot{background:var(--warn)}
+.matrix .cell.verdict-empty .dot{background:var(--crit)}
 .inspector-panel .surface-tag{color:var(--muted);font-size:0.72rem;text-transform:uppercase;margin:0}
 .inspector-panel .verb-tag{font-weight:600;margin:2px 0 6px 0}
 .inspector-panel .evidence{margin:6px 0}
@@ -1074,13 +1213,44 @@ td.verdict-empty{color:var(--muted);border:2px dashed var(--sem-empty);backgroun
 .mode-ladder .ladder-panel{display:block}
 .copy-btn{font-size:0.78rem;padding:4px 10px}
 .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-.pill{display:inline-block;border-radius:5px;padding:1px 6px;font-size:0.72rem;border:1px solid var(--sem-thin);color:var(--sem-thin)}
-.pill-critical{border-color:var(--sem-empty);color:var(--sem-empty);font-weight:600}
+.pill{display:inline-block;border-radius:5px;padding:1px 6px;font-size:0.72rem;border:1px solid var(--warn);color:var(--warn)}
+.pill-critical{background:var(--crit);border-color:var(--crit);color:#fff;font-weight:700;padding:2px 9px;box-shadow:var(--shadow)}
+tr:has(.pill-critical){background:var(--crit-bg)}
+tr:has(.pill-critical) td{border-color:var(--crit-line);font-weight:600}
 .hygiene-unchecked{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600}
-.warn-count{font-weight:600;color:var(--sem-empty)}
+.warn-count{font-weight:600;color:var(--crit)}
+table.sortable thead th{padding:0}
+button.th-sort{width:100%;background:transparent;border:none;color:var(--muted);font:inherit;font-weight:600;text-align:left;cursor:pointer;padding:6px 8px}
+button.th-sort:hover{color:var(--accent)}
+thead th[aria-sort="ascending"] button.th-sort,thead th[aria-sort="descending"] button.th-sort{color:var(--accent);text-decoration:underline}
+button.gauge{font:inherit;text-align:left;cursor:pointer;border:1px solid var(--line);border-left-width:3px}
+.gauge-chev{float:right;color:var(--muted);font-size:0.7rem;margin-left:8px}
+button.gauge[aria-expanded="true"]{border-color:var(--accent)}
+.gauge-drawer{padding:0 20px 8px}
+.gauge-drill-panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:10px 14px;margin-top:6px;font-size:0.82rem}
+.gauge-drill,.gauge-contributors{margin:4px 0 0;padding-left:18px}
+.gauge-drill li,.gauge-contributors li{margin:2px 0}
+.gauge-contributors-label{color:var(--muted);font-size:0.72rem;text-transform:uppercase;letter-spacing:.03em;margin:0}
+.gauge-drill-tab{color:var(--accent);font-size:0.78rem;margin:6px 0 0}
+.copy-preview{display:inline-block;text-align:left}
+.copy-preview > summary{cursor:pointer;color:var(--accent);font-size:0.78rem}
+.copy-preview-body{max-height:280px;overflow:auto;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin:6px 0;font-family:var(--mono);font-size:0.75rem;white-space:pre-wrap;word-break:break-word}
+.drag-fields{margin:4px 0}
+.drag-fields > summary{cursor:pointer;color:var(--accent);font-size:0.78rem}
+.drag-fields div{font-size:0.8rem;margin:2px 0}
+tr.friction-component-row.sel td{background:var(--accent-soft);border-color:var(--accent)}
+svg .cell-rect,svg .ladder-bar{cursor:pointer}
 """
+# Graduated friction-heat ramp (Codex/demo parity finding: fh1 rendered visually
+# IDENTICAL to fh4 — both hit opacity:1, differing only by a subtle stroke-color
+# swap). Opacity + stroke-width now step up monotonically with HEAT_RAMP's own
+# light->dark color progression, so "some" (fh1) genuinely recedes relative to
+# "most-active" (fh4) instead of only the outline color changing.
+_HEAT_OPACITY = ("0.55", "0.72", "0.88", "1")
+_HEAT_STROKE_W = (2, 3, 4, 5)
 _HEAT_CSS = "".join(
-    f"body.friction-on .fh{i}{{stroke:{color};stroke-width:4}}"
+    f"body.friction-on .fh{i}{{stroke:{color};stroke-width:{_HEAT_STROKE_W[i - 1]};"
+    f"opacity:{_HEAT_OPACITY[i - 1]}}}"
     f".legend-swatch.fh{i}{{background:{color}}}"
     for i, color in enumerate(HEAT_RAMP, start=1)
 )
@@ -1117,22 +1287,22 @@ STATIC_SCRIPT = """
     });
   }
 
-  // cross-view nav: any element with data-goto (+ optional data-cell-id) switches view & selects
-  document.querySelectorAll('[data-goto]').forEach(function(el){
-    el.addEventListener('click', function(){
-      activate(el.dataset.goto);
-      var cid = el.dataset.cellId;
-      var target = document.getElementById(el.dataset.goto);
-      if (cid) { selectCell(cid); }
-      // WCAG 2.2 AA: the source element's view is now hidden, so move keyboard focus
-      // INTO the target view instead of letting it drop to <body>. Prefer the exact
-      // selected cell (already focusable, tabindex="0"); fall back to the view itself
-      // (each `.view` section carries tabindex="-1" for this).
-      var selEl = cid && target ? target.querySelector('[data-cell-id="' + cid + '"]') : null;
-      if (selEl && selEl.focus) { selEl.focus(); }
-      else if (target && target.focus) { target.focus(); }
+  // theme toggle (target #10): an explicit user choice always wins over the OS-level
+  // prefers-color-scheme media query, by stamping [data-theme] on the root -- the CSS
+  // attribute selectors are written to out-specificity the media query either direction.
+  var themeBtn = document.getElementById('theme-toggle');
+  if (themeBtn){
+    themeBtn.addEventListener('click', function(){
+      var root = document.documentElement;
+      var current = root.getAttribute('data-theme');
+      if (!current){
+        current = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+      }
+      var next = current === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      themeBtn.setAttribute('aria-pressed', next === 'dark' ? 'true' : 'false');
     });
-  });
+  }
 
   // coverage inspector selection
   var cells = document.querySelectorAll('.matrix-cell');
@@ -1186,15 +1356,69 @@ STATIC_SCRIPT = """
   function flash(b){ b.setAttribute('aria-pressed', 'true');
     setTimeout(function(){ b.setAttribute('aria-pressed', 'false'); }, 600); }
 
-  // WCAG 2.2 AA keyboard access: Enter/Space activate the role="button" cells
-  // (mini-grid data-goto cells + coverage matrix cells) that only had click handlers.
+  // Sortable tables (item 4): delegated click on a <th> sort button reorders the
+  // <tbody> rows by the column's data-sort-type. Server order is the initial DOM state;
+  // client sort NEVER changes emitted bytes. Stable via the original-index tiebreak.
+  document.querySelectorAll('table.sortable').forEach(function(tbl){
+    tbl.querySelectorAll('thead th button[data-sort-col]').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        var th = btn.closest('th');
+        var col = parseInt(btn.getAttribute('data-sort-col'), 10);
+        var type = btn.getAttribute('data-sort-type');
+        var asc = th.getAttribute('aria-sort') !== 'ascending';
+        var tbody = tbl.querySelector('tbody');
+        var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+        var decorated = rows.map(function(r, i){
+          var cell = r.children[col];
+          var raw = cell ? cell.textContent.trim() : '';
+          var key = (type === 'num') ? parseFloat(raw) : raw;
+          if (type === 'num' && isNaN(key)) { key = -Infinity; }
+          return {r: r, key: key, i: i};
+        });
+        decorated.sort(function(a, b){
+          if (a.key < b.key) { return asc ? -1 : 1; }
+          if (a.key > b.key) { return asc ? 1 : -1; }
+          return a.i - b.i;
+        });
+        decorated.forEach(function(d){ tbody.appendChild(d.r); });
+        // reset all headers to neutral, then mark the active one (indicator: shape, not color)
+        tbl.querySelectorAll('thead th[aria-sort]').forEach(function(h){
+          h.setAttribute('aria-sort', 'none');
+          var ind = h.querySelector('.sort-ind');
+          if (ind) { ind.textContent = '↕'; }
+        });
+        th.setAttribute('aria-sort', asc ? 'ascending' : 'descending');
+        var activeInd = th.querySelector('.sort-ind');
+        if (activeInd) { activeInd.textContent = asc ? '▲' : '▼'; }
+      });
+    });
+  });
+
+  // Header gauge drill-down accordion (item 1): each .gauge button toggles its shared
+  // drawer panel; one open at a time, re-click closes.
+  var gaugeBtns = document.querySelectorAll('button.gauge[aria-controls]');
+  gaugeBtns.forEach(function(g){
+    g.addEventListener('click', function(){
+      var open = g.getAttribute('aria-expanded') === 'true';
+      gaugeBtns.forEach(function(other){
+        other.setAttribute('aria-expanded', 'false');
+        var p = document.getElementById(other.getAttribute('aria-controls'));
+        if (p) { p.hidden = true; }
+      });
+      var panel = document.getElementById(g.getAttribute('aria-controls'));
+      if (!open && panel){ g.setAttribute('aria-expanded', 'true'); panel.hidden = false; }
+    });
+  });
+
+  // WCAG 2.2 AA keyboard access: Enter/Space activate the role="button" coverage
+  // matrix cells, which only had click handlers.
   function keyActivate(e){
     if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar'){
       if (e.key !== 'Enter'){ e.preventDefault(); }   // Space would scroll the page
       e.currentTarget.click();
     }
   }
-  document.querySelectorAll('[data-goto], .matrix-cell').forEach(function(el){
+  document.querySelectorAll('.matrix-cell').forEach(function(el){
     el.addEventListener('keydown', keyActivate);
   });
 
@@ -1204,6 +1428,28 @@ STATIC_SCRIPT = """
     views.forEach(function(v){ v.hidden = false; }); }); }
 
   if (views.length){ activate('view-overview'); }
+
+  // Treemap/ladder click-to-act (item 6): clicking a cell jumps to the Friction tab (the
+  // keyboard-accessible home for per-cell data) and highlights that node_key's row in the
+  // sortable component table. Guarded: the tab jump is always useful; the row highlight
+  // only fires when a matching row exists. Length-crit rings have pointer-events:none, so
+  // only the real cell-rect / ladder-bar receives the click. NEVER interpolate `key` into a
+  // selector string — a node_key derived from a POSIX path can contain ", ], or \\ and
+  // would throw a DOMException; iterate the rows and compare getAttribute instead.
+  var componentRows = document.querySelectorAll('tr.friction-component-row[data-node-key]');
+  document.querySelectorAll('svg [data-node-key]').forEach(function(cell){
+    cell.addEventListener('click', function(){
+      var key = cell.getAttribute('data-node-key');
+      activate('view-friction');
+      var match = null;
+      componentRows.forEach(function(r){
+        var hit = r.getAttribute('data-node-key') === key;
+        r.classList.toggle('sel', hit);
+        if (hit) { match = r; }
+      });
+      if (match){ match.scrollIntoView({block: 'center'}); }
+    });
+  });
 
   // Live-serve progressive enhancement: when served by serve.py, subscribe to the SSE
   // /events endpoint and reload on 'refresh'. On file:// (or a STATIC one-shot artifact
@@ -1251,6 +1497,31 @@ TREEMAP_LABEL_MIN_H = 30
 # determinism; MIN keeps the smallest cell visibly on-canvas rather than near-invisible.
 _OPACITY_MIN = 0.35
 _OPACITY_MAX = 1.0
+# Demo parity #5: rounded corners + inter-tile gap on every treemap rect (the
+# shipped renderer drew flat, edge-to-edge tiles with no separation).
+TREEMAP_CELL_RX = 6
+TREEMAP_CELL_GAP = 2.5
+# Deterministic label-fit budget: the `.cell-label`/ladder-name font is the mono
+# stack at 12px, and a stdlib SVG renderer has no real text-metrics API to measure
+# an exact glyph width, so width is estimated from a fixed px-per-char ratio
+# (monospace glyphs are near-uniform width). The ratio is deliberately
+# conservative — errs toward truncating a hair early rather than ever
+# overflowing into a neighboring tile — which is the actual worst treemap defect
+# this fixes: long basenames on small tiles stacking illegibly over each other.
+_LABEL_CHAR_PX = 12 * 0.62
+_LABEL_INSET_PX = 8
+
+
+def _fit_label(text, avail_w):
+    """Truncate `text` with an ellipsis so it fits within `avail_w` px of the
+    label font — returns "" when there is no room for even one character plus
+    the ellipsis (the caller then omits the `<text>` element entirely)."""
+    max_chars = int((float(avail_w) - _LABEL_INSET_PX) / _LABEL_CHAR_PX)
+    if max_chars < 2:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
 
 
 def _scaled_opacity(size, max_size):
@@ -1263,12 +1534,61 @@ def _scaled_opacity(size, max_size):
     return _OPACITY_MIN + (_OPACITY_MAX - _OPACITY_MIN) * ratio
 
 
-def _render_treemap_svg(tree, heat, dom_id):
+def _heat_bucket_map(heat):
+    """Rank/quantile heat->bucket map (C2), built ONCE per render (by
+    `_render_weight_view`) from the FULL heat dict and shared by every treemap/ladder
+    call so a given heat value always gets the same fhN class no matter which panel
+    draws it. Buckets the DISTINCT heat values, not the raw count (the old
+    `min(heat_n, len(HEAT_RAMP))` flooded fh4 with every node at heat>=4) — so the top
+    bucket stays a genuine minority slice on real distributions instead of a flood.
+    `sorted(set(...))` (never a bare set iterated directly) so ties are a pure function
+    of value, independent of dict/set iteration order or PYTHONHASHSEED (§4.4
+    determinism). Zero heated nodes returns `{}` (no max()/min()/quantile on an empty
+    sequence). A single distinct value has nothing to rank against — rank/k == 1.0
+    deterministically resolves it to the top bucket rather than crashing or dividing
+    by zero. Returns {value: bucket}; an unheated node (heat 0, absent from `heat`)
+    stays bucket 0 via the caller's `bucket_map.get(heat_n, 0)`."""
+    distinct = sorted({v for v in heat.values() if v})
+    k = len(distinct)
+    if k == 0:
+        return {}
+    n = len(HEAT_RAMP)
+    return {v: max(1, min(n, math.ceil((i + 1) / k * n))) for i, v in enumerate(distinct)}
+
+
+def _cell_title(path, heat_n, crit_lines):
+    """Self-explaining hover-`<title>` for a treemap/ladder cell. Leads with a churn
+    word so a zero-friction cell reads `churn: none recorded` (never the old
+    `(friction: 0)` contradiction the operator caught), and — when the length-crit
+    ring is present — states explicitly that the amber ring is SIZE, not churn
+    (honors the amber/friction decouple lesson). `crit_lines` is `None` for a
+    non-critical cell."""
+    churn = f"churn: {heat_n} friction record(s)" if heat_n else "churn: none recorded"
+    parts = [str(path), churn]
+    if crit_lines is not None:
+        parts.append(f"size: {crit_lines} lines (over the {LENGTH_CRITICAL_LINES}-line cap)")
+        parts.append("amber ring = oversize, NOT churn")
+    return " · ".join(parts)
+
+
+def _render_treemap_svg(tree, heat, dom_id, bucket_map=None, length_crit_keys=None):
     """Heat is shown two ways once the friction overlay toggle is on (never color
     alone, §UI): a CSS-class-driven stroke ramp on the cell, AND a text join-count
     badge in the corner. Both are hidden-by-default via `body.friction-on` CSS so the
     toggle button has a visible, demonstrable effect. Fill opacity is value-scaled
-    (A5) via the SVG `fill-opacity` attribute — never `style=`."""
+    (A5) via the SVG `fill-opacity` attribute — never `style=`. `bucket_map` (C2) is
+    the rank/quantile value->bucket map shared with the ladder site; `_render_weight_view`
+    always passes it explicitly (computed once from the full heat dict) — the `None`
+    default (fallback to a locally-derived map) only serves callers/tests that render a
+    single tree in isolation. `length_crit_keys` (B-t3 follow-up) is a `{node_key:
+    lines}` dict — the SEPARATE, honest length-criticality signal
+    (`_length_critical_node_keys`) — deliberately independent of `heat`/
+    `bucket_map`: a file can be length-critical with zero friction (e.g. `review`,
+    never named by any telemetry record) or vice versa. The `lines` value feeds
+    `_cell_title` so the hover text explains WHY a ringed cell is ringed."""
+    if bucket_map is None:
+        bucket_map = _heat_bucket_map(heat)
+    length_crit_keys = length_crit_keys or {}
     w, h = tree["canvas_w"], tree["canvas_h"]
     max_size = max((float(c.get("size", 0)) for c in tree["cells"]), default=0.0)
     parts = [f'<svg id="{esc_html(dom_id)}" viewBox="0 0 {_fmt_float(w)} {_fmt_float(h)}" '
@@ -1276,26 +1596,56 @@ def _render_treemap_svg(tree, heat, dom_id):
     parts.append(f'<title id="{esc_html(dom_id)}-title">Context-weight treemap</title>')
     for c in tree["cells"]:
         heat_n = heat.get(c["node_key"], 0)
-        bucket = min(heat_n, len(HEAT_RAMP)) if heat_n else 0
+        bucket = bucket_map.get(heat_n, 0)
         rect_cls = f"cell-rect heatable fh{bucket}" if bucket else "cell-rect heatable"
-        label = esc_html(Path(c["path"]).name)
         opacity = _fmt_float(_scaled_opacity(c.get("size", 0), max_size))
+        # Demo parity #5: inset every rect by half the gap on each side so adjacent
+        # tiles show paper-colored separation instead of touching edge-to-edge, and
+        # round the corners — `max(0.0, ...)` clamps a gap that would otherwise
+        # exceed a tiny tile's own size to a zero (never negative) width/height.
+        gx = max(0.0, float(c["x"]) + TREEMAP_CELL_GAP / 2)
+        gy = max(0.0, float(c["y"]) + TREEMAP_CELL_GAP / 2)
+        gw = max(0.0, float(c["w"]) - TREEMAP_CELL_GAP)
+        gh = max(0.0, float(c["h"]) - TREEMAP_CELL_GAP)
+        title = _cell_title(c["path"], heat_n, length_crit_keys.get(c["node_key"]))
         parts.append(
-            f'<rect x="{c["x"]}" y="{c["y"]}" width="{c["w"]}" height="{c["h"]}" '
+            f'<rect x="{_fmt_float(gx)}" y="{_fmt_float(gy)}" width="{_fmt_float(gw)}" '
+            f'height="{_fmt_float(gh)}" rx="{TREEMAP_CELL_RX}" '
             f'fill="{esc_html(c.get("fill", "#56b4e9"))}" fill-opacity="{opacity}" '
             f'class="{rect_cls}" data-node-key="{esc_html(c["node_key"])}">'
-            f'<title>{esc_html(c["path"])} (friction: {heat_n})</title></rect>')
-        tx, ty = _fmt_float(float(c["x"]) + 2), _fmt_float(float(c["y"]) + 13)
+            f'<title>{esc_html(title)}</title></rect>')
+        tx, ty = _fmt_float(gx + 4), _fmt_float(gy + 14)
+        # Original (un-inset) w/h decide the auto-hide threshold — the gap itself
+        # shouldn't push a tile that would otherwise fit just under the cutoff.
         if float(c["w"]) > TREEMAP_LABEL_MIN_W and float(c["h"]) > TREEMAP_LABEL_MIN_H:
-            parts.append(f'<text x="{tx}" y="{ty}" class="cell-label">{label}</text>')
+            # Demo parity defect (worst offender): an un-truncated basename on a
+            # small-but-above-threshold tile overflowed past the tile edge into
+            # neighboring tiles, stacking illegibly. Fit the label to the tile's
+            # own (inset) width so it never renders wider than the tile it labels.
+            fitted = _fit_label(Path(c["path"]).name, gw)
+            if fitted:
+                parts.append(f'<text x="{tx}" y="{ty}" class="cell-label">{esc_html(fitted)}</text>')
         if heat_n:
             # FIX (Codex P2): the badge renders for EVERY heated cell, independent of the
             # text-label threshold above — otherwise a sub-threshold cell is heat-colored
             # with no other signal, breaking the legend's "color is never the only
             # signal" claim (and WCAG use-of-color).
-            bx = _fmt_float(float(c["x"]) + float(c["w"]) - 2)
+            bx = _fmt_float(gx + gw - 3)
             parts.append(f'<text x="{bx}" y="{ty}" text-anchor="end" '
                           f'class="friction-badge">{heat_n}</text>')
+        if c["node_key"] in length_crit_keys:
+            # Length-criticality outline (B-t3 follow-up): a persistent `--crit`
+            # ring + corner dot, rendered as SIBLING elements that carry neither
+            # `heatable` nor an `fhN` class — so `body.friction-on
+            # .heatable:not(.fhN){opacity:.25}` structurally cannot dim them.
+            # Always on, in both friction modes, on tiles too small for a label.
+            parts.append(
+                f'<rect x="{_fmt_float(gx)}" y="{_fmt_float(gy)}" width="{_fmt_float(gw)}" '
+                f'height="{_fmt_float(gh)}" rx="{TREEMAP_CELL_RX}" '
+                f'class="length-crit-ring" data-node-key="{esc_html(c["node_key"])}"/>')
+            mx = _fmt_float(gx + max(0.0, gw - 7))
+            my = _fmt_float(gy + max(0.0, gh - 7))
+            parts.append(f'<circle cx="{mx}" cy="{my}" r="4" class="length-crit-marker"/>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -1307,13 +1657,21 @@ _LADDER_BAR_MAX_W = 300.0
 _LADDER_COUNT_W = 50.0
 
 
-def _render_ladder_svg(tree, heat, dom_id):
+def _render_ladder_svg(tree, heat, dom_id, bucket_map=None, length_crit_keys=None):
     """A5 alternative representation: one horizontal bar per cell instead of nested
     rectangles — same cells as the matching treemap (`tree["cells"]`), sorted by
     descending size (path as the tie-break, for a total-order determinism key, §4.4).
     Reuses the treemap's `fhN` heat-bucket logic (AM-3) so ladder bars heat too; bar
     width is the SVG `width` attribute, value-scaled to the row's max size — never
-    `style=`."""
+    `style=`. `bucket_map` (C2) is the SAME rank/quantile value->bucket map the
+    matching treemap used — `_render_weight_view` always passes it explicitly so the
+    two representations never diverge; the `None` default only serves isolated
+    callers/tests. `length_crit_keys` (B-t3 follow-up) mirrors the treemap's ring —
+    ladder gets the ring only (no corner marker: the truncated name column already
+    runs close to the bar, and a value/badge already occupy the row's other ends)."""
+    if bucket_map is None:
+        bucket_map = _heat_bucket_map(heat)
+    length_crit_keys = length_crit_keys or {}
     cells = sorted(tree["cells"], key=lambda c: (-float(c.get("size", 0)), c["path"]))
     max_size = max((float(c.get("size", 0)) for c in cells), default=0.0)
     row_h = _LADDER_ROW_H
@@ -1325,22 +1683,34 @@ def _render_ladder_svg(tree, heat, dom_id):
     parts.append(f'<title id="{esc_html(dom_id)}-title">Context-weight ladder</title>')
     for i, c in enumerate(cells):
         heat_n = heat.get(c["node_key"], 0)
-        bucket = min(heat_n, len(HEAT_RAMP)) if heat_n else 0
+        bucket = bucket_map.get(heat_n, 0)
         bar_cls = f"ladder-bar heatable fh{bucket}" if bucket else "ladder-bar heatable"
         size = float(c.get("size", 0))
         width = _LADDER_BAR_MAX_W * (size / max_size) if max_size > 0 else 0.0
         y = row_h * i
-        label = esc_html(Path(c["path"]).name)
+        # Demo parity #5/#6: same collision guard as the treemap — a long basename
+        # is truncated to the fixed label column so it never runs into the bar.
+        label = esc_html(_fit_label(Path(c["path"]).name, _LADDER_LABEL_W))
         text_y = _fmt_float(y + row_h - 7)
+        track_y = _fmt_float(y + 3)
+        track_h = _fmt_float(row_h - 6)
+        # Right-aligned tabular value in the reserved count column (demo parity #6):
+        # anchored at the column's own right edge, not the bar's start, so values
+        # stay column-aligned regardless of bar width.
+        value_x = _fmt_float(_LADDER_LABEL_W + _LADDER_BAR_MAX_W + _LADDER_COUNT_W - 4)
+        title = _cell_title(c["path"], heat_n, length_crit_keys.get(c["node_key"]))
         parts.append(
             f'<text x="0" y="{text_y}" class="cell-label">{label}</text>'
-            f'<rect x="{_fmt_float(_LADDER_LABEL_W)}" y="{_fmt_float(y + 3)}" '
-            f'width="{_fmt_float(width)}" height="{_fmt_float(row_h - 6)}" '
+            f'<rect x="{_fmt_float(_LADDER_LABEL_W)}" y="{track_y}" '
+            f'width="{_fmt_float(_LADDER_BAR_MAX_W)}" height="{track_h}" '
+            f'rx="4" class="ladder-track"/>'
+            f'<rect x="{_fmt_float(_LADDER_LABEL_W)}" y="{track_y}" '
+            f'width="{_fmt_float(width)}" height="{track_h}" rx="4" '
             f'fill="{esc_html(c.get("fill", "#56b4e9"))}" class="{bar_cls}" '
             f'data-node-key="{esc_html(c["node_key"])}">'
-            f'<title>{esc_html(c["path"])} (friction: {heat_n})</title></rect>'
-            f'<text x="{_fmt_float(_LADDER_LABEL_W + _LADDER_BAR_MAX_W + 8)}" '
-            f'y="{text_y}" class="cell-label">{esc_html(c.get("size", 0))}</text>'
+            f'<title>{esc_html(title)}</title></rect>'
+            f'<text x="{value_x}" y="{text_y}" text-anchor="end" '
+            f'class="cell-label">{esc_html(c.get("size", 0))}</text>'
         )
         if heat_n:
             # FIX (Codex round-2 P2, ladder residual): mirror the treemap's
@@ -1349,9 +1719,17 @@ def _render_ladder_svg(tree, heat, dom_id):
             # the bar's own end (like the treemap badge's `x+w-2`) so it reads against
             # the bar's fill; the shared `.friction-badge` CSS (white fill + black
             # stroke, §CSS) keeps it legible over any bar color.
-            bx = _fmt_float(_LADDER_LABEL_W + width - 2)
+            bx = _fmt_float(_LADDER_LABEL_W + width - 3)
             parts.append(f'<text x="{bx}" y="{text_y}" text-anchor="end" '
                           f'class="friction-badge">{heat_n}</text>')
+        if c["node_key"] in length_crit_keys:
+            # Same always-on, friction-independent ring as the treemap — a sibling
+            # element with neither `heatable` nor `fhN`, so the dimming rule can't
+            # touch it.
+            parts.append(
+                f'<rect x="{_fmt_float(_LADDER_LABEL_W)}" y="{track_y}" '
+                f'width="{_fmt_float(_LADDER_BAR_MAX_W)}" height="{track_h}" rx="4" '
+                f'class="length-crit-ring" data-node-key="{esc_html(c["node_key"])}"/>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -1367,7 +1745,11 @@ GAUGE_SPECS = (  # (source_kind, key, label) — source_kind selects where the v
 )
 
 
-def _render_gauge(key, label, value, delta=None):
+def _render_gauge(key, label, value, delta=None, has_drill=False):
+    """A header gauge. `has_drill=True` renders a `<button>` (item 1 accordion trigger,
+    `aria-expanded`/`aria-controls` wired to the shared drawer panel) instead of an inert
+    `<div>` — `class="gauge gauge-{semantic}"` and `data-gauge` are preserved in both forms
+    so existing regression assertions hold either way."""
     band, semantic = _gauge_band(key, value)
     band_html = f'<div class="band">{esc_html(band)}</div>' if band else ""
     delta_html = ""
@@ -1375,9 +1757,78 @@ def _render_gauge(key, label, value, delta=None):
         delta_text, delta_semantic = delta
         delta_html = (f'<div class="delta delta-{esc_html(delta_semantic)}">'
                       f'{esc_html(delta_text)}</div>')
+    inner = (f'<div class="v">{esc_html(value)}</div><div class="l">{esc_html(label)}</div>'
+             f'{band_html}{delta_html}')
+    if has_drill:
+        return (f'<button class="gauge gauge-{esc_html(semantic)}" data-gauge="{esc_html(key)}" '
+                f'aria-expanded="false" aria-controls="gdrawer-{esc_html(key)}">'
+                f'{inner}<span class="gauge-chev" aria-hidden="true">▾</span></button>')
     return (f'<div class="gauge gauge-{esc_html(semantic)}" data-gauge="{esc_html(key)}">'
-            f'<div class="v">{esc_html(value)}</div><div class="l">{esc_html(label)}</div>'
-            f'{band_html}{delta_html}</div>')
+            f'{inner}</div>')
+
+
+# Which tab hosts the full detail for a count gauge (drill footer pointer text).
+_GAUGE_TAB_HINT = {
+    "always_loaded_file_count": "Weight", "instruction_files_over_200": "Hygiene",
+    "duplicate_pair_count": "Hygiene", "phantom_ref_count": "Hygiene",
+    "friction_total": "Friction",
+}
+
+
+def _drill_list(items, cls="gauge-drill"):
+    body = "".join(f'<li>{it}</li>' for it in items) or '<li class="empty-state">none</li>'
+    return f'<ul class="{cls}">{body}</ul>'
+
+
+def _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate):
+    """Per-gauge drill content. Count gauges -> the real underlying items (`.gauge-drill`).
+    Aggregate gauges -> a `.gauge-contributors` 'top contributors' set (DISTINCT class,
+    explicitly NOT a complete list). friction_total -> a three-term decomposition
+    (joined-events / metrics-aggregate-only / codex-runs) that reconciles to the total
+    (`_friction_contributions`) — NOT a per-stream split. Every list sorts by a total key
+    for cross-PYTHONHASHSEED byte-determinism."""
+    hint = _GAUGE_TAB_HINT.get(key)
+    tab = f'<p class="gauge-drill-tab">→ open the {esc_html(hint)} tab for the full table</p>' if hint else ""
+    if key == "always_loaded_file_count":
+        cells = sorted(models["context_weight"]["always"]["cells"],
+                       key=lambda c: (c.get("path", ""),))
+        items = [f'<code>{esc_html(c.get("path",""))}</code>' for c in cells]
+        return _drill_list(items) + tab
+    if key == "instruction_files_over_200":
+        flags = sorted(doc.get("instruction_length_flags", []) or [],
+                       key=lambda f: (-f.get("lines", 0), f.get("path", "")))
+        items = [f'<code>{esc_html(f.get("path",""))}</code> — {esc_html(f.get("lines",0))} lines'
+                 for f in flags]
+        return _drill_list(items) + tab
+    if key == "duplicate_pair_count":
+        pairs = sorted((doc.get("duplication") or {}).get("pairs", []) or [],
+                       key=lambda p: (-p.get("score", 0.0), p.get("a", ""), p.get("b", "")))
+        items = [f'<code>{esc_html(p.get("a",""))}</code> ⇄ <code>{esc_html(p.get("b",""))}</code>'
+                 for p in pairs]
+        return _drill_list(items) + tab
+    if key == "phantom_ref_count":
+        refs = sorted(doc.get("phantom_refs", []) or [],
+                      key=lambda r: (r.get("source", ""), r.get("ref", "")))
+        items = [f'<code>{esc_html(r.get("source",""))}</code> → {esc_html(r.get("ref",""))}'
+                 for r in refs]
+        return _drill_list(items) + tab
+    if key == "friction_total":
+        items = [f'{esc_html(label)}: {esc_html(n)}'
+                 for label, n in _friction_contributions(joined, footer, codex_aggregate)]
+        return _drill_list(items) + tab
+    if key in ("always_loaded_words", "always_loaded_tokens_est"):
+        # Codex/QA finding 2: `always_loaded_words` must sort and display each
+        # contributor's WORD count, not its token estimate — the two fields diverge
+        # per file (schema.md `always_loaded.files[].words` vs `.tokens_est`).
+        field = "words" if key == "always_loaded_words" else "size"
+        cells = sorted(models["context_weight"]["always"]["cells"],
+                       key=lambda c: (-c.get(field, 0), c.get("path", "")))[:5]
+        items = [f'<code>{esc_html(c.get("path",""))}</code> — {esc_html(c.get(field,0))}'
+                 for c in cells]
+        return ('<p class="gauge-contributors-label">Top contributors '
+                '(largest always-loaded files — not a complete list)</p>'
+                + _drill_list(items, cls="gauge-contributors"))
+    return ""
 
 
 def _trend_delta(trend_model, key):
@@ -1406,21 +1857,48 @@ def _trend_delta(trend_model, key):
     return (text, semantic)
 
 
-def _render_instrument_readout(headline, phantom_ref_count, friction_total_value, trend_model):
+def _render_instrument_readout(headline, phantom_ref_count, friction_total_value,
+                               trend_model, models, doc, joined, footer, codex_aggregate):
+    """Item 1: every gauge is now a drill-down accordion trigger — a shared
+    `.gauge-drawer` (one `.gauge-drill-panel` per gauge, closed on load) follows the
+    `.gauges` row so the accordion JS (STATIC_SCRIPT) can toggle `hidden`/`aria-expanded`
+    without touching emitted bytes elsewhere."""
     values = {"phantom_ref_count": phantom_ref_count, "friction_total": friction_total_value}
-    cards = []
+    cards, panels = [], []
     for kind, key, label in GAUGE_SPECS:
         value = values[key] if kind in ("phantom", "friction") else headline.get(key, 0)
         delta = _trend_delta(trend_model, key) if kind == "headline" else None
-        cards.append(_render_gauge(key, label, value, delta))
-    return f'<div class="gauges">{"".join(cards)}</div>'
+        drill = _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate)
+        cards.append(_render_gauge(key, label, value, delta, has_drill=bool(drill)))
+        if drill:
+            panels.append(f'<div class="gauge-drill-panel" id="gdrawer-{esc_html(key)}" '
+                          f'role="region" aria-label="{esc_html(label)} detail" hidden>'
+                          f'{drill}</div>')
+    drawer = f'<div class="gauge-drawer">{"".join(panels)}</div>' if panels else ""
+    return f'<div class="gauges">{"".join(cards)}</div>{drawer}'
 
 
-def _render_copy_controls(view_id):
-    """A8 per-view copy button — clicking reads the sibling JSON island's markdown
-    payload via `.textContent` + `JSON.parse` (executable script never embeds the
-    payload directly, §9-R C)."""
-    return f'<button class="copy-btn action-btn" data-copy-target="copy-{view_id}">Copy</button>'
+def _render_copy_disclosure(target_id, payload, summary_label):
+    """Transparency-before-copy (item 2): a native <details> revealing the EXACT payload
+    the copy button will grab, in a scrollable <pre>, plus an explicit inner copy button.
+    Zero new JS — the inner .copy-btn reuses the existing generic data-copy-target handler;
+    the <pre> shows esc_html(payload) (the same markdown the island holds). No silent
+    auto-copy: copy is gated behind the inner button, exactly as the operator asked."""
+    return (
+        '<details class="copy-preview">'
+        f'<summary>{esc_html(summary_label)} ▾</summary>'
+        f'<pre class="copy-preview-body">{esc_html(payload)}</pre>'
+        f'<button class="copy-btn action-btn" data-copy-target="{esc_html(target_id)}">'
+        'Copy to clipboard</button>'
+        '</details>'
+    )
+
+
+def _render_copy_controls(view_id, payload):
+    """A8 per-view copy control, now wrapped in a copy-preview disclosure (item 2). The
+    inert JSON island (rendered separately by _render_copy_island) still backs the copy;
+    the disclosure shows the same payload for transparency."""
+    return _render_copy_disclosure(f"copy-{view_id}", payload, "Copy view as markdown")
 
 
 def _render_json_island(island_id, payload):
@@ -1460,6 +1938,97 @@ def build_consolidation_brief(pair):
         "Route this through `/coding-team`: review both files, merge the shared "
         "guidance into one canonical location, and update the other file to reference "
         "it (or delete it) so the harness carries the rule exactly once.\n"
+    )
+
+
+# Relabel the bare synthesis `outcome` token as an operator-facing instruction. Known
+# synthesis values (schema.md drag-candidate enum) map explicitly; unknown/free-text
+# outcome (it is semi-free synthesis prose) falls through to "Recommended: {raw}".
+_DRAG_OUTCOME_LABELS = {
+    "keep": "Keep — cost is justified, no action",
+    "give it one home": "Consolidate — give it one canonical home",
+    "load it later": "Defer — load it later (off the always-loaded path)",
+    "turn it into a check": "Automate — turn it into a check/hook",
+    "probation": "Demotion candidate — on probation (watch/act next cycle)",
+    "retire safely": "Retire — remove it safely",
+}
+
+
+def _drag_outcome_label(outcome):
+    label = _DRAG_OUTCOME_LABELS.get(outcome)
+    if label is not None:
+        return label
+    return f"Recommended: {outcome}" if outcome else "No recommendation recorded"
+
+
+def build_dragcandidate_brief(row):
+    """drag candidate -> /coding-team-ready simplify/consolidate brief. Pure function of
+    `row` ({n, surface, evidence, outcome, what_must_survive, risk_if_wrong})."""
+    surface = row.get("surface", "")
+    evidence = row.get("evidence", "") or "(none recorded)"
+    what = row.get("what_must_survive", "") or "(none recorded)"
+    risk = row.get("risk_if_wrong", "") or "(none recorded)"
+    return (
+        f"# Address drag candidate: {surface}\n\n"
+        "## Finding\n"
+        f"`{surface}` is flagged as a drag candidate. Recommendation: "
+        f"{_drag_outcome_label(row.get('outcome',''))}.\n\n"
+        f"## Evidence\n{evidence}\n\n"
+        f"## What must survive\n{what}\n\n"
+        f"## Risk if wrong\n{risk}\n\n"
+        "## Action\n"
+        "Route this through `/coding-team`: weigh the upkeep cost against the value, then "
+        "simplify, consolidate, or demote the component while preserving what must "
+        "survive above.\n"
+    )
+
+
+_DRAG_DEFINITION = ('A drag candidate is a component whose upkeep cost (churn / '
+                    'duplication / size) may exceed its value — a candidate to simplify, '
+                    'consolidate, or demote.')
+
+
+def _drag_fields_details(row):
+    """The three labeled synthesis fields as a native <details> (zero JS)."""
+    return (
+        '<details class="drag-fields"><summary>why / what to preserve ▾</summary>'
+        f'<div><b>Evidence:</b> {esc_html(row.get("evidence","") or "(none recorded)")}</div>'
+        f'<div><b>Must survive:</b> {esc_html(row.get("what_must_survive","") or "(none recorded)")}</div>'
+        f'<div><b>Risk if wrong:</b> {esc_html(row.get("risk_if_wrong","") or "(none recorded)")}</div>'
+        '</details>')
+
+
+# Deterministic phantom-ref guidance keyed by `kind`; catch-all last (every mapping
+# table needs an else branch). `resolved` True is the provenance-only case.
+_PHANTOM_GUIDANCE = {
+    "path": "Broken path — fix the link to point at the real file, or create the missing target if it should exist.",
+    "external": "External ref — verify the target still exists and is correct, or remove the pointer.",
+    "env_flag": "Env-flag ref — wire the flag to a real gate, or drop the mention.",
+}
+_PHANTOM_GUIDANCE_DEFAULT = "Verify the target exists or remove the pointer."
+
+
+def _phantom_guidance(kind, resolved):
+    if resolved:
+        return "Resolved at collection time — listed for provenance; no action needed."
+    return _PHANTOM_GUIDANCE.get(kind, _PHANTOM_GUIDANCE_DEFAULT)
+
+
+def build_phantom_ref_brief(ref):
+    """phantom ref -> /coding-team-ready fix brief. Pure function of `ref`
+    ({source, ref, kind, resolved}) — same ref, same markdown, every call."""
+    source = ref.get("source", "")
+    r = ref.get("ref", "")
+    kind = ref.get("kind", "")
+    return (
+        "# Fix phantom reference\n\n"
+        "## Finding\n"
+        f"`{source}` points at `{r}` (kind: {kind}) which does not resolve to a real target.\n\n"
+        "## What to do\n"
+        f"{_phantom_guidance(kind, ref.get('resolved', False))}\n\n"
+        "## Action\n"
+        "Route this through `/coding-team`: correct or remove the reference in "
+        f"`{source}`, then re-run `/harness-map` to confirm the phantom ref is gone.\n"
     )
 
 
@@ -1503,13 +2072,12 @@ def _render_brief_island(kind, index, markdown):
     return _render_json_island(f"brief-{kind}-{index}", markdown)
 
 
-def _render_brief_button(kind, index):
-    """B3/D6 per-finding copy button — reuses the EXISTING `.copy-btn` control (and
-    therefore the existing generic click handler in `STATIC_SCRIPT`, which reads
-    `data-copy-target` for any `.copy-btn`, not just the A8 per-view ones); no new
-    CSS, no `STATIC_SCRIPT` change, no inline handler."""
-    island_id = f"brief-{kind}-{index}"
-    return f'<button class="copy-btn action-btn" data-copy-target="{island_id}">Copy brief</button>'
+def _render_brief_control(kind, index, markdown, summary_label="Copy brief"):
+    """Per-finding action brief: the inert island + a copy-preview disclosure that reveals
+    the exact brief markdown before copy. Replaces the bare _render_brief_button/island
+    pairing at every finding site (dup, overcap, gap, phantom, drag)."""
+    return (_render_brief_island(kind, index, markdown)
+            + _render_copy_disclosure(f"brief-{kind}-{index}", markdown, summary_label))
 
 
 # Hygiene digest rows: (overview_model["hygiene"] key, GAUGE_BANDS key for severity, label).
@@ -1552,8 +2120,10 @@ def _render_overview_digest(overview_model):
         drag_html = "".join(
             f'<li>{_sev_dot("bad" if r.get("outcome") == "probation" else "warn")}'
             f'#{esc_html(r.get("n",""))} {esc_html(r.get("surface",""))} '
-            f'<span class="badge">{esc_html(r.get("outcome",""))}</span></li>'
-            for r in drag_rows)
+            f'<span class="badge">{esc_html(_drag_outcome_label(r.get("outcome","")))}</span>'
+            f'{_drag_fields_details(r)}'
+            f'{_render_brief_control("dragov", i, build_dragcandidate_brief(r))}</li>'
+            for i, r in enumerate(drag_rows))
     else:
         drag_html = f'<li>{_sev_dot("good")}no drag candidates flagged</li>'
     return (
@@ -1561,7 +2131,8 @@ def _render_overview_digest(overview_model):
         f'<div class="digest-group"><h3>Roadmap gaps ({len(gaps)})</h3><ul>{gaps_html}</ul></div>'
         f'<div class="digest-group"><h3>Weight tax (top always-loaded)</h3><ul>{tax_html}</ul></div>'
         f'<div class="digest-group"><h3>Hygiene</h3><ul>{hyg_html}</ul></div>'
-        f'<div class="digest-group"><h3>Drag candidates ({len(drag_rows)})</h3><ul>{drag_html}</ul></div>'
+        f'<div class="digest-group"><h3>Drag candidates ({len(drag_rows)})</h3>'
+        f'<p class="digest">{esc_html(_DRAG_DEFINITION)}</p><ul>{drag_html}</ul></div>'
         '</div>'
     )
 
@@ -1572,68 +2143,36 @@ def _render_friction_hero(friction_model):
     (RESOLVED DECISION 1: friction on Overview is a count, not node-keyed heat)."""
     top_drag = friction_model["top_drag"]
     top_drag_html = "".join(
-        f'<li>#{esc_html(r.get("n",""))} {esc_html(r.get("surface",""))}</li>' for r in top_drag
+        f'<li>#{esc_html(r.get("n",""))} {esc_html(r.get("surface",""))} '
+        f'<span class="badge">{esc_html(_drag_outcome_label(r.get("outcome","")))}</span></li>'
+        for r in top_drag
     ) or '<li class="empty-state">none</li>'
     return (
         f'<div class="hero-friction hero-friction-{esc_html(friction_model["semantic"])}">'
         '<h2>Friction</h2>'
         f'<p class="count">{esc_html(friction_model["count"])} events '
         f'<span class="badge">{esc_html(friction_model["band"])}</span></p>'
-        f'<h3>Top drag candidates</h3><ul>{top_drag_html}</ul>'
+        f'<h3>Top drag candidates</h3><p class="digest">{esc_html(_DRAG_DEFINITION)}</p>'
+        f'<ul>{top_drag_html}</ul>'
         '</div>'
     )
 
 
-def _render_overview_view(overview_model, civc):
-    """A3/AM-2 — left: `.mini-grid` of verdict-colored, keyboard-operable mini-cells
-    that navigate to Coverage + preselect the matching inspector cell (shared
-    `[data-goto]` handler, Task 4). Right: the friction hero card + "Needs attention"
-    digest. RESOLVED DECISION 1: mini-cells carry verdict color ONLY — no friction
-    heat, no `node_key`, no `heatable`/`fhN` classes anywhere in this view."""
-    if civc["available"]:
-        cells_html = "".join(
-            f'<div class="mini-cell verdict-{esc_html(c["verdict"])}" '
-            f'data-goto="view-coverage" data-cell-id="{esc_html(c["verb"])}-{esc_html(c["surface"])}" '
-            f'role="button" tabindex="0" '
-            f'aria-label="{esc_html(c["verb"])} × {esc_html(c["surface"])}: {esc_html(c["verdict"])}"></div>'
-            for c in civc["cells"])
-        mini_grid = f'<div class="mini-grid">{cells_html}</div>'
-    else:
-        mini_grid = '<p class="empty-state">synthesis sidecar not found — Coverage Matrix unavailable this run.</p>'
-    return (
-        '<section id="view-overview" class="view" role="tabpanel" '
-        'aria-labelledby="view-btn-overview" tabindex="-1">'
-        f'<div class="view-toolbar">{_render_copy_controls("overview")}</div>'
-        '<div class="overview-grid">'
-        f'<div class="card"><h2>Coverage at a glance</h2>{mini_grid}</div>'
-        f'<div>{_render_friction_hero(overview_model["friction"])}{_render_overview_digest(overview_model)}</div>'
-        '</div>'
-        '</section>'
-    )
-
-
-# A4: the cell selected by default on first render — also the nav TARGET clicked from
-# the Overview mini-cell (Task 7). Must exist in VERBS x SURFACES.
+# A4: the cell selected by default on first render. Must exist in VERBS x SURFACES.
 COVERAGE_PRESELECT = ("Constrain", "memory")
 
 
-def _render_coverage_view(civc):
-    """Sticky-inspector rework of the former `_render_civc_drag_tab` matrix half — the
-    drag half now lives in `_render_friction_view` (IA mapping). Every one of the 36
-    verb x surface cells is pre-rendered as a clickable `.matrix-cell` plus a matching
-    `.inspector-panel`; client-side selection (Task 4's shared script) just toggles the
+def _render_coverage_matrix_body(civc, date):
+    """The Coverage Matrix legend + `.matrix` card-grid + sticky `.inspector` — the
+    matrix/inspector half of the merged Overview view (Task B-t2 tab merge folded the
+    former standalone `_render_coverage_view` in here). Every one of the 36 verb x
+    surface cells is pre-rendered as a clickable `.cell.matrix-cell` plus a matching
+    `.inspector-panel`; client-side selection (the shared script) just toggles the
     `sel` class / `hidden` attribute — no data is computed or fetched at click time."""
     if not civc["available"]:
-        civc_body = '<p class="empty-state">synthesis sidecar not found — Coverage Matrix unavailable this run.</p>'
-        return (
-            '<section id="view-coverage" class="view" role="tabpanel" '
-            'aria-labelledby="view-btn-coverage" tabindex="-1">'
-            f'<div class="view-toolbar">{_render_copy_controls("coverage")}</div>'
-            '<div class="card"><h2>Coverage Matrix</h2>'
-            '<p class="subtitle">six verbs (what the harness does to behavior) '
-            '× six surfaces (what it’s made of)</p>'
-            f'{civc_body}</div></section>'
-        )
+        return (f'<p class="empty-state">Coverage Matrix unavailable — no '
+                f'<code>harness-synthesis-{esc_html(date)}.json</code> in this report directory. '
+                f'Re-run <code>/harness-map</code> Step B to generate it.</p>')
     legend = (
         '<p class="civc-legend">Coverage scale (empty cells are intentional roadmap, not blanks): '
         '<span class="badge verdict-empty">empty</span> → '
@@ -1641,15 +2180,15 @@ def _render_coverage_view(civc):
         '<span class="badge verdict-covered">covered</span>. '
         'Cells with a "note" expose it via a details toggle.</p>'
     )
-    header = "".join(f"<th>{esc_html(s)}</th>" for s in SURFACES)
     by_key = {(c["verb"], c["surface"]): c for c in civc["cells"]}
-    rows = []
+    grid_cells = ['<div class="mhead"></div>']
+    grid_cells += [f'<div class="mhead">{esc_html(s)}</div>' for s in SURFACES]
     panels = []
     gap_index = 0   # B3/D6: brief index for empty cells, incremented in the SAME
                      # fixed VERBS x SURFACES traversal order the grid itself uses —
                      # deterministic regardless of which cells the synthesis provided.
     for verb in VERBS:
-        cell_html = []
+        grid_cells.append(f'<div class="mhead mhead-row">{esc_html(verb)}</div>')
         for surface in SURFACES:
             c = by_key.get((verb, surface), {"verdict": "empty", "evidence": None, "note": ""})
             verdict = c.get("verdict", "empty")
@@ -1659,10 +2198,12 @@ def _render_coverage_view(civc):
             # Fixed attribute order — `class` FIRST, `sel` token AFTER the verdict
             # token, then `data-cell-id` — the A4 preselect test asserts this exact
             # string; do not reorder.
-            cell_html.append(
-                f'<td class="matrix-cell verdict-{esc_html(verdict)}{sel_token}" '
-                f'data-cell-id="{esc_html(cell_id)}" role="button" tabindex="0">'
-                f'<span class="badge verdict-{esc_html(verdict)}">{esc_html(verdict)}</span></td>'
+            grid_cells.append(
+                f'<div class="cell matrix-cell verdict-{esc_html(verdict)}{sel_token}" '
+                f'data-cell-id="{esc_html(cell_id)}" role="button" tabindex="0" '
+                f'aria-label="{esc_html(verb)} × {esc_html(surface)}: {esc_html(verdict)}">'
+                f'<span class="cv">{esc_html(verdict)}</span>'
+                f'<span class="dot" aria-hidden="true"></span></div>'
             )
             evidence = c.get("evidence")
             note = c.get("note") or ""
@@ -1671,8 +2212,7 @@ def _render_coverage_view(civc):
             note_html = (f'<details><summary>note</summary>{esc_html(note)}</details>' if note
                          else '<p class="empty-state">no note</p>')
             if verdict == "empty":
-                brief_html = (_render_brief_button("gap", gap_index)
-                              + _render_brief_island("gap", gap_index, build_gap_stub_brief(verb, surface)))
+                brief_html = _render_brief_control("gap", gap_index, build_gap_stub_brief(verb, surface))
                 gap_index += 1
             else:
                 brief_html = ""
@@ -1684,50 +2224,91 @@ def _render_coverage_view(civc):
                 f'<span class="badge verdict-{esc_html(verdict)}">{esc_html(verdict)}</span>'
                 f'{evidence_html}{note_html}{brief_html}</div>'
             )
-        rows.append(f"<tr><th>{esc_html(verb)}</th>{''.join(cell_html)}</tr>")
-    civc_body = (
+    matrix_html = f'<div class="matrix">{"".join(grid_cells)}</div>'
+    return (
         legend + '<div class="coverage-grid">'
-        f'<div class="overflow-x"><table><tr><th></th>{header}</tr>'
-        f'{"".join(rows)}</table></div>'
+        f'<div class="overflow-x">{matrix_html}</div>'
         f'<aside class="inspector">{"".join(panels)}</aside></div>'
     )
+
+
+def _render_overview_view(overview_model, civc, date, copy_payload):
+    """Merged Overview + Coverage tab (Task B-t2 tab merge — the two former tabs
+    overlapped: Overview's mini-grid duplicated Coverage's full matrix at a smaller
+    scale). Main area: the full `.matrix` card-grid + its sticky `.inspector`
+    (`_render_coverage_matrix_body`). Sidebar: the friction hero card + "Needs
+    attention" digest, retained verbatim from the former Overview tab. RESOLVED
+    DECISION 1 still holds: no friction heat markers (`heatable`/`fhN`/`node_key`)
+    anywhere in this view — friction here stays a count, never node-keyed heat."""
+    matrix_body = _render_coverage_matrix_body(civc, date)
     return (
-        '<section id="view-coverage" class="view" role="tabpanel" '
-        'aria-labelledby="view-btn-coverage" tabindex="-1">'
-        f'<div class="view-toolbar">{_render_copy_controls("coverage")}</div>'
+        '<section id="view-overview" class="view" role="tabpanel" '
+        'aria-labelledby="view-btn-overview" tabindex="-1">'
+        f'<div class="view-toolbar">{_render_copy_controls("overview", copy_payload)}</div>'
+        '<div class="overview-grid">'
         '<div class="card"><h2>Coverage Matrix</h2>'
         '<p class="subtitle">six verbs (what the harness does to behavior) '
         '× six surfaces (what it’s made of)</p>'
-        f'{civc_body}</div></section>'
+        f'{matrix_body}</div>'
+        f'<div>{_render_friction_hero(overview_model["friction"])}{_render_overview_digest(overview_model)}</div>'
+        '</div>'
+        '</section>'
     )
 
 
-def _render_weight_view(model, heat, friction_enabled):
+def _render_weight_view(model, heat, friction_enabled, doc, copy_payload):
     """Verbatim body of the former `_render_context_weight_tab`, now also carrying the
     friction legend + overlay toggle (moved here — heat only ever lands on these two
     treemaps, RESOLVED DECISION 1) and the A5/AM-3 treemap<->ladder toggle: both
     representations are pre-rendered for both panels so the client just flips a CSS
     class (§ progressive-enhancement pattern) — no re-render at click time.
     `friction_enabled=False` (i.e. `--no-friction`) omits the toggle button + legend
-    entirely (Codex P3): with `heat={}` there is nothing for the toggle to reveal, so
-    toggling `friction-on` would only dim every cell to 0.25 with nothing highlighted."""
-    always_treemap = _render_treemap_svg(model["always"], heat, "treemap-always")
-    always_ladder = _render_ladder_svg(model["always"], heat, "ladder-always")
-    ondemand_treemap = _render_treemap_svg(model["on_demand"], heat, "treemap-ondemand")
-    ondemand_ladder = _render_ladder_svg(model["on_demand"], heat, "ladder-ondemand")
+    entirely (Codex P3). §C1 change 4 (Codex-caught): `friction_enabled=True` alone is
+    NOT enough — a loaded-but-all-ambiguous/unmatched run leaves `heat={}`, and an active
+    toggle over zero heated nodes would only dim EVERY cell to 0.25 with nothing
+    highlighted. The toggle + legend now require BOTH friction_enabled AND at least one
+    heated node; the loaded-but-empty case renders a plain 'no node-attributed friction'
+    note instead of a toggle with nothing to reveal. C2: `bucket_map` is computed ONCE
+    here from the full heat dict (both panels combined) and passed to all four render
+    calls, so a given heat value gets the same fhN bucket everywhere in this view.
+    `doc` (B-t3 follow-up) feeds `_length_critical_node_keys` — computed ONCE here,
+    same pattern as `bucket_map`, and passed to all four calls so a length-critical
+    file gets the ring consistently across both representations."""
+    bucket_map = _heat_bucket_map(heat)
+    length_crit_keys = _length_critical_node_keys(doc)
+    always_treemap = _render_treemap_svg(model["always"], heat, "treemap-always", bucket_map, length_crit_keys)
+    always_ladder = _render_ladder_svg(model["always"], heat, "ladder-always", bucket_map, length_crit_keys)
+    ondemand_treemap = _render_treemap_svg(model["on_demand"], heat, "treemap-ondemand", bucket_map, length_crit_keys)
+    ondemand_ladder = _render_ladder_svg(model["on_demand"], heat, "ladder-ondemand", bucket_map, length_crit_keys)
+    show_toggle = friction_enabled and bool(heat)
     toggle_html = (
         '<button class="action-btn" id="friction-toggle" aria-pressed="false">'
         'Show friction heat on treemap + ladder cells</button>'
+    ) if show_toggle else (
+        '<p class="empty-state" id="friction-empty-note">no node-attributed friction — '
+        'telemetry loaded but nothing joined to a map component</p>'
     ) if friction_enabled else ""
     legend_html = (
         '<div class="friction-legend" id="friction-legend">'
         '<span>Friction heat, once the overlay is on:</span>'
         '<span class="legend-entry"><span class="legend-swatch fh0"></span>none</span>'
-        '<span class="legend-entry"><span class="legend-swatch fh1"></span>some</span>'
+        '<span class="legend-entry"><span class="legend-swatch fh1"></span>light</span>'
+        '<span class="legend-entry"><span class="legend-swatch fh2"></span>some</span>'
+        '<span class="legend-entry"><span class="legend-swatch fh3"></span>frequent</span>'
         '<span class="legend-entry"><span class="legend-swatch fh4"></span>most-active</span>'
         '<span class="legend-note">every heated cell also shows a join-count '
         'badge in the corner (color is never the only signal)</span></div>'
-    ) if friction_enabled else ""
+    ) if show_toggle else ""
+    # Length-crit legend (B-t3 follow-up): ALWAYS visible whenever at least one
+    # length-critical file exists — independent of `show_toggle`/`friction_enabled`,
+    # since the ring itself is always-on regardless of friction mode.
+    length_crit_legend_html = (
+        '<div class="friction-legend" id="length-crit-legend">'
+        '<span class="legend-entry"><span class="legend-swatch length-crit-swatch">'
+        '</span>critically oversized file (&gt;'
+        f'{esc_html(LENGTH_CRITICAL_LINES)} lines, from the Hygiene tab — always '
+        'shown, independent of friction)</span></div>'
+    ) if length_crit_keys else ""
     return (
         '<section id="view-weight" class="view" role="tabpanel" '
         'aria-labelledby="view-btn-weight" tabindex="-1">'
@@ -1737,9 +2318,10 @@ def _render_weight_view(model, heat, friction_enabled):
         '<button class="seg-btn" data-mode="ladder" aria-pressed="false">▤ Ladder</button>'
         '</div>'
         f'{toggle_html}'
-        f'{_render_copy_controls("weight")}'
+        f'{_render_copy_controls("weight", copy_payload)}'
         '</div>'
         f'{legend_html}'
+        f'{length_crit_legend_html}'
         '<p class="subtitle">On-demand skills cost only when invoked; MEMORY.md + '
         'CLAUDE.md are the real per-turn tax — the treemap/ladder toggle shows the '
         'same weights two ways.</p>'
@@ -1759,7 +2341,12 @@ def _render_bipartite_body(model):
             cls = {"direct": "direct", "dispatcher": "dispatcher", "none": "orphan"}[n["registered_via"]]
             badge = f'<span class="badge {cls}">{esc_html(n["registered_via"])}</span>'
         label = esc_html(n.get("name") or n.get("command") or n.get("script", ""))
-        return f'<li data-node-key="{esc_html(n["node_key"])}">{label} {badge}</li>'
+        desc = ""
+        if side == "right":
+            d = n.get("description", "")
+            desc = (f'<span class="script-desc">{esc_html(d)}</span>' if d
+                    else '<span class="script-desc empty-state">no description</span>')
+        return f'<li data-node-key="{esc_html(n["node_key"])}">{label} {badge}{desc}</li>'
 
     left_html = "".join(_row(n, "left") for n in model["left"]) or '<li class="empty-state">none</li>'
     orphan_html = "".join(
@@ -1802,7 +2389,7 @@ def _render_dupweb_body(model, raw_pairs):
             f'<tr><td>{esc_html(e["a"])} ⇄ {esc_html(e["b"])}</td>'
             f'<td class="tabular-nums">{_fmt_float(e["score"] * 100)}% shared</td>'
             f'<td>{esc_html(e["shared_sample"])}</td>'
-            f'<td>{_render_brief_button("dup", i)}{_render_brief_island("dup", i, build_consolidation_brief(raw_pairs[i]))}</td>'
+            f'<td>{_render_brief_control("dup", i, build_consolidation_brief(raw_pairs[i]))}</td>'
             '</tr>'
             for i, e in enumerate(model["edges"]))
         dup_body = f'<div class="overflow-x"><table><tr><th>Pair</th><th>Overlap</th><th>Sample</th><th>Action</th></tr>{rows}</table></div>'
@@ -1811,9 +2398,15 @@ def _render_dupweb_body(model, raw_pairs):
     if model["phantom_refs"]:
         prows = "".join(
             f'<tr><td>{esc_html(r.get("source",""))}</td><td>{esc_html(r.get("ref",""))}</td>'
-            f'<td>{esc_html(r.get("kind",""))}</td><td>{esc_html(r.get("resolved"))}</td></tr>'
-            for r in model["phantom_refs"])
-        phantom_body = f'<div class="overflow-x"><table><tr><th>Source</th><th>Ref</th><th>Kind</th><th>Resolved</th></tr>{prows}</table></div>'
+            f'<td>{esc_html(r.get("kind",""))}</td><td>{esc_html(r.get("resolved"))}</td>'
+            f'<td>{esc_html(_phantom_guidance(r.get("kind",""), r.get("resolved", False)))}</td>'
+            f'<td>{_render_brief_control("phantom", i, build_phantom_ref_brief(r))}</td></tr>'
+            for i, r in enumerate(model["phantom_refs"]))
+        phantom_body = (
+            '<p class="digest">A phantom ref is a pointer in an instruction file to a '
+            'target that doesn’t resolve — a dangling link.</p>'
+            '<div class="overflow-x"><table><tr><th>Source</th><th>Ref</th><th>Kind</th>'
+            f'<th>Resolved</th><th>What to do</th><th>Action</th></tr>{prows}</table></div>')
     else:
         phantom_body = '<p class="empty-state">no phantom refs</p>'
     return (
@@ -1836,10 +2429,10 @@ def _render_length_flags_body(doc):
 
         def _row(i, f):
             pill = ('<span class="pill pill-critical">critical</span>'
-                    if f.get("lines", 0) > 600 else '<span class="pill">over</span>')
+                    if f.get("lines", 0) > LENGTH_CRITICAL_LINES else '<span class="pill">over</span>')
             return (f'<tr><td>{esc_html(f["path"])}</td><td class="tabular-nums">{esc_html(f["lines"])}</td>'
                     f'<td>{pill}</td>'
-                    f'<td>{_render_brief_button("overcap", i)}{_render_brief_island("overcap", i, build_refactor_brief(f))}</td>'
+                    f'<td>{_render_brief_control("overcap", i, build_refactor_brief(f))}</td>'
                     '</tr>')
 
         rows = "".join(_row(i, f) for i, f in enumerate(sorted_flags))
@@ -1858,7 +2451,7 @@ def _render_unchecked_binaries_body(doc):
     return f'<div class="card"><p>Unchecked binaries: <span class="hygiene-unchecked">{esc_html(n)}</span></p></div>'
 
 
-def _render_hygiene_view(doc, models):
+def _render_hygiene_view(doc, models, copy_payload):
     """Composes the former bipartite/trend/dupweb tab bodies plus length flags
     (finding #5b) and the unchecked-binary count (finding #5a) under ONE view
     (RESOLVED DECISION 2 — hook wiring folded here as 'Wiring integrity', never
@@ -1866,7 +2459,7 @@ def _render_hygiene_view(doc, models):
     return (
         '<section id="view-hygiene" class="view" role="tabpanel" '
         'aria-labelledby="view-btn-hygiene" tabindex="-1">'
-        f'<div class="view-toolbar">{_render_copy_controls("hygiene")}</div>'
+        f'<div class="view-toolbar">{_render_copy_controls("hygiene", copy_payload)}</div>'
         f'{_render_length_flags_body(doc)}'
         f'{_render_dupweb_body(models["dupweb"], (doc.get("duplication") or {}).get("pairs", []) or [])}'
         f'{_render_unchecked_binaries_body(doc)}'
@@ -1948,19 +2541,31 @@ def _render_component_friction_table(joined):
     """A6 per-component join table (finding #1): which map nodes got heated, and how
     many friction records each. Reads the SAME `joined` dict `build_friction_overlay`
     already returns — does not re-derive. `sorted(joined.items())` (node_key ascending)
-    for deterministic, insertion-order-independent output."""
+    for deterministic, insertion-order-independent output.
+
+    Sortable table (item 4): server order (`sorted(joined.items())`, node_key ascending)
+    is the deterministic INITIAL DOM state (`aria-sort="none"` on load — never
+    pre-toggled); the client sort reorders only the live DOM, never the emitted bytes.
+    Each row carries `data-node-key` so the treemap click-to-jump (item 6) can
+    highlight it."""
     if not joined:
-        rows = '<tr class="friction-component-row"><td colspan="2" class="empty-state">no components joined</td></tr>'
+        rows = ('<tr class="friction-component-row"><td colspan="2" class="empty-state">'
+                 'no components joined</td></tr>')
     else:
         rows = "".join(
-            f'<tr class="friction-component-row"><td>{esc_html(node_key)}</td>'
-            f'<td>{esc_html(len(records))}</td></tr>'
+            f'<tr class="friction-component-row" data-node-key="{esc_html(node_key)}">'
+            f'<td>{esc_html(node_key)}</td><td>{esc_html(len(records))}</td></tr>'
             for node_key, records in sorted(joined.items())
         )
     return (
-        '<div class="overflow-x"><table class="friction-components">'
-        '<tr><th>Component</th><th>Friction records</th></tr>'
-        f'{rows}</table></div>'
+        '<div class="overflow-x"><table class="friction-components sortable">'
+        '<thead><tr>'
+        '<th aria-sort="none"><button class="th-sort" data-sort-col="0" data-sort-type="text">'
+        'Component <span class="sort-ind" aria-hidden="true">↕</span></button></th>'
+        '<th aria-sort="none"><button class="th-sort" data-sort-col="1" data-sort-type="num">'
+        'Friction records <span class="sort-ind" aria-hidden="true">↕</span></button></th>'
+        '</tr></thead>'
+        f'<tbody>{rows}</tbody></table></div>'
     )
 
 
@@ -1998,7 +2603,7 @@ def _render_friction_panel(joined, footer, codex_aggregate, friction_total_value
     )
 
 
-def _render_friction_view(joined, footer, codex_aggregate, drag, friction_total_value):
+def _render_friction_view(joined, footer, codex_aggregate, drag, friction_total_value, date, copy_payload):
     """Former `_render_friction_panel`, moved verbatim, plus the drag-candidate table
     half of the former `_render_civc_drag_tab` appended (IA mapping). A6/DECISION 6
     (Task 8): 4 stream cards + a per-component join table now render above the
@@ -2006,34 +2611,52 @@ def _render_friction_view(joined, footer, codex_aggregate, drag, friction_total_
     instrument gauge renders — instead of the raw joined-record count."""
     friction_body = _render_friction_panel(joined, footer, codex_aggregate, friction_total_value)
     if not drag["available"]:
-        drag_body = '<p class="empty-state">synthesis sidecar not found — drag-candidate table unavailable this run.</p>'
+        drag_body = (f'<p class="empty-state">drag-candidate table unavailable — no '
+                     f'<code>harness-synthesis-{esc_html(date)}.json</code> in this report directory. '
+                     f'Re-run <code>/harness-map</code> Step B to generate it.</p>')
     elif not drag["rows"]:
         drag_body = '<p class="empty-state">no drag candidates</p>'
     else:
+        # Sortable table (item 4, T1's JS via `class="sortable"`); `i` = row index in
+        # `drag["rows"]` — drives the per-row `kind="drag"` brief island id. Rows carry
+        # NO `data-node-key`: Task 6's click-to-jump targets only `tr.friction-component-row`,
+        # and drag rows are neither map components nor telemetry-joined.
         rows = "".join(
-            f'<tr><td>{esc_html(r.get("n",""))}</td><td>{esc_html(r.get("surface",""))}</td>'
-            f'<td>{esc_html(r.get("evidence",""))}</td><td class="badge">{esc_html(r.get("outcome",""))}</td></tr>'
-            for r in drag["rows"])
-        drag_body = f'<div class="overflow-x"><table><tr><th>#</th><th>Surface</th><th>Evidence</th><th>Outcome</th></tr>{rows}</table></div>'
+            f'<tr>'
+            f'<td>{esc_html(r.get("n",""))}</td><td>{esc_html(r.get("surface",""))}</td>'
+            f'<td>{esc_html(_drag_outcome_label(r.get("outcome","")))}</td>'
+            f'<td>{_drag_fields_details(r)}'
+            f'{_render_brief_control("drag", i, build_dragcandidate_brief(r))}</td></tr>'
+            for i, r in enumerate(drag["rows"]))
+        drag_body = (
+            f'<p class="digest">{esc_html(_DRAG_DEFINITION)}</p>'
+            '<div class="overflow-x"><table class="sortable"><thead><tr>'
+            '<th aria-sort="none"><button class="th-sort" data-sort-col="0" data-sort-type="num">#'
+            ' <span class="sort-ind" aria-hidden="true">↕</span></button></th>'
+            '<th aria-sort="none"><button class="th-sort" data-sort-col="1" data-sort-type="text">'
+            'Surface <span class="sort-ind" aria-hidden="true">↕</span></button></th>'
+            '<th aria-sort="none"><button class="th-sort" data-sort-col="2" data-sort-type="text">'
+            'Recommendation <span class="sort-ind" aria-hidden="true">↕</span></button></th>'
+            f'<th>Detail</th></tr></thead><tbody>{rows}</tbody></table></div>')
     return (
         '<section id="view-friction" class="view" role="tabpanel" '
         'aria-labelledby="view-btn-friction" tabindex="-1">'
-        f'<div class="view-toolbar">{_render_copy_controls("friction")}</div>'
+        f'<div class="view-toolbar">{_render_copy_controls("friction", copy_payload)}</div>'
         f'{friction_body}'
         f'<div class="card"><h2>Drag candidates</h2>{drag_body}</div>'
         '</section>'
     )
 
 
-VIEWS = (("view-overview", "Overview"), ("view-coverage", "Coverage"),
+VIEWS = (("view-overview", "Overview"),
          ("view-weight", "Weight"), ("view-friction", "Friction"), ("view-hygiene", "Hygiene"))
 
 
 def render_html(date, models, friction, notes, generation=None):
     """Assembles the final HTML document — a fixed named-section sequence (§4.8),
-    never set/dict-driven order. 5-view IA (A1): all views render WITHOUT `hidden`
-    server-side (progressive enhancement) — the static script collapses to Overview
-    on load."""
+    never set/dict-driven order. 4-view IA (A1, Task B-t2 merged the former separate
+    Overview/Coverage tabs into one): all views render WITHOUT `hidden` server-side
+    (progressive enhancement) — the static script collapses to Overview on load."""
     doc = notes["doc"]
     skipped = notes["skipped"]
     headline = doc.get("headline", {}) or {}
@@ -2044,7 +2667,7 @@ def render_html(date, models, friction, notes, generation=None):
     # toggle gate (Codex P3) reads from.
     friction_enabled = any(f["status"] != "disabled" for f in footer)
     phantom_ref_count = len(doc.get("phantom_refs", []) or [])
-    friction_total_value = friction_total(joined, codex_aggregate)
+    friction_total_value = friction_total(joined, codex_aggregate, _metrics_aggregate_only(footer))
     overview_model = build_overview_model(models, headline, phantom_ref_count, friction_total_value)
 
     warn_count = len(doc.get("inaccessible", []) or []) + len(doc.get("errors", []) or [])
@@ -2082,22 +2705,24 @@ def render_html(date, models, friction, notes, generation=None):
         "<header><h1>harness-map</h1>",
         f'<div class="subtitle">root: {esc_html(doc.get("root",""))} | date: {esc_html(date)} '
         f'| generated_at: {esc_html(doc.get("generated_at",""))} {warn_badge}</div></header>',
-        _render_instrument_readout(headline, phantom_ref_count, friction_total_value, models["trend"]),
+        _render_instrument_readout(headline, phantom_ref_count, friction_total_value,
+                                   models["trend"], models, doc, joined, footer, codex_aggregate),
         '<div class="controls">',
         '<nav class="view-switch" role="tablist">',
         view_buttons,
         '</nav>',
         '<button class="action-btn" id="expand-all">Expand all / print view</button>',
+        '<button class="action-btn" id="theme-toggle" type="button" '
+        'aria-pressed="false" aria-label="Toggle color theme">◐</button>',
         "</div>",
         "<main>",
-        _render_overview_view(overview_model, models["civc"]),
-        _render_coverage_view(models["civc"]),
-        _render_weight_view(models["context_weight"], heat, friction_enabled),
-        _render_friction_view(joined, footer, codex_aggregate, models["drag"], friction_total_value),
-        _render_hygiene_view(doc, models),
+        _render_overview_view(overview_model, models["civc"], date, copy_payloads["overview"]),
+        _render_weight_view(models["context_weight"], heat, friction_enabled, doc, copy_payloads["weight"]),
+        _render_friction_view(joined, footer, codex_aggregate, models["drag"], friction_total_value, date,
+                              copy_payloads["friction"]),
+        _render_hygiene_view(doc, models, copy_payloads["hygiene"]),
         "</main>",
         _render_copy_island("overview", copy_payloads["overview"]),
-        _render_copy_island("coverage", copy_payloads["coverage"]),
         _render_copy_island("weight", copy_payloads["weight"]),
         _render_copy_island("friction", copy_payloads["friction"]),
         _render_copy_island("hygiene", copy_payloads["hygiene"]),
