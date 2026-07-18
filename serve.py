@@ -137,6 +137,14 @@ class _State:
         # re-collect) -- NEVER used to slice a partial tail (the cheap path always re-reads
         # each stream file in FULL, C18 parity).
         self.stream_offsets = {}
+        # FIX 4 (Codex challenge): stream keys whose last-observed truncation/rotation/deletion
+        # has NOT yet been consumed by a successful full `_rebuild`. Touched ONLY by the single
+        # watcher thread (no lock needed). Set when `_classify_stream_sweep` reports "truncated";
+        # forces the full-recollect path every sweep until a rebuild SUCCEEDS, then cleared. This
+        # replaces the old "zero state.stream_offsets[key] before the rebuild" step, which made a
+        # truncate-to-empty stream compare 0==0 next sweep -> "none" -> the required re-collect was
+        # lost forever if that rebuild failed transiently (stale state served permanently).
+        self.pending_truncation = set()
         # SSE fan-out: bounded per-client queues, mutated ONLY under clients_lock (never
         # the ctx lock, so a slow /events writer cannot block a GET `/` read). The watcher
         # compares fresh snapshots against watch_snapshot to decide when a rebuild is due.
@@ -497,18 +505,21 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
 
             # No collector-input change this sweep: B2 friction-stream classification.
             classification, changed = _classify_stream_sweep(state)
-            if classification == "none":
-                continue
             if classification == "truncated":
-                # Offset-drift guard: reset the shrunk/deleted stream(s) to 0 BEFORE the full
-                # re-collect, so a mid-failure retry never computes a negative "grown" delta
-                # (a successful `_rebuild` then re-seeds them from its own PRE-read snapshot,
-                # which is None for a deleted stream).
-                for key in changed:
-                    state.stream_offsets[key] = 0
-            if classification == "truncated" or _FORCE_FULL_RECOLLECT:
+                # FIX 4 (Codex challenge): REMEMBER the truncation as pending instead of zeroing
+                # state.stream_offsets[key] before the fallible rebuild. Zeroing a truncate-to-
+                # empty stream's offset made it compare 0==0 next sweep -> "none" -> the required
+                # full recollect was lost forever if THIS rebuild then failed transiently. The
+                # saved offset is left UNTOUCHED (a successful `_rebuild` re-seeds it from its own
+                # PRE-read snapshot); the pending flag forces the full path until that succeeds.
+                state.pending_truncation.update(changed)
+            force_full = bool(state.pending_truncation) or _FORCE_FULL_RECOLLECT
+            if classification == "none" and not force_full:
+                continue
+            if force_full:
                 if not _try_full_rebuild(state, out_dir, root, project_root, label="full recollect"):
-                    continue
+                    continue  # keep pending_truncation set -> the truncation is retried next sweep
+                state.pending_truncation.clear()  # a successful full rebuild consumed the truncation
                 continue
 
             # classification == "grown": C18 date-rollover check BEFORE taking the cheap
@@ -552,6 +563,14 @@ class RequestHandler(BaseHTTPRequestHandler):
     # open, healthy stream will be misclassified as idle and closed.
     timeout = 10
 
+    # Expected client-side end states on ANY write to the connection socket: a hard disconnect
+    # (BrokenPipeError/ConnectionResetError), the 10s idle-read timeout surfacing as TimeoutError
+    # (socket.timeout is now its alias), or a generic socket fault (bare OSError). The first three
+    # are OSError subclasses; this is a specific, minimal tuple, NOT a broad `except Exception`.
+    # Shared by BOTH the `GET /` body write (FIX 8) and the `/events` stream so a client that
+    # disconnects mid-response exits quietly instead of letting socketserver print a traceback.
+    _CLIENT_GONE = (BrokenPipeError, ConnectionResetError, TimeoutError, OSError)
+
     def _send_security_headers(self):
         """Anti-framing headers on EVERY response (200/400/404): this server holds the
         user's PRIVATE harness dashboard. Loopback binding alone does not stop a
@@ -576,12 +595,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             state = self.server.state
             with state.lock:
                 body = state.ctx.html_bytes
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self._send_security_headers()
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self._send_security_headers()
+                self.end_headers()
+                self.wfile.write(body)
+            except self._CLIENT_GONE:
+                # FIX 8: a client that RSTs/closes during the header or (large) body write raises
+                # BrokenPipeError/ConnectionResetError/OSError from the socket write. Unlike
+                # /events, this path did not catch it, so socketserver printed a traceback to
+                # stderr (server survived, but noisy). Mirror _serve_events's `_CLIENT_GONE`
+                # handling and exit quietly — a normal client disconnect is not a server error.
+                return
         elif self.path == "/events":
             self._serve_events()
         else:
@@ -619,14 +646,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         with state.lock:
             current_gen = state.generation
         # A stuck/slow-reading or disconnected client makes wfile.write/flush raise on the
-        # connection socket. Because RequestHandler.timeout sets socket.settimeout(10), a
-        # stalled write raises TimeoutError (socket.timeout is now an alias of TimeoutError)
-        # after 10s; a hard disconnect raises BrokenPipeError/ConnectionResetError; other
-        # socket faults surface as a bare OSError. All four are expected client-side end
-        # states, NOT server bugs -- catch them and return cleanly (the finally unregisters)
-        # so socketserver never prints a traceback to stderr. This is a specific, minimal
-        # tuple (the first three are OSError subclasses), NOT a broad `except Exception`.
-        _client_gone = (BrokenPipeError, ConnectionResetError, TimeoutError, OSError)
+        # connection socket (TimeoutError after the 10s idle timeout, BrokenPipeError/
+        # ConnectionResetError on a hard disconnect, bare OSError otherwise). All are expected
+        # client-side end states, NOT server bugs -- catch them via the shared `_CLIENT_GONE`
+        # tuple (identical to the GET `/` handler, FIX 8) and return cleanly (the finally
+        # unregisters) so socketserver never prints a traceback to stderr.
+        _client_gone = self._CLIENT_GONE
         try:
             try:
                 self.send_response(200)

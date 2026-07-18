@@ -1220,6 +1220,78 @@ def test_friction_stream_malformed_lines_skip_and_count(tmp_path):
     assert '"records_invalid":1' in text.replace(" ", "") or "records_invalid" in text
 
 
+# ---------------------------------------------- read_jsonl robustness (Codex challenge F2/F3/F7)
+def test_read_jsonl_over_cap_single_line_rejected_without_full_read(tmp_path):
+    # FIX 2: a single line far larger than max_bytes must be REJECTED (never fully allocated),
+    # so a multi-GB line cannot hang/OOM the renderer. Use a small cap + a 5000-byte line
+    # (never GBs) — the same overflow codepath, cheap to exercise.
+    stream = tmp_path / "huge.jsonl"
+    stream.write_text(json.dumps({"payload": "z" * 5000}) + "\n")
+
+    records, malformed, nonblank = rh.read_jsonl(stream, max_bytes=1000)
+
+    assert records == []                # the over-cap line was never parsed
+    assert malformed == 1               # the rejected overflow tail is counted once
+    assert nonblank == 0                # no complete line fit under the cap
+
+
+def test_read_jsonl_over_cap_keeps_complete_lines_rejects_overflow_tail(tmp_path):
+    # FIX 2: complete lines fully inside the byte budget still parse; only the past-cap
+    # overflow tail is rejected (never parsed mid-token).
+    stream = tmp_path / "mixed.jsonl"
+    stream.write_text(
+        json.dumps({"a": 1}) + "\n"
+        + json.dumps({"big": "z" * 5000}) + "\n"
+        + json.dumps({"c": 3}) + "\n"
+    )
+
+    records, malformed, nonblank = rh.read_jsonl(stream, max_bytes=1000)
+
+    assert records == [{"a": 1}]        # the one complete line under the cap parsed
+    assert malformed == 1               # the overflow tail (huge line + trailing line) rejected once
+    assert nonblank == 1
+
+
+def test_read_jsonl_under_cap_returns_all_records(tmp_path):
+    # FIX 2: the normal under-cap path is unchanged — every record returned, zero malformed,
+    # read through the O_NONBLOCK regular-file open.
+    stream = tmp_path / "ok.jsonl"
+    stream.write_text(json.dumps({"a": 1}) + "\n" + json.dumps({"b": 2}) + "\n")
+
+    records, malformed, nonblank = rh.read_jsonl(stream)
+
+    assert records == [{"a": 1}, {"b": 2}]
+    assert malformed == 0
+    assert nonblank == 2
+
+
+def test_read_jsonl_regular_file_reads_through_nonblock_open(tmp_path):
+    # FIX 7: the O_RDONLY|O_NONBLOCK open + S_ISREG fstat accepts a normal regular file and
+    # reads its full contents (the guard only rejects non-regular targets like FIFO/device).
+    stream = tmp_path / "regular.jsonl"
+    stream.write_text(json.dumps({"regular": True}) + "\n")
+
+    records, malformed, nonblank = rh.read_jsonl(stream)
+
+    assert records == [{"regular": True}]
+    assert malformed == 0
+    assert nonblank == 1
+
+
+def test_read_jsonl_pathological_bignum_skipped_not_raised(tmp_path):
+    # FIX 3: a bare integer past Python's int-string conversion limit raises ValueError
+    # (NOT json.JSONDecodeError) inside json.loads; the broadened except must skip+count it
+    # as malformed so no exception escapes, and a following valid line must still parse.
+    stream = tmp_path / "bignum.jsonl"
+    stream.write_text("1" * 5000 + "\n" + json.dumps({"ok": True}) + "\n")
+
+    records, malformed, nonblank = rh.read_jsonl(stream)
+
+    assert records == [{"ok": True}]    # the valid line after the poison line still parsed
+    assert malformed == 1               # the pathological number counted as malformed
+    assert nonblank == 2                # both physical lines counted as non-blank
+
+
 # ============================================================= 6. IA pivot: 5 views + switcher
 def test_five_views_present_not_six_tabs(tmp_path):
     doc = _minimal_doc()

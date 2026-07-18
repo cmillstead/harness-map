@@ -527,6 +527,79 @@ def test_truncated_jsonl_resets_offset_and_full_recollects(live_server_with_stre
         "a shrunk/rotated stream must force a FULL re-collect, never a cheap re-render"
 
 
+def test_truncation_retries_full_recollect_after_transient_rebuild_failure(live_server_with_streams):
+    # FIX 4 (Codex challenge): a truncate-to-EMPTY whose forced full re-collect FAILS transiently
+    # must still retry on the next sweep. The old code zeroed state.stream_offsets[key] BEFORE the
+    # rebuild, so after a truncate-to-0 + failed rebuild the next sweep compared size 0 == offset 0
+    # -> "none" -> the required re-collect was lost forever (stale state served permanently). Real
+    # (no-mock) fault injection: a non-empty dir at the html path makes write_html_safely's
+    # os.replace() raise a real OSError, failing the first forced rebuild; removing it lets the
+    # retry succeed. collect_count incrementing ONLY after the unblock proves the retry survived.
+    server, out_dir, root, stream_path = live_server_with_streams
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    html_path = out_dir / f"harness-map-{today}.html"
+
+    # Grow + settle so the saved offset is > 0 (the precondition for the truncate-to-0 == 0 bug).
+    _append_decision_record(stream_path)
+    _append_decision_record(stream_path)
+    _wait_settle(server)
+    assert server.state.stream_offsets[str(stream_path)] > 0
+    before_count = server.state.collect_count
+
+    # Block the html write, then truncate the stream to empty: the forced full re-collect runs
+    # the collector (succeeds) but fails at the on-disk html write (os.replace onto a non-empty
+    # dir) -> _try_full_rebuild returns False -> the truncation stays pending.
+    if html_path.exists():
+        html_path.unlink()
+    html_path.mkdir()
+    (html_path / "keep").write_text("x")
+    try:
+        stream_path.write_text("")  # truncate to empty (size 0)
+        _wait_settle(server)
+        assert server.state.collect_count == before_count, \
+            "the html-write block must have failed the forced re-collect (setup precondition)"
+        assert server._watcher_thread.is_alive()
+    finally:
+        if html_path.is_dir():
+            shutil.rmtree(html_path)
+
+    # Unblocked: the pending truncation must force the full path again and now SUCCEED.
+    _wait_settle(server)
+    assert server.state.collect_count > before_count, \
+        "a transient rebuild failure after truncation must still retry -> the re-collect is NOT lost"
+    assert server.state.stream_offsets[str(stream_path)] == 0, \
+        "the successful re-collect must re-seed the offset from its PRE-read size (empty stream -> 0)"
+
+
+def test_get_root_swallows_client_disconnect_without_raising(live_server):
+    # FIX 8 (Codex challenge): a client that RSTs/closes during the GET `/` body write raises
+    # BrokenPipeError from the socket write; unlike /events, the old handler did not catch it, so
+    # socketserver printed a traceback. Real (no-mock) severed transport: a socketpair whose read
+    # end is closed makes the unbuffered body write raise a genuine BrokenPipeError. do_GET must
+    # mirror _serve_events's _CLIENT_GONE handling and return cleanly instead of propagating.
+    server, _out_dir = live_server
+    assert BrokenPipeError in srv.RequestHandler._CLIENT_GONE
+    assert ConnectionResetError in srv.RequestHandler._CLIENT_GONE
+
+    sock_server, sock_client = socket.socketpair()
+    handler = srv.RequestHandler.__new__(srv.RequestHandler)
+    handler.server = server
+    handler.request_version = "HTTP/1.1"
+    handler.command = "GET"
+    handler.requestline = "GET / HTTP/1.1"
+    handler.path = "/"
+    handler.close_connection = True
+    headers = http.client.HTTPMessage()
+    headers["Host"] = "127.0.0.1"
+    handler.headers = headers
+    handler.wfile = sock_server.makefile("wb", buffering=0)  # unbuffered -> write raises in-handler
+    try:
+        sock_client.close()  # sever the client end BEFORE the body write
+        handler.do_GET()     # must NOT raise despite the broken transport
+    finally:
+        sock_server.close()
+
+
 def test_date_rollover_forces_full_recollect(live_server_with_streams):
     # C18 PARITY-OR-DEGRADE: the cheap path re-renders friction using the CACHED ctx.date;
     # across a local midnight, `build_friction_overlay`'s `d > current_date` filter would

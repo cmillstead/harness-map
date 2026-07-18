@@ -17,6 +17,7 @@ import html
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -590,33 +591,69 @@ def _split_component(component):
 
 
 def read_jsonl(path, max_bytes=5_000_000, max_lines=20_000):
-    """(records, malformed_count, lines_nonblank) — never raises. `path` must already
-    be known to exist and be a regular file (caller's job, Codex F11). Disclosed caps
-    guard against a FIFO/unbounded stream hanging the renderer."""
+    """(records, malformed_count, lines_nonblank) — never raises. Disclosed caps guard
+    against a FIFO/device/unbounded stream hanging or OOMing the renderer.
+
+    Codex F7 (TOCTOU-safe open): open via os.open(O_RDONLY | O_NONBLOCK) and accept ONLY a
+    regular file (stat.S_ISREG on the OPEN fd) — if the path was atomically swapped to a
+    FIFO/device after any caller existence check, O_NONBLOCK makes the open return instead of
+    blocking forever on a writer-less FIFO, and the fstat check then rejects it (treated as
+    absent, the same [], 0, 0 an absent file yields).
+
+    Codex F2 (hard byte cap): read AT MOST `max_bytes + 1` bytes total (binary), so a single
+    multi-GB line — or many near-200k-char lines — can never be fully allocated. A stream
+    that exceeds `max_bytes` has its overflow tail rejected (never parsed, since it may be cut
+    mid-token) and counted once as malformed; complete lines fully inside the budget still
+    parse normally. For the common under-cap case the return is byte-for-byte the same records/
+    counters as a full read, preserving serve.py's size-based stream-offset heuristic (which
+    stats the file itself and never depends on this function's byte accounting)."""
     records, malformed, nonblank = [], 0, 0
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                nonblank += 1
-                if len(line) > 200_000:
-                    malformed += 1
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    malformed += 1
-                    continue
-                if not isinstance(rec, dict):
-                    malformed += 1
-                    continue
-                records.append(rec)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
         return [], 0, 0
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return [], 0, 0  # FIFO/device/dir swapped in after any caller check: treat as absent
+        # closefd=False -> the `finally` owns the single close; the wrapper never double-closes.
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            data = f.read(max_bytes + 1)  # +1 lets us DETECT (not allocate) a past-cap overflow
+    except OSError:
+        return [], 0, 0
+    finally:
+        os.close(fd)
+    if len(data) > max_bytes:
+        # Over the cap: keep only the complete lines fully inside the budget and reject the
+        # (possibly truncated) overflow tail — never parse a line that may be cut mid-token.
+        data = data[:max_bytes]
+        cut = data.rfind(b"\n")
+        data = data[:cut + 1] if cut != -1 else b""  # no whole line under the cap -> reject all
+        malformed += 1  # the rejected overflow tail counts once as malformed
+    text = data.decode("utf-8", errors="replace")
+    for i, raw in enumerate(text.split("\n")):
+        if i >= max_lines:
+            break
+        line = raw.strip()
+        if not line:
+            continue
+        nonblank += 1
+        if len(line) > 200_000:
+            malformed += 1
+            continue
+        try:
+            rec = json.loads(line)
+        except (ValueError, RecursionError):
+            # FIX 3: a pathological bare number (e.g. a 5000-digit int) trips Python's
+            # int-string conversion limit -> ValueError, which json.JSONDecodeError (a
+            # ValueError SUBCLASS) would NOT catch; a deeply-nested array trips RecursionError.
+            # Both mean "malformed line", handled identically to a JSON syntax error — never
+            # allowed to propagate and fail every rebuild while serving stale state.
+            malformed += 1
+            continue
+        if not isinstance(rec, dict):
+            malformed += 1
+            continue
+        records.append(rec)
     return records, malformed, nonblank
 
 
