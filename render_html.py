@@ -14,6 +14,7 @@ import base64
 import dataclasses
 import hashlib
 import html
+import importlib.util
 import json
 import math
 import os
@@ -28,6 +29,12 @@ DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SIDECAR_RE = re.compile(r"^harness-map-(\d{4}-\d{2}-\d{2})\.json$")
 
 # --- fixed enums (determinism §4.4: never sorted(set(...)), always the schema tuple) ---
+# T12 (P1 fix): the operator-only 6-entry tuple below MISSED the three categories
+# `_walk_project_tier` (collector.py) emits in compose mode -- project rules,
+# CLAUDE.local.md, and nested CLAUDE.md were silently dropped from BOTH the treemap
+# (`_tokens_treemap`, which iterates this tuple) and the ladder (which renders the
+# SAME `tree["cells"]` `_tokens_treemap` built -- one fix covers both). Kept a FIXED
+# tuple, never `sorted(set(...))` (§4.4 determinism).
 ALWAYS_CATEGORIES = (
     ("claude_md", "CLAUDE.md (root)"),
     ("project_claude_md", "CLAUDE.md (project)"),
@@ -35,6 +42,9 @@ ALWAYS_CATEGORIES = (
     ("rule", "Rules"),
     ("coding_team_rule", "coding-team rules"),
     ("skill_rule", "Sub-skill rules"),
+    ("project_rule", "Project rules"),
+    ("project_claude_local_md", "CLAUDE.local.md"),
+    ("project_claude_md_nested", "CLAUDE.md (nested)"),
 )
 ON_DEMAND_GROUPS = (
     ("skill", "Skill bodies"),
@@ -180,7 +190,17 @@ def select_current(sidecars, date):
 
 
 # --------------------------------------------------------------------------- node keys
-def _al_node_key(path):
+def _al_node_key(path, tier="operator"):
+    """T12 (P2 fix): operator and project roots each surface files at the SAME
+    relative path (an operator `CLAUDE.md` and a project `CLAUDE.md` both give
+    `path == "CLAUDE.md"`), so the plain `always_loaded:{path}` key used to collide --
+    friction-join/tooltip/click couldn't tell the two apart. The OPERATOR format is
+    UNCHANGED (`tier` unrecognized/absent also falls through to it, via
+    `_normalize_tier`) so the friction telemetry-join -- which is operator-tier only,
+    §_canonical_ref_candidates -- keeps matching exactly as before; only project-tier
+    entries gain the `project:` discriminator segment."""
+    if _normalize_tier(tier) == "project":
+        return f"always_loaded:project:{path}"
     return f"always_loaded:{path}"
 
 
@@ -192,11 +212,20 @@ def _hook_node_key(name):
     return f"hook:{Path(name).name}"
 
 
-def _dup_node_key(path):
+def _dup_node_key(path, tier="operator"):
     """Map a duplication-corpus path onto the SAME node_key an existing view already
-    uses (§1.3) so friction/dup heat lands on one identity, not a shadow duplicate."""
-    if re.match(r"^(rules/|skills/[^/]+/rules/)", path):
-        return _al_node_key(path)
+    uses (§1.3) so friction/dup heat lands on one identity, not a shadow duplicate.
+    `tier` (T12 P2) is forwarded to the `_al_node_key` (rules/) branch, so a
+    project-tier rule's dup/length-crit identity matches the tier-disambiguated
+    treemap node_key `_tokens_treemap` now emits for it -- `.claude/rules/*.md` is the
+    ONE fixed shape `_walk_project_tier` (collector.py) ever writes a project rule at,
+    so it's gated behind `tier == "project"` (never matched for the default/operator
+    tier, so `build_dupweb_model`/`_canonical_ref_candidates` -- neither of which pass
+    `tier` -- see byte-identical pre-T12 behavior; extending dup-web itself to be
+    tier-aware is out of T12's scope, see the T12 report)."""
+    if re.match(r"^(rules/|skills/[^/]+/rules/)", path) or (
+            tier == "project" and re.match(r"^\.claude/rules/", path)):
+        return _al_node_key(path, tier)
     m = re.match(r"^skills/([^/]+)/SKILL\.md$", path)
     if m:
         return _od_node_key(m.group(1))
@@ -224,9 +253,11 @@ def _length_critical_node_keys(doc):
     repo-relative path format the dup-web corpus uses) — a path outside its known
     patterns (rules/, skills/*/SKILL.md, skills/*/{phases,prompts,agents}/*) falls
     back to a `dup:`-prefixed key that won't match any real treemap cell, a silent
-    no-op rather than a crash."""
+    no-op rather than a crash. `f.get("tier", "operator")` (T12 P2) is forwarded so a
+    project-tier flag's key matches the SAME tier-disambiguated node_key
+    `_tokens_treemap` now gives that file, instead of desyncing from it."""
     flags = doc.get("instruction_length_flags", []) or []
-    return {_dup_node_key(f["path"]): f.get("lines", 0)
+    return {_dup_node_key(f["path"], f.get("tier", "operator")): f.get("lines", 0)
             for f in flags if f.get("lines", 0) > LENGTH_CRITICAL_LINES}
 
 
@@ -320,7 +351,8 @@ def _tokens_treemap(files, canvas_w=960.0, canvas_h=420.0):
         groups.append(g)
         cat_files = sorted(by_cat.get(g["category"], []), key=lambda f: (-f.get("tokens_est", 0), f["path"]))
         cell_items = [{"size": f.get("tokens_est", 0), "words": f.get("words", 0),
-                       "path": f["path"], "node_key": _al_node_key(f["path"])}
+                       "path": f["path"], "node_key": _al_node_key(f["path"], f.get("tier", "operator")),
+                       "tier": f.get("tier", "operator")}
                       for f in cat_files]
         cells = squarify(cell_items, float(g["x"]), float(g["y"]), float(g["w"]), float(g["h"]))
         for c in cells:
@@ -340,15 +372,18 @@ def _on_demand_treemap(doc, canvas_w=960.0, canvas_h=420.0):
     items_by_group = {g: [] for g, _ in ON_DEMAND_GROUPS}
     for s in on_demand.get("skills", []) or []:
         items_by_group["skill"].append({"size": s.get("words", 0), "path": s.get("name", ""),
-                                         "node_key": _od_node_key(s.get("name", ""))})
+                                         "node_key": _od_node_key(s.get("name", "")),
+                                         "tier": s.get("tier", "operator")})
     for b in on_demand.get("skill_internal_bodies", []) or []:
         kind = b.get("kind")
         if kind in items_by_group:
             items_by_group[kind].append({"size": b.get("words", 0), "path": b.get("path", ""),
-                                          "node_key": _od_node_key(b.get("path", ""))})
+                                          "node_key": _od_node_key(b.get("path", "")),
+                                          "tier": b.get("tier", "operator")})
     for m in on_demand.get("memory_bodies", []) or []:
         items_by_group["memory"].append({"size": m.get("words", 0), "path": m.get("path", ""),
-                                          "node_key": _od_node_key(m.get("path", ""))})
+                                          "node_key": _od_node_key(m.get("path", "")),
+                                          "tier": m.get("tier", "operator")})
     group_items = []
     for g, label in ON_DEMAND_GROUPS:
         total = sum(i["size"] for i in items_by_group[g])
@@ -427,12 +462,25 @@ def build_trend_model(dated_docs):
 
 def build_dupweb_model(doc):
     """(d) Duplication web: dedup node set (lex-sorted) + edges in pair order +
-    phantom_refs table."""
+    phantom_refs table.
+
+    F1 (T13 QA): the collector already emits `pair["a_tier"]`/`["b_tier"]` in compose
+    mode, but this builder used to discard them — the tier filter toggle had NOTHING
+    to dim on a cross-tier dup pair, the ONE M4 view whose whole purpose is cross-tier
+    duplication. Each edge now also carries `a_tier`/`b_tier` (`_normalize_tier`
+    defaults an absent/unrecognized value to "operator" — C15 back-compat for a
+    pre-tier or non-compose sidecar) and the RAW `a_path`/`b_path` (unprefixed, unlike
+    `a`/`b` which stay the existing `_dup_node_key`-format node_key an existing
+    consumer — `_collect_node_keys`, the markdown copy export — already reads that way,
+    so those two fields are left untouched)."""
     dup = doc.get("duplication", {}) or {}
     pairs = dup.get("pairs", []) or []
     node_paths = sorted({p for pair in pairs for p in (pair["a"], pair["b"])})
     nodes = [{"node_key": _dup_node_key(p), "path": p} for p in node_paths]
     edges = [{"a": _dup_node_key(pair["a"]), "b": _dup_node_key(pair["b"]),
+              "a_path": pair["a"], "b_path": pair["b"],
+              "a_tier": _normalize_tier(pair.get("a_tier")),
+              "b_tier": _normalize_tier(pair.get("b_tier")),
               "score": pair.get("score", 0.0), "shared_sample": pair.get("shared_sample", "")}
              for pair in pairs]
     return {"nodes": nodes, "edges": edges, "threshold": dup.get("threshold", 0.6),
@@ -1024,35 +1072,68 @@ def build_friction_overlay(doc, streams, node_index, current_date, disabled):
 
 
 # ----------------------------------------------------------------------------- write safety
-def _resolves_inside_root(candidate, root, root_stat):
-    """Reused from collector.py's guard (§3.3), inverted use here: harness-map's
-    write target must NOT resolve inside the harness root."""
-    if candidate == root or root in candidate.parents:
-        return True
-    for anc in (candidate, *candidate.parents):
-        try:
-            st = os.stat(anc)
-        except OSError:
-            continue
-        if os.path.samestat(st, root_stat):
-            return True
-    return False
+def write_html_safely(out_path, text, guard_roots, input_paths=()):
+    """Hard-link-safe, TOCTOU-narrowed write (P1-B, Codex challenge): re-validates the
+    RESOLVED write target against EVERY root in `guard_roots` (+ `input_paths`) via the
+    shared `collector.validate_write_target` guard IMMEDIATELY before writing — no
+    caller-side check that ran earlier (build_server's startup guard, main()'s own
+    compose pre-check, or nothing at all) can see a `--out-dir` symlink (or the html
+    filename itself) retargeted AFTERWARD; this re-check runs FRESH on the raw
+    `out_path` on EVERY call, so it always resolves the CURRENT on-disk target. Every
+    caller now routes its write-time root guard through here rather than duplicating
+    it, closing the "check once, write many times later" gap that made a --out-dir
+    symlink swapped after startup slip past a stale one-shot validation.
 
+    Then writes via the collector's mkstemp/fsync/os.replace-in-the-resolved-directory
+    pattern (reused verbatim) — never `write_text()`, which would truncate a
+    hard-linked inode also linked under a guarded root — through the VALIDATED
+    resolved path, re-checked ONE MORE TIME immediately before the `mkstemp` call
+    below (mirrors collector.main's own recheck-then-write shape exactly, closing the
+    validate-then-mkstemp parent-dir-swap window the same way), so a directory-
+    component symlink hop is settled at the check closest to the write, not re-followed
+    at write time.
 
-def write_html_safely(out_path, text, harness_root):
-    """Hard-link-safe write (Codex F1): mkstemp in the SAME dir + fsync + os.replace,
-    reusing the collector's pattern verbatim — never `write_text()`, which would
-    truncate a hard-linked inode also linked under the harness root."""
+    A rejection at EITHER check raises `RenderError` (a catchable `Exception`, not
+    `SystemExit`) — serve.py's watcher-loop degrade handlers (`except Exception`,
+    `except (CollectorError, RenderError, OSError)`) catch it and keep the daemon
+    thread alive on last-good, exactly like any other rebuild fault; only main()'s own
+    top-level CLI handler turns it into a non-zero exit.
+
+    `guard_roots` is a single root (str/Path) or an iterable of roots — the caller
+    decides operator-only (non-compose) vs operator+project (compose); falsy entries
+    are dropped. A falsy/empty `guard_roots` skips validation entirely (no root to
+    guard against) — none of the current callers pass one."""
     out_path = Path(out_path)
-    if harness_root is not None:
-        try:
-            root_stat = os.stat(harness_root)
-            if _resolves_inside_root(out_path.resolve(), Path(harness_root).resolve(), root_stat):
-                raise SystemExit(f"fatal: refusing to write inside harness root: {out_path}")
-        except OSError:
-            pass
+    if guard_roots is None:
+        roots = []
+    elif isinstance(guard_roots, (str, Path)):
+        roots = [guard_roots]
+    else:
+        roots = list(guard_roots)
+    roots = [r for r in roots if r]
+    if roots:
+        collector_mod = _get_sibling_collector()
+        ok, resolved = collector_mod.validate_write_target(out_path, roots, input_paths)
+        if not ok:
+            raise RenderError(f"fatal: refusing to write inside a guarded root: {out_path}")
+        out_path = resolved
     tmp_name = None
     try:
+        if roots:
+            # P30/TOCTOU narrowing (parity with collector.main's own pre-mkstemp re-check,
+            # collector.py's `--out` write path): re-resolve the ALREADY-validated target
+            # FRESH from disk and re-check it against every guard root IMMEDIATELY before
+            # mkstemp — a parent-directory symlink swapped in during the window between the
+            # check above and this line would otherwise slip through on the now-stale
+            # `out_path`. Reuses the same `validate_write_target` guard (not a hand-rolled
+            # duplicate), so this stays in lockstep with the check above; on rejection it
+            # raises the SAME catchable RenderError. The residual window between THIS
+            # re-check and the mkstemp call itself is the same accepted, documented
+            # low-risk limitation collector.main carries (single-user local tool; not fully
+            # closed).
+            ok, out_path = _get_sibling_collector().validate_write_target(out_path, roots, input_paths)
+            if not ok:
+                raise RenderError(f"fatal: refusing to write inside a guarded root: {out_path}")
         fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), suffix=".tmp")
         # errors="backslashreplace" (Codex P1): a lone UTF-16 surrogate anywhere in `text`
         # (a non-UTF-8 filename the collector preserved via surrogateescape, reaching
@@ -1078,10 +1159,10 @@ def write_html_safely(out_path, text, harness_root):
 
 # ---------------------------------------------------------------------------------- CSS/JS
 STATIC_STYLE = """
-:root{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05);--r:10px;--mono:ui-monospace,"SF Mono","JetBrains Mono","Menlo",monospace}
-@media (prefers-color-scheme: dark){:root{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35)}}
-:root[data-theme="dark"]{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35)}
-:root[data-theme="light"]{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05)}
+:root{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05);--r:10px;--mono:ui-monospace,"SF Mono","JetBrains Mono","Menlo",monospace;--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#0e7490;--tier-project-bg:#cffafe;--tier-project-line:#67e8f9}
+@media (prefers-color-scheme: dark){:root{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#22d3ee;--tier-project-bg:#083344;--tier-project-line:#155e75}}
+:root[data-theme="dark"]{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#22d3ee;--tier-project-bg:#083344;--tier-project-line:#155e75}
+:root[data-theme="light"]{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05);--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#0e7490;--tier-project-bg:#cffafe;--tier-project-line:#67e8f9}
 *{box-sizing:border-box}
 body{background:var(--paper);color:var(--ink);font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:0;padding:0}
 header{padding:16px 20px;border-bottom:1px solid var(--line)}
@@ -1113,6 +1194,9 @@ button.view-btn{background:transparent;border:none;border-bottom:2px solid trans
 button.view-btn[aria-selected="true"]{border-bottom-color:var(--accent);color:var(--accent);font-weight:600}
 button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
 button.seg-btn[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);background:var(--paper)}
+.tier-filter{display:inline-flex;gap:4px;flex-wrap:wrap;border:1px solid var(--line);border-radius:6px;padding:2px;margin-left:auto}
+button.tier-filter-btn{background:transparent;border:none;border-radius:4px;padding:6px 10px;color:var(--muted);font-size:0.85rem;cursor:pointer}
+button.tier-filter-btn[aria-checked="true"]{background:var(--surface-2);color:var(--ink);font-weight:600}
 button:focus-visible,a:focus-visible,summary:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 main{padding:16px 20px}
 .view[hidden]{display:none}
@@ -1158,7 +1242,7 @@ th{color:var(--muted);font-weight:600}
 svg text{font-family:inherit}
 footer.sources{border-top:1px solid var(--line);padding:10px 20px;color:var(--muted);font-size:0.78rem}
 .overflow-x{overflow-x:auto}
-@media (prefers-reduced-motion: no-preference){button{transition:border-color .15s}}
+@media (prefers-reduced-motion: no-preference){button{transition:border-color .15s}.tier-node{transition:opacity .15s}}
 .cell-rect{stroke:var(--line);stroke-width:0.5}
 .ladder-track{fill:var(--surface-2)}
 body.friction-on .heatable:not(.fh1):not(.fh2):not(.fh3):not(.fh4){opacity:0.25}
@@ -1240,6 +1324,39 @@ button.gauge[aria-expanded="true"]{border-color:var(--accent)}
 .drag-fields div{font-size:0.8rem;margin:2px 0}
 tr.friction-component-row.sel td{background:var(--accent-soft);border-color:var(--accent)}
 svg .cell-rect,svg .ladder-bar{cursor:pointer}
+/* Project-tier targeting (T6): a wrapper `<g>`/`<tr>` carries `tier-node
+   tier-{operator|project}` around a treemap cell / ladder row / hygiene table row, so a
+   later opacity-dim (T7's filter toggle) dims sibling overlays (the length-crit ring +
+   marker) along with the cell, not just the rect. Operator tier stays visually
+   unchanged (muted tokens alias the existing --muted/--line) — only project-tier gets a
+   distinct accent stroke/border, so a non-compose (operator-only) render is unaffected. */
+.tier-node.tier-project .cell-rect,.tier-node.tier-project .ladder-bar{stroke:var(--tier-project);stroke-width:1.5}
+/* Border-left on the first cell, not a `tr` background — `tr:has(.pill-critical)`
+   above already owns full-row background under `border-collapse:collapse`, and a
+   length-critical row can ALSO be project-tier; this stays a non-clobbering signal
+   layered alongside it instead of fighting it for the same property. */
+tr.tier-project td:first-child{border-left:3px solid var(--tier-project)}
+.badge.tier-operator{border-color:var(--tier-operator-line);color:var(--tier-operator)}
+.badge.tier-project{border-color:var(--tier-project-line);color:var(--tier-project)}
+.badge.tier-dark{border-color:var(--crit);color:var(--crit)}
+.tier-summary .tier-surface-list{list-style:none;margin:0;padding:0}
+.tier-summary .tier-surface-list li{margin:4px 0;font-size:0.85rem}
+.tier-summary .tier-surface{font-family:var(--mono);color:var(--muted);text-transform:uppercase;font-size:0.72rem;letter-spacing:.03em;margin-right:6px}
+.tier-dark-callout{margin-top:10px}
+.tier-dark-callout h3{font-size:0.78rem;margin:0 0 6px 0;color:var(--muted);font-family:var(--mono);text-transform:uppercase;letter-spacing:.03em}
+.tier-dark-callout ul{margin:0;padding-left:18px}
+.tier-dark-callout li{margin:3px 0;font-size:0.82rem}
+/* Composed-settings source-tier badges (T7b) — the 3-way user/project/local vocabulary
+   (`_normalize_settings_tier`), distinct from the `.badge.tier-operator`/`.badge.tier-project`
+   pair above (the binary skills/agents/rules NODE tag). "user" and "project" reuse those same
+   tokens (same conceptual weight: user~operator's muted baseline, project~project's accent);
+   "local" (the highest-precedence settings source) reuses `--accent-2`, already themed
+   light/dark, rather than inventing a new CSS variable. */
+.badge.tier-src-user{border-color:var(--tier-operator-line);color:var(--tier-operator)}
+.badge.tier-src-project{border-color:var(--tier-project-line);color:var(--tier-project)}
+.badge.tier-src-local{border-color:var(--accent-2);color:var(--accent-2)}
+.badge.mcp-enabled{border-color:var(--good);color:var(--good)}
+.badge.mcp-disabled{border-color:var(--crit);color:var(--crit)}
 """
 # Graduated friction-heat ramp (Codex/demo parity finding: fh1 rendered visually
 # IDENTICAL to fh4 — both hit opacity:1, differing only by a subtle stroke-color
@@ -1254,7 +1371,22 @@ _HEAT_CSS = "".join(
     f".legend-swatch.fh{i}{{background:{color}}}"
     for i, color in enumerate(HEAT_RAMP, start=1)
 )
-STATIC_STYLE = STATIC_STYLE + _HEAT_CSS
+# Tier filter dim-in-place (T7, P2-8) — appended AFTER `_HEAT_CSS` so these two
+# declarations are the LAST rules in the stylesheet: if a future edit ever raises the
+# heat block's specificity, the tier dim still wins any equal-specificity tie. In
+# practice no such tie exists today — the selector targets the WRAPPER
+# (`.tier-node`, the `<g>`/`<tr>` T6 wraps every cell/row in), never `.fhN`/
+# `.heatable` (which live on the CHILD rect/bar), so opacity composes automatically
+# via ordinary nested compositing: a heated + tier-dimmed cell renders at
+# (dim-opacity * heat-opacity), and the length-crit ring/marker — a SIBLING inside
+# the same wrapper — dims right along with it, never independently. "All" (no body
+# class) leaves both rules inert; a non-compose render (no `.tier-filter` control,
+# every node tagged `tier-operator` by `_normalize_tier`'s default) is unaffected.
+_TIER_FILTER_CSS = (
+    "body.tier-project-only .tier-node.tier-operator{opacity:.25}"
+    "body.tier-operator-only .tier-node.tier-project{opacity:.25}"
+)
+STATIC_STYLE = STATIC_STYLE + _HEAT_CSS + _TIER_FILTER_CSS
 
 STATIC_SCRIPT = """
 (function(){
@@ -1284,6 +1416,45 @@ STATIC_SCRIPT = """
       else { next = btns.length - 1; }
       btns[next].focus();
       activate(btns[next].dataset.target);
+    });
+  }
+
+  // Tier filter (T7): TRUE roving-tabindex radiogroup (WAI-ARIA APG radio pattern) --
+  // unlike the view-switch tablist above (arrow-key but NOT roving: buttons carry no
+  // tabindex, only aria-selected flips -- P2-7 finding), this control keeps exactly
+  // ONE tabstop at all times. Arrow keys move focus AND selection AND the tabindex=0
+  // together (radio-group convention: moving focus changes the checked state, unlike
+  // a tablist where selection may lag focus). Selecting sets a body-level class the
+  // CSS reads to dim-in-place (never a re-layout, M3) -- "All" clears both classes.
+  // The control is absent entirely on a non-compose render (no tier_composition in
+  // the sidecar), so this whole block is a silent no-op there.
+  var tierGroup = document.querySelector('.tier-filter');
+  if (tierGroup){
+    var tierBtns = Array.prototype.slice.call(tierGroup.querySelectorAll('.tier-filter-btn'));
+    var selectTier = function(btn){
+      tierBtns.forEach(function(b){
+        var checked = b === btn;
+        b.setAttribute('aria-checked', checked ? 'true' : 'false');
+        b.setAttribute('tabindex', checked ? '0' : '-1');
+      });
+      document.body.classList.remove('tier-operator-only', 'tier-project-only');
+      var f = btn.dataset.tierFilter;
+      if (f === 'operator-only' || f === 'project-only') { document.body.classList.add(f); }
+    };
+    tierBtns.forEach(function(b){
+      b.addEventListener('click', function(){ selectTier(b); b.focus(); });
+    });
+    tierGroup.addEventListener('keydown', function(e){
+      var step = {ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1}[e.key];
+      if (e.key !== 'Home' && e.key !== 'End' && step === undefined) { return; }
+      e.preventDefault();
+      var idx = tierBtns.indexOf(document.activeElement);
+      var next;
+      if (e.key === 'Home') { next = 0; }
+      else if (e.key === 'End') { next = tierBtns.length - 1; }
+      else { next = ((idx === -1 ? 0 : idx) + step + tierBtns.length) % tierBtns.length; }
+      tierBtns[next].focus();
+      selectTier(tierBtns[next]);
     });
   }
 
@@ -1556,18 +1727,43 @@ def _heat_bucket_map(heat):
     return {v: max(1, min(n, math.ceil((i + 1) / k * n))) for i, v in enumerate(distinct)}
 
 
-def _cell_title(path, heat_n, crit_lines):
+def _normalize_tier(value):
+    """Project-tier targeting (T6): project-tier data is UNTRUSTED input (T3's threat
+    model) — an adversarial/malformed sidecar could carry any string in a node's `tier`
+    field. Render only ever emits one of the two known enum members into a CSS class
+    attribute, never the raw value; an absent OR unrecognized value defaults to
+    "operator" (back-compat, C15 — old-shape sidecars carry no `tier` key at all)."""
+    return value if value in ("operator", "project") else "operator"
+
+
+def _normalize_settings_tier(value):
+    """T7b (`composed_settings`, T5): the settings/hooks/MCP compose chain uses its OWN
+    3-way `user|project|local` tier vocabulary — distinct from `_normalize_tier`'s binary
+    `operator|project` NODE tag above (skills/agents/rules/commands). The two are never
+    interchangeable: a project's `.claude/settings.local.json` is "local" here but its
+    skills are still tagged "project" by `_normalize_tier`. Same defensive posture as
+    `_normalize_tier` — an absent or unrecognized value (a stale/hand-edited sidecar) never
+    reaches a CSS class attribute raw; it defaults to "user", the vocabulary's own
+    least-distinctive/muted member."""
+    return value if value in ("user", "project", "local") else "user"
+
+
+def _cell_title(path, heat_n, crit_lines, tier=None):
     """Self-explaining hover-`<title>` for a treemap/ladder cell. Leads with a churn
     word so a zero-friction cell reads `churn: none recorded` (never the old
     `(friction: 0)` contradiction the operator caught), and — when the length-crit
     ring is present — states explicitly that the amber ring is SIZE, not churn
     (honors the amber/friction decouple lesson). `crit_lines` is `None` for a
-    non-critical cell."""
+    non-critical cell. `tier` (T6) adds a "tier: project" note ONLY for project-tier
+    cells — the common operator-tier case stays silent so the hover text is unchanged
+    for every non-compose (operator-only) render."""
     churn = f"churn: {heat_n} friction record(s)" if heat_n else "churn: none recorded"
     parts = [str(path), churn]
     if crit_lines is not None:
         parts.append(f"size: {crit_lines} lines (over the {LENGTH_CRITICAL_LINES}-line cap)")
         parts.append("amber ring = oversize, NOT churn")
+    if _normalize_tier(tier) == "project":
+        parts.append("tier: project (this repo's .claude/)")
     return " · ".join(parts)
 
 
@@ -1607,7 +1803,16 @@ def _render_treemap_svg(tree, heat, dom_id, bucket_map=None, length_crit_keys=No
         gy = max(0.0, float(c["y"]) + TREEMAP_CELL_GAP / 2)
         gw = max(0.0, float(c["w"]) - TREEMAP_CELL_GAP)
         gh = max(0.0, float(c["h"]) - TREEMAP_CELL_GAP)
-        title = _cell_title(c["path"], heat_n, length_crit_keys.get(c["node_key"]))
+        # Tier-bearing wrapper (T6, P2-8): every cell's rect/label/badge/ring/marker are
+        # SIBLINGS inside one `<g class="tier-node tier-{tier}">` — a later opacity-dim
+        # (T7's filter toggle, mirroring `body.friction-on .heatable`) targets the
+        # wrapper and so dims the length-crit ring/marker along with the cell, not just
+        # the rect. `data-node-key` stays on the rect only (the existing click-to-act
+        # listener attaches per-element via querySelectorAll; putting it on both would
+        # double-attach the handler).
+        tier = _normalize_tier(c.get("tier"))
+        parts.append(f'<g class="tier-node tier-{tier}">')
+        title = _cell_title(c["path"], heat_n, length_crit_keys.get(c["node_key"]), tier)
         parts.append(
             f'<rect x="{_fmt_float(gx)}" y="{_fmt_float(gy)}" width="{_fmt_float(gw)}" '
             f'height="{_fmt_float(gh)}" rx="{TREEMAP_CELL_RX}" '
@@ -1646,6 +1851,7 @@ def _render_treemap_svg(tree, heat, dom_id, bucket_map=None, length_crit_keys=No
             mx = _fmt_float(gx + max(0.0, gw - 7))
             my = _fmt_float(gy + max(0.0, gh - 7))
             parts.append(f'<circle cx="{mx}" cy="{my}" r="4" class="length-crit-marker"/>')
+        parts.append("</g>")
     parts.append("</svg>")
     return "".join(parts)
 
@@ -1698,7 +1904,11 @@ def _render_ladder_svg(tree, heat, dom_id, bucket_map=None, length_crit_keys=Non
         # anchored at the column's own right edge, not the bar's start, so values
         # stay column-aligned regardless of bar width.
         value_x = _fmt_float(_LADDER_LABEL_W + _LADDER_BAR_MAX_W + _LADDER_COUNT_W - 4)
-        title = _cell_title(c["path"], heat_n, length_crit_keys.get(c["node_key"]))
+        # Tier-bearing wrapper (T6, P2-8) — same rationale as the treemap: wraps the
+        # label/track/bar/badge/ring group so a later opacity-dim covers all of them.
+        tier = _normalize_tier(c.get("tier"))
+        parts.append(f'<g class="tier-node tier-{tier}">')
+        title = _cell_title(c["path"], heat_n, length_crit_keys.get(c["node_key"]), tier)
         parts.append(
             f'<text x="0" y="{text_y}" class="cell-label">{label}</text>'
             f'<rect x="{_fmt_float(_LADDER_LABEL_W)}" y="{track_y}" '
@@ -1730,6 +1940,7 @@ def _render_ladder_svg(tree, heat, dom_id, bucket_map=None, length_crit_keys=Non
                 f'<rect x="{_fmt_float(_LADDER_LABEL_W)}" y="{track_y}" '
                 f'width="{_fmt_float(_LADDER_BAR_MAX_W)}" height="{track_h}" rx="4" '
                 f'class="length-crit-ring" data-node-key="{esc_html(c["node_key"])}"/>')
+        parts.append("</g>")
     parts.append("</svg>")
     return "".join(parts)
 
@@ -2232,19 +2443,84 @@ def _render_coverage_matrix_body(civc, date):
     )
 
 
-def _render_overview_view(overview_model, civc, date, copy_payload):
+def _render_tier_summary_band(doc):
+    """Project-tier composition summary (T6, P2-7 precision) — "project adds N /
+    overrides M" on the Overview view, sourced from `doc["tier_composition"]` (T4's
+    additive, compose-mode-only field). Absent entirely on a non-compose or old-shape
+    sidecar (C15 back-compat): returns "" so the Overview view — and every existing
+    byte-determinism assertion built against a tier-less fixture — is unaffected.
+
+    Per-surface rollup reads `surfaces[<surface>]["merge"]` to distinguish UNION
+    surfaces (every project entry is an "add", never an override/dark — R5-A) from
+    SHADOW surfaces (add/override/dark all meaningful). The dark-skill callout lists
+    every `status:"shadowed"` PROJECT node — a project skill/command/agent the
+    operator-tier (or, for agents, user-tier) collision winner shadows out, i.e.
+    defined but never runs."""
+    tc = doc.get("tier_composition")
+    if not tc:
+        return ""
+    surfaces = tc.get("surfaces", {}) or {}
+    participating = tc.get("participating_surfaces") or sorted(surfaces)
+    nodes = tc.get("nodes", []) or []
+    total_adds = sum(s.get("adds", 0) for s in surfaces.values())
+    total_overrides = sum(s.get("overrides", 0) for s in surfaces.values())
+    total_dark = sum(s.get("dark", 0) for s in surfaces.values())
+
+    def _surface_row(surface):
+        s = surfaces.get(surface, {})
+        merge = s.get("merge", "shadow")
+        adds = s.get("adds", 0)
+        if merge == "union":
+            detail = f'<span class="badge tier-project">{esc_html(adds)} add(s)</span> (union — both tiers load)'
+        else:
+            winner = s.get("winner_tier") or "n/a"
+            detail = (
+                f'<span class="badge tier-project">{esc_html(adds)} add(s)</span> '
+                f'<span class="badge tier-project">{esc_html(s.get("overrides", 0))} override(s)</span> '
+                f'<span class="badge tier-dark">{esc_html(s.get("dark", 0))} dark</span> '
+                f'(shadow — {esc_html(winner)} wins a collision)'
+            )
+        return f'<li><span class="tier-surface">{esc_html(surface)}</span>{detail}</li>'
+
+    rows_html = "".join(_surface_row(s) for s in participating)
+
+    dark_nodes = [n for n in nodes if n.get("status") == "shadowed" and n.get("tier") == "project"]
+    dark_html = ""
+    if dark_nodes:
+        items = "".join(
+            f'<li><span class="badge tier-dark">dark</span> '
+            f'{esc_html(n.get("surface", ""))}:{esc_html(n.get("name", ""))} '
+            f'<span class="script-desc">{esc_html(n.get("path", ""))} — shadowed by operator '
+            f'{esc_html((n.get("shadowed_by") or {}).get("path", ""))}, defined but never runs</span></li>'
+            for n in dark_nodes)
+        dark_html = f'<div class="tier-dark-callout"><h3>Dark project skills &amp; commands</h3><ul>{items}</ul></div>'
+
+    return (
+        '<div class="card tier-summary" id="tier-summary"><h2>Project-tier composition</h2>'
+        f'<p class="digest">project adds {esc_html(total_adds)} / overrides {esc_html(total_overrides)}'
+        f'{f" / {esc_html(total_dark)} dark" if total_dark else ""}</p>'
+        f'<ul class="tier-surface-list">{rows_html}</ul>'
+        f'{dark_html}</div>'
+    )
+
+
+def _render_overview_view(overview_model, civc, date, copy_payload, doc):
     """Merged Overview + Coverage tab (Task B-t2 tab merge — the two former tabs
     overlapped: Overview's mini-grid duplicated Coverage's full matrix at a smaller
     scale). Main area: the full `.matrix` card-grid + its sticky `.inspector`
     (`_render_coverage_matrix_body`). Sidebar: the friction hero card + "Needs
     attention" digest, retained verbatim from the former Overview tab. RESOLVED
     DECISION 1 still holds: no friction heat markers (`heatable`/`fhN`/`node_key`)
-    anywhere in this view — friction here stays a count, never node-keyed heat."""
+    anywhere in this view — friction here stays a count, never node-keyed heat.
+    `doc` (T6) feeds `_render_tier_summary_band`, which renders "" absent
+    `tier_composition` — a non-compose render's markup is unaffected."""
     matrix_body = _render_coverage_matrix_body(civc, date)
+    tier_summary = _render_tier_summary_band(doc)
     return (
         '<section id="view-overview" class="view" role="tabpanel" '
         'aria-labelledby="view-btn-overview" tabindex="-1">'
         f'<div class="view-toolbar">{_render_copy_controls("overview", copy_payload)}</div>'
+        f'{tier_summary}'
         '<div class="overview-grid">'
         '<div class="card"><h2>Coverage Matrix</h2>'
         '<p class="subtitle">six verbs (what the harness does to behavior) '
@@ -2325,6 +2601,7 @@ def _render_weight_view(model, heat, friction_enabled, doc, copy_payload):
         '<p class="subtitle">On-demand skills cost only when invoked; MEMORY.md + '
         'CLAUDE.md are the real per-turn tax — the treemap/ladder toggle shows the '
         'same weights two ways.</p>'
+        f'{_render_transparency_note(doc)}'
         '<div class="card"><h2>Always-loaded (by category, sized by est. tokens)</h2>'
         f'<div class="treemap-panel">{always_treemap}</div>'
         f'<div class="ladder-panel">{always_ladder}</div></div>'
@@ -2383,10 +2660,33 @@ def _render_dupweb_body(model, raw_pairs):
     UNPREFIXED `doc["duplication"]["pairs"]` list (`build_dupweb_model` builds
     `model["edges"]` from this exact list, in the same order, only prefixing `a`/`b`
     into node-keys for the arrow display) — `build_consolidation_brief` needs the
-    real paths, not the display node-keys, so the brief is index-aligned to it."""
+    real paths, not the display node-keys, so the brief is index-aligned to it.
+
+    F1 (T13 QA): each row also carries a `tier-node tier-{tier}` wrapper class (same
+    convention `_render_length_flags_body` already uses for the length-flags table) so
+    the tier filter toggle actually dims dup-pair rows. A row's tier is "project" if
+    EITHER endpoint is project-tier, else "operator" — a cross-tier pair is a PROJECT
+    signal (the project introduced content duplicating the operator's), so tagging it
+    dim-with-operator would hide the exact case M4 exists to surface. The pair text
+    shows the RAW `a_path`/`b_path` (a human-readable repo-relative path), never the
+    internal `dup:<path>`/`always_loaded:...` node-key string `e["a"]`/`e["b"]` carry;
+    a project-tier endpoint also gets the standard `.badge.tier-project` marker (color
+    is never the only signal, matching this file's existing convention). On a
+    non-compose/pre-tier sidecar every edge normalizes to `a_tier=b_tier="operator"`
+    (C15), so every row renders `tier-node tier-operator` with no badge — the SAME
+    "operator" class every treemap/ladder cell and length-flags row already carries
+    unconditionally, not new markup this table alone introduces."""
     if model["edges"]:
+        def _row_tier(e):
+            return "project" if "project" in (e["a_tier"], e["b_tier"]) else "operator"
+
+        def _endpoint(path, tier):
+            badge = ' <span class="badge tier-project">project</span>' if tier == "project" else ""
+            return f'{esc_html(path)}{badge}'
+
         rows = "".join(
-            f'<tr><td>{esc_html(e["a"])} ⇄ {esc_html(e["b"])}</td>'
+            f'<tr class="tier-node tier-{_row_tier(e)}">'
+            f'<td>{_endpoint(e["a_path"], e["a_tier"])} ⇄ {_endpoint(e["b_path"], e["b_tier"])}</td>'
             f'<td class="tabular-nums">{_fmt_float(e["score"] * 100)}% shared</td>'
             f'<td>{esc_html(e["shared_sample"])}</td>'
             f'<td>{_render_brief_control("dup", i, build_consolidation_brief(raw_pairs[i]))}</td>'
@@ -2422,7 +2722,12 @@ def _render_length_flags_body(doc):
     output stays deterministic regardless of the flag list's original order.
 
     B3/D6: each row also gets an action-launcher refactor-brief button, indexed by
-    its position in this same sorted order (the row's own deterministic identity)."""
+    its position in this same sorted order (the row's own deterministic identity).
+
+    T6: each row also carries a `tier-node tier-{operator|project}` class (same
+    wrapper vocabulary as the treemap/ladder `<g>`, C15 back-compat default when a
+    flag entry carries no `tier` key) — a project-tier row also gets a visible
+    "project" badge (never color alone, matching this file's existing convention)."""
     flags = doc.get("instruction_length_flags", []) or []
     if flags:
         sorted_flags = sorted(flags, key=lambda f: (-f.get("lines", 0), f["path"]))
@@ -2430,7 +2735,12 @@ def _render_length_flags_body(doc):
         def _row(i, f):
             pill = ('<span class="pill pill-critical">critical</span>'
                     if f.get("lines", 0) > LENGTH_CRITICAL_LINES else '<span class="pill">over</span>')
-            return (f'<tr><td>{esc_html(f["path"])}</td><td class="tabular-nums">{esc_html(f["lines"])}</td>'
+            tier = _normalize_tier(f.get("tier"))
+            tier_badge = (' <span class="badge tier-project">project</span>'
+                          if tier == "project" else "")
+            return (f'<tr class="tier-node tier-{tier}">'
+                    f'<td>{esc_html(f["path"])}{tier_badge}</td>'
+                    f'<td class="tabular-nums">{esc_html(f["lines"])}</td>'
                     f'<td>{pill}</td>'
                     f'<td>{_render_brief_control("overcap", i, build_refactor_brief(f))}</td>'
                     '</tr>')
@@ -2451,11 +2761,160 @@ def _render_unchecked_binaries_body(doc):
     return f'<div class="card"><p>Unchecked binaries: <span class="hygiene-unchecked">{esc_html(n)}</span></p></div>'
 
 
+def _render_composed_mcp_body(mcp_servers):
+    """T7b: `composed_settings.mcp` (T5's `collect_composed_mcp`/`_redact_mcp_server`) —
+    one row per registered server: source-tier badge, enabled/disabled state, and
+    env/header-key NAMES only. T5 already redacts every raw `env`/`headers` VALUE before
+    it ever reaches the sidecar — this function only ever reads `env_keys`/`header_keys`
+    (never a hypothetical raw `env`/`headers` field on `s`), so a value can't leak here
+    even if one were mistakenly present on the dict."""
+    if not mcp_servers:
+        return ('<div class="card"><h2>MCP servers (composed)</h2>'
+                '<p class="empty-state">none registered</p></div>')
+
+    def _row(s):
+        tier = _normalize_settings_tier(s.get("tier"))
+        enabled = bool(s.get("enabled"))
+        state_badge = (f'<span class="badge {"mcp-enabled" if enabled else "mcp-disabled"}">'
+                        f'{"enabled" if enabled else "disabled"}</span>')
+        key_parts = []
+        if s.get("env_keys"):
+            key_parts.append("env: " + ", ".join(esc_html(k) for k in s["env_keys"]))
+        if s.get("header_keys"):
+            key_parts.append("headers: " + ", ".join(esc_html(k) for k in s["header_keys"]))
+        keys_html = (f'<span class="script-desc">{"; ".join(key_parts)}</span>' if key_parts
+                     else '<span class="script-desc empty-state">no env/header keys</span>')
+        return (f'<li><span class="badge tier-src-{tier}">{esc_html(tier)}</span> '
+                f'{esc_html(s.get("name", ""))} {state_badge}{keys_html}</li>')
+
+    rows = "".join(_row(s) for s in sorted(mcp_servers, key=lambda s: s.get("name") or ""))
+    return f'<div class="card"><h2>MCP servers (composed)</h2><ul>{rows}</ul></div>'
+
+
+def _render_composed_hooks_body(hooks):
+    """T7b: `composed_settings.hooks` (T5's `_compose_hooks`) — the tier-tagged UNION
+    across user/project/local (every matching hook fires, unlike the precedence-winner
+    settings/MCP merges). Renders ALONGSIDE the pre-existing operator-only "Registered
+    hooks (settings.json)" card in `_render_bipartite_body` (untouched — still the
+    wiring-integrity/orphan-detection view fed by operator settings only); this card is
+    compose mode's cross-tier view, carrying each hook's source file."""
+    if not hooks:
+        return ('<div class="card"><h2>Hooks (composed, all tiers)</h2>'
+                '<p class="empty-state">none registered across any tier</p></div>')
+
+    def _row(h):
+        tier = _normalize_settings_tier(h.get("tier"))
+        matcher = f' ({esc_html(h.get("matcher"))})' if h.get("matcher") else ""
+        exists = h.get("exists")
+        exists_note = ("script found" if exists is True
+                        else "script missing" if exists is False
+                        else "existence unknown (out-of-root or non-script command)")
+        return (f'<li><span class="badge tier-src-{tier}">{esc_html(tier)}</span> '
+                f'{esc_html(h.get("event", ""))}{matcher} '
+                f'<span class="script-desc">{esc_html(h.get("command", ""))} — {exists_note} — '
+                f'source: {esc_html(h.get("source_file") or "unknown")}</span></li>')
+
+    rows = "".join(_row(h) for h in hooks)
+    return f'<div class="card"><h2>Hooks (composed, all tiers)</h2><ul>{rows}</ul></div>'
+
+
+def _render_composed_permissions_body(perms):
+    """T7b: `composed_settings.permissions` (T5's `_merge_permissions_union_deny_wins`)
+    — allow/deny/ask counts unioned across every tier, deny always wins a same-rule
+    conflict."""
+    return (
+        '<div class="card"><h2>Permissions (composed, union)</h2>'
+        f'<p class="digest">allow {esc_html(perms.get("allow_count", 0))} · '
+        f'deny {esc_html(perms.get("deny_count", 0))} · '
+        f'ask {esc_html(perms.get("ask_count", 0))} '
+        f'({esc_html(perms.get("evidence", ""))}) — a rule denied by any tier is '
+        'denied everywhere</p></div>'
+    )
+
+
+_SETTINGS_OVERRIDE_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+
+def _render_composed_overrides_body(overrides):
+    """T7b: `composed_settings.overrides` (T5's `_settings_overrides`) — the ALLOWLISTED
+    non-permission settings keys (`model`/`cleanupPeriodDays`/`sandbox`/`enabledPlugins`,
+    plus `env` key-names-only) that differ across tiers, winner + overridden tiers.
+
+    P1-C (renderer-side defense): collector.py's `_settings_override_safe_value`
+    allowlists/type-gates `winning_value` before it reaches the sidecar — but this
+    renderer does NOT trust that upstream invariant blindly. A hand-crafted/malformed
+    sidecar could still carry a raw non-scalar in `winning_value` with no `value_kind`
+    marker at all, so `_fmt_winning_value` independently re-checks the runtime TYPE:
+    a scalar (str/int/float/bool/None) or a list OF scalars (the `env` override's list
+    of key NAMES, the one legitimate list shape the collector emits) renders normally;
+    anything else — a dict, a list containing a non-scalar, or an explicit
+    `value_kind` of `"complex"`/`"redacted"` — renders a fixed placeholder, NEVER the
+    raw value."""
+    if not overrides:
+        return ('<div class="card"><h2>Settings overrides (composed)</h2>'
+                '<p class="empty-state">no cross-tier setting overrides</p></div>')
+
+    def _fmt_winning_value(o):
+        value_kind = o.get("value_kind")
+        if value_kind == "complex":
+            return "(complex value hidden)"
+        if value_kind == "redacted":
+            return "(redacted)"
+        v = o.get("winning_value")
+        if isinstance(v, list):
+            if all(isinstance(x, _SETTINGS_OVERRIDE_SCALAR_TYPES) for x in v):
+                return ", ".join(esc_html(x) for x in v)
+            return "(complex value hidden)"
+        if isinstance(v, _SETTINGS_OVERRIDE_SCALAR_TYPES):
+            # P3 defect fix: genuine JSON null (v is None, no value_kind marker)
+            # should render as "null" (JSON repr) not "None" (Python repr)
+            if v is None:
+                return "null"
+            return esc_html(v)
+        return "(complex value hidden)"
+
+    def _row(o):
+        tier = _normalize_settings_tier(o.get("winning_tier"))
+        overridden = ", ".join(esc_html(_normalize_settings_tier(t))
+                               for t in (o.get("overridden_tiers") or []))
+        return (f'<li><span class="badge tier-src-{tier}">{esc_html(tier)}</span> '
+                f'{esc_html(o.get("key", ""))} = {_fmt_winning_value(o)} '
+                f'<span class="script-desc">overrides: {overridden or "none"}</span></li>')
+
+    rows = "".join(_row(o) for o in overrides)
+    return f'<div class="card"><h2>Settings overrides (composed)</h2><ul>{rows}</ul></div>'
+
+
+def _render_composed_settings_body(doc):
+    """T7b (dark-feature closure): `doc["composed_settings"]` (T5) was fully collected —
+    MCP registrations, the tier-tagged hooks union, the permissions union, and settings
+    overrides — but rendered NOWHERE; compose mode's whole point is operator visibility
+    into what a project's `.claude/` layer adds on top of the operator's own `~/.claude/`,
+    and "collected but never shown" defeats that (dark feature). Gated on
+    `composed_settings` presence, same pattern as T6's `_render_tier_summary_band` gating
+    on `tier_composition` — a non-compose or old-shape sidecar carries no key at all, so
+    this returns "" and the Hygiene view's markup is unaffected. Uses the 3-way
+    `user|project|local` SETTINGS-tier vocabulary (T5, `_normalize_settings_tier`) —
+    distinct from `_normalize_tier`'s binary `operator|project` NODE tier used everywhere
+    else in this view."""
+    cs = doc.get("composed_settings")
+    if not cs:
+        return ""
+    return (
+        '<h2>Composed settings (compose mode)</h2>'
+        f'{_render_composed_mcp_body(cs.get("mcp") or [])}'
+        f'{_render_composed_hooks_body(cs.get("hooks") or [])}'
+        f'{_render_composed_permissions_body(cs.get("permissions") or {})}'
+        f'{_render_composed_overrides_body(cs.get("overrides") or [])}'
+    )
+
+
 def _render_hygiene_view(doc, models, copy_payload):
     """Composes the former bipartite/trend/dupweb tab bodies plus length flags
     (finding #5b) and the unchecked-binary count (finding #5a) under ONE view
     (RESOLVED DECISION 2 — hook wiring folded here as 'Wiring integrity', never
-    dropped)."""
+    dropped). `_render_composed_settings_body` (T7b) appends last, compose-mode-only —
+    absent entirely (returns "") on any non-compose or old-shape `doc`."""
     return (
         '<section id="view-hygiene" class="view" role="tabpanel" '
         'aria-labelledby="view-btn-hygiene" tabindex="-1">'
@@ -2466,14 +2925,61 @@ def _render_hygiene_view(doc, models, copy_payload):
         f'{_render_trend_body(models["trend"])}'
         '<h2>Wiring integrity</h2>'
         f'{_render_bipartite_body(models["bipartite"])}'
+        f'{_render_composed_settings_body(doc)}'
         '</section>'
     )
+
+
+def _render_out_of_root_refs_body(doc):
+    """F3 (T13 QA, DARK FEATURE): `out_of_root_refs` (T3's H2 audit trail — every
+    project-tier path a symlink/traversal escaped `project-containment-root` into, so
+    it was noted but NOT read/traversed/excerpted) is UNTRUSTED input — `name` +
+    `target` (a raw `readlink()` string), `trusted: False` — collected but rendered
+    NOWHERE (confirmed zero matches). Reuses the exact `esc_html`'d `<ul>` card
+    pattern the adjacent Blind spots card already uses. Compose-mode only, C15: a
+    non-compose or old-shape doc carries no `out_of_root_refs` key at all (`build_document`
+    only sets it inside `if compose:`), so this returns "" and a non-compose render's
+    markup is byte-identical to before this card existed."""
+    refs = doc.get("out_of_root_refs")
+    if refs is None:
+        return ""
+    if refs:
+        items = "".join(
+            f'<li>{esc_html(r.get("name", ""))} → {esc_html(r.get("target", ""))} '
+            '<span class="badge tier-dark">untrusted</span></li>' for r in refs)
+        body = f"<ul>{items}</ul>"
+    else:
+        body = '<p class="empty-state">none</p>'
+    return f'<div class="card"><h2>Out-of-root refs ({len(refs)})</h2>{body}</div>'
+
+
+def _render_transparency_note(doc):
+    """F3 (T13 QA, DARK FEATURE): the composed weight-exclusion count (P31/C18 weight
+    honesty) and the roots actually walked (R2-B `inspected_roots`) were collected but
+    never surfaced anywhere in the HTML. Absent `inspected_roots` (non-compose or
+    old-shape sidecar, C15) returns "" so a non-compose render's markup is unaffected.
+    `excluded_count`'s ABSENCE (vs. `0`) distinguishes "not measured" from "0 excluded,
+    measured" — both states are rendered explicitly, never silently folded into a bare
+    "0" that could mean either."""
+    inspected = doc.get("inspected_roots")
+    if not inspected:
+        return ""
+    root_labels = (("operator", "operator"), ("project_containment", "project"),
+                   ("project_harness", "project harness (.claude/)"))
+    roots_walked = [label for key, label in root_labels if inspected.get(key)]
+    roots_text = ("roots walked: " + ", ".join(esc_html(r) for r in roots_walked)) \
+        if roots_walked else "roots walked: none"
+    excluded = ((doc.get("always_loaded", {}) or {}).get("totals", {}) or {}).get("excluded_count")
+    excluded_text = (f"{esc_html(excluded)} file(s) excluded from weight (out-of-root/inaccessible)"
+                      if excluded is not None else "weight-exclusion count not measured")
+    return f'<p class="digest" id="weight-transparency-note">{excluded_text} · {roots_text}</p>'
 
 
 def _render_provenance_footer(doc, skipped, footer, date):
     """Former `_render_notes_tab`, relocated to a `<footer>` (never `<main>`) — the
     root/date/generated_at + data-sources + warning-count lines stay always-visible;
-    the rest collapses behind `<details>`."""
+    the rest collapses behind `<details>`. `_render_out_of_root_refs_body` (F3) appends
+    last inside the detail — compose-mode-only, "" (no markup change) otherwise."""
     def _list(items, empty_msg):
         if not items:
             return f'<p class="empty-state">{esc_html(empty_msg)}</p>'
@@ -2501,6 +3007,7 @@ def _render_provenance_footer(doc, skipped, footer, date):
         f'<div class="card"><h2>Blind spots ({len(blind_spots)})</h2>{_list(blind_spots, "none")}</div>'
         f'<div class="card"><h2>Errors ({len(errors)})</h2>{_list(errors, "none")}</div>'
         f'<div class="card"><h2>Skipped sidecars ({len(skipped)})</h2>{skipped_html}</div>'
+        f'{_render_out_of_root_refs_body(doc)}'
         '</details></footer>'
     )
 
@@ -2687,6 +3194,25 @@ def render_html(date, models, friction, notes, generation=None):
     gen_meta = (f'<meta name="hm-generation" content="{int(generation)}">'
                 if generation is not None else "")
 
+    # Tier filter toggle (T7): rendered ONLY when the sidecar carries `tier_composition`
+    # (T6's own gate for tier UI, `test_tier_summary_band_absent_without_tier_composition`)
+    # -- a non-compose (operator-only) render has nothing to filter (`_normalize_tier`
+    # defaults every node to "operator"), so the control is absent and the controls bar
+    # stays byte-identical to pre-T7 (C15). Three-state radiogroup, single tabstop
+    # ("All" checked by default) -- roving tabindex wired in STATIC_SCRIPT.
+    tier_filter_html = ""
+    if doc.get("tier_composition"):
+        tier_filter_html = (
+            '<div class="tier-filter" role="radiogroup" aria-label="Tier filter">'
+            '<button class="tier-filter-btn" role="radio" aria-checked="true" '
+            'tabindex="0" data-tier-filter="all">All</button>'
+            '<button class="tier-filter-btn" role="radio" aria-checked="false" '
+            'tabindex="-1" data-tier-filter="operator-only">Operator only</button>'
+            '<button class="tier-filter-btn" role="radio" aria-checked="false" '
+            'tabindex="-1" data-tier-filter="project-only">Project only</button>'
+            '</div>'
+        )
+
     view_buttons = "".join(
         f'<button class="view-btn" id="view-btn-{vid.split("-", 1)[1]}" role="tab" '
         f'data-target="{vid}" aria-selected="false">{esc_html(label)}</button>'
@@ -2714,9 +3240,10 @@ def render_html(date, models, friction, notes, generation=None):
         '<button class="action-btn" id="expand-all">Expand all / print view</button>',
         '<button class="action-btn" id="theme-toggle" type="button" '
         'aria-pressed="false" aria-label="Toggle color theme">◐</button>',
+        tier_filter_html,
         "</div>",
         "<main>",
-        _render_overview_view(overview_model, models["civc"], date, copy_payloads["overview"]),
+        _render_overview_view(overview_model, models["civc"], date, copy_payloads["overview"], doc),
         _render_weight_view(models["context_weight"], heat, friction_enabled, doc, copy_payloads["weight"]),
         _render_friction_view(joined, footer, codex_aggregate, models["drag"], friction_total_value, date,
                               copy_payloads["friction"]),
@@ -2847,6 +3374,37 @@ def render_from_out_dir(out_dir, date=None, streams=None, no_friction=False, gen
 
 
 # ---------------------------------------------------------------------------------- main
+def _load_sibling_collector():
+    """Lazily loads the sibling `collector.py` by absolute path (mirrors serve.py's
+    `_load_sibling`, so this works regardless of the invoking cwd or whether render_html
+    itself was loaded via `spec_from_file_location`, as the test suite does) — collector.py
+    never imports render_html.py, so no load-time cycle. Loaded on demand (not at module
+    import time) so a non-compose invocation never pays the cost of importing collector.py
+    at all. Callers should go through `_get_sibling_collector()` instead of calling this
+    directly, to share the cached module rather than re-exec'ing it per call."""
+    module_dir = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location(
+        "harness_map_render_html_collector", module_dir / "collector.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_SIBLING_COLLECTOR_MODULE = None
+
+
+def _get_sibling_collector():
+    """Cached accessor for `_load_sibling_collector()` (P1-B): `write_html_safely` calls
+    this on EVERY write, including the serve.py B2 cheap friction-only re-render path,
+    so re-exec'ing collector.py's whole module body per call would defeat the entire
+    point of that cheap path. Imported lazily on first use (never at module import
+    time), then reused for the rest of the process."""
+    global _SIBLING_COLLECTOR_MODULE
+    if _SIBLING_COLLECTOR_MODULE is None:
+        _SIBLING_COLLECTOR_MODULE = _load_sibling_collector()
+    return _SIBLING_COLLECTOR_MODULE
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Render an interactive HTML map from harness-map sidecar(s).")
     ap.add_argument("--out-dir", required=True)
@@ -2880,9 +3438,20 @@ def main(argv=None):
 
     date, html_text, doc = ctx.date, ctx.html_text, ctx.doc
     out_path = Path(args.out_dir) / f"harness-map-{date}.html"
+    # T13 F2 / P1-B: a compose sidecar carries `inspected_roots.project_containment` --
+    # when present, an `--out-dir` inside the composed PROJECT repo must be rejected too,
+    # not only the operator root. Absent `inspected_roots` (non-compose or old-shape
+    # sidecar, C15) leaves `guard_roots` holding only the operator root, so a non-compose
+    # run's behavior/output is unchanged. This is now the ONLY write-time guard (no
+    # separate up-front check that write_html_safely's own re-validation could grow stale
+    # against by the time the write actually happens) — `write_html_safely` re-resolves
+    # and re-checks `guard_roots` fresh, immediately before writing.
+    inspected_roots = doc.get("inspected_roots")
+    project_containment_root = inspected_roots.get("project_containment") if inspected_roots else None
+    guard_roots = [r for r in (doc.get("root"), project_containment_root) if r]
     try:
-        write_html_safely(out_path, html_text, doc.get("root"))
-    except SystemExit as e:
+        write_html_safely(out_path, html_text, guard_roots)
+    except RenderError as e:
         print(str(e), file=sys.stderr)
         return 1
     except OSError as e:

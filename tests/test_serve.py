@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from test_collector import _build_two_tier_maximal_fixture, _SECRET_SENTINELS
 from test_render_html import _minimal_doc, _write_sidecar  # reuse fixtures
 
 SERVE = Path(__file__).resolve().parents[1] / "serve.py"
@@ -191,11 +192,11 @@ _DEBOUNCE = 0.2
 _HEARTBEAT = 1.0
 
 
-def _start_watching_server(out_dir, root, project_root):
+def _start_watching_server(out_dir, root, project_root, compose=False):
     server = srv.build_server(
         out_dir=out_dir, root=root, project_root=project_root,
         host="127.0.0.1", port=0, no_friction=True, watch=True,
-        poll_seconds=_POLL, debounce_seconds=_DEBOUNCE, heartbeat=_HEARTBEAT)
+        poll_seconds=_POLL, debounce_seconds=_DEBOUNCE, heartbeat=_HEARTBEAT, compose=compose)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     return server
@@ -241,6 +242,39 @@ def live_server_watching_proj(tmp_path):
     server = _start_watching_server(out_dir, root, proj)
     yield server, out_dir, root, proj
     _teardown_watching_server(server)
+
+
+@pytest.fixture
+def live_server_watching_compose(tmp_path):
+    # T8: a two-tier fixture -- operator root + a project-containment-root carrying its own
+    # `.claude/{rules,commands}`. HOME is sandboxed (restored in the finally below) so
+    # collect_composed_mcp reads a controlled ~/.claude.json, never the real dev machine's --
+    # same real-env-var pattern test_collector.py uses via subprocess `env=`, adapted for an
+    # in-process call (serve.py never shells out to collector.py).
+    home = tmp_path / "home"
+    home.mkdir()
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "rules").mkdir()
+    (root / "rules" / "a.md").write_text("# rule a\n")
+    (root / "CLAUDE.md").write_text("# claude\n")
+    proj = tmp_path / "projroot"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / ".claude" / "commands").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj claude\n" + "word " * 20)
+    server = _start_watching_server(out_dir, root, proj, compose=True)
+    try:
+        yield server, out_dir, root, proj
+    finally:
+        _teardown_watching_server(server)
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
 
 
 def _wait_settle(server):
@@ -1015,3 +1049,332 @@ def test_startup_malformed_synthesis_clean_fatal(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "fatal: could not start server" in captured.err, \
         f"expected the clean fatal message on stderr, got {captured.err!r}"
+
+
+# ================================================================= T8: compose propagation
+# + compose-aware watched-set + tier-aware, containment-gated watcher + both-root guard
+
+def test_compose_flag_reaches_collector_produces_composed_doc(live_server_watching_compose):
+    # Real behavioral proof (no argv introspection/mocks): --compose reaching collector.main()
+    # is what produces the compose-only `inspected_roots`/`tier_composition` sidecar fields.
+    server, out_dir, root, proj = live_server_watching_compose
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    sidecar = json.loads((out_dir / f"harness-map-{today}.json").read_text())
+    assert "inspected_roots" in sidecar
+    assert sidecar["inspected_roots"]["operator"] == str(root.resolve())
+    assert sidecar["inspected_roots"]["project_containment"] == str(proj.resolve())
+    assert "tier_composition" in sidecar
+
+
+def test_compose_end_to_end_serves_composed_dashboard(live_server_watching_compose):
+    server, out_dir, root, proj = live_server_watching_compose
+    port = server.server_address[1]
+    body = _get_root_body(port)
+    assert "project adds" in body
+
+
+def test_watched_set_covers_project_tier_additions_both_roots(live_server_watching_compose):
+    # WS-B superset, audited across BOTH roots: a nested project command AND the project's
+    # own CLAUDE.md must be in the watched set the running compose server seeded from.
+    server, out_dir, root, proj = live_server_watching_compose
+    snap_keys = set(map(str, server.state.watch_snapshot.keys()))
+    assert str(proj / "CLAUDE.md") in snap_keys
+    assert str(proj / ".claude" / "commands") in snap_keys
+    assert str(root / "rules") in snap_keys                       # operator side still covered
+
+
+def test_watched_set_tags_operator_and_project_entries(live_server_watching_compose):
+    server, out_dir, root, proj = live_server_watching_compose
+    snap = server.state.watch_snapshot
+    proj_tier, _value = snap[proj / "CLAUDE.md"]
+    op_tier, _value2 = snap[root / "CLAUDE.md"]
+    assert proj_tier == "project"
+    assert op_tier == "operator"
+
+
+def test_nested_project_command_addition_triggers_recollect(live_server_watching_compose):
+    server, out_dir, root, proj = live_server_watching_compose
+    _wait_settle(server)
+    before = server.state.collect_count
+    (proj / ".claude" / "commands" / "brand_new.md").write_text(
+        "---\nname: brand_new\ndescription: new.\n---\nBody.\n")
+    _wait_settle(server)
+    assert server.state.collect_count > before
+
+
+def test_nested_project_claude_md_addition_triggers_recollect(live_server_watching_compose):
+    server, out_dir, root, proj = live_server_watching_compose
+    (proj / "sub").mkdir()
+    _wait_settle(server)
+    before = server.state.collect_count
+    (proj / "sub" / "CLAUDE.md").write_text("# nested\n" + "word " * 20)
+    _wait_settle(server)
+    assert server.state.collect_count > before
+
+
+def test_project_out_of_root_symlink_not_followed_by_watcher(live_server_watching_compose, tmp_path):
+    # T8/R3: an ESCAPING project-tier symlink's target mutating must NOT trigger a recollect --
+    # the watcher lstats/readlinks it, never follows into the target (mirrors T3's containment
+    # gate exactly).
+    server, out_dir, root, proj = live_server_watching_compose
+    external = tmp_path / "external_rule.md"
+    external.write_text("external v1\n")
+    (proj / ".claude" / "rules" / "escaping.md").symlink_to(external)
+    _wait_settle(server)   # settle the symlink-creation rebuild
+    before = server.state.collect_count
+    external.write_text("external v2 changed and longer\n")
+    _wait_settle(server)
+    assert server.state.collect_count == before, \
+        "an escaping project symlink's target change must not trigger a recollect"
+
+
+def test_project_contained_symlink_target_mutation_triggers_recollect(live_server_watching_compose):
+    # T8/R3 regression pin: a CONTAINED project symlink (target lives INSIDE project_root) must
+    # still trigger a recollect on target-content change -- the opposite of the escaping case
+    # above, proving the gate is containment-based, not a blanket "never follow project tier."
+    server, out_dir, root, proj = live_server_watching_compose
+    target = proj / "internal_rule.md"
+    target.write_text("internal v1\n")
+    (proj / ".claude" / "rules" / "aliased.md").symlink_to(target)
+    _wait_settle(server)   # settle the symlink-creation rebuild
+    before = server.state.collect_count
+    target.write_text("internal v2 changed and longer\n")
+    _wait_settle(server)
+    assert server.state.collect_count > before, \
+        "a CONTAINED project symlink's target change must still trigger a recollect"
+
+
+def test_out_dir_inside_operator_root_rejected_in_compose_mode(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    bad_out = root / "leak-out"
+    with pytest.raises(ValueError):
+        srv.build_server(out_dir=bad_out, root=root, project_root=proj,
+                         host="127.0.0.1", port=0, no_friction=True, compose=True)
+
+
+def test_out_dir_inside_project_root_rejected_in_compose_mode(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    bad_out = proj / "leak-out"
+    with pytest.raises(ValueError):
+        srv.build_server(out_dir=bad_out, root=root, project_root=proj,
+                         host="127.0.0.1", port=0, no_friction=True, compose=True)
+
+
+def test_out_dir_outside_both_roots_accepted_in_compose_mode(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    server = srv.build_server(out_dir=out_dir, root=root, project_root=proj,
+                              host="127.0.0.1", port=0, no_friction=True, compose=True)
+    server.server_close()
+
+
+def test_non_compose_out_dir_guard_still_rejects_inside_operator_root(tmp_path):
+    # Regression pin: the NEW startup guard must not regress the pre-existing (non-compose)
+    # single-root protection write_html_safely already enforced at render time.
+    root = tmp_path / "root"
+    root.mkdir()
+    bad_out = root / "leak-out"
+    with pytest.raises((ValueError, srv.render_html.RenderError, srv.CollectorError, SystemExit)):
+        srv.build_server(out_dir=bad_out, root=root, project_root=root,
+                         host="127.0.0.1", port=0, no_friction=True)
+
+
+# ==================================================== P1-B: write-time re-validation
+# build_server's own startup guard (above) validates --out-dir ONCE, before the server
+# starts running. These pin the SEPARATE, later, write-time guard: every full/cheap
+# rebuild's HTML write must independently re-validate against BOTH roots at the moment
+# it writes -- a --out-dir symlink (or a pre-existing symlink AT the html filename
+# itself) safe at startup, retargeted afterward, must never let a write land inside the
+# project-containment root.
+
+def _minimal_compose_server(tmp_path, out_dir):
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    server = srv.build_server(out_dir=out_dir, root=root, project_root=proj,
+                              host="127.0.0.1", port=0, no_friction=True, compose=True)
+    return server, root, proj
+
+
+def test_rebuild_friction_only_rejects_html_path_symlinked_into_project_root(tmp_path):
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    server, root, proj = _minimal_compose_server(tmp_path, out_dir)
+    try:
+        ctx_date = server.state.ctx.date
+        html_path = out_dir / f"harness-map-{ctx_date}.html"
+        leak_target = proj / "leak-friction.html"
+        html_path.unlink()
+        html_path.symlink_to(leak_target)
+        with pytest.raises(srv.render_html.RenderError):
+            srv._rebuild_friction_only(server.state, out_dir)
+        assert not leak_target.exists(), \
+            "a pre-existing html-path symlink into the project root must never be written through"
+    finally:
+        server.server_close()
+
+
+def test_rebuild_rejects_html_path_symlinked_into_project_root(tmp_path):
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    server, root, proj = _minimal_compose_server(tmp_path, out_dir)
+    try:
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        html_path = out_dir / f"harness-map-{today}.html"
+        leak_target = proj / "leak-full.html"
+        html_path.unlink()
+        html_path.symlink_to(leak_target)
+        with pytest.raises(srv.render_html.RenderError):
+            srv._rebuild(server.state, out_dir, root, proj, compose=True)
+        assert not leak_target.exists(), \
+            "a pre-existing html-path symlink into the project root must never be written through"
+    finally:
+        server.server_close()
+
+
+def test_rebuild_friction_only_rejects_out_dir_symlink_retargeted_into_project_root(tmp_path):
+    # The fuller production shape: --out-dir ITSELF is a symlink, safe at startup, then
+    # retargeted into the project root before the next cheap re-render.
+    safe_target = tmp_path / "safe_out"
+    safe_target.mkdir()
+    out_link = tmp_path / "out_link"
+    out_link.symlink_to(safe_target)
+    server, root, proj = _minimal_compose_server(tmp_path, out_link)
+    try:
+        out_link.unlink()
+        out_link.symlink_to(proj)
+        with pytest.raises(srv.render_html.RenderError):
+            srv._rebuild_friction_only(server.state, out_link)
+        assert not any(proj.glob("harness-map-*.html")), \
+            "a retargeted --out-dir symlink must never let a write land inside the project root"
+    finally:
+        server.server_close()
+
+
+def test_guard_rejection_survives_watcher_degrade_handler_not_bare_systemexit(tmp_path):
+    """P2 regression pin (Codex challenge): `write_html_safely`'s guard rejection must be
+    a catchable `Exception`, not a bare `SystemExit` (a `BaseException`) that would
+    escape `_watcher_loop`'s degrade handlers and silently kill the daemon thread. This
+    reproduces the EXACT shape of the watcher loop's own cheap-path handler
+    (serve.py ~642-649: `try: _rebuild_friction_only(...) except Exception as exc:
+    ...degrade to full recollect...`) against the realistic production attack (T8 P1-B):
+    a compose `--out-dir` symlink, safe at startup, retargeted into the project root
+    AFTER the server is already live and serving. Before the fix, the inner
+    `except Exception` here does NOT catch the guard's `SystemExit`, so it propagates
+    out of this test uncaught -- pytest reports the test itself as errored (RED). After
+    the fix, `RenderError` is caught exactly like any other rebuild fault (GREEN)."""
+    safe_target = tmp_path / "safe_out"
+    safe_target.mkdir()
+    out_link = tmp_path / "out_link"
+    out_link.symlink_to(safe_target)
+    server, root, proj = _minimal_compose_server(tmp_path, out_link)
+    try:
+        out_link.unlink()
+        out_link.symlink_to(proj)
+        caught = None
+        try:
+            srv._rebuild_friction_only(server.state, out_link)
+        except Exception as exc:  # mirrors _watcher_loop's own cheap-path degrade handler verbatim
+            caught = exc
+        assert caught is not None, \
+            "the guard rejection must raise something an `except Exception` handler can catch"
+        assert isinstance(caught, Exception)
+        assert not isinstance(caught, SystemExit), \
+            "SystemExit is a BaseException -- it would escape every watcher degrade handler"
+        assert isinstance(caught, srv.render_html.RenderError)
+        assert not any(proj.glob("harness-map-*.html")), \
+            "the guard rejection must still block the write, not just become catchable"
+    finally:
+        server.server_close()
+
+
+# ================================================================= T9: integration test net
+# The SAME maximal two-tier fixture test_collector.py/test_render_html.py exercise, served
+# live via `build_server` (in-process, matching every other serve.py test -- serve.py never
+# shells out to collector.py). HOME is sandboxed via os.environ save/restore, the same
+# real-env-var pattern `live_server_watching_compose` (T8) already established.
+
+def test_maximal_two_tier_fixture_serves_composed_dashboard(fake_harness, tmp_path):
+    proj, home = _build_two_tier_maximal_fixture(fake_harness, tmp_path)
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)
+    out_dir = tmp_path / "served_maximal"
+    out_dir.mkdir()
+    try:
+        server = srv.build_server(out_dir=out_dir, root=fake_harness, project_root=proj,
+                                  host="127.0.0.1", port=0, no_friction=True, compose=True)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            port = server.server_address[1]
+            body = _get_root_body(port)
+            # tenant isolation + dark-skill callout, served live (not just rendered to disk)
+            assert "project adds 8 / overrides 1 / 2 dark" in body
+            assert "Dark project skills" in body
+            assert "skill:demo" in body and "command:demo-cmd" in body
+            # composed-settings section (T7b), all four cards
+            assert "MCP servers (composed)" in body
+            assert "Hooks (composed, all tiers)" in body
+            assert "Permissions (composed, union)" in body
+            assert "Settings overrides (composed)" in body
+            # secret-safety end-to-end at the SERVED-BODY layer, on the SAME fixture
+            for secret in _SECRET_SENTINELS:
+                assert secret not in body, f"raw secret leaked into the served page: {secret}"
+        finally:
+            server.shutdown()
+            server.server_close()
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
+
+def test_maximal_two_tier_fixture_serves_old_shape_dashboard_when_compose_unset(
+        fake_harness, tmp_path):
+    """C15 back-compat at the SERVE layer: the SAME fixture, served with `compose`
+    unset (the default), must produce and serve a genuinely old-shape page -- no
+    tier-summary band, no composed-settings cards -- proving serve.py's own default
+    path (not just render_html.py in isolation) tolerates the absent-tier case."""
+    proj, home = _build_two_tier_maximal_fixture(fake_harness, tmp_path)
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)
+    out_dir = tmp_path / "served_old_shape"
+    out_dir.mkdir()
+    try:
+        server = srv.build_server(out_dir=out_dir, root=fake_harness, project_root=proj,
+                                  host="127.0.0.1", port=0, no_friction=True)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            port = server.server_address[1]
+            body = _get_root_body(port)
+            assert "harness-map" in body and "<!DOCTYPE html>" in body
+            assert 'id="tier-summary"' not in body
+            assert "MCP servers (composed)" not in body
+            assert "Hooks (composed, all tiers)" not in body
+            assert "Permissions (composed, union)" not in body
+            assert "Settings overrides (composed)" not in body
+        finally:
+            server.shutdown()
+            server.server_close()
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home

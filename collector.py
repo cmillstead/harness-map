@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -236,6 +237,263 @@ def _resolves_inside_root(candidate, root, root_stat):
     return False
 
 
+def validate_write_target(raw_path, roots, input_paths=()):
+    """SINGLE shared write-guard called at each write sink's CALLER entry point:
+    collector.main's `--out` guard, serve.py `build_server`'s `--out-dir` startup guard,
+    and render_html.main's `--out-dir` compose-mode guard (T13 F2) — every caller that
+    can see BOTH roots reuses this rather than re-implementing the containment check.
+    `render_html.write_html_safely` ALSO routes its write-time root guard through this
+    helper: it calls `validate_write_target` immediately on entry AND again immediately
+    before its `mkstemp` (a pre-mkstemp re-check mirroring collector.main's, narrowing the
+    validate-then-write TOCTOU window), raising `render_html.RenderError` on rejection.
+    So this helper is the single shared containment check for every write sink — the
+    collector `--out`/serve `--out-dir` startup guards AND the render/serve per-write sinks.
+
+    A candidate is REJECTED if it resolves inside ANY of `roots` (segment-safe via
+    `_resolves_inside_root` — Path.parents + inode compare, NEVER str.startswith),
+    tested both LEXICALLY (normpath, catches a textual '..' that still exits a root)
+    and RESOLVED (catches a symlink alias into a root — mirrors main()'s prior FIX 2/3).
+    It is ALSO rejected if it equals any path in `input_paths` (the collector's own
+    read surface, e.g. `iter_input_paths()`) — that clause is what stops a target like
+    `~/.claude.json` (a T5 MCP input that sits OUTSIDE every dir-root, so containment
+    alone would wrongly allow overwriting it). That `input_paths` check (P2-B hardened)
+    compares LITERALLY (lexical/resolved string equality — defense-in-depth, kept as-is)
+    PLUS by resolved realpath/inode identity: an input path that is ITSELF a symlink
+    (e.g. `~/.claude.json` aliasing `/reports/result.json`) is resolved before comparing,
+    and — where both the input and the candidate target exist — an `os.path.samestat`
+    inode check catches an alias the string comparison alone would miss (a literal
+    `Path(p) in (lexical, resolved)` never resolves `p`, so it could not see that
+    `~/.claude.json` and `--out /reports/result.json` name the SAME file).
+
+    Returns `(ok, resolved_path)`: `resolved_path` is the Path to write through when
+    `ok` is True, `None` when `ok` is False. A root that cannot be stat()'d is SKIPPED
+    (nothing safe to compare against) rather than treated as a rejection."""
+    expanded = Path(raw_path).expanduser()
+    lexical = Path(os.path.normpath(str(expanded)))
+    try:
+        resolved = expanded.resolve()
+    except OSError:
+        resolved = expanded
+    for root in roots:
+        root = Path(root)
+        try:
+            root_stat = os.stat(root)
+        except OSError:
+            continue
+        for cand in (lexical, resolved):
+            if _resolves_inside_root(cand, root, root_stat):
+                return False, None
+    for p in input_paths:
+        p_path = Path(p)
+        if p_path in (lexical, resolved):
+            return False, None
+        try:
+            p_resolved = p_path.resolve()
+        except OSError:
+            p_resolved = p_path
+        if p_resolved == resolved:
+            return False, None
+        try:
+            if os.path.samestat(os.stat(p_resolved), os.stat(resolved)):
+                return False, None
+        except OSError:
+            pass
+    return True, resolved
+
+
+# --- T3: project-tier read gate (H2 containment) + TOCTOU-closed read ---
+# The operator tier keeps its existing trusted symlink-following UNCHANGED (it deploys
+# via symlinks by design). Every project-tier read/traverse/excerpt sink below routes
+# through THIS gate instead of re-implementing containment per call site.
+
+def _project_tier_gate(candidate, containment_root, containment_root_stat):
+    """Single project-tier read/traverse gate (H2). Returns `(contained, identity_stat)`:
+    `contained=True` only when `candidate` exists and its REALPATH lies inside
+    `containment_root` — segment-safe via `_resolves_inside_root` (`Path.parents` +
+    inode compare, NEVER `str.startswith`). `identity_stat` is the `os.stat(candidate)`
+    result captured AT THIS CHECK (follows symlinks) — a subsequent TOCTOU-closed read
+    (`_read_project_file`) MUST re-validate an opened fd's `fstat()` against this SAME
+    identity before trusting the bytes (T3 P1-5). `contained=False` (identity_stat=None)
+    for a broken symlink, a stat()-inaccessible path, or a realpath that escapes
+    `containment_root` — the caller must record an `out_of_root_ref` and skip; never
+    read, traverse, or excerpt."""
+    try:
+        identity_stat = os.stat(candidate)   # follows symlinks -- the resolved identity
+    except OSError:
+        return False, None
+    real = Path(_physical_key(candidate))
+    if not _resolves_inside_root(real, containment_root, containment_root_stat):
+        return False, None
+    return True, identity_stat
+
+
+def _record_out_of_root_ref(out_of_root_refs, seen, rel_root, candidate):
+    """Record an escaping project-tier path (H2) as a structured, untrusted
+    `out_of_root_ref`: `name` (harness-relative, via `_rel_safe`) + `target` (the raw
+    `readlink()` string for a symlink, else a best-effort realpath) + `trusted: False`.
+    NEVER reads `candidate`'s contents. Deduped by `name` in `seen` so a dir-level skip
+    and a file-level skip for the same entry are not double-recorded."""
+    name = _rel_safe(rel_root, candidate)
+    if name in seen:
+        return
+    seen.add(name)
+    try:
+        is_link = candidate.is_symlink()
+    except OSError:
+        is_link = False
+    if is_link:
+        try:
+            target = os.readlink(candidate)
+        except OSError:
+            target = _physical_key(candidate)
+    else:
+        target = _physical_key(candidate)
+    out_of_root_refs.append({"name": name, "target": target, "trusted": False})
+
+
+def _read_project_file(path, containment_root, containment_root_stat):
+    """TOCTOU-closed project-tier file read (T3 P1-5, hardened P1-A). The `is_file()`-
+    then-`open()` window accepted elsewhere in this file for the self-owned operator tier
+    (see `_read_text`/`_read_head`) is CLOSED here for untrusted project-tier reads.
+
+    Codex reproduced an ABA symlink race against the OLD design (`_project_tier_gate`
+    captured an identity `stat()` FIRST, then a SEPARATE `realpath()` call decided
+    containment, and only THEN was the path re-opened by pathname): an attacker who can
+    retime a symlink swap makes the path resolve OUTSIDE the containment root during the
+    identity stat, INSIDE during the containment realpath (so H2 wrongly "passes"), and
+    back OUTSIDE before this open — the reopened OUTSIDE inode matched the STALE identity
+    captured at the first (also outside) resolution, so external bytes returned as
+    VERIFIED with no `out_of_root_ref`. FIX: bind the containment decision to the OPENED
+    fd, not to a pathname resolved before or after it. Open first (`O_NONBLOCK` so a FIFO
+    swapped in after a caller's `_project_tier_gate` pre-check can't hang forever on a
+    writer-less FIFO), `fstat()` the opened fd for its immutable identity, THEN re-derive
+    the realpath and require ALL of: (a) it resolves inside `containment_root`
+    (`_resolves_inside_root`, segment-safe), (b) a FRESH `os.stat()` of that realpath —
+    taken now, not earlier — `samestat()`s the opened fd's fstat (so the containment
+    check and the bytes about to be read are provably the SAME inode, closing the ABA
+    window in both directions), and (c) the fd is a regular file. Any mismatch is
+    INACCESSIBLE; the bytes behind a swapped-out fd are never surfaced as VERIFIED.
+    `containment_root`/`containment_root_stat` are the SAME pair every project-tier
+    containment check uses (H2) — no `identity_stat` param anymore; the gate's pre-open
+    stat is no longer trusted for the read decision. Returns `(text | None, evidence)`,
+    evidence in `{"VERIFIED", "INACCESSIBLE"}`."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None, "INACCESSIBLE"
+    try:
+        post_stat = os.fstat(fd)
+        if not stat.S_ISREG(post_stat.st_mode):
+            return None, "INACCESSIBLE"
+        real = Path(_physical_key(path))
+        if not _resolves_inside_root(real, containment_root, containment_root_stat):
+            return None, "INACCESSIBLE"
+        try:
+            real_stat = os.stat(real)
+        except OSError:
+            return None, "INACCESSIBLE"
+        if not os.path.samestat(real_stat, post_stat):
+            return None, "INACCESSIBLE"
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            data = fh.read()
+    except OSError:
+        return None, "INACCESSIBLE"
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return data.decode("utf-8", errors="replace"), "VERIFIED"
+
+
+def _project_file_entry(rel_root, path, category, containment_root_stat, inaccessible):
+    """Project-tier analog of `_file_entry`: identical output shape, but reads through
+    the TOCTOU-closed `_read_project_file` (T3, hardened P1-A) instead of `_read_text`.
+    The caller MUST have already passed `path` through `_project_tier_gate` as a cheap
+    pre-filter (skip an obviously-escaping path without even attempting an open) — the
+    read below is the actual security decision, bound to the opened fd, independent of
+    the gate's outcome; `rel_root` doubles as `_read_project_file`'s containment root."""
+    text, evidence = _read_project_file(path, rel_root, containment_root_stat)
+    if evidence == "INACCESSIBLE":
+        _append_inaccessible_once(inaccessible, _rel_safe(rel_root, path))
+        return None
+    words, lines, tokens_est = _metrics(text)
+    return {
+        "path": _rel(rel_root, path),
+        "category": category,
+        "words": words,
+        "lines": lines,
+        "tokens_est": tokens_est,
+        "evidence": "VERIFIED",
+    }
+
+
+def _walk_contained_dirs(start, containment_root, containment_root_stat, out_of_root_refs, seen_refs):
+    """Manual, cycle-safe directory walk under `start` (H2) — yields each directory
+    (including `start`) whose realpath lies inside `containment_root`. Deliberately NOT
+    `Path.rglob`, which follows symlinks unconditionally: a directory entry that is a
+    symlink resolving OUTSIDE `containment_root` is recorded as an `out_of_root_ref` and
+    NOT descended into — no listing of its children, no reads, no further traversal.
+    Cycle-safe: a directory whose physical identity was already visited is skipped
+    without re-descending, so a project-internal symlink loop cannot hang the walk.
+
+    P1-A hardened: the OLD design ran `_project_tier_gate` (a pathname `stat()` for
+    identity, then a SEPARATE pathname `realpath()` for containment) and THEN listed the
+    SAME pathname again (`d.iterdir()`) — an attacker retiming a symlink swap could make
+    the containment check see one inode and the subsequent listing see another, the same
+    ABA class as the file-read race `_read_project_file` closes. FIX: open the directory
+    FIRST (`O_DIRECTORY | O_NONBLOCK`), `fstat()` the opened fd for its immutable
+    identity, THEN re-derive the realpath and require BOTH that it resolves inside
+    `containment_root` AND that a FRESH `os.stat()` of that realpath `samestat()`s the
+    OPENED fd — closing the ABA window exactly like `_read_project_file` — and enumerate
+    children via `os.scandir(fd)` (an int fd, not the pathname again) so the listing is
+    of the PROVEN inode, never a re-resolved path."""
+    visited = set()
+    stack = [Path(start)]
+    while stack:
+        d = stack.pop()
+        key = _physical_key(d)
+        if key in visited:
+            continue
+        visited.add(key)
+        try:
+            fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK)
+        except OSError:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, containment_root, d)
+            continue
+        try:
+            post_stat = os.fstat(fd)
+            real = Path(_physical_key(d))
+            if not _resolves_inside_root(real, containment_root, containment_root_stat):
+                _record_out_of_root_ref(out_of_root_refs, seen_refs, containment_root, d)
+                continue
+            try:
+                real_stat = os.stat(real)
+            except OSError:
+                _record_out_of_root_ref(out_of_root_refs, seen_refs, containment_root, d)
+                continue
+            if not os.path.samestat(real_stat, post_stat):
+                _record_out_of_root_ref(out_of_root_refs, seen_refs, containment_root, d)
+                continue
+            yield d
+            try:
+                entries = sorted(os.scandir(fd), key=lambda e: e.name)
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    is_dir = False
+                if is_dir:
+                    stack.append(d / entry.name)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _metrics(text):
     words = len(text.split())
     lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
@@ -356,10 +614,363 @@ def _file_entry(root, path, category, inaccessible, rel_root=None):
     }
 
 
-def walk_always_loaded(root, project_root, inaccessible, errors):
+def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
+    """Compose-mode project-tier walk (P1-1): project CLAUDE files under the
+    project-containment-root (`<repo>/CLAUDE.md`, `<repo>/CLAUDE.local.md`, and nested
+    `<repo>/**/CLAUDE.md` — including `<repo>/.claude/CLAUDE.md`, a valid load form per
+    T1) plus project-harness-root rules (`<repo>/.claude/rules/*.md`). Every entry is
+    tagged tier="project". Unconditional on any operator-root registration (H1:
+    composed mode replaces the legacy single-file, registration-gated
+    project_claude_md branch in walk_always_loaded).
+
+    T3/H2: EVERY read and directory descent here is gated by `_project_tier_gate`
+    (containment) and, for file bodies, read via the TOCTOU-closed `_read_project_file`
+    instead of `_file_entry`/`_read_text`. A directory (the `<repo>/**` walk that finds
+    nested CLAUDE.md, or `.claude/rules` itself) whose realpath escapes the project
+    containment root is NOT descended into; a file whose realpath escapes is NOT read.
+    Both are recorded as `out_of_root_refs` (name + target, untrusted) instead."""
+    files = []
+    seen = set()
+    seen_refs = set()
+    project_root = Path(project_root)
+    harness_root = project_root / ".claude"
+
+    try:
+        containment_stat = os.stat(project_root)
+    except OSError as e:
+        errors.append(f"project containment root not accessible: {project_root}: {e}")
+        return files
+
+    claude_files = []
+    try:
+        for d in _walk_contained_dirs(project_root, project_root, containment_stat,
+                                       out_of_root_refs, seen_refs):
+            for fname in ("CLAUDE.md", "CLAUDE.local.md"):
+                f = d / fname
+                present, ok = _safe_exists(f)
+                if ok and present:
+                    claude_files.append(f)
+    except OSError as e:
+        errors.append(f"project CLAUDE.md walk failed for {project_root}: {e}")
+
+    for f in sorted(claude_files):
+        key = _physical_key(f)
+        if key in seen:
+            continue
+        contained, _identity = _project_tier_gate(f, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, f)
+            continue
+        if f.name == "CLAUDE.local.md":
+            category = "project_claude_local_md"
+        elif f.parent == project_root:
+            category = "project_claude_md"
+        else:
+            category = "project_claude_md_nested"
+        entry = _project_file_entry(project_root, f, category, containment_stat, inaccessible)
+        if entry:
+            entry["tier"] = "project"
+            files.append(entry)
+            seen.add(key)
+
+    rules_dir = harness_root / "rules"
+    rule_files = []
+    try:
+        is_rules_dir = rules_dir.is_dir()
+    except OSError as e:
+        errors.append(f"project rules is_dir failed for {rules_dir}: {e}")
+        is_rules_dir = False
+    if is_rules_dir:
+        contained, _identity = _project_tier_gate(rules_dir, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, rules_dir)
+        else:
+            try:
+                rule_files = sorted(rules_dir.glob("*.md"))
+            except OSError as e:
+                errors.append(f"project rules glob failed for {rules_dir}: {e}")
+                rule_files = []
+    for f in rule_files:
+        key = _physical_key(f)
+        if key in seen:
+            continue
+        contained, _identity = _project_tier_gate(f, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, f)
+            continue
+        entry = _project_file_entry(project_root, f, "project_rule", containment_stat, inaccessible)
+        if entry:
+            entry["tier"] = "project"
+            files.append(entry)
+            seen.add(key)
+
+    return files
+
+
+# --- T4: node model + collision-keyed shadow resolver (compose mode only) ---
+# Canonical tier-tagged nodes for the 4 collision-keyed surfaces (skill/agent/command/
+# rule), each carrying a collision key (surface, name) plus tier. Feeds
+# _resolve_tier_composition below, which marks the effective/shadowed winner per surface
+# and classifies each project-tier node as an add/override/dark entry. Project-tier
+# skill/agent/command discovery here is a NEW read/traverse surface (T4) — every path is
+# routed through T3's `_project_tier_gate` (H2 containment), same as `_walk_project_tier`.
+
+def _walk_operator_tier_nodes(root):
+    """Operator-tier skill/agent/command nodes (T4). A lean single-level existence walk
+    (no body read — the node model needs only the collision key + path for the shadow
+    resolver; word/line metrics stay owned by collect_descriptions/collect_on_demand).
+    Commands get their FIRST node collection here — no prior section inventoried
+    commands/*.md as nodes at all. Operator tier keeps its existing trusted
+    symlink-following (unchanged, matches every other operator-tier walk)."""
+    nodes = []
+    skills_dir = root / "skills"
+    if skills_dir.is_dir():
+        try:
+            skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
+        except OSError:
+            skill_dirs = []
+        for skill_dir in skill_dirs:
+            skill_md = skill_dir / "SKILL.md"
+            present, ok = _safe_exists(skill_md)
+            if ok and present:
+                nodes.append({"surface": "skill", "name": skill_dir.name,
+                              "tier": "operator", "path": _rel(root, skill_md)})
+    for surface, dirname in (("agent", "agents"), ("command", "commands")):
+        d = root / dirname
+        if not d.is_dir():
+            continue
+        try:
+            files = sorted(d.glob("*.md"))
+        except OSError:
+            files = []
+        for f in files:
+            nodes.append({"surface": surface, "name": f.stem, "tier": "operator",
+                          "path": _rel(root, f)})
+    return nodes
+
+
+def _walk_project_tier_nodes(project_root, out_of_root_refs):
+    """Project-tier skill/agent/command nodes (T4): `<repo>/.claude/{skills,agents,
+    commands}/`. Existence + identity ONLY (same rationale as
+    `_walk_operator_tier_nodes` — no body read needed for the collision-key model).
+    EVERY path (surface dir, skill dir, leaf file) is routed through T3's
+    `_project_tier_gate` (H2) — an escaping symlink at any level is recorded as an
+    `out_of_root_ref` and excluded from the node list, mirroring `_walk_project_tier`'s
+    rules-dir handling exactly (reused, not reimplemented)."""
+    project_root = Path(project_root)
+    harness_root = project_root / ".claude"
+    nodes = []
+    seen_refs = set()
+    try:
+        containment_stat = os.stat(project_root)
+    except OSError:
+        return nodes
+
+    skills_dir = harness_root / "skills"
+    try:
+        is_skills_dir = skills_dir.is_dir()
+    except OSError:
+        is_skills_dir = False
+    if is_skills_dir:
+        contained, _identity = _project_tier_gate(skills_dir, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skills_dir)
+        else:
+            try:
+                skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
+            except OSError:
+                skill_dirs = []
+            for skill_dir in skill_dirs:
+                sd_contained, _identity = _project_tier_gate(skill_dir, project_root, containment_stat)
+                if not sd_contained:
+                    _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skill_dir)
+                    continue
+                skill_md = skill_dir / "SKILL.md"
+                present, ok = _safe_exists(skill_md)
+                if not (ok and present):
+                    continue
+                f_contained, _identity = _project_tier_gate(skill_md, project_root, containment_stat)
+                if not f_contained:
+                    _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skill_md)
+                    continue
+                nodes.append({"surface": "skill", "name": skill_dir.name, "tier": "project",
+                              "path": _rel(project_root, skill_md)})
+
+    for surface, dirname in (("agent", "agents"), ("command", "commands")):
+        d = harness_root / dirname
+        try:
+            is_dir = d.is_dir()
+        except OSError:
+            is_dir = False
+        if not is_dir:
+            continue
+        contained, _identity = _project_tier_gate(d, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, d)
+            continue
+        try:
+            files = sorted(d.glob("*.md"))
+        except OSError:
+            files = []
+        for f in files:
+            f_contained, _identity = _project_tier_gate(f, project_root, containment_stat)
+            if not f_contained:
+                _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, f)
+                continue
+            nodes.append({"surface": surface, "name": f.stem, "tier": "project",
+                          "path": _rel(project_root, f)})
+    return nodes
+
+
+_RULE_NODE_CATEGORIES = {"rule", "coding_team_rule", "skill_rule", "project_rule"}
+
+
+def _rule_nodes_from_files(files):
+    """'rule' surface nodes (T4), derived from the already-deduped, already-tier-tagged
+    `always_loaded.files` list (T2/T3) instead of re-walking/re-reading disk. Rules are a
+    UNION surface (both tiers load, no shadow winner) so the node model only needs the
+    collision key (name + tier + path), which `files[]` already carries — avoids a
+    second read of every rule file."""
+    return [{"surface": "rule", "name": Path(f["path"]).stem, "tier": f.get("tier", "operator"),
+             "path": f["path"]}
+            for f in files if f["category"] in _RULE_NODE_CATEGORIES]
+
+
+_CLAUDE_MD_NODE_CATEGORIES = {"claude_md", "project_claude_md", "project_claude_md_nested",
+                               "project_claude_local_md"}
+
+
+def _claude_md_nodes_from_files(files):
+    """'claude_md' surface nodes (T4/P2-A), derived from the already-deduped,
+    already-tier-tagged `always_loaded.files` list — same reuse pattern as
+    `_rule_nodes_from_files`. A UNION surface (both an operator CLAUDE.md and a project
+    CLAUDE.md/CLAUDE.local.md/nested CLAUDE.md load, no shadow winner) so composition
+    only needs the collision key `files[]` already carries. Fixes P2-A: without this, a
+    project whose ONLY always-loaded surface is CLAUDE.md renders "project adds 0" even
+    though a CLAUDE.md was actually added."""
+    return [{"surface": "claude_md", "name": Path(f["path"]).stem, "tier": f.get("tier", "operator"),
+             "path": f["path"]}
+            for f in files if f["category"] in _CLAUDE_MD_NODE_CATEGORIES]
+
+
+# Normalizes `composed_hooks`' THREE-tier settings vocabulary (`user`/`project`/`local`
+# — correct for `composed_settings.hooks`, T5 §3) down to the tier_composition node
+# model's BINARY `operator`/`project` vocabulary (P2, cross-model review): `local` is
+# part of the project's OWN local config, so it is project-side in the binary model, not
+# a third bucket. Only `_hook_nodes_from_composed` consumes this — `composed_hooks`
+# itself (and `doc["composed_settings"]["hooks"]`) keeps the 3-way vocabulary untouched.
+_HOOK_NODE_TIER = {"user": "operator", "project": "project", "local": "project"}
+
+
+def _hook_nodes_from_composed(composed_hooks):
+    """'hook' surface nodes (T4/P2-A), derived from the already-tier-tagged,
+    already-precedence-merged `composed_settings.hooks` records (T5's `_compose_hooks`)
+    — same reuse pattern as `_rule_nodes_from_files`/`_claude_md_nodes_from_files`. A
+    UNION surface: every tier's hook fires regardless of collision (T5 §3), so
+    composition only needs the collision key + path the composed record already carries.
+    `composed_hooks` natively carries settings' THREE-tier vocabulary (`user`/`project`/
+    `local`); the node model here is BINARY like every other surface, so each node's tier
+    is normalized via `_HOOK_NODE_TIER` (P2 fix — previously the 3-way tier leaked
+    through unchanged, so a Local-tier hook was never counted toward the project "adds"
+    total `_resolve_tier_composition` derives from `tier=="project"`, and `"local"`/
+    `"user"` wrongly appeared in a node model documented as operator|project only).
+    `name`/`path` prefer the resolved script path (the concrete on-disk artifact); a hook
+    whose command didn't resolve to a script token falls back to the raw command string
+    so it is still represented rather than silently dropped (never-silent, matches this
+    file's `_script_from_command`/`note` posture elsewhere)."""
+    nodes = []
+    for h in composed_hooks:
+        script = h.get("script")
+        path = script if script else h["command"]
+        name = Path(script).stem if script else h["command"][:60]
+        nodes.append({"surface": "hook", "name": name, "tier": _HOOK_NODE_TIER[h["tier"]],
+                      "path": path})
+    return nodes
+
+
+# tier-precedence: CC-docs (HIGH confidence), live-verify deferred 2026-07-22 (T1
+# RESOLUTION). Skills/commands: operator SHADOWS project (operator wins a name
+# collision). Agents: project SHADOWS user — the INVERSE of skills. Rules/CLAUDE files/
+# hooks: UNION (both tiers load, no winner). This resolver keys the collision winner OFF
+# THE SURFACE — it is not one global rule; getting a surface backwards inverts the
+# "overrides M" headline count.
+_SURFACE_MERGE = {
+    "skill": {"merge": "shadow", "winner_tier": "operator"},
+    "command": {"merge": "shadow", "winner_tier": "operator"},
+    "agent": {"merge": "shadow", "winner_tier": "project"},
+    "rule": {"merge": "union", "winner_tier": None},
+    "claude_md": {"merge": "union", "winner_tier": None},
+    "hook": {"merge": "union", "winner_tier": None},
+}
+
+
+def _resolve_tier_composition(raw_nodes):
+    """Per-surface shadow resolver (T4, M4/R5-A). Groups `raw_nodes` by the collision
+    key (surface, name); for a SHADOW surface with both tiers present, marks the
+    `_SURFACE_MERGE` winner "effective" and the loser "shadowed" (with `shadowed_by`
+    naming the winner); for a UNION surface every node stays "effective" (both load, no
+    winner). Classifies each surface's PROJECT-tier nodes into adds/overrides/dark
+    (R5-A): a union project entry is always an add (loads alongside, never shadowed); a
+    shadow project entry is an add (no operator collision), an override (project WON the
+    collision — only possible on agents), or dark (project LOST the collision — a
+    defined-but-never-runs project skill/command the operator should see). Returns
+    `(resolved_nodes, surfaces_summary, participating_surfaces)`; `resolved_nodes` is
+    sorted by the composite determinism key `(path, tier)` (L1)."""
+    by_key = {}
+    for n in raw_nodes:
+        by_key.setdefault((n["surface"], n["name"]), []).append(n)
+
+    resolved = []
+    surfaces_summary = {
+        surface: {"merge": cfg["merge"], "winner_tier": cfg["winner_tier"],
+                  "adds": 0, "overrides": 0, "dark": 0}
+        for surface, cfg in _SURFACE_MERGE.items()
+    }
+
+    for (surface, _name), group in by_key.items():
+        cfg = _SURFACE_MERGE[surface]
+        if cfg["merge"] == "union":
+            for n in group:
+                resolved.append({**n, "status": "effective", "shadowed_by": None})
+                if n["tier"] == "project":
+                    surfaces_summary[surface]["adds"] += 1
+            continue
+        by_tier = {n["tier"]: n for n in group}
+        operator_n = by_tier.get("operator")
+        project_n = by_tier.get("project")
+        if operator_n and project_n:
+            winner = operator_n if cfg["winner_tier"] == "operator" else project_n
+            loser = project_n if winner is operator_n else operator_n
+            resolved.append({**winner, "status": "effective", "shadowed_by": None})
+            resolved.append({**loser, "status": "shadowed",
+                             "shadowed_by": {"tier": winner["tier"], "path": winner["path"]}})
+            if cfg["winner_tier"] == "project":
+                surfaces_summary[surface]["overrides"] += 1
+            else:
+                surfaces_summary[surface]["dark"] += 1
+        else:
+            only = operator_n or project_n
+            resolved.append({**only, "status": "effective", "shadowed_by": None})
+            if only["tier"] == "project":
+                surfaces_summary[surface]["adds"] += 1
+
+    resolved.sort(key=lambda n: (n["path"], n["tier"]))
+    return resolved, surfaces_summary, sorted(_SURFACE_MERGE)
+
+
+def walk_always_loaded(root, project_root, inaccessible, errors, compose=False,
+                        out_of_root_refs=None):
     """Collect always-loaded surfaces: harness CLAUDE.md, the active project's memory
     index only (other projects' indexes go to conditional_variants), the active
-    project's own CLAUDE.md (outside --root), rules/*.md, and coding-team rules."""
+    project's own CLAUDE.md (outside --root), rules/*.md, and coding-team rules.
+    `compose=True` (P1-1): tags every operator-tier entry with an additive
+    tier="operator" field, suppresses the legacy registration-gated project_claude_md
+    branch below (H1 — the project's CLAUDE.md is instead emitted, unconditionally and
+    tier="project", by the broader _walk_project_tier three-root walk appended at the
+    end), and appends that project-tier walk's own entries to `files`. Default
+    (compose=False) behavior is UNCHANGED byte-for-byte. `out_of_root_refs` (T3/H2) is
+    mutated in place with any project-tier path that escaped containment; only consulted
+    when `compose=True` and `project_root` is set."""
     files = []
     conditional_variants = []
     # A file reachable via multiple glob paths (a rules/ deploy symlink pointing at its
@@ -379,16 +990,21 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
         if key not in seen:
             entry = _file_entry(root, root_claude, "claude_md", inaccessible)
             if entry:
+                if compose:
+                    entry["tier"] = "operator"
                 files.append(entry)
                 seen.add(key)
 
     active_slug = None
     if project_root is not None:
         active_slug = _project_slug(project_root)
-        # Only count this project's CLAUDE.md if the project is registered under this
-        # harness root's projects/<slug>/memory/ — otherwise --project-root defaulting to
-        # an unrelated cwd would leak an unrelated CLAUDE.md into an unrelated --root's count.
-        if (root / "projects" / active_slug / "memory").is_dir():
+        # Only count this project's CLAUDE.md via THIS legacy branch if the project is
+        # registered under this harness root's projects/<slug>/memory/ (unregistered
+        # --project-root defaulting to an unrelated cwd must not leak an unrelated
+        # CLAUDE.md), AND compose is off — compose mode emits the project CLAUDE.md via
+        # _walk_project_tier below instead, unconditionally on registration (H1: the two
+        # paths must never BOTH fire for the same physical file, or it double-counts).
+        if not compose and (root / "projects" / active_slug / "memory").is_dir():
             proj_claude = Path(project_root) / "CLAUDE.md"
             present, ok = _safe_exists(proj_claude)
             if not ok:
@@ -428,6 +1044,8 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
                 if key not in seen:
                     entry = _file_entry(root, idx, "memory", inaccessible)
                     if entry:
+                        if compose:
+                            entry["tier"] = "operator"
                         files.append(entry)
                         seen.add(key)
             else:
@@ -435,14 +1053,17 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
                 if text is None:
                     continue
                 words, lines, tokens_est = _metrics(text)
-                conditional_variants.append({
+                variant = {
                     "path": _rel(root, idx),
                     "project_slug": slug,
                     "words": words,
                     "lines": lines,
                     "tokens_est": tokens_est,
                     "evidence": "VERIFIED",
-                })
+                }
+                if compose:
+                    variant["tier"] = "operator"
+                conditional_variants.append(variant)
 
     # Note (comment per task spec): root ~/.claude/MEMORY.md does NOT exist in the live
     # harness — only the memory/ stub directory. We still count memory/MEMORY.md when present.
@@ -455,6 +1076,8 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
         if key not in seen:
             entry = _file_entry(root, stub, "memory", inaccessible)
             if entry:
+                if compose:
+                    entry["tier"] = "operator"
                 files.append(entry)
                 seen.add(key)
 
@@ -505,8 +1128,14 @@ def walk_always_loaded(root, project_root, inaccessible, errors):
                 continue
             entry = _file_entry(root, f, category, inaccessible)
             if entry:
+                if compose:
+                    entry["tier"] = "operator"
                 files.append(entry)
                 seen.add(key)
+
+    if compose and project_root is not None:
+        files.extend(_walk_project_tier(project_root, inaccessible, errors,
+                                         out_of_root_refs if out_of_root_refs is not None else []))
 
     return files, conditional_variants
 
@@ -694,15 +1323,59 @@ def parse_settings(root, errors, blind_spots):
     except OSError as e:
         errors.append(f"settings.json unreadable: {e!r}")
         return {}, False
+    return _parse_json_object_guarded(text, "settings.json", errors)
+
+
+def _parse_json_object_guarded(text, label, errors):
+    """Shared JSON-object shape guard (T3 C22), reused by `parse_settings` (operator) and
+    `parse_project_settings` (project tier): malformed JSON, OR any well-formed JSON value
+    that is not a top-level object (a number, a string, an array, `null`) degrades to
+    `({}, False)` plus a descriptive `errors[]` entry — never a crash, never surfaced as a
+    partial/garbage settings dict. `label` names the source in the error text (e.g.
+    `"settings.json"`, `"project settings.json"`)."""
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
-        errors.append(f"failed to parse settings.json: {e}")
+        errors.append(f"failed to parse {label}: {e}")
         return {}, False
     if not isinstance(parsed, dict):
-        errors.append("settings.json is not a JSON object; treated as empty.")
+        errors.append(f"{label} is not a JSON object; treated as empty.")
         return {}, False
     return parsed, True
+
+
+def parse_project_settings(project_root, containment_root, containment_root_stat, errors,
+                            blind_spots, out_of_root_refs, filename="settings.json"):
+    """Project-tier analog of `parse_settings` (T3 foundation for T5's full Local >
+    Project > User settings merge across `<repo>/.claude/settings.local.json`,
+    `<repo>/.claude/settings.json`, and `~/.claude/settings.json`). Reads
+    `<repo>/.claude/<filename>` through the SAME project-tier gate (H2 containment) +
+    TOCTOU-closed read (`_project_tier_gate`/`_read_project_file`) as every other
+    project-tier sink, then the SAME JSON-object shape guard
+    (`_parse_json_object_guarded`) as the operator settings.json. `filename` (T5) lets the
+    Local tier (`settings.local.json`) reuse this exact function instead of a duplicate —
+    the default `"settings.json"` is the Project tier and keeps every T3 test's error/
+    blind-spot string byte-identical. T5 owns the precedence chain across the three
+    settings sources and calls this (or `parse_settings` for the User tier) per source
+    file. Returns `(settings_dict, parsed_ok)`, same shape as `parse_settings`."""
+    settings_path = Path(project_root) / ".claude" / filename
+    present, ok = _safe_exists(settings_path)
+    if not ok:
+        errors.append(f"project {filename} existence check failed for {settings_path}")
+        return {}, False
+    if not present:
+        blind_spots.append(f"project {filename} not found; project-tier settings reflect defaults.")
+        return {}, False
+    contained, _identity = _project_tier_gate(settings_path, containment_root, containment_root_stat)
+    if not contained:
+        _record_out_of_root_ref(out_of_root_refs, set(), containment_root, settings_path)
+        errors.append(f"project {filename} resolves outside the project containment root; not read.")
+        return {}, False
+    text, evidence = _read_project_file(settings_path, containment_root, containment_root_stat)
+    if evidence == "INACCESSIBLE":
+        errors.append(f"project {filename} unreadable or not a regular file: {settings_path}")
+        return {}, False
+    return _parse_json_object_guarded(text, f"project {filename}", errors)
 
 
 def collect_permissions(settings, parsed_ok):
@@ -921,6 +1594,323 @@ def reconcile_hooks(root, settings, inaccessible, blind_spots):
     }
 
 
+# --- T5: settings / hooks / MCP full-chain merge (compose mode only) ---
+# tier-precedence: CC-docs (HIGH confidence), live-verify deferred 2026-07-22 (T1
+# RESOLUTION). Three settings SOURCES — User (`~/.claude/settings.json`, the operator's
+# own `parse_settings` result), Project (`<repo>/.claude/settings.json`), Local
+# (`<repo>/.claude/settings.local.json`) — precedence Local > Project > User for every
+# key EXCEPT `permissions`, which instead MERGES (union, deny wins a same-rule conflict —
+# §3 merge table). Hooks are a separate merge rule again: UNION, every tier's matching
+# hooks fire, no precedence winner. Every function below is additive/compose-only; the
+# operator-only `parse_settings`/`collect_permissions`/`reconcile_hooks`/`collect_config`
+# above are UNCHANGED so non-compose output stays byte-identical.
+
+def _iter_hook_entries(settings):
+    """Like `_iter_hook_commands`, but yields `(event, matcher, command)` instead of just
+    `command` — a composed hook record (T5 R5-B) needs the event key and matcher string
+    per source, which the plain command-only iterator (used by `build_document`'s
+    operator-only hooks section and by `iter_input_paths`) does not carry. Duplicates
+    `_iter_hook_commands`'s exact input-shape guards (T3 C22: a malformed `entries`/
+    `entry`/`entry_hooks` shape is skipped, never crashes) rather than refactoring that
+    already-shipped, already-tested function mid-task."""
+    hooks_cfg = settings.get("hooks", {})
+    if not isinstance(hooks_cfg, dict):
+        return
+    for event, entries in hooks_cfg.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            matcher = entry.get("matcher")
+            entry_hooks = entry.get("hooks", [])
+            if not isinstance(entry_hooks, list):
+                continue
+            for h in entry_hooks:
+                if isinstance(h, dict) and h.get("type") == "command" and isinstance(h.get("command"), str):
+                    yield event, matcher, h["command"]
+
+
+def _merge_permissions_union_deny_wins(settings_stack_with_ok):
+    """T5 §3: `permissions` is the ONE settings.json key that MERGES across tiers rather
+    than overriding by precedence — union of allow/deny/ask rule strings from every tier,
+    deny wins a same-rule conflict (a rule denied by ANY tier is denied, even if another
+    tier allows/asks it). `settings_stack_with_ok` is `[(tier, settings_dict, parsed_ok),
+    ...]` — order does not matter for a union+deny-wins merge, but callers pass the shared
+    Local>Project>User triple every T5 function consumes for consistency. `evidence` is
+    `"VERIFIED"` when at least one tier's settings actually parsed as a real JSON object,
+    `"INACCESSIBLE"` only when every tier is absent/malformed (mirrors
+    `collect_permissions`'s single-source evidence convention, generalized to "at least
+    one real source" for a union).
+
+    P3 hardened: "parsed" used to be re-derived from `bool(settings)` — a legitimately
+    PRESENT, VALID, but EMPTY `{}` settings.json (parses fine, just has no keys) is
+    falsy, so it was silently treated as absent/malformed and could flip `evidence` to
+    INACCESSIBLE even though every tier parsed successfully. FIX: track parse success via
+    the explicit `parsed_ok` flag each tier's own `parse_settings`/`parse_project_settings`
+    call already returns (and `collect_permissions`, the non-compose single-tier sibling,
+    already uses correctly) — NOT dict truthiness — so "present and empty" is VERIFIED,
+    never conflated with "absent or malformed"."""
+    deny, allow, ask = set(), set(), set()
+    any_parsed = False
+    for _tier, settings, parsed_ok in settings_stack_with_ok:
+        if not parsed_ok:
+            continue
+        any_parsed = True
+        perms = settings.get("permissions", {})
+        if not isinstance(perms, dict):
+            continue
+        for bucket, target in (("allow", allow), ("deny", deny), ("ask", ask)):
+            rules = perms.get(bucket, [])
+            if isinstance(rules, list):
+                target.update(r for r in rules if isinstance(r, str))
+    allow -= deny
+    ask -= deny
+    return {
+        "allow_count": len(allow), "deny_count": len(deny), "ask_count": len(ask),
+        "evidence": "VERIFIED" if any_parsed else "INACCESSIBLE",
+    }
+
+
+def _compose_hooks(sources, project_root, out_of_root_refs):
+    """T5 R5-B: source-aware hook UNION across User/Project/Local (§3: hooks merge by
+    union — every matching hook fires regardless of tier, unlike settings scalars/MCP
+    which pick one precedence winner). Each record retains `event`, `matcher`, `tier`, and
+    `source_file` alongside `command`/`script`/`exists`. `sources` is `[(tier,
+    settings_dict, source_file_str_or_None, resolve_root_path_or_None), ...]`. A
+    project/local hook's `command`/script path resolves against the REPO ROOT
+    (`resolve_root` passed per-source via `_script_from_command`), never the operator
+    root — a project-tier `./hooks/x.py` command means `<repo>/hooks/x.py`. The user
+    (operator) tier keeps its existing trusted symlink-following (plain `.exists()`); a
+    project/local tier script path is routed through T3's `_project_tier_gate` (H2
+    containment) before its existence is reported — an escaping symlink target is
+    recorded as an `out_of_root_ref`, `exists` reported as `None` (unknown/untrusted),
+    never followed."""
+    containment_stat = None
+    if project_root is not None:
+        try:
+            containment_stat = os.stat(project_root)
+        except OSError:
+            containment_stat = None
+    seen_refs = set()
+    records = []
+    for tier, settings, source_file, resolve_root in sources:
+        if not settings or resolve_root is None:
+            continue
+        for event, matcher, command in _iter_hook_entries(settings):
+            script_path, _note = _script_from_command(command, resolve_root)
+            script_rel = _rel_safe(resolve_root, script_path) if script_path is not None else None
+            if script_path is None:
+                exists = None
+            elif tier == "user":
+                try:
+                    exists = script_path.exists()
+                except OSError:
+                    exists = False
+            elif containment_stat is None:
+                exists = None
+            else:
+                contained, _identity = _project_tier_gate(script_path, project_root, containment_stat)
+                if not contained:
+                    _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, script_path)
+                    exists = None
+                else:
+                    exists = True
+            records.append({"event": event, "matcher": matcher, "command": command,
+                            "script": script_rel, "exists": exists,
+                            "tier": tier, "source_file": source_file})
+    return records
+
+
+# The ONLY non-permission settings.json keys this readout ever surfaces (M5/P2-9) — the
+# SAME small set `collect_config` already treats as safe/non-secret-shaped. A key outside
+# this allowlist is NEVER surfaced here even if a fixture defines it at multiple tiers:
+# an arbitrary/unknown settings key could hold anything, and "allowlist, don't guess" is
+# the same secret-safety posture `collect_config.env_keys` uses for `env`.
+_SETTINGS_OVERRIDE_ALLOWLIST = ("model", "cleanupPeriodDays", "sandbox", "enabledPlugins")
+
+
+def _settings_scalar_value(key, settings):
+    """Best-effort safe scalar readout for `key` from `settings` (T5 P2-9) — mirrors
+    `collect_config`'s own coercions for its two non-trivially-shaped keys (`sandbox`'s
+    nested-object form, `enabledPlugins`'s name->bool map) so `settings_overrides`
+    reports the SAME winning value a human would see in `config`, never a raw container
+    that could carry something unexpected."""
+    if key == "sandbox":
+        raw = settings.get("sandbox")
+        return bool(raw.get("enabled", False)) if isinstance(raw, dict) else bool(raw)
+    if key == "enabledPlugins":
+        raw = settings.get("enabledPlugins", {})
+        return {k: bool(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    return settings.get(key)
+
+
+_SETTINGS_OVERRIDE_VALUE_MAX_LEN = 200
+
+
+def _settings_override_safe_value(value):
+    """P1-C: type-gate `winning_value` — `_SETTINGS_OVERRIDE_ALLOWLIST` only restricts
+    which KEY NAMES are surfaced; on its own it does nothing to stop an attacker from
+    stuffing an arbitrary nested object under an allowlisted key (project settings
+    `{"model": {"token": "SECRET"}}` — "model" IS allowlisted, so the raw dict would
+    otherwise be emitted verbatim). Returns `(winning_value, value_kind)`: a safe SCALAR
+    (`str`/`int`/`float`/`bool`/`None`) passes through as `(value, None)`; an
+    over-`_SETTINGS_OVERRIDE_VALUE_MAX_LEN` str is NEVER emitted whole, returning
+    `(None, "redacted")` rather than risking a leaked secret-bearing string; any other
+    non-scalar (`dict`/`list`) is NEVER emitted, returning `(None, "complex")`."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, None
+    if isinstance(value, str):
+        if len(value) > _SETTINGS_OVERRIDE_VALUE_MAX_LEN:
+            return None, "redacted"
+        return value, None
+    return None, "complex"
+
+
+def _settings_overrides(settings_stack):
+    """M5/P2-9: non-permission settings-key overrides across the full Local > Project >
+    User chain, SECRET-SAFE — routed through `_SETTINGS_OVERRIDE_ALLOWLIST`, the same
+    small allowlist posture as `collect_config`, PLUS a value-TYPE gate
+    (`_settings_override_safe_value`, P1-C) so an allowlisted key cannot smuggle an
+    arbitrary nested object/oversized string past the key-name allowlist. `settings_stack`
+    MUST already be in precedence order `[("local", ...), ("project", ...), ("user",
+    ...)]` — the first tier in the list that defines a key is the winner. `env` is
+    special-cased: only the CHANGED key NAMES are reported (never a value), mirroring
+    `collect_config.env_keys`. NOT folded into `tier_composition`'s node "overrides" count
+    (T4) — that count is node-surface shadowing (skills/commands/agents); this is
+    scalar-key overriding."""
+    overrides = []
+    present_tiers = [(tier, s) for tier, s in settings_stack if s]
+    for key in _SETTINGS_OVERRIDE_ALLOWLIST:
+        defining = [(tier, _settings_scalar_value(key, s)) for tier, s in present_tiers if key in s]
+        if len(defining) < 2:
+            continue
+        winner_tier, winner_raw = defining[0]
+        winning_value, value_kind = _settings_override_safe_value(winner_raw)
+        entry = {"key": key, "winning_tier": winner_tier, "winning_value": winning_value,
+                "overridden_tiers": [t for t, _ in defining[1:]]}
+        if value_kind is not None:
+            entry["value_kind"] = value_kind
+        overrides.append(entry)
+    # P2 fix (cross-model review): winner selection is by KEY PRESENCE (`isinstance(...,
+    # dict)`), not by truthiness of the value — `and s["env"]` used to treat a tier that
+    # explicitly sets an EMPTY env (`{}`) as "does not define env", so a higher-precedence
+    # tier's deliberate empty env lost to a lower tier's non-empty one instead of winning.
+    env_by_tier = [(tier, sorted(s["env"].keys())) for tier, s in present_tiers
+                   if isinstance(s.get("env"), dict)]
+    if env_by_tier:
+        winner_tier, winner_keys = env_by_tier[0]
+        overridden = [t for t, keys in env_by_tier[1:] if keys != winner_keys]
+        if overridden:
+            overrides.append({"key": "env", "winning_tier": winner_tier,
+                              "winning_value": winner_keys, "overridden_tiers": overridden})
+    return overrides
+
+
+def _mcp_servers_from(obj):
+    """`obj["mcpServers"]` if `obj` is a dict and that key is itself a dict; else `{}`.
+    Guards every static MCP projection the same way (T3 C22 input-shape discipline: a
+    malformed shape degrades to empty, never crashes)."""
+    if not isinstance(obj, dict):
+        return {}
+    servers = obj.get("mcpServers")
+    return servers if isinstance(servers, dict) else {}
+
+
+def _redact_mcp_server(name, tier, source_file, raw):
+    """One MCP server registration -> the SECRET-SAFE emitted record (R4). `raw` (the
+    server's config dict as found in the source JSON) is NEVER stored or returned
+    verbatim — only a fixed allowlist of non-secret fields plus `env`/`headers` KEY NAMES
+    survive (mirrors `collect_config.env_keys`: names only, never values). `command`/
+    `url`/`args` are deliberately OMITTED — unlike `env`/`headers`, the plan does not
+    document those as secret-safe, and a CLI arg list can legally carry an inline
+    `--api-key=...` flag; omitting is the conservative default until a real need to
+    surface them is confirmed. `enabled` reflects the server's OWN `disabled` field
+    verbatim (`disabled: true` -> `enabled: False`) — the collector does not invent a
+    cross-reference against an unconfirmed settings.json approval-list schema."""
+    if not isinstance(raw, dict):
+        raw = {}
+    env = raw.get("env")
+    headers = raw.get("headers")
+    server_type = raw.get("type") if isinstance(raw.get("type"), str) else None
+    return {
+        "name": name, "tier": tier, "source_file": source_file, "type": server_type,
+        "enabled": not bool(raw.get("disabled", False)),
+        "env_keys": sorted(env.keys()) if isinstance(env, dict) else [],
+        "header_keys": sorted(headers.keys()) if isinstance(headers, dict) else [],
+    }
+
+
+def collect_composed_mcp(project_root, errors, blind_spots, out_of_root_refs):
+    """T5 R4: MCP server registrations from the three EXACT static projections, Local >
+    Project > User precedence, secret-safe (see `_redact_mcp_server`). Sources:
+      User:    ~/.claude.json    -> mcpServers
+      Local:   ~/.claude.json    -> projects[<project_containment_root abspath>].mcpServers
+      Project: <repo>/.mcp.json  -> mcpServers  (untrusted -> T3 `_project_tier_gate`)
+    `~/.claude.json` is the operator's OWN file — TRUSTED, no containment gate — and is
+    ALWAYS the real `$HOME/.claude.json`, never `--root`-relative: `CLAUDE_CONFIG_DIR`
+    redirects only the harness/skills tree (`_default_operator_root`), never this
+    per-user registry, per CC's documented behavior. Returns a name-sorted list; when a
+    name is registered at more than one tier, the HIGHEST-precedence tier's registration
+    wins (Local, then Project, then User) — matching every other T5 precedence merge."""
+    user_claude_json_path = Path.home() / ".claude.json"
+    user_json = {}
+    text, evidence = _read_text(user_claude_json_path)
+    if evidence == "VERIFIED":
+        user_json, _ok = _parse_json_object_guarded(text, "~/.claude.json", errors)
+    else:
+        blind_spots.append("~/.claude.json not found or unreadable; MCP User/Local tier "
+                            "registrations reflect defaults.")
+
+    user_servers = _mcp_servers_from(user_json)
+
+    local_servers = {}
+    if project_root is not None:
+        projects_key = str(Path(project_root).expanduser().resolve())
+        projects_map = user_json.get("projects") if isinstance(user_json, dict) else None
+        project_entry = projects_map.get(projects_key) if isinstance(projects_map, dict) else None
+        local_servers = _mcp_servers_from(project_entry)
+
+    project_servers = {}
+    if project_root is not None:
+        mcp_json_path = Path(project_root) / ".mcp.json"
+        present, ok = _safe_exists(mcp_json_path)
+        if not ok:
+            errors.append(f".mcp.json existence check failed for {mcp_json_path}")
+        elif present:
+            try:
+                containment_stat = os.stat(project_root)
+            except OSError:
+                containment_stat = None
+            if containment_stat is None:
+                errors.append(f"project containment root not accessible for {mcp_json_path}")
+            else:
+                contained, _identity = _project_tier_gate(mcp_json_path, Path(project_root), containment_stat)
+                if not contained:
+                    _record_out_of_root_ref(out_of_root_refs, set(), Path(project_root), mcp_json_path)
+                else:
+                    text, evidence = _read_project_file(mcp_json_path, Path(project_root), containment_stat)
+                    if evidence == "VERIFIED":
+                        proj_json, _ok = _parse_json_object_guarded(text, ".mcp.json", errors)
+                        project_servers = _mcp_servers_from(proj_json)
+                    else:
+                        errors.append(f".mcp.json unreadable or not a regular file: {mcp_json_path}")
+
+    project_source = str(Path(project_root) / ".mcp.json") if project_root is not None else None
+    tiered = (
+        ("local", local_servers, str(user_claude_json_path)),
+        ("project", project_servers, project_source),
+        ("user", user_servers, str(user_claude_json_path)),
+    )
+    resolved = {}
+    for tier, servers, source_file in tiered:
+        for name, raw in servers.items():
+            if name in resolved:
+                continue  # a higher-precedence tier (earlier in `tiered`) already won
+            resolved[name] = _redact_mcp_server(name, tier, source_file, raw)
+    return sorted(resolved.values(), key=lambda s: s["name"])
+
+
 # Reused CONSTANT — canonical origin: skills/coding-team/hooks/hook-health-check.py:177-204
 # check_instruction_file_lengths (threshold 200, "case study #24"). This collector
 # REIMPLEMENTS the scan harness-wide (that function is coding-team-scoped). Keep the
@@ -1009,16 +1999,94 @@ def _ordered_capped_shingles(words, k=SHINGLE_K, cap=MAX_SHINGLES_PER_FILE):
     return set(ordered)
 
 
-def scan_duplication(root, blind_spots):
+# T4/M4: project-tier surfaces fed into the CROSS-TIER duplication corpus — mirrors
+# _DUP_GLOBS's operator-tier surface set as closely as the project `.claude/` layout
+# allows (project skills' SKILL.md bodies are gathered separately, below, since they
+# live one level deeper than a flat glob reaches).
+_PROJECT_DUP_SURFACE_DIRS = ((".claude/rules", "*.md"), (".claude/agents", "*.md"),
+                             (".claude/commands", "*.md"))
+
+
+def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs):
+    """Project-tier half of the M4 cross-tier duplication corpus (T4): `.claude/rules`,
+    `.claude/agents`, `.claude/commands` bodies plus each project skill's SKILL.md.
+    EVERY read routes through T3's `_project_tier_gate` + `_read_project_file` (H2) — an
+    escaping symlink is recorded as an `out_of_root_ref` and excluded, never body-read or
+    excerpted. Feeds `duplication.pairs[].shared_sample`, one of T3's three named
+    excerpt sinks."""
+    project_root = Path(project_root)
+    harness_root = project_root / ".claude"
+    seen_refs = set()
+    seen_physical = set()
+    corpus = []  # [(rel_path, "project", shingle_set), ...]
+    try:
+        containment_stat = os.stat(project_root)
+    except OSError:
+        return corpus
+
+    candidates = []
+    for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
+        d = project_root / rel_dir
+        try:
+            if d.is_dir():
+                candidates.extend(sorted(d.glob(pattern)))
+        except OSError:
+            continue
+    skills_dir = harness_root / "skills"
+    try:
+        if skills_dir.is_dir():
+            for skill_dir in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
+                skill_md = skill_dir / "SKILL.md"
+                present, ok = _safe_exists(skill_md)
+                if ok and present:
+                    candidates.append(skill_md)
+    except OSError:
+        pass
+
+    for fp in candidates:
+        key = _physical_key(fp)
+        if key in seen_physical:
+            continue
+        seen_physical.add(key)
+        contained, _identity = _project_tier_gate(fp, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, fp)
+            continue
+        try:
+            size = fp.stat().st_size
+        except OSError:
+            continue
+        if size > MAX_FILE_BYTES:
+            blind_spots.append(
+                f"{_rel(project_root, fp)} exceeds {MAX_FILE_BYTES} bytes; skipped in duplication scan.")
+            continue
+        text, _evidence = _read_project_file(fp, project_root, containment_stat)
+        if text is None:
+            continue
+        words = _normalize_words(text)
+        shingles = _ordered_capped_shingles(words)
+        if not shingles:
+            blind_spots.append(
+                f"{_rel(project_root, fp)} has fewer than {SHINGLE_K} normalized words; "
+                "skipped in duplication scan.")
+            continue
+        corpus.append((_rel(project_root, fp), "project", shingles))
+    return corpus
+
+
+def scan_duplication(root, blind_spots, project_root=None, compose=False, out_of_root_refs=None):
     """Candidate near-duplicate pairs by containment coefficient (|A∩B| / min(|A|,|B|))
     over k=8 word shingles — chosen over Jaccard because it correctly flags a short file
     fully subsumed by a longer one (schema.md Note 2). SIGNALS only: this is a candidate
     list. Deciding "one declared home + callers" for a pair is a synthesis-pass JUDGMENT,
-    not something this collector decides."""
+    not something this collector decides. `compose=True` (T4/M4) adds the project-tier
+    corpus so duplication runs ACROSS BOTH TIERS COMBINED — an operator rule duplicated
+    by a project file is a signal ("this repo re-implements an operator rule"). Additive:
+    `compose=False` behavior (corpus, pairs shape, output) is byte-for-byte unchanged."""
     # Generalized skills/coding-team/rules -> skills/*/rules for release portability; the
     # seen_physical dedup below still collapses a rule reachable via multiple glob paths.
     seen_physical = set()
-    corpus = []  # [(rel_path, shingle_set), ...]
+    corpus = []  # [(rel_path, tier, shingle_set), ...]
     for pattern in _DUP_GLOBS:
         try:
             candidates = sorted(root.glob(pattern))
@@ -1050,21 +2118,29 @@ def scan_duplication(root, blind_spots):
                     f"{_rel(root, fp)} has fewer than {SHINGLE_K} normalized words; "
                     "skipped in duplication scan.")
                 continue
-            corpus.append((_rel(root, fp), shingles))
+            corpus.append((_rel(root, fp), "operator", shingles))
+
+    if compose and project_root is not None:
+        corpus.extend(_project_tier_duplication_corpus(
+            project_root, blind_spots, out_of_root_refs if out_of_root_refs is not None else []))
 
     pairs = []
     for i in range(len(corpus)):
-        path_a, set_a = corpus[i]
+        path_a, tier_a, set_a = corpus[i]
         for j in range(i + 1, len(corpus)):
-            path_b, set_b = corpus[j]
+            path_b, tier_b, set_b = corpus[j]
             score = _containment(set_a, set_b)
             if score < DUP_THRESHOLD:
                 continue
             shared = set_a & set_b
             sample = min(shared) if shared else ""
-            a, b = sorted((path_a, path_b))
-            pairs.append({"a": a, "b": b, "score": score, "shared_sample": sample,
-                          "evidence": "INFERRED"})
+            (a, tier_of_a), (b, tier_of_b) = sorted(((path_a, tier_a), (path_b, tier_b)))
+            pair = {"a": a, "b": b, "score": score, "shared_sample": sample,
+                    "evidence": "INFERRED"}
+            if compose:
+                pair["a_tier"] = tier_of_a
+                pair["b_tier"] = tier_of_b
+            pairs.append(pair)
 
     # Deterministic across runs, including when a file exceeds the shingle cap: sort by
     # (-score, a, b), then cap to the top MAX_PAIRS.
@@ -1462,7 +2538,97 @@ def _iter_descendant_dirs(base):
                 continue
 
 
-def iter_input_paths(root, project_root=None):
+# T8: project-tier explicit membership-watched surface dirs (compose mode only) --
+# `<repo>/.claude/{rules,agents,commands,skills}` mirror `_PROJECT_DUP_SURFACE_DIRS` +
+# `_walk_project_tier_nodes`'s surfaces; `.claude/hooks` is included too even though no
+# collector read currently descends into it -- the Three Roots doc names it as part of
+# the project-harness-root, and watching an absent/unread dir is a harmless superset
+# (its future creation is still observable, matching the operator-tier `for d in (...)`
+# unconditional-membership block below).
+_PROJECT_HARNESS_SURFACE_DIRS = ("rules", "agents", "commands", "skills", "hooks")
+
+
+def _compose_project_input_paths(project_root):
+    """Compose-mode project-tier watch surface (T8): a SUPERSET of every project-tier read
+    `_walk_project_tier` (T2 -- repo-root/nested CLAUDE.md + CLAUDE.local.md via the
+    containment-root walk), `_walk_project_tier_nodes`/`_project_tier_duplication_corpus`
+    (T4/M4 -- `.claude/{rules,agents,commands,skills}`), and `_compose_hooks` (T5 -- a
+    project/local settings.json hook command's resolved script existence) add to the
+    collector output. Returns a `set` of ABSOLUTE `Path`s, every one lexically under
+    `project_root` -- serve.py's watcher relies on that lexical-containment invariant to
+    tier-tag the watched set (T8's `(path, tier)` contract) without a second stat pass."""
+    project_root = Path(project_root)
+    paths = set()
+    try:
+        containment_stat = os.stat(project_root)
+    except OSError:
+        return paths
+
+    # -- repo-root + every CONTAINED nested dir, membership-watched, PLUS each dir's
+    #    CLAUDE.md/CLAUDE.local.md (content) -- the SAME `_walk_contained_dirs` walk
+    #    `_walk_project_tier` uses (H2 containment gate included), so this naturally
+    #    covers `.claude/`, `.claude/rules/`, `.claude/skills/`, `.claude/skills/<name>/`,
+    #    `.claude/agents/`, `.claude/commands/` as membership-watched dirs for free -- an
+    #    escaping symlinked dir is not yielded (mirrors: the collector never descends into
+    #    it either). Scratch out_of_root_refs/seen are discarded -- the watcher needs only
+    #    the path set, not the bookkeeping build_document records for the real doc. --
+    scratch_refs, scratch_seen = [], set()
+    for d in _walk_contained_dirs(project_root, project_root, containment_stat,
+                                   scratch_refs, scratch_seen):
+        paths.add(d)
+        for fname in ("CLAUDE.md", "CLAUDE.local.md"):
+            f = d / fname
+            present, ok = _safe_exists(f)
+            if ok and present:
+                paths.add(f)
+
+    # -- explicit project-harness-root surface dirs (membership), unconditional (even if
+    #    absent today) -- mirrors the operator-tier `for d in (...)` block above. --
+    harness_root = project_root / ".claude"
+    paths.add(harness_root)
+    for d in _PROJECT_HARNESS_SURFACE_DIRS:
+        paths.add(harness_root / d)
+
+    # -- content globs: the SAME dir+pattern tuples `_project_tier_duplication_corpus` (M4)
+    #    consumes for `.claude/{rules,agents,commands}`, plus each project skill's SKILL.md
+    #    (the T4 node model + M4 corpus both read exactly this file per skill dir). --
+    for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
+        try:
+            paths.update((project_root / rel_dir).glob(pattern))
+        except OSError:
+            pass
+    try:
+        skill_dirs = sorted(p for p in (harness_root / "skills").iterdir() if p.is_dir())
+    except OSError:
+        skill_dirs = []
+    for skill_dir in skill_dirs:
+        paths.add(skill_dir / "SKILL.md")
+
+    # -- T5: a project/local settings.json hook command's resolved script existence
+    #    (`_compose_hooks`'s `.exists()` check) -- mirrors the operator-tier resolved-hook-
+    #    script loop below EXACTLY (same lexical-containment logic), reading project/local
+    #    settings via the SAME `parse_project_settings` T5's own merge uses. --
+    proj_settings, _ok1 = parse_project_settings(project_root, project_root, containment_stat,
+                                                  [], [], [])
+    local_settings, _ok2 = parse_project_settings(project_root, project_root, containment_stat,
+                                                   [], [], [], filename="settings.local.json")
+    project_root_resolved = project_root.resolve()
+    for settings in (proj_settings, local_settings):
+        for command in _iter_hook_commands(settings):
+            script_path, _note = _script_from_command(command, project_root)
+            if script_path is None:
+                continue
+            try:
+                lexical = script_path.parent.resolve() / script_path.name
+                lexical.relative_to(project_root_resolved)
+            except (ValueError, OSError):
+                continue  # genuinely outside the project root -- un-watchable via this walk
+            paths.add(script_path)
+
+    return paths
+
+
+def iter_input_paths(root, project_root=None, compose=False):
     """SINGLE SOURCE OF TRUTH for the complete filesystem input surface build_document reads
     — the set a live-dashboard filesystem watcher (T4) must observe to know when a re-render
     is due. Returns a deterministic, de-duplicated, string-sorted list of Path.
@@ -1492,7 +2658,15 @@ def iter_input_paths(root, project_root=None):
         — an unbounded, content-derived set. Creating a referenced file OUTSIDE the dirs above
         can flip a phantom-ref verdict without a watched signal. In practice almost every
         referenced path already lives under a watched dir (rules/, skills/, agents/, commands/,
-        hooks/); the instruction-file EDIT that introduces the ref itself IS watched."""
+        hooks/); the instruction-file EDIT that introduces the ref itself IS watched.
+
+    `compose` (T8, default False): when True AND `project_root` is given, ALSO yields the
+    project-tier reads T2/T3/T4/T5 added under the project-containment-root/project-harness-
+    root in compose mode (`_compose_project_input_paths`) — nested CLAUDE.md/CLAUDE.local.md,
+    `.claude/{rules,agents,commands,skills,hooks}`, and project/local hook-script existence.
+    Gated on `compose`, NOT merely on `project_root` (which already has a legacy non-compose
+    meaning above — the active operator-project's CLAUDE.md), so a non-compose caller's
+    watched/read surface for the SAME `project_root` argument stays byte-identical."""
     root = Path(root)
     paths = set()
 
@@ -1511,6 +2685,20 @@ def iter_input_paths(root, project_root=None):
     #    the projects/<slug>/memory dir. Yielded unconditionally when given: a harmless superset. --
     if project_root is not None:
         paths.add(Path(project_root) / "CLAUDE.md")
+
+    # -- T5 settings/hooks/MCP full-chain inputs (compose mode). `~/.claude.json` is the
+    #    User+Local MCP source (collect_composed_mcp) — it sits OUTSIDE every dir-root, so
+    #    it is yielded here PRECISELY so validate_write_target's `input_paths=` clause can
+    #    reject a `--out ~/.claude.json` that containment alone would wrongly permit.
+    #    Project settings.json/settings.local.json/.mcp.json are yielded unconditionally
+    #    when project_root is given (harmless superset, matches the CLAUDE.md pattern
+    #    above) even though they may not exist on disk. --
+    paths.add(Path.home() / ".claude.json")
+    if project_root is not None:
+        project_root_p = Path(project_root)
+        paths.add(project_root_p / ".claude" / "settings.json")
+        paths.add(project_root_p / ".claude" / "settings.local.json")
+        paths.add(project_root_p / ".mcp.json")
 
     # -- container dirs whose MEMBERSHIP changes collector output --
     #   skills   : new/removed skill -> descriptions, on_demand, rules, test coverage
@@ -1589,10 +2777,15 @@ def iter_input_paths(root, project_root=None):
             continue  # genuinely outside root (case c) — un-watchable via a root walk
         paths.add(script_path)
 
+    # -- T8: compose-mode project-tier additions (gated on `compose`, not merely on
+    #    `project_root`'s presence -- see the docstring note above). --
+    if compose and project_root is not None:
+        paths.update(_compose_project_input_paths(project_root))
+
     return sorted(paths, key=str)
 
 
-def build_document(root, project_root):
+def build_document(root, project_root, compose=False):
     root = Path(root).resolve()
     inaccessible = []
     errors = []
@@ -1610,7 +2803,18 @@ def build_document(root, project_root):
         "session-start injection set is not introspectable from disk.",
     ]
 
-    files, conditional_variants = walk_always_loaded(root, project_root, inaccessible, errors)
+    out_of_root_refs = []
+    # T5 P31/C18 (composed weight honesty): snapshot BEFORE walk_always_loaded so the
+    # deltas below capture EXACTLY the out-of-root/inaccessible entries that would have
+    # contributed to always_loaded weight — nothing from later scans (duplication, node
+    # model, MCP) leaks into this count. Unused in non-compose mode.
+    _weight_out_of_root_before = len(out_of_root_refs)
+    _weight_inaccessible_before = len(inaccessible)
+    files, conditional_variants = walk_always_loaded(root, project_root, inaccessible, errors,
+                                                      compose=compose,
+                                                      out_of_root_refs=out_of_root_refs)
+    weight_excluded_count = ((len(out_of_root_refs) - _weight_out_of_root_before)
+                              + (len(inaccessible) - _weight_inaccessible_before))
     skill_descriptions, agent_descriptions = collect_descriptions(root, inaccessible)
     skills, skill_internal_bodies, memory_bodies = collect_on_demand(root, project_root, inaccessible)
 
@@ -1619,7 +2823,8 @@ def build_document(root, project_root):
     permissions_section = collect_permissions(settings, settings_parsed_ok)
     config_section = collect_config(root, settings, settings_parsed_ok, blind_spots)
     instruction_length_flags = flag_long_instructions(root)
-    duplication_section = scan_duplication(root, blind_spots)
+    duplication_section = scan_duplication(root, blind_spots, project_root=project_root,
+                                            compose=compose, out_of_root_refs=out_of_root_refs)
     corpus_files = _staleness_corpus(root, inaccessible)
     phantom_refs = check_phantom_refs(root, corpus_files, inaccessible)
     promotion_candidates = collect_promotion_candidates(root, corpus_files, settings)
@@ -1629,6 +2834,13 @@ def build_document(root, project_root):
         "tokens_est": sum(f["tokens_est"] for f in files),
         "file_count": len(files),
     }
+    if compose:
+        # P31/C18: weight is a sum over READABLE entries only (files[] above already
+        # excludes out-of-root + inaccessible project entries) — this makes the exclusion
+        # EXPLICIT so a dropped file reads as "N excluded," never as a silently-smaller
+        # total. Additive/compose-only; absent in a non-compose doc distinguishes
+        # "0 excluded (measured)" from "not measured at all."
+        totals["excluded_count"] = weight_excluded_count
 
     always_loaded = {
         "files": files,
@@ -1668,6 +2880,120 @@ def build_document(root, project_root):
         "blind_spots": blind_spots,
         "errors": errors,
     }
+    if compose:
+        # T11 (disclose-and-defer, operator-approved 2026-07-22): the per-file hygiene
+        # analyses above (flag_long_instructions, _staleness_corpus, check_phantom_refs,
+        # collect_promotion_candidates, detect_test_coverage, _hooks_body_corpus) take no
+        # project_root and run OPERATOR-TIER-ONLY, even in --compose — a genuinely
+        # oversized/stale/phantom/promotion-candidate/untested PROJECT-tier file is never
+        # flagged by them. Full per-tier hygiene is deferred to v1.1 (see the plan); this
+        # discloses the current limitation so "0 project flags" is never misread as
+        # "project clean" ([[no-known-broken]]: a silent gap is a trap).
+        blind_spots.append(
+            "Compose mode: instruction_length_flags, staleness, phantom_refs, "
+            "promotion_candidates, test_coverage, and the hooks-body duplication corpus "
+            "(flag_long_instructions, _staleness_corpus, check_phantom_refs, "
+            "collect_promotion_candidates, detect_test_coverage, _hooks_body_corpus) scan "
+            "the OPERATOR tier only — project-tier files are NOT covered by these "
+            "analyses in v1.")
+        # R2-B: name BOTH roots walked (today's `doc["root"]` is operator-only) — additive,
+        # so a non-compose run's schema is byte-identical to before this field existed.
+        project_containment_root = Path(project_root).expanduser().resolve() if project_root else None
+        doc["inspected_roots"] = {
+            "operator": str(root),
+            "project_containment": str(project_containment_root) if project_containment_root else None,
+            "project_harness": (str(project_containment_root / ".claude")
+                                 if project_containment_root else None),
+        }
+        # T3/H2: additive-in-compose-only, same pattern as inspected_roots above — a
+        # non-compose run's schema stays byte-identical to before this field existed.
+        doc["out_of_root_refs"] = out_of_root_refs
+        # T5: settings/hooks/MCP full-chain merge (Local > Project > User) — additive,
+        # same compose-only pattern as inspected_roots/out_of_root_refs above. `settings`
+        # (User tier) was already parsed via `parse_settings` above for the
+        # operator-only sections; Project/Local reuse T3's `parse_project_settings`. This
+        # block moved AHEAD of T4 (P2-A) so `composed_hooks` exists before `raw_nodes` is
+        # assembled — T4's 'hook' surface (below) is derived from this SAME merged list,
+        # never a second independent hooks read.
+        project_settings, local_settings = {}, {}
+        project_ok, local_ok = False, False
+        if project_containment_root is not None:
+            try:
+                proj_containment_stat = os.stat(project_containment_root)
+            except OSError:
+                proj_containment_stat = None
+            if proj_containment_stat is not None:
+                project_settings, project_ok = parse_project_settings(
+                    project_containment_root, project_containment_root, proj_containment_stat,
+                    errors, blind_spots, out_of_root_refs)
+                local_settings, local_ok = parse_project_settings(
+                    project_containment_root, project_containment_root, proj_containment_stat,
+                    errors, blind_spots, out_of_root_refs, filename="settings.local.json")
+        # Precedence order Local > Project > User — the shared stack every T5 merge
+        # function below consumes (permissions union is order-independent; overrides/MCP
+        # take the FIRST tier in this list that defines a given key/name as the winner).
+        settings_stack = [("local", local_settings), ("project", project_settings), ("user", settings)]
+        # P3: a SEPARATE stack carrying each tier's real `parsed_ok` flag (from
+        # `parse_settings`/`parse_project_settings`) alongside the dict — `settings_stack`
+        # above stays dict-only/unchanged for `_settings_overrides` (whose `key in s`
+        # truthiness filter is functionally equivalent for an empty dict either way);
+        # `_merge_permissions_union_deny_wins` needs the real flag, since `bool({})` would
+        # wrongly read a present-but-legitimately-empty settings.json as "did not parse".
+        settings_stack_with_ok = [("local", local_settings, local_ok),
+                                   ("project", project_settings, project_ok),
+                                   ("user", settings, settings_parsed_ok)]
+
+        project_settings_source = (str(project_containment_root / ".claude" / "settings.json")
+                                    if project_containment_root else None)
+        local_settings_source = (str(project_containment_root / ".claude" / "settings.local.json")
+                                  if project_containment_root else None)
+        composed_hooks = _compose_hooks(
+            [("user", settings, str(root / "settings.json"), root),
+             ("project", project_settings, project_settings_source, project_containment_root),
+             ("local", local_settings, local_settings_source, project_containment_root)],
+            project_containment_root, out_of_root_refs)
+
+        doc["composed_settings"] = {
+            "permissions": _merge_permissions_union_deny_wins(settings_stack_with_ok),
+            "hooks": composed_hooks,
+            "overrides": _settings_overrides(settings_stack),
+            "mcp": collect_composed_mcp(project_containment_root, errors, blind_spots, out_of_root_refs),
+        }
+
+        # T4: canonical tier-tagged node model + per-surface shadow resolver — additive,
+        # same compose-only pattern as inspected_roots/out_of_root_refs above. 'claude_md'
+        # and 'hook' (P2-A) reuse `files[]`/`composed_hooks` (both already
+        # built/tier-tagged above) rather than re-walking or re-reading disk.
+        raw_nodes = _walk_operator_tier_nodes(root)
+        if project_root is not None:
+            raw_nodes += _walk_project_tier_nodes(project_root, out_of_root_refs)
+        raw_nodes += _rule_nodes_from_files(files)
+        raw_nodes += _claude_md_nodes_from_files(files)
+        raw_nodes += _hook_nodes_from_composed(composed_hooks)
+        resolved_nodes, surfaces_summary, participating_surfaces = _resolve_tier_composition(raw_nodes)
+        doc["tier_composition"] = {
+            "nodes": resolved_nodes,
+            "surfaces": surfaces_summary,
+            "participating_surfaces": participating_surfaces,
+        }
+
+        # T11 (Bug 3, T9-found): `out_of_root_refs` is populated by several independent
+        # recording sites above (_walk_project_tier, _project_tier_duplication_corpus,
+        # _walk_project_tier_nodes, parse_project_settings x2, _compose_hooks,
+        # collect_composed_mcp), each deduping ONLY against its own call-local `seen` set
+        # inside `_record_out_of_root_ref` -- so the SAME escaping path is recorded once per
+        # recording site that independently encounters it (e.g. a project rule symlink is
+        # walked by both the always-loaded rules scan and the duplication-corpus scan).
+        # Dedupe ONCE here by `name` -- the same identity `_record_out_of_root_ref` already
+        # dedupes on intra-call -- first occurrence kept, stable order preserved.
+        seen_ref_names = set()
+        deduped_refs = []
+        for ref in out_of_root_refs:
+            if ref["name"] in seen_ref_names:
+                continue
+            seen_ref_names.add(ref["name"])
+            deduped_refs.append(ref)
+        doc["out_of_root_refs"] = deduped_refs
     return doc
 
 
@@ -1702,35 +3028,54 @@ def _empty_document(root):
     }
 
 
+def _default_operator_root():
+    """Operator-scan-root auto-resolution (P1-1, M6): `$CLAUDE_CONFIG_DIR` if set, else
+    `$HOME/.claude` — NEVER hard-coded. Used only as the `--root` argparse default; an
+    explicit `--root` always wins. When `CLAUDE_CONFIG_DIR` is unset (the common case),
+    this resolves identically to the prior hard-coded default."""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(cfg) if cfg else (Path.home() / ".claude")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Read-only harness map collector.")
-    ap.add_argument("--root", default=str(Path.home() / ".claude"))
+    ap.add_argument("--root", default=str(_default_operator_root()))
     ap.add_argument("--project-root", default=os.getcwd())
-    ap.add_argument("--out", default=None, help="Optional JSON out-path; MUST be outside --root.")
+    ap.add_argument("--compose", action="store_true",
+                     help="Compose operator ⊕ project tiers: three-root walk, every node "
+                          "additive-tagged tier=operator|project. Default (unset) behavior "
+                          "is unchanged (operator-only).")
+    ap.add_argument("--out", default=None, help="Optional JSON out-path; MUST be outside --root "
+                     "(and outside --project-root too when --compose is set).")
     ap.add_argument("--indent", type=int, default=2)
     args = ap.parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     out_path = None
+    out_roots = [root]                 # guarded roots for BOTH the upfront check and the
+                                        # write-time TOCTOU recheck below (P1-6a)
     if args.out is not None:
         try:
-            root_stat = os.stat(root)                        # root is expected to be an existing dir
+            os.stat(root)                                     # root is expected to be an existing dir
         except OSError as e:
             # A bad/inaccessible --root must NOT crash before the crash-safe envelope below —
             # skip the --out write (nothing safe to validate against) but still fall through to
             # build_document/print so the always-valid-JSON-envelope invariant holds.
             print(f"warning: --root not accessible, skipping --out write: {e}", file=sys.stderr)
-            root_stat = None
-        if root_stat is not None:
-            # normpath collapses a root-EXITING '..' (e.g. <root>/../x.json -> <root-parent>/x.json)
-            # so a path that only textually traverses root is not falsely rejected (FIX 3).
-            lexical = Path(os.path.normpath(str(Path(args.out).expanduser())))
-            resolved = Path(args.out).expanduser().resolve()  # resolves symlink aliases
-            for cand in (lexical, resolved):
-                if _resolves_inside_root(cand, root, root_stat):  # case/hardlink-robust (FIX 2)
-                    ap.error("--out must be outside --root (read-only invariant)")
+        else:
+            input_paths = []
+            if args.compose:
+                try:
+                    project_containment_root = Path(args.project_root).expanduser().resolve()
+                    out_roots.append(project_containment_root)
+                except OSError:
+                    pass
+                input_paths = iter_input_paths(root, args.project_root, compose=True)
+            ok, resolved = validate_write_target(args.out, out_roots, input_paths)
+            if not ok:
+                ap.error("--out must be outside --root (read-only invariant)")
             out_path = resolved                                # write through the validated resolved path
     try:
-        doc = build_document(root, args.project_root)
+        doc = build_document(root, args.project_root, compose=args.compose)
     except Exception as exc:  # noqa: BLE001 — collector must always emit a FULL-key valid envelope
         doc = _empty_document(root)
         doc["errors"].append(f"collector crashed: {exc!r}")
@@ -1759,8 +3104,13 @@ def main(argv=None):
         tmp_name = None
         try:
             resolved_recheck = out_path.resolve()
-            if _resolves_inside_root(resolved_recheck, root, os.stat(root)):
-                raise OSError("--out resolved inside --root at write time (TOCTOU)")
+            for guard_root in out_roots:
+                try:
+                    guard_root_stat = os.stat(guard_root)
+                except OSError:
+                    continue
+                if _resolves_inside_root(resolved_recheck, Path(guard_root), guard_root_stat):
+                    raise OSError("--out resolved inside a guarded root at write time (TOCTOU)")
             fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(text)

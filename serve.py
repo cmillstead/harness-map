@@ -80,7 +80,7 @@ def _stat_identity(path):
     return (st.st_ino, st.st_mtime_ns)
 
 
-def _run_collector(root, project_root, sidecar_path):
+def _run_collector(root, project_root, sidecar_path, compose=False):
     """Runs collector.main() in-process, suppressing its always-on JSON stdout print.
 
     P30 SIDECAR-FRESHNESS GUARD: collector.main() returns 0 even when the `--out`
@@ -90,9 +90,14 @@ def _run_collector(root, project_root, sidecar_path):
     would serve a stale render, so freshness is verified via inode identity: snapshot
     the sidecar's (st_ino, st_mtime_ns) before the call, require it EXISTS and DIFFERS
     after the call.
+
+    `compose` (T8, default False): propagates `--compose` to collector.main() so the
+    written sidecar carries the composed operator ⊕ project tiers.
     """
     pre = _stat_identity(sidecar_path)
     argv = ["--root", str(root), "--project-root", str(project_root), "--out", str(sidecar_path)]
+    if compose:
+        argv.append("--compose")
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = collector.main(argv)
@@ -194,7 +199,21 @@ def _broadcast_refresh(state):
                 pass
 
 
-def _rebuild(state, out_dir, root, project_root):
+def _write_guard_roots(ctx):
+    """P1-B (Codex challenge): the guard roots for the write-time re-validation every
+    HTML write sink (`_rebuild`, `_rebuild_friction_only`) passes to
+    `render_html.write_html_safely` — read fresh from the JUST-PRODUCED `ctx.doc` on
+    EVERY call, never cached, so a retargeted `--out-dir` symlink is always checked
+    against the CURRENT operator root and (in compose mode) the CURRENT project-
+    containment root. `ctx.doc["inspected_roots"]["project_containment"]` is present
+    only when the sidecar was collected with `--compose` (T8); a non-compose ctx has no
+    `inspected_roots` key at all, so this degrades to `[operator_root]` — unchanged
+    single-root behavior for the non-compose case."""
+    inspected_roots = ctx.doc.get("inspected_roots") or {}
+    return [r for r in (ctx.doc.get("root"), inspected_roots.get("project_containment")) if r]
+
+
+def _rebuild(state, out_dir, root, project_root, compose=False):
     """Write-then-publish (publish only AFTER the fallible on-disk write succeeds):
     0. snapshot each stream's PRE-render size (FIX 1) and the next publish generation (FIX 4)
     1. run the collector (P30-guarded) to produce today's sidecar
@@ -207,6 +226,17 @@ def _rebuild(state, out_dir, root, project_root):
     Any exception raised before step 4 propagates to the caller (the watcher loop catches
     it); the last-good `state.ctx` is left untouched (no swap, no counter increment, no
     broadcast) so a mid-serve collect/render/write fault never publishes a broken document.
+    This now ALSO covers write_html_safely's own guard rejection (P1-B, Codex challenge;
+    raised as a catchable `render_html.RenderError`, NOT `SystemExit` -- a `SystemExit`
+    here would be a `BaseException` that escapes this loop's `except Exception`/
+    `except (..., RenderError, ...)` degrade handlers and silently kill the watcher
+    thread): the startup `--out-dir` guard in `build_server` only ever validated ONCE,
+    before this function has run even a single time -- a `--out-dir` symlink retargeted
+    into a guarded root AFTER that startup check must still be caught at EVERY
+    subsequent write, never just the first, and the watcher must SURVIVE that
+    rejection rather than dying.
+
+    `compose` (T8, default False): propagated straight through to `_run_collector`.
     """
     out_dir = Path(out_dir)
     # FIX 1: snapshot each stream's size BEFORE the render consumes it, so a lower bound of
@@ -217,7 +247,7 @@ def _rebuild(state, out_dir, root, project_root):
     next_gen = state.generation + 1  # FIX 4: the generation this render is published at
     today = datetime.now().strftime("%Y-%m-%d")
     sidecar_path = out_dir / f"harness-map-{today}.json"
-    _run_collector(root, project_root, sidecar_path)
+    _run_collector(root, project_root, sidecar_path, compose=compose)
     # P30 ACCEPTED TOCTOU WINDOW: _run_collector's freshness check reads the sidecar's
     # inode identity, then render_from_out_dir below re-opens and re-reads the same
     # sidecar path itself — a co-resident process could swap the file in that narrow gap.
@@ -227,7 +257,7 @@ def _rebuild(state, out_dir, root, project_root):
         out_dir, date=today, streams=state.streams, no_friction=state.no_friction,
         generation=next_gen)
     html_path = out_dir / f"harness-map-{today}.html"
-    render_html.write_html_safely(html_path, ctx.html_text, ctx.doc.get("root"))
+    render_html.write_html_safely(html_path, ctx.html_text, _write_guard_roots(ctx))
     with state.lock:
         state.ctx = ctx
         state.collect_count += 1
@@ -236,17 +266,62 @@ def _rebuild(state, out_dir, root, project_root):
     _broadcast_refresh(state)
 
 
-def _path_value(path):
-    """Snapshot value for ONE watched path, stat FOLLOWING symlinks (os.stat/os.path.realpath,
-    never lstat) so a change to a deploy-symlink TARGET living OUTSIDE --root is still observed
-    (skill dirs are deploy symlinks — that missed-target case is why iter_input_paths, not a
-    hand-kept list, is the source of truth). Returns a small comparable tuple:
-      * missing:      (False, None, None, None)
-      * directory:    (True, "dir", sorted-listdir tuple | None, symlink-target mtime | None)
-      * regular file: (True, "file", (mtime_ns, size), symlink-target mtime | None)
+def _path_value(path, tier="operator", project_root=None):
+    """Snapshot value for ONE watched path. `tier`/`project_root` (T8) decide the symlink-
+    follow POLICY: `tier="operator"` (the default, unchanged) always stats FOLLOWING symlinks
+    (os.stat/os.path.realpath, never lstat) so a change to a deploy-symlink TARGET living
+    OUTSIDE --root is still observed (skill dirs are deploy symlinks — that missed-target
+    case is why iter_input_paths, not a hand-kept list, is the source of truth).
+
+    `tier="project"` is CONTAINMENT-GATED instead of unconditional (T8 mirrors T3 exactly,
+    reusing `collector._project_tier_gate`): a project-tier path whose realpath resolves
+    INSIDE `project_root` is STILL followed (identical to the operator branch below — a
+    target-content change must still trigger a refresh, matching T3's own read policy for a
+    contained project symlink); a project-tier path whose realpath ESCAPES `project_root`
+    uses lstat/readlink ONLY — no target stat/read, never diverging from what the collector
+    itself would follow (a missing path degrades to the same missing-tuple result either way).
+
+    Returns a small comparable tuple:
+      * missing:            (False, None, None, None)
+      * directory:          (True, "dir", sorted-listdir tuple | None, symlink-target mtime | None)
+      * regular file:       (True, "file", (mtime_ns, size), symlink-target mtime | None)
+      * escaping symlink:   (True, "symlink-escaping", readlink() target | None, None)
     A container dir's sorted-listdir membership flips when a skill/hook/rule/agent/project is
     added or removed (even an EMPTY dir appearing). An unreadable dir's listdir OSError degrades
     to None membership — the existence bit still records the flip."""
+    if tier == "project" and project_root is not None:
+        contained = False
+        try:
+            containment_stat = os.stat(project_root)
+        except OSError:
+            containment_stat = None
+        if containment_stat is not None:
+            contained, _identity = collector._project_tier_gate(
+                Path(path), Path(project_root), containment_stat)
+        if not contained:
+            # T3 mirror: escaping (or stat-inaccessible/missing) -> lstat/readlink only, NEVER
+            # follow into the target. A genuinely-missing path's lstat also raises ENOENT, so
+            # this converges on the same (False, None, None, None) the follow branch below
+            # would have produced for a missing path -- no behavioral gap for that case.
+            try:
+                lst = os.lstat(path)
+            except OSError:
+                return (False, None, None, None)
+            if stat.S_ISLNK(lst.st_mode):
+                try:
+                    target = os.readlink(path)
+                except OSError:
+                    target = None
+                return (True, "symlink-escaping", target, None)
+            if stat.S_ISDIR(lst.st_mode):
+                try:
+                    members = tuple(sorted(os.listdir(path)))
+                except OSError:
+                    members = None
+                return (True, "dir", members, None)
+            return (True, "file", (lst.st_mtime_ns, lst.st_size), None)
+    # operator tier (default) OR a CONTAINED project-tier entry: unchanged follow-symlinks
+    # behavior.
     link_target_mtime = None
     if os.path.islink(path):
         # os.stat below already follows the link, but fold the realpath target's mtime in
@@ -268,14 +343,36 @@ def _path_value(path):
     return (True, "file", (st.st_mtime_ns, st.st_size), link_target_mtime)
 
 
-def _watched_snapshot(root, project_root=None):
-    """Point-in-time snapshot {Path: value} of the ENTIRE collector input surface, keyed by
-    exactly the paths collector.iter_input_paths yields — so the watched set can never drift
-    from what the collector reads (a new collector input added THERE is watched automatically).
-    A snapshot inequality (any file mtime/size, any container membership/existence, or any
-    symlink-target mtime changed) is the watcher's re-render signal."""
-    return {path: _path_value(path)
-            for path in collector.iter_input_paths(root, project_root)}
+def _classify_watch_tier(path, project_root):
+    """Lexical-only classification (T8, no stat): True if `path` structurally lives under
+    `project_root`'s directory tree -- i.e. this watched entry is one of the project-tier
+    additions `collector.iter_input_paths(..., compose=True)` added under the project-
+    containment-root. Purely a `Path.parents` check, independent of whatever the path
+    CURRENTLY resolves to -- the resolve-time follow/no-follow POLICY decision belongs to
+    `_path_value` (T3's realpath containment gate via `_project_tier_gate`), not here."""
+    path = Path(path)
+    project_root = Path(project_root)
+    return path == project_root or project_root in path.parents
+
+
+def _watched_snapshot(root, project_root=None, compose=False):
+    """Point-in-time snapshot {Path: (tier, value)} of the ENTIRE collector input surface,
+    keyed by exactly the paths collector.iter_input_paths yields — so the watched set can
+    never drift from what the collector reads (a new collector input added THERE is watched
+    automatically). A snapshot inequality (any file mtime/size, any container membership/
+    existence, or any symlink-target mtime changed) is the watcher's re-render signal.
+
+    T8: each entry is TIER-TAGGED ("operator"/"project") by lexical containment against
+    `project_root` (compose mode only — non-compose stays all-"operator", unchanged), and
+    that tier drives `_path_value`'s containment-gated follow policy for project-tier
+    entries. Keys stay bare Paths (unchanged contract); values become `(tier, path_value)`."""
+    snapshot = {}
+    for path in collector.iter_input_paths(root, project_root, compose=compose):
+        tier = "operator"
+        if compose and project_root is not None and _classify_watch_tier(path, project_root):
+            tier = "project"
+        snapshot[path] = (tier, _path_value(path, tier, project_root if compose else None))
+    return snapshot
 
 
 def _synthesis_path(out_dir, date):
@@ -312,6 +409,11 @@ def _rebuild_friction_only(state, out_dir):
 
     `collect_count` is deliberately NEVER touched here (the T5 counter contract): only a
     full `_rebuild` proves a collector run happened.
+
+    Shares `_rebuild`'s P1-B write-time re-validation via `_write_guard_roots`/
+    `write_html_safely`: since this cheap path runs on every settled append-only sweep
+    (far more often than a full `_rebuild`), it is EXACTLY the path a `--out-dir`
+    symlink retargeted after startup would most likely hit first.
     """
     with state.lock:
         ctx = state.ctx
@@ -327,7 +429,7 @@ def _rebuild_friction_only(state, out_dir):
         generation=next_gen)
     html_bytes = html_text.encode("utf-8", "backslashreplace")
     html_path = out_dir / f"harness-map-{ctx.date}.html"
-    render_html.write_html_safely(html_path, html_text, ctx.doc.get("root"))
+    render_html.write_html_safely(html_path, html_text, _write_guard_roots(ctx))
     with state.lock:
         state.ctx = dataclasses.replace(
             state.ctx, friction=new_friction, html_text=html_text, html_bytes=html_bytes)
@@ -417,7 +519,7 @@ def _classify_stream_sweep(state):
     return "none", []
 
 
-def _try_full_rebuild(state, out_dir, root, project_root, label):
+def _try_full_rebuild(state, out_dir, root, project_root, label, compose=False):
     """Runs one full `_rebuild`, containing a failure (CollectorError / RenderError /
     OSError) HERE -- logs "{label} failed, keeping last-good render" to stderr and returns
     False -- instead of letting it propagate. Extracted so every full-rebuild call site in
@@ -425,7 +527,7 @@ def _try_full_rebuild(state, out_dir, root, project_root, label):
     C18 date-rollover degrade, and the cheap-path failure degrade) shares the identical
     keep-last-good/don't-advance-snapshot semantics behind one implementation."""
     try:
-        _rebuild(state, out_dir, root, project_root)
+        _rebuild(state, out_dir, root, project_root, compose=compose)
     except (CollectorError, render_html.RenderError, OSError) as exc:
         print(f"harness-map watcher: {label} failed, keeping last-good render: {exc}",
               file=sys.stderr)
@@ -433,7 +535,8 @@ def _try_full_rebuild(state, out_dir, root, project_root, label):
     return True
 
 
-def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, debounce_seconds):
+def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, debounce_seconds,
+                   compose=False):
     """Daemon poll loop: every `poll_seconds` build a fresh collector-input snapshot; on any
     difference enter a debounce that keeps re-sweeping until `debounce_seconds` pass with NO
     further change, then run ONE `_rebuild` (coalescing a burst of N writes into one refresh).
@@ -476,7 +579,7 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
             # (Codex r3 FIX 1) and the C18 date-rollover check below, so the two never disagree
             # on the date within a single iteration.
             today = datetime.now().strftime("%Y-%m-%d")
-            current = _watched_snapshot(root, project_root)
+            current = _watched_snapshot(root, project_root, compose)
             synth_current = _synthesis_value(out_dir, today)  # Codex r3 FIX 1
             if current != state.watch_snapshot or synth_current != state.synth_snapshot:
                 # Change detected (a collector input OR the synthesis sidecar moved): debounce
@@ -484,7 +587,7 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
                 while not stop_event.is_set():
                     if stop_event.wait(debounce_seconds):
                         return
-                    settled = _watched_snapshot(root, project_root)
+                    settled = _watched_snapshot(root, project_root, compose)
                     settled_synth = _synthesis_value(out_dir, today)
                     if settled == current and settled_synth == synth_current:
                         break
@@ -495,7 +598,8 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
                 # A synthesis change MUST take the full-rebuild path (it feeds the Coverage
                 # Matrix + drag MODELS, which the cheap friction-only path reuses from cache and
                 # would leave stale) -- `_try_full_rebuild` is the only rebuild called here.
-                if not _try_full_rebuild(state, out_dir, root, project_root, label="rebuild"):
+                if not _try_full_rebuild(state, out_dir, root, project_root, label="rebuild",
+                                          compose=compose):
                     continue  # do NOT advance either snapshot -> the change is retried next sweep
                 state.watch_snapshot = current
                 state.synth_snapshot = synth_current  # Codex r3 FIX 1: advance PRE-read value
@@ -517,7 +621,8 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
             if classification == "none" and not force_full:
                 continue
             if force_full:
-                if not _try_full_rebuild(state, out_dir, root, project_root, label="full recollect"):
+                if not _try_full_rebuild(state, out_dir, root, project_root,
+                                          label="full recollect", compose=compose):
                     continue  # keep pending_truncation set -> the truncation is retried next sweep
                 state.pending_truncation.clear()  # a successful full rebuild consumed the truncation
                 continue
@@ -532,7 +637,7 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
             # key), so the rollover check here reads the SAME date the synthesis-tracking used.
             if ctx_date != today:
                 if not _try_full_rebuild(state, out_dir, root, project_root,
-                                          label="date-rollover recollect"):
+                                          label="date-rollover recollect", compose=compose):
                     continue
                 continue
 
@@ -544,7 +649,7 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
                 print(f"harness-map watcher: cheap friction re-render failed ({exc}), "
                       f"degrading to full recollect", file=sys.stderr)
                 if not _try_full_rebuild(state, out_dir, root, project_root,
-                                          label="full recollect fallback"):
+                                          label="full recollect fallback", compose=compose):
                     continue
             # Both the cheap `_rebuild_friction_only` and its full-rebuild fallback re-seed
             # stream_offsets from their own PRE-read snapshots (FIX 1) -- no re-seed here.
@@ -706,7 +811,7 @@ def _build_streams(no_friction):
 def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
                   no_friction=False, streams=None, watch=False,
                   poll_seconds=POLL_SECONDS, debounce_seconds=DEBOUNCE_SECONDS,
-                  heartbeat=HEARTBEAT_SECONDS):
+                  heartbeat=HEARTBEAT_SECONDS, compose=False):
     """Validates `host`, builds the friction `streams` dict (unless one is supplied),
     runs one `_rebuild`, then constructs the threading server bound to shared state.
     Lets any collect/render/write exception from the initial `_rebuild` propagate, so
@@ -719,11 +824,30 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     `_rebuild` reads the inputs (so a change concurrent with the first rebuild stays visible
     as a diff on the first sweep) and BEFORE the thread starts. On a CLEAN startup the
     baseline equals what the first sweep computes (out_dir is outside root, so the rebuild
-    mutates no watched path), so the first sweep only fires on a genuine post-startup change."""
+    mutates no watched path), so the first sweep only fires on a genuine post-startup change.
+
+    `compose` (T8, default False): propagates `--compose` to every collector run (initial +
+    every watcher rebuild) and switches the watched-set/out-dir guard to two-tier mode."""
     host = _validate_host(host)
     out_dir = Path(out_dir)
     root = Path(root)
     project_root = Path(project_root)
+    # T8 P1-6b: both-root out-dir/write guard, routed through T2's SHARED
+    # collector.validate_write_target (the same guard collector.py --out and
+    # render_html.write_html_safely reuse) -- a startup fail-fast BEFORE any collect/render/
+    # write is attempted. Non-compose guards ONLY the operator root (write_html_safely's own
+    # single-root check already covers this at render time; this adds an earlier, cleaner
+    # failure). Compose mode ALSO guards the project-containment-root and rejects a target
+    # equal to any compose-mode collector input (e.g. `~/.claude.json`), reusing T2's own
+    # `input_paths=` clause rather than re-implementing it.
+    guard_roots = [root]
+    guard_input_paths = []
+    if compose:
+        guard_roots.append(project_root)
+        guard_input_paths = collector.iter_input_paths(root, project_root, compose=True)
+    ok, _resolved = collector.validate_write_target(out_dir, guard_roots, guard_input_paths)
+    if not ok:
+        raise ValueError(f"--out-dir must be outside the guarded root(s): {out_dir}")
     if streams is None:
         streams = _build_streams(no_friction)
     state = _State(streams=streams, no_friction=no_friction)
@@ -736,7 +860,7 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     # the next edit. The collector enforces out_dir OUTSIDE root, so the rebuild never mutates a
     # watched path -> on a CLEAN startup this pre-rebuild baseline still equals what the first
     # sweep computes (no spurious re-render).
-    state.watch_snapshot = _watched_snapshot(root, project_root)
+    state.watch_snapshot = _watched_snapshot(root, project_root, compose)
     # Codex r3 FIX 1: seed the synthesis-sidecar baseline BEFORE the initial `_rebuild`, using
     # the same `today` the rebuild renders at, so a synthesis write concurrent with startup
     # stays visible as a diff on the first sweep (safe direction) and a CLEAN startup (synthesis
@@ -752,7 +876,7 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     # enumerated startup exceptions propagate UNCHANGED (re-raised) so their type/message are
     # preserved; this normalizes ONLY the unexpected ones and is NOT a swallow (always re-raised).
     try:
-        _rebuild(state, out_dir, root, project_root)
+        _rebuild(state, out_dir, root, project_root, compose=compose)
     except (CollectorError, render_html.RenderError, OSError, SystemExit):
         raise
     except Exception as exc:  # noqa: BLE001 - startup-failure normalizer (Codex r3 FIX 2): re-raises, never swallows
@@ -770,7 +894,8 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     if watch:
         watcher = threading.Thread(
             target=_watcher_loop,
-            args=(state, out_dir, root, project_root, stop_event, poll_seconds, debounce_seconds),
+            args=(state, out_dir, root, project_root, stop_event, poll_seconds, debounce_seconds,
+                  compose),
             name="harness-map-watcher", daemon=True)
         watcher.start()
         server._watcher_thread = watcher
@@ -788,6 +913,10 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--no-friction", action="store_true")
+    ap.add_argument("--compose", action="store_true",
+                     help="Compose operator ⊕ project tiers (see collector.py --compose): "
+                          "propagated to every collector run and to the two-tier watched-set/"
+                          "out-dir guard. Default (unset) behavior is unchanged (operator-only).")
     args = ap.parse_args(argv)
 
     try:
@@ -798,12 +927,18 @@ def main(argv=None):
     try:
         server = build_server(
             out_dir=Path(args.out_dir), root=Path(args.root), project_root=Path(args.project_root),
-            host=host, port=args.port, no_friction=args.no_friction, watch=True)
-    except (CollectorError, render_html.RenderError, OSError, SystemExit) as e:
-        # SystemExit here can ONLY come from write_html_safely's inside-root guard inside
-        # build_server's startup _rebuild call (argparse's own --host SystemExit already
-        # happened above, before this try, and is deliberately NOT caught here) — treat it
-        # as a clean startup failure like the other three, not a bare traceback.
+            host=host, port=args.port, no_friction=args.no_friction, watch=True,
+            compose=args.compose)
+    except (CollectorError, render_html.RenderError, OSError, SystemExit, ValueError) as e:
+        # RenderError here now ALSO covers write_html_safely's inside-root guard rejection
+        # inside build_server's startup _rebuild call -- it used to raise a bare SystemExit
+        # (P1-B, Codex challenge; changed because a live serve run's watcher-loop degrade
+        # handlers, which only catch Exception, could not catch a BaseException escaping
+        # mid-run). SystemExit is kept in this tuple as defense-in-depth for any other
+        # startup fault that might still raise it (argparse's own --host SystemExit already
+        # happened above, before this try, and is deliberately NOT caught here) -- treat any
+        # of these as a clean startup failure, not a bare traceback. ValueError (T8) is
+        # build_server's own both-root out-dir guard rejecting `--out-dir` up front.
         print(f"fatal: could not start server: {e}", file=sys.stderr)
         return 1
     bound_host, bound_port = server.server_address[0], server.server_address[1]

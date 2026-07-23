@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from test_collector import run_collector
+from test_collector import _build_two_tier_maximal_fixture, _SECRET_SENTINELS, run_collector
 
 RENDER = Path(__file__).resolve().parents[1] / "render_html.py"
 REAL_SAMPLE = Path("/Users/cevin/Documents/obsidian-vault/AI/output/harness-map-2026-07-15.json")
@@ -1986,6 +1986,133 @@ def test_write_html_safely_refuses_inside_harness_root(tmp_path):
     assert not (out_dir / "harness-map-2026-07-15.html").exists()
 
 
+def test_write_html_safely_accepts_list_guard_roots_and_rejects_second_root(tmp_path):
+    """P1-B (render_html half): `write_html_safely`'s `guard_roots` param must accept
+    MULTIPLE roots (a list) and reject a target resolving inside ANY of them -- not
+    just the first. Direct unit-level call, bypassing main()'s own write path entirely,
+    so this pins write_html_safely's OWN independent multi-root guarantee."""
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    bad_target = proj / "leak" / "harness-map-2026-07-15.html"
+    with pytest.raises(rh.RenderError):
+        rh.write_html_safely(bad_target, "<html></html>", [operator_root, proj])
+    assert not bad_target.exists()
+
+
+def test_write_html_safely_still_rejects_single_operator_root(tmp_path):
+    """Regression pin: a bare single root (str/Path, not a list) must still work --
+    every non-compose call site passes exactly this shape."""
+    operator_root = tmp_path / "fakeclaude"
+    operator_root.mkdir()
+    bad_target = operator_root / "reports" / "harness-map-2026-07-15.html"
+    with pytest.raises(rh.RenderError):
+        rh.write_html_safely(bad_target, "<html></html>", operator_root)
+    assert not bad_target.exists()
+
+
+def test_write_html_safely_writes_through_when_outside_every_guard_root(tmp_path):
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    target = out_dir / "harness-map-2026-07-15.html"
+    rh.write_html_safely(target, "<html>ok</html>", [operator_root, proj])
+    assert target.read_text(encoding="utf-8") == "<html>ok</html>"
+
+
+def test_write_html_safely_rejects_symlinked_out_dir_retargeted_into_project_root(tmp_path):
+    """The realistic production shape (T8 P1-B): `--out-dir` is a symlink, safe at some
+    earlier check, later retargeted to point inside a guarded root -- the actual write
+    target is only known by re-resolving at write time, which write_html_safely now
+    always does."""
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    safe_dir = tmp_path / "safe_out"
+    safe_dir.mkdir()
+    out_link = tmp_path / "out_link"
+    out_link.symlink_to(safe_dir)
+    target = out_link / "harness-map-2026-07-15.html"
+    # retarget AFTER the symlink was created safely, mirroring a swapped --out-dir
+    out_link.unlink()
+    out_link.symlink_to(proj)
+    with pytest.raises(rh.RenderError):
+        rh.write_html_safely(target, "<html></html>", [operator_root, proj])
+    assert not (proj / "harness-map-2026-07-15.html").exists()
+
+
+def test_write_html_safely_recheck_immediately_before_mkstemp_closes_toctou_window(
+        tmp_path, monkeypatch):  # mock-ok: interposes on real fs symlink timing, not a faked dependency
+    """P3 hardening (parity with collector.main's own pre-mkstemp re-check, Codex
+    challenge): validate_write_target's PARENT DIRECTORY itself -- not the write target's
+    own name -- gets swapped into a symlink pointing at a guard root, in the window
+    AFTER the top-of-function validation resolved `out_path` to a concrete (symlink-free)
+    path but BEFORE `mkstemp` opens it. `out_path` itself never changes; re-resolving the
+    SAME already-resolved path a second time is what must catch a parent component that
+    turned into a symlink in that window. Interposes on the real `validate_write_target`
+    call COUNT to flip a REAL filesystem symlink between call 1 (safe) and call 2
+    (unsafe), deterministically forcing the exact interleaving a genuine race would only
+    sometimes hit -- every call still goes through the real guard logic, no return value
+    or side effect is faked."""
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    safe_dir = tmp_path / "safe_out"
+    safe_dir.mkdir()
+    target = safe_dir / "harness-map-2026-07-15.html"
+
+    collector_mod = rh._get_sibling_collector()
+    real_validate = collector_mod.validate_write_target
+    calls = {"n": 0}
+
+    def _swap_parent_dir_after_first_call(raw_path, roots, input_paths=()):
+        calls["n"] += 1
+        result = real_validate(raw_path, roots, input_paths)
+        if calls["n"] == 1:
+            # `safe_dir` is empty (nothing written through it yet) -- swap it itself
+            # into a symlink pointing INTO the guarded project root, simulating a
+            # parent-directory retarget landing exactly in the validate-to-mkstemp gap.
+            safe_dir.rmdir()
+            safe_dir.symlink_to(proj)
+        return result
+
+    monkeypatch.setattr(collector_mod, "validate_write_target", _swap_parent_dir_after_first_call)  # mock-ok: interposes on real fs symlink timing, not a faked dependency
+    with pytest.raises(rh.RenderError):
+        rh.write_html_safely(target, "<html></html>", [operator_root, proj])
+    assert calls["n"] == 2, "both the top-of-function and the pre-mkstemp re-check must run"
+    assert not any(proj.glob("*.html")), \
+        "a parent-dir symlink swapped in between validate and mkstemp must never be written through"
+
+
+def test_render_out_path_symlinked_into_project_root_rejected_at_write_time(tmp_path):
+    """P1-B sink 3 (render_html.main): the html OUTPUT PATH itself resolving into the
+    composed project root via a pre-existing symlink must be rejected -- write_html_safely
+    is main()'s write-time guard, independent of whatever earlier check ran."""
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = str(operator_root)
+    doc["inspected_roots"] = {"operator": str(operator_root.resolve()),
+                              "project_containment": str(proj.resolve()),
+                              "project_harness": str((proj / ".claude").resolve())}
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    leak_target = proj / "leak3.html"
+    (out_dir / "harness-map-2026-07-15.html").symlink_to(leak_target)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode != 0
+    assert not leak_target.exists()
+
+
 def test_hard_link_target_regression(tmp_path):
     """A pre-existing HTML target that is a hard link to a file inside the doc's
     `root` must not be truncated by the write (Codex F1)."""
@@ -2913,3 +3040,1229 @@ def test_maximal_fixture_is_byte_identical_across_pythonhashseed(tmp_path):
         assert p.returncode == 0, p.stderr
         outs.append((out_dir / "harness-map-2026-07-15.html").read_bytes())
     assert outs[0] == outs[1]
+
+
+# ============================================================= 11. Project-tier targeting (T6)
+# T4's exact output shape (`_resolve_tier_composition`, collector.py) as a STATIC dict
+# literal — never a live collector run, so this module stays insulated from T5 (which
+# lands `tier_composition`'s sibling settings/hooks/MCP fields concurrently). One
+# collision per shadow surface exercises every branch: skill (operator wins -> project
+# marked "dark"), agent (project wins -> "override"), plus a project-only command "add"
+# and a project rule "add" on the union surface.
+TIER_COMPOSITION_FIXTURE = {
+    "nodes": [
+        {"surface": "skill", "name": "review", "tier": "operator", "path": "skills/review/SKILL.md",
+         "status": "effective", "shadowed_by": None},
+        {"surface": "skill", "name": "review", "tier": "project", "path": ".claude/skills/review/SKILL.md",
+         "status": "shadowed", "shadowed_by": {"tier": "operator", "path": "skills/review/SKILL.md"}},
+        {"surface": "command", "name": "deploy", "tier": "project", "path": ".claude/commands/deploy.md",
+         "status": "effective", "shadowed_by": None},
+        {"surface": "agent", "name": "auditor", "tier": "operator", "path": "agents/auditor.md",
+         "status": "shadowed", "shadowed_by": {"tier": "project", "path": ".claude/agents/auditor.md"}},
+        {"surface": "agent", "name": "auditor", "tier": "project", "path": ".claude/agents/auditor.md",
+         "status": "effective", "shadowed_by": None},
+        {"surface": "rule", "name": "x", "tier": "project", "path": ".claude/rules/x.md",
+         "status": "effective", "shadowed_by": None},
+    ],
+    "surfaces": {
+        "skill": {"merge": "shadow", "winner_tier": "operator", "adds": 0, "overrides": 0, "dark": 1},
+        "command": {"merge": "shadow", "winner_tier": "operator", "adds": 1, "overrides": 0, "dark": 0},
+        "agent": {"merge": "shadow", "winner_tier": "project", "adds": 0, "overrides": 1, "dark": 0},
+        "rule": {"merge": "union", "winner_tier": None, "adds": 1, "overrides": 0, "dark": 0},
+    },
+    "participating_surfaces": ["agent", "command", "rule", "skill"],
+}
+
+
+def test_tier_summary_band_renders_rollup_per_surface_and_dark_callout(tmp_path):
+    doc = _minimal_doc()
+    doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
+    out_dir = tmp_path / "tier_summary"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="tier-summary"' in text
+    # rollup: adds = command(1) + rule(1) = 2; overrides = agent(1) = 1; dark = skill(1) = 1
+    assert "project adds 2 / overrides 1 / 1 dark" in text
+    # per-surface breakdown names every participating surface
+    for surface in ("skill", "command", "agent", "rule"):
+        assert f'<span class="tier-surface">{surface}</span>' in text
+    # dark-skill callout: the shadowed project "review" skill, flagged as never-runs
+    assert "Dark project skills &amp; commands" in text
+    assert "skill:review" in text
+    assert "defined but never runs" in text
+    assert "shadowed by operator skills/review/SKILL.md" in text
+    # confined to the Overview view (not duplicated elsewhere)
+    import re
+    ov = re.search(r'<section id="view-overview".*?</section>', text, re.S)
+    assert ov is not None and 'id="tier-summary"' in ov.group(0)
+
+
+# Finding D (P3): the "Dark project skills" callout also lists dark COMMANDS (both
+# skills and commands resolve operator-wins, so both can appear under it) — a fixture
+# whose only dark entry is a colliding project command must not render under a heading
+# that claims "skills" only.
+COMMAND_ONLY_DARK_FIXTURE = {
+    "nodes": [
+        {"surface": "command", "name": "deploy", "tier": "operator", "path": "commands/deploy.md",
+         "status": "effective", "shadowed_by": None},
+        {"surface": "command", "name": "deploy", "tier": "project", "path": ".claude/commands/deploy.md",
+         "status": "shadowed", "shadowed_by": {"tier": "operator", "path": "commands/deploy.md"}},
+    ],
+    "surfaces": {
+        "command": {"merge": "shadow", "winner_tier": "operator", "adds": 0, "overrides": 0, "dark": 1},
+    },
+    "participating_surfaces": ["command"],
+}
+
+
+def test_dark_callout_heading_covers_dark_commands_not_just_skills(tmp_path):
+    doc = _minimal_doc()
+    doc["tier_composition"] = COMMAND_ONLY_DARK_FIXTURE
+    out_dir = tmp_path / "tier_summary_dark_command"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    # the only dark entry is a command — the heading must not claim "skills" only
+    assert "Dark project skills &amp; commands" in text
+    assert "Dark project skills</h3>" not in text
+    assert "command:deploy" in text
+
+
+def test_tier_summary_band_absent_without_tier_composition(tmp_path):
+    """Back-compat (C15, T6-owned for render): an old-shape sidecar with no
+    `tier_composition` key at all must render with zero errors and simply omit the
+    band — never a KeyError, never a stray empty card."""
+    doc = _minimal_doc()
+    assert "tier_composition" not in doc
+    out_dir = tmp_path / "tier_summary_absent"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="tier-summary"' not in text
+    assert "project adds" not in text
+
+
+def test_treemap_cells_wrapped_in_tier_bearing_group():
+    tree = {"cells": [
+        {"path": "op.md", "node_key": "always_loaded:op.md", "size": 10, "tier": "operator",
+         "x": "0.00", "y": "0.00", "w": "80.00", "h": "40.00", "fill": "#000"},
+        {"path": "proj.md", "node_key": "always_loaded:proj.md", "size": 10, "tier": "project",
+         "x": "0.00", "y": "40.00", "w": "80.00", "h": "40.00", "fill": "#000"},
+    ], "canvas_w": 100.0, "canvas_h": 100.0}
+    svg = rh._render_treemap_svg(tree, {}, "t")
+    assert '<g class="tier-node tier-operator"><rect' in svg
+    assert '<g class="tier-node tier-project"><rect' in svg
+    import re
+    op_cell = re.search(r'<g class="tier-node tier-operator">.*?data-node-key="always_loaded:op\.md".*?</g>',
+                         svg, re.S)
+    proj_cell = re.search(r'<g class="tier-node tier-project">.*?data-node-key="always_loaded:proj\.md".*?</g>',
+                           svg, re.S)
+    assert op_cell is not None and proj_cell is not None
+
+
+def test_ladder_rows_wrapped_in_tier_bearing_group():
+    tree = {"cells": [
+        {"path": "op.md", "node_key": "always_loaded:op.md", "size": 10, "tier": "operator",
+         "x": "0.00", "y": "0.00", "w": "80.00", "h": "40.00", "fill": "#000"},
+        {"path": "proj.md", "node_key": "always_loaded:proj.md", "size": 5, "tier": "project",
+         "x": "0.00", "y": "40.00", "w": "80.00", "h": "40.00", "fill": "#000"},
+    ], "canvas_w": 100.0, "canvas_h": 100.0}
+    svg = rh._render_ladder_svg(tree, {}, "l")
+    import re
+    op_row = re.search(r'<g class="tier-node tier-operator">.*?data-node-key="always_loaded:op\.md".*?</g>',
+                        svg, re.S)
+    proj_row = re.search(r'<g class="tier-node tier-project">.*?data-node-key="always_loaded:proj\.md".*?</g>',
+                          svg, re.S)
+    assert op_row is not None and proj_row is not None
+
+
+def test_treemap_cell_defaults_to_operator_when_tier_key_absent():
+    """C15 back-compat: a cell dict with no `tier` key at all (the pre-T6 / non-compose
+    shape) must default to operator, never crash on a missing key."""
+    tree = {"cells": [
+        {"path": "a.md", "node_key": "always_loaded:a.md", "size": 10,
+         "x": "0.00", "y": "0.00", "w": "80.00", "h": "40.00", "fill": "#000"},
+    ], "canvas_w": 100.0, "canvas_h": 100.0}
+    svg = rh._render_treemap_svg(tree, {}, "t")
+    assert '<g class="tier-node tier-operator"><rect' in svg
+    assert "tier-project" not in svg
+
+
+@pytest.mark.parametrize("payload", ["evil", '"><script>alert(1)</script>', "operator--><g>x</g>"])
+def test_tier_value_normalizes_adversarial_input_to_operator(payload):
+    """Untrusted project-tier data (T3's threat model) must never place a raw `tier`
+    string into a CSS class attribute — only the two known enum members are ever
+    emitted; anything else (including an injection attempt) defaults to operator."""
+    tree = {"cells": [
+        {"path": "a.md", "node_key": "always_loaded:a.md", "size": 10, "tier": payload,
+         "x": "0.00", "y": "0.00", "w": "80.00", "h": "40.00", "fill": "#000"},
+    ], "canvas_w": 100.0, "canvas_h": 100.0}
+    svg = rh._render_treemap_svg(tree, {}, "t")
+    assert payload not in svg
+    assert '<g class="tier-node tier-operator"><rect' in svg
+
+
+def test_length_flags_table_rows_tagged_with_tier_and_project_badge(tmp_path):
+    doc = _minimal_doc()
+    doc["instruction_length_flags"] = [
+        {"path": ".claude/skills/wide/SKILL.md", "lines": 250, "threshold": 200,
+         "evidence": "VERIFIED", "tier": "project"},
+        {"path": "skills/wide2/SKILL.md", "lines": 240, "threshold": 200, "evidence": "VERIFIED"},
+    ]
+    out_dir = tmp_path / "tier_flags"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    hyg = re.search(r'<section id="view-hygiene".*?</section>', text, re.S).group(0)
+    proj_row = re.search(r'<tr class="tier-node tier-project">.*?</tr>', hyg, re.S)
+    assert proj_row is not None
+    assert '.claude/skills/wide/SKILL.md' in proj_row.group(0)
+    assert '<span class="badge tier-project">project</span>' in proj_row.group(0)
+    op_row = re.search(r'<tr class="tier-node tier-operator">.*?</tr>', hyg, re.S)
+    assert op_row is not None
+    assert "skills/wide2/SKILL.md" in op_row.group(0)
+    assert '<span class="badge tier-project">project</span>' not in op_row.group(0)
+
+
+def test_tier_tokens_present_in_light_and_dark_static_style():
+    style = rh.STATIC_STYLE
+    assert style.count("--tier-operator:var(--muted)") == 4
+    assert style.count("--tier-project:#0e7490") == 2   # light theme (base :root + [data-theme=light])
+    assert style.count("--tier-project:#22d3ee") == 2   # dark theme (media dark + [data-theme=dark])
+
+
+def test_one_executable_script_and_csp_hash_reconciles_with_tier_composition(tmp_path):
+    doc = _minimal_doc()
+    doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
+    out_dir = tmp_path / "tier_csp"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    p = _ExternalRefParser()
+    p.feed(text)
+    assert p.tag_counts.get("style", 0) == 1
+    assert p.on_handlers == []
+    assert p.style_attrs == []
+    import re
+    exe_scripts = re.findall(r'<script(?![^>]*type="application/json")[^>]*>', text)
+    assert len(exe_scripts) == 1
+    m = re.search(r"style-src 'sha256-([^']+)'; script-src 'sha256-([^']+)'", text)
+    assert m is not None
+    assert m.group(1) == rh._csp_hash(rh.STATIC_STYLE)
+    assert m.group(2) == rh._csp_hash(rh.STATIC_SCRIPT)
+
+
+def test_byte_determinism_with_tier_composition_across_pythonhashseed(tmp_path):
+    doc = _minimal_doc()
+    doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
+    doc["instruction_length_flags"] = [
+        {"path": ".claude/skills/wide/SKILL.md", "lines": 250, "threshold": 200,
+         "evidence": "VERIFIED", "tier": "project"},
+    ]
+    out_dir = tmp_path / "tier_det"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    outs = []
+    for seed in ("0", "1"):
+        p = run_render(out_dir, "--date", "2026-07-15", "--no-friction",
+                       env={**os.environ, "PYTHONHASHSEED": seed})
+        assert p.returncode == 0, p.stderr
+        outs.append((out_dir / "harness-map-2026-07-15.html").read_bytes())
+    assert outs[0] == outs[1]
+
+
+# ============================================================= 12. Tier filter toggle (T7)
+def test_tier_filter_control_renders_with_single_roving_tabstop(tmp_path):
+    """M3/P2-7: a three-state radiogroup (All / Operator only / Project only), gated on
+    `tier_composition` presence (same gate T6 used for the summary band). TRUE roving
+    tabindex from the start: exactly one button is a tabstop ("All", checked by
+    default), the other two are removed from tab order entirely -- not just an
+    `aria-selected` flip (the pre-existing `.view-switch` tablist's own gap, P2-7)."""
+    doc = _minimal_doc()
+    doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
+    out_dir = tmp_path / "tier_filter_control"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    group = re.search(r'<div class="tier-filter" role="radiogroup" aria-label="Tier filter">'
+                       r'.*?</div>', text, re.S)
+    assert group is not None
+    btns = re.findall(r'<button class="tier-filter-btn"[^>]*>', group.group(0))
+    assert len(btns) == 3
+    assert [b for b in btns if 'data-tier-filter="all"' in b][0].count('tabindex="0"') == 1
+    assert [b for b in btns if 'data-tier-filter="all"' in b][0].count('aria-checked="true"') == 1
+    for filt in ("operator-only", "project-only"):
+        btn = [b for b in btns if f'data-tier-filter="{filt}"' in b][0]
+        assert 'tabindex="-1"' in btn
+        assert 'aria-checked="false"' in btn
+    assert sum(b.count('tabindex="0"') for b in btns) == 1
+
+
+def test_tier_filter_control_absent_without_tier_composition(tmp_path):
+    """C15 back-compat: a non-compose (no `tier_composition`) sidecar has nothing to
+    filter -- the control, and every trace of it, must be absent so the controls bar
+    stays exactly as it rendered pre-T7."""
+    doc = _minimal_doc()
+    assert "tier_composition" not in doc
+    out_dir = tmp_path / "tier_filter_absent"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'class="tier-filter"' not in text
+    assert 'role="radiogroup"' not in text
+    assert "data-tier-filter" not in text
+
+
+def test_tier_filter_dim_css_targets_wrapper_and_is_ordered_after_heat_css():
+    """P2-8: the dim rule must target the tier-bearing WRAPPER (`.tier-node`, not
+    `.fhN`/`.heatable` which live on the child rect/bar) -- opacity then composes
+    automatically via nested compositing instead of fighting the heat rules for the
+    same element. Also asserts the dim rules are textually the LAST declarations in
+    the stylesheet (appended after `_HEAT_CSS`), so a later-appended heat rule can
+    never silently win an equal-specificity tie."""
+    style = rh.STATIC_STYLE
+    dim_op = "body.tier-project-only .tier-node.tier-operator{opacity:.25}"
+    dim_proj = "body.tier-operator-only .tier-node.tier-project{opacity:.25}"
+    assert dim_op in style
+    assert dim_proj in style
+    heat_fh4_idx = style.index("body.friction-on .fh4{")
+    assert style.index(dim_op) > heat_fh4_idx
+    assert style.index(dim_proj) > heat_fh4_idx
+    # the selector never touches .fhN/.heatable directly (would fight the heat rule
+    # for the SAME element instead of composing via the parent wrapper)
+    assert ".fh" not in dim_op and ".fh" not in dim_proj
+    assert ".heatable" not in dim_op and ".heatable" not in dim_proj
+
+
+def test_tier_filter_triple_interaction_treemap_composes_heat_and_length_crit(tmp_path):
+    """Triple-interaction (mandatory): a node that is simultaneously tier-project,
+    friction-heated, AND length-critical must render as ONE `tier-node tier-project`
+    wrapper containing the heated (`fhN`) rect and the length-crit ring + marker as
+    siblings -- proving a single opacity dim on the wrapper covers all three at once,
+    never independently.
+
+    T12: uses the REAL `project_rule` category (`_walk_project_tier`'s actual output,
+    collector.py:619) at a REAL project-relative path (`.claude/rules/proj.md` -- the
+    shape `_project_file_entry` emits, not the operator-shaped `rules/proj.md` this
+    test used pre-T12, which happened to already work because the P1 bug hadn't been
+    fixed AND the P2 node_key collision hadn't been introduced yet). The friction
+    decision below joins by BARE basename (`proj.md`, no `/`) -- T12's P2 fix makes a
+    PATH-bearing ref operator-tier-only (`_canonical_ref_candidates` never emits a
+    `project:`-keyed candidate, by design: telemetry paths are always operator-root-
+    relative), but the basename index (`build_node_index`) is tier-blind by
+    construction (`_basename_of_node_key` strips everything up to the last `/`, and
+    the `project:` discriminator sits before the final path segment) -- so a bare-name
+    join still finds the project node. This proves both halves of P2 at once: a
+    path-bearing operator-style ref would NOT resolve here (see the dedicated
+    node_key-disambiguation test below), while a basename ref still can."""
+    doc = _minimal_doc(extra_files=[
+        {"path": ".claude/rules/proj.md", "category": "project_rule", "words": 30, "lines": 700,
+         "tokens_est": 40, "evidence": "VERIFIED", "tier": "project"},
+    ])
+    doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
+    doc["instruction_length_flags"] = [
+        {"path": ".claude/rules/proj.md", "lines": 700, "threshold": 200, "evidence": "VERIFIED",
+         "tier": "project"},
+    ]
+    out_dir = tmp_path / "triple_treemap"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    decisions_file = out_dir / "decisions.jsonl"
+    decisions_file.write_text(json.dumps({"date": "2026-07-01", "component": "proj.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    weight = re.search(r'<section id="view-weight".*?</section>', text, re.S).group(0)
+    # exactly one project-tier cell exists in this fixture, so the FIRST (treemap)
+    # `tier-node tier-project` group is unambiguous and closes at its own `</g>`
+    g = re.search(r'<g class="tier-node tier-project">.*?</g>', weight, re.S)
+    assert g is not None
+    cell = g.group(0)
+    node_key = "always_loaded:project:.claude/rules/proj.md"
+    assert f'data-node-key="{node_key}"' in cell
+    assert re.search(r'class="cell-rect heatable fh\d"', cell)
+    assert 'class="length-crit-ring"' in cell
+    assert 'class="length-crit-marker"' in cell
+    # both the treemap AND ladder panels render this cell (T6's existing 2-ring invariant)
+    assert weight.count(f'data-node-key="{node_key}"') >= 2
+
+
+def test_tier_filter_triple_interaction_table_row_crit_and_project_survive_dim(tmp_path):
+    """Extends T6's table coverage gap (a row that is BOTH length-critical AND
+    project-tier was only indirectly tested there via the non-clobbering `border-left`
+    signal). Assert the `tr:has(.pill-critical)` crit background rule and the
+    `.tier-node.tier-project` dim-target class land on the SAME `<tr>` -- the crit
+    background is never overridden/removed by the tier dim, only uniformly faded
+    (opacity on the row, not a property collision)."""
+    doc = _minimal_doc()
+    doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
+    doc["instruction_length_flags"] = [
+        {"path": ".claude/skills/wide/SKILL.md", "lines": 700, "threshold": 200,
+         "evidence": "VERIFIED", "tier": "project"},
+    ]
+    out_dir = tmp_path / "triple_table"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    hyg = re.search(r'<section id="view-hygiene".*?</section>', text, re.S).group(0)
+    proj_row = re.search(r'<tr class="tier-node tier-project">.*?</tr>', hyg, re.S)
+    assert proj_row is not None
+    row = proj_row.group(0)
+    assert '.claude/skills/wide/SKILL.md' in row
+    assert 'class="pill pill-critical">critical</span>' in row
+    # the CSS invariant this row depends on for its crit signal to survive a tier dim:
+    # `tr:has(.pill-critical)` paints the background, `.tier-node.tier-project` is the
+    # dim-target class on the same element -- opacity fades both together, never
+    # strips the background rule itself.
+    assert "tr:has(.pill-critical){background:var(--crit-bg)}" in rh.STATIC_STYLE
+
+
+def test_tier_filter_roving_tabindex_js_present_in_rendered_script(tmp_path):
+    """The roving-tabindex mechanism (single tabstop, Arrow moves focus+tabindex+
+    selection together) must exist in the ACTUAL embedded script of a real render --
+    not merely in the Python source. Mirrors the existing `ArrowRight`/`ArrowLeft`
+    tablist assertion for `.view-switch`."""
+    doc = _minimal_doc()
+    doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
+    out_dir = tmp_path / "tier_roving_js"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "querySelector('.tier-filter')" in text
+    assert "setAttribute('tabindex'" in text
+    assert "tier-operator-only" in text and "tier-project-only" in text
+    assert "ArrowRight" in text and "ArrowLeft" in text and "ArrowUp" in text and "ArrowDown" in text
+
+
+def test_tier_filter_zero_inline_style_and_on_handlers_with_control_present(tmp_path):
+    doc = _minimal_doc()
+    doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
+    out_dir = tmp_path / "tier_filter_clean"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'class="tier-filter"' in text
+    p = _ExternalRefParser()
+    p.feed(text)
+    assert p.on_handlers == []
+    assert p.style_attrs == []
+    assert p.tag_counts.get("style", 0) == 1
+    import re
+    exe_scripts = re.findall(r'<script(?![^>]*type="application/json")[^>]*>', text)
+    assert len(exe_scripts) == 1
+    m = re.search(r"style-src 'sha256-([^']+)'; script-src 'sha256-([^']+)'", text)
+    assert m.group(1) == rh._csp_hash(rh.STATIC_STYLE)
+    assert m.group(2) == rh._csp_hash(rh.STATIC_SCRIPT)
+
+
+def test_byte_determinism_with_tier_filter_and_triple_interaction_across_pythonhashseed(tmp_path):
+    # T12: real `project_rule` category + real `.claude/rules/` path (see the sibling
+    # triple-interaction test above for why -- the synthetic `category: "rule"` /
+    # `rules/proj.md` shape this test used pre-T12 never exercised the P1/P2 fixes).
+    doc = _minimal_doc(extra_files=[
+        {"path": ".claude/rules/proj.md", "category": "project_rule", "words": 30, "lines": 700,
+         "tokens_est": 40, "evidence": "VERIFIED", "tier": "project"},
+    ])
+    doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
+    doc["instruction_length_flags"] = [
+        {"path": ".claude/rules/proj.md", "lines": 700, "threshold": 200, "evidence": "VERIFIED",
+         "tier": "project"},
+    ]
+    out_dir = tmp_path / "tier_filter_det"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    decisions_file = out_dir / "decisions.jsonl"
+    decisions_file.write_text(json.dumps({"date": "2026-07-01", "component": "proj.md"}) + "\n")
+    outs = []
+    for seed in ("0", "1"):
+        p = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions_file),
+                       env={**os.environ, "PYTHONHASHSEED": seed})
+        assert p.returncode == 0, p.stderr
+        outs.append((out_dir / "harness-map-2026-07-15.html").read_bytes())
+    assert outs[0] == outs[1]
+
+
+def test_tier_filter_tokens_use_existing_theme_vars_no_new_theme_debt():
+    """The dim/control CSS reuses existing tokens (`--muted`, `--surface-2`, `--ink`,
+    `--line`) that are already defined for both light and dark -- no NEW token was
+    introduced that would need its own light/dark duplication (regression guard
+    against silently shipping a light-only or dark-only color)."""
+    import re
+    style = rh.STATIC_STYLE
+    filter_rule = re.search(r"\.tier-filter\{[^}]*\}", style).group(0)
+    btn_rule = re.search(r"button\.tier-filter-btn\{[^}]*\}", style).group(0)
+    checked_rule = re.search(r'button\.tier-filter-btn\[aria-checked="true"\]\{[^}]*\}', style).group(0)
+    assert "var(--line)" in filter_rule
+    assert "var(--muted)" in btn_rule
+    assert "var(--surface-2)" in checked_rule and "var(--ink)" in checked_rule
+
+
+# ============================================================= 12b. project-tier category + node_key
+# fixes (T12). `_walk_project_tier` (collector.py) emits three real always-loaded
+# categories -- `project_rule`, `project_claude_local_md`, `project_claude_md_nested`
+# -- that T6/T7's own tests never used (they hand-crafted `category: "rule"` instead,
+# which happened to already be in `ALWAYS_CATEGORIES`), so the P1 gap (the real
+# categories missing from the allowlist) slipped through. Real category names +
+# real project-relative path shapes (`.claude/rules/*.md`, matching
+# `_project_file_entry`) throughout this section, per the same lesson.
+def test_always_categories_extended_with_three_project_tier_entries():
+    cats = dict(rh.ALWAYS_CATEGORIES)
+    assert cats["project_rule"] == "Project rules"
+    assert cats["project_claude_local_md"] == "CLAUDE.local.md"
+    assert cats["project_claude_md_nested"] == "CLAUDE.md (nested)"
+    # still a FIXED tuple (§4.4 determinism -- never sorted(set(...)))
+    assert isinstance(rh.ALWAYS_CATEGORIES, tuple)
+    assert len(rh.ALWAYS_CATEGORIES) == 9
+
+
+def test_al_node_key_operator_unchanged_project_gets_tier_segment():
+    """Direct unit coverage of the P2 fix's core function: operator format is
+    byte-identical to pre-T12 (`tier` absent or "operator"); project gains the
+    `project:` discriminator; an unrecognized/untrusted tier value (T3's threat
+    model -- an adversarial sidecar could carry anything) defaults safely to
+    operator, never lets an arbitrary string ride into the node_key."""
+    assert rh._al_node_key("CLAUDE.md") == "always_loaded:CLAUDE.md"
+    assert rh._al_node_key("CLAUDE.md", "operator") == "always_loaded:CLAUDE.md"
+    assert rh._al_node_key("CLAUDE.md", "project") == "always_loaded:project:CLAUDE.md"
+    assert rh._al_node_key("CLAUDE.md", "bogus-tier") == "always_loaded:CLAUDE.md"
+
+
+def test_project_tier_categories_render_as_treemap_cells_and_ladder_rows(tmp_path):
+    """P1 fix, end-to-end: a compose fixture carrying all three previously-missing
+    real categories -- each must render exactly twice (treemap cell + ladder row,
+    T6's existing 2-ring invariant), wrapped `tier-node tier-project` (accent, never
+    muted operator)."""
+    doc = _minimal_doc(extra_files=[
+        {"path": ".claude/rules/proj-rule.md", "category": "project_rule", "words": 10,
+         "lines": 20, "tokens_est": 15, "evidence": "VERIFIED", "tier": "project"},
+        {"path": "CLAUDE.local.md", "category": "project_claude_local_md", "words": 10,
+         "lines": 20, "tokens_est": 16, "evidence": "VERIFIED", "tier": "project"},
+        {"path": "sub/CLAUDE.md", "category": "project_claude_md_nested", "words": 10,
+         "lines": 20, "tokens_est": 17, "evidence": "VERIFIED", "tier": "project"},
+    ])
+    out_dir = tmp_path / "project_categories"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    weight = re.search(r'<section id="view-weight".*?</section>', text, re.S).group(0)
+    for path in (".claude/rules/proj-rule.md", "CLAUDE.local.md", "sub/CLAUDE.md"):
+        node_key = f"always_loaded:project:{path}"
+        assert weight.count(f'data-node-key="{node_key}"') == 2, path
+        g = re.search(r'<g class="tier-node tier-project">.*?data-node-key="' +
+                       re.escape(node_key) + r'".*?</g>', weight, re.S)
+        assert g is not None, f"{path} not wrapped tier-node tier-project"
+
+
+def test_operator_and_project_claude_md_get_distinct_node_keys(tmp_path):
+    """P2 fix: operator `CLAUDE.md` (category `claude_md`) and project `CLAUDE.md`
+    (category `project_claude_md`) both give `path == "CLAUDE.md"` -- pre-T12 both
+    produced the identical `data-node-key="always_loaded:CLAUDE.md"`."""
+    doc = _minimal_doc(extra_files=[
+        {"path": "CLAUDE.md", "category": "project_claude_md", "words": 10, "lines": 20,
+         "tokens_est": 18, "evidence": "VERIFIED", "tier": "project"},
+    ])
+    out_dir = tmp_path / "claude_md_collision"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    weight = re.search(r'<section id="view-weight".*?</section>', text, re.S).group(0)
+    assert weight.count('data-node-key="always_loaded:CLAUDE.md"') == 2
+    assert weight.count('data-node-key="always_loaded:project:CLAUDE.md"') == 2
+
+
+def test_friction_join_matches_operator_claude_md_not_project_counterpart(tmp_path):
+    """Regression guard: with BOTH an operator and project CLAUDE.md present, a
+    friction decision naming the bare `CLAUDE.md` basename must heat ONLY the
+    operator node -- the project node (same basename, different tier, and now a
+    DISTINCT node_key per P2) must never pick up the same heat via node_key
+    collision (the pre-T12 bug) -- proving the friction-join stays operator-only and
+    correctly attributed once tiers are disambiguated."""
+    doc = _minimal_doc(extra_files=[
+        {"path": "CLAUDE.md", "category": "project_claude_md", "words": 10, "lines": 20,
+         "tokens_est": 18, "evidence": "VERIFIED", "tier": "project"},
+    ])
+    out_dir = tmp_path / "friction_no_cross_tier"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    decisions_file = out_dir / "decisions.jsonl"
+    decisions_file.write_text(json.dumps({"date": "2026-07-01", "component": "CLAUDE.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15", "--decisions-file", str(decisions_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    weight = re.search(r'<section id="view-weight".*?</section>', text, re.S).group(0)
+    op_title = re.search(r'data-node-key="always_loaded:CLAUDE\.md"><title>([^<]*)</title>', weight)
+    proj_title = re.search(r'data-node-key="always_loaded:project:CLAUDE\.md"><title>([^<]*)</title>',
+                            weight)
+    assert op_title is not None and proj_title is not None
+    assert "churn: 1 friction record" in op_title.group(1)
+    assert "churn: none recorded" in proj_title.group(1)
+
+
+def test_non_compose_doc_emits_no_project_tier_markup_for_new_categories(tmp_path):
+    """Non-compose byte-identical, in spirit (C15): a sidecar with zero project-tier
+    files must emit zero `tier-project`/`project:`-keyed markup for the 3 new
+    categories -- `_tokens_treemap`'s existing `if tokens <= 0: continue` skip means
+    an empty category never produces a group or a cell."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "non_compose_new_categories"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    # `tier-project` alone is too broad -- it's a static CSS class/token name present
+    # in every render (`.tier-node.tier-project{...}`, `--tier-project` custom
+    # property) regardless of doc content; the actual per-node markup is the quoted
+    # `class="tier-node tier-project"` wrapper, which only a real project-tier cell
+    # emits.
+    assert 'class="tier-node tier-project"' not in text
+    assert "always_loaded:project:" not in text
+
+
+def test_project_categories_render_clean_csp_and_light_dark(tmp_path):
+    doc = _minimal_doc(extra_files=[
+        {"path": ".claude/rules/proj-rule.md", "category": "project_rule", "words": 10,
+         "lines": 20, "tokens_est": 15, "evidence": "VERIFIED", "tier": "project"},
+    ])
+    out_dir = tmp_path / "project_categories_clean"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    p = _ExternalRefParser()
+    p.feed(text)
+    assert p.on_handlers == []
+    assert p.style_attrs == []
+    assert p.tag_counts.get("style", 0) == 1
+    import re
+    exe_scripts = re.findall(r'<script(?![^>]*type="application/json")[^>]*>', text)
+    assert len(exe_scripts) == 1
+    m = re.search(r"style-src 'sha256-([^']+)'; script-src 'sha256-([^']+)'", text)
+    assert m.group(1) == rh._csp_hash(rh.STATIC_STYLE)
+    assert m.group(2) == rh._csp_hash(rh.STATIC_SCRIPT)
+    assert "prefers-color-scheme: dark" in rh.STATIC_STYLE
+
+
+def test_project_categories_byte_identical_across_pythonhashseed(tmp_path):
+    doc = _minimal_doc(extra_files=[
+        {"path": ".claude/rules/proj-rule.md", "category": "project_rule", "words": 10,
+         "lines": 20, "tokens_est": 15, "evidence": "VERIFIED", "tier": "project"},
+        {"path": "CLAUDE.local.md", "category": "project_claude_local_md", "words": 10,
+         "lines": 20, "tokens_est": 16, "evidence": "VERIFIED", "tier": "project"},
+        {"path": "sub/CLAUDE.md", "category": "project_claude_md_nested", "words": 10,
+         "lines": 20, "tokens_est": 17, "evidence": "VERIFIED", "tier": "project"},
+    ])
+    out_dir = tmp_path / "project_categories_det"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    outs = []
+    for seed in ("0", "1"):
+        p = run_render(out_dir, "--date", "2026-07-15", "--no-friction",
+                       env={**os.environ, "PYTHONHASHSEED": seed})
+        assert p.returncode == 0, p.stderr
+        outs.append((out_dir / "harness-map-2026-07-15.html").read_bytes())
+    assert outs[0] == outs[1]
+
+
+def test_maximal_two_tier_fixture_end_to_end_render(fake_harness, tmp_path):
+    """T9 built `_build_two_tier_maximal_fixture` as ONE end-to-end exercise and
+    consumed it at the collector-doc layer (`test_maximal_two_tier_fixture_end_to_end_
+    collector_doc`, test_collector.py) but never wrote the matching render-layer
+    assertion here -- exactly the P1/P2 gap this task closes: the fixture's real
+    project rule (`.claude/rules/only-project.md`) would have been silently dropped
+    from the treemap/ladder pre-fix (P1), and its project `CLAUDE.md` would have
+    collided node_keys with the operator's `CLAUDE.md` pre-fix (P2). Runs the REAL
+    collector (`--compose`) over the REAL fixture and feeds its actual output
+    straight to the renderer -- no hand-crafted doc anywhere in this test."""
+    proj, home = _build_two_tier_maximal_fixture(fake_harness, tmp_path)
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    out_dir = tmp_path / "maximal_render"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    weight = re.search(r'<section id="view-weight".*?</section>', text, re.S).group(0)
+    # P1: the fixture's real project-only UNION rule (category `project_rule`)
+    # renders -- twice (treemap + ladder), tier-project wrapped
+    proj_rule_key = "always_loaded:project:.claude/rules/only-project.md"
+    assert weight.count(f'data-node-key="{proj_rule_key}"') == 2
+    assert re.search(r'<g class="tier-node tier-project">.*?data-node-key="' +
+                      re.escape(proj_rule_key) + r'".*?</g>', weight, re.S)
+    # P2: operator + project CLAUDE.md both render, with DISTINCT node_keys
+    assert weight.count('data-node-key="always_loaded:CLAUDE.md"') == 2
+    assert weight.count('data-node-key="always_loaded:project:CLAUDE.md"') == 2
+    # secret-safety end-to-end (T5's collector-doc leak test, T9 spec) also holds
+    # once this same fixture reaches the RENDER layer
+    for secret in _SECRET_SENTINELS:
+        assert secret not in text, f"raw secret leaked into rendered HTML: {secret}"
+
+
+# ============================================================= 13. Composed settings display (T7b)
+# T5's exact output shape (`doc["composed_settings"]`) as a STATIC dict literal — never a
+# live collector run, same insulation posture as `TIER_COMPOSITION_FIXTURE` above. The
+# "leaky" MCP server also carries raw `env`/`headers` keys T5 itself would NEVER emit
+# (only `env_keys`/`header_keys` NAME lists survive T5's own redaction) — this fixture
+# probes that the RENDER layer never touches those hypothetical raw fields either, even
+# if a malformed/hand-edited sidecar carried them.
+COMPOSED_SETTINGS_FIXTURE = {
+    "permissions": {"allow_count": 3, "deny_count": 1, "ask_count": 2, "evidence": "VERIFIED"},
+    "hooks": [
+        {"event": "PreToolUse", "matcher": "Bash", "command": "python3 hooks/op-hook.py",
+         "script": "hooks/op-hook.py", "exists": True, "tier": "user",
+         "source_file": "/fake/root/settings.json"},
+        {"event": "PostToolUse", "matcher": "Write", "command": "python3 ./hooks/proj-hook.py",
+         "script": "hooks/proj-hook.py", "exists": True, "tier": "project",
+         "source_file": "/fake/project/.claude/settings.json"},
+        {"event": "SessionStart", "matcher": None, "command": "echo local-only",
+         "script": None, "exists": None, "tier": "local",
+         "source_file": "/fake/project/.claude/settings.local.json"},
+    ],
+    "overrides": [
+        {"key": "model", "winning_tier": "local", "winning_value": "local-model",
+         "overridden_tiers": ["project", "user"]},
+        {"key": "env", "winning_tier": "project", "winning_value": ["EXTRA_KEY", "GITHUB_TOKEN"],
+         "overridden_tiers": ["user"]},
+    ],
+    "mcp": [
+        {"name": "quiet", "tier": "user", "source_file": "/fake/home/.claude.json",
+         "type": "http", "enabled": False, "env_keys": [], "header_keys": []},
+        {"name": "leaky", "tier": "local", "source_file": "/fake/home/.claude.json",
+         "type": "stdio", "enabled": True,
+         "env_keys": ["API_KEY"], "header_keys": ["Authorization"],
+         # T5 would NEVER emit these two raw fields — present here only to prove render
+         # structurally cannot leak them (it only ever reads env_keys/header_keys).
+         "env": {"API_KEY": "SECRET-render-leak-abc123"},
+         "headers": {"Authorization": "Bearer SECRET-render-leak-xyz789"}},
+    ],
+}
+
+
+def test_composed_mcp_servers_rendered_with_tier_enabled_and_key_names_no_secret_leak(tmp_path):
+    doc = _minimal_doc()
+    doc["composed_settings"] = COMPOSED_SETTINGS_FIXTURE
+    out_dir = tmp_path / "composed_mcp"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "MCP servers (composed)" in text
+    import re
+    mcp_card = re.search(
+        r'<div class="card"><h2>MCP servers \(composed\)</h2>.*?</ul></div>', text, re.S).group(0)
+    leaky = re.search(r'<li><span class="badge tier-src-local">.*?</li>', mcp_card, re.S).group(0)
+    assert "leaky" in leaky
+    assert '<span class="badge mcp-enabled">enabled</span>' in leaky
+    assert "API_KEY" in leaky and "Authorization" in leaky
+    quiet = re.search(r'<li><span class="badge tier-src-user">.*?</li>', mcp_card, re.S).group(0)
+    assert "quiet" in quiet
+    assert '<span class="badge mcp-disabled">disabled</span>' in quiet
+    assert "no env/header keys" in quiet
+    # mandatory leak assertion: the raw secret VALUES never reach the serialized HTML,
+    # even though this fixture deliberately carries them on the source dict.
+    assert "SECRET-render-leak-abc123" not in text
+    assert "SECRET-render-leak-xyz789" not in text
+
+
+def test_composed_hooks_rendered_tier_tagged_with_source_file(tmp_path):
+    doc = _minimal_doc()
+    doc["composed_settings"] = COMPOSED_SETTINGS_FIXTURE
+    out_dir = tmp_path / "composed_hooks"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Hooks (composed, all tiers)" in text
+    import re
+    hooks_card = re.search(
+        r'<div class="card"><h2>Hooks \(composed, all tiers\)</h2>.*?</ul></div>', text, re.S).group(0)
+    for tier, event, source in (
+        ("user", "PreToolUse", "/fake/root/settings.json"),
+        ("project", "PostToolUse", "/fake/project/.claude/settings.json"),
+        ("local", "SessionStart", "/fake/project/.claude/settings.local.json"),
+    ):
+        row = re.search(rf'<li><span class="badge tier-src-{tier}">.*?</li>', hooks_card, re.S).group(0)
+        assert event in row
+        assert source in row
+    # the pre-existing operator-only wiring card is untouched, still present alongside
+    assert "Registered hooks (settings.json)" in text
+
+
+def test_composed_permissions_union_counts_rendered(tmp_path):
+    doc = _minimal_doc()
+    doc["composed_settings"] = COMPOSED_SETTINGS_FIXTURE
+    out_dir = tmp_path / "composed_perms"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Permissions (composed, union)" in text
+    assert "allow 3" in text and "deny 1" in text and "ask 2" in text
+
+
+def test_composed_overrides_rendered_with_allowlisted_key_and_winning_tier(tmp_path):
+    doc = _minimal_doc()
+    doc["composed_settings"] = COMPOSED_SETTINGS_FIXTURE
+    out_dir = tmp_path / "composed_overrides"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Settings overrides (composed)" in text
+    import re
+    overrides_card = re.search(
+        r'<div class="card"><h2>Settings overrides \(composed\)</h2>.*?</ul></div>', text, re.S).group(0)
+    model_row = re.search(r'<li><span class="badge tier-src-local">.*?model.*?</li>',
+                          overrides_card, re.S).group(0)
+    assert "local-model" in model_row
+    assert "overrides: project, user" in model_row
+    env_row = re.search(r'<li><span class="badge tier-src-project">.*?env.*?</li>',
+                        overrides_card, re.S).group(0)
+    assert "EXTRA_KEY, GITHUB_TOKEN" in env_row
+    assert "overrides: user" in env_row
+
+
+def test_composed_overrides_body_hides_malformed_non_scalar_winning_value():
+    """P1-C (renderer half): collector.py's `_settings_override_safe_value` only ever
+    emits a safe SCALAR `winning_value` (or None + a `value_kind` marker for a complex/
+    oversized one) — but the RENDERER must defend independently, never trusting that
+    upstream invariant blindly. A hand-crafted/malformed sidecar carrying a raw dict
+    straight through `winning_value` (no `value_kind` marker at all) must never reach
+    the emitted HTML verbatim."""
+    overrides = [
+        {"key": "model", "winning_tier": "local",
+         "winning_value": {"token": "SECRET_SENTINEL"}, "overridden_tiers": ["user"]},
+    ]
+    html = rh._render_composed_overrides_body(overrides)
+    assert "SECRET_SENTINEL" not in html
+    assert "(complex value hidden)" in html
+
+
+def test_composed_overrides_body_hides_value_kind_marked_records():
+    """The collector's OWN `value_kind` marker (`"complex"`/`"redacted"`) must also be
+    honored, rendering the documented placeholder instead of the (already-None)
+    `winning_value`."""
+    overrides = [
+        {"key": "model", "winning_tier": "local", "winning_value": None,
+         "value_kind": "complex", "overridden_tiers": ["user"]},
+        {"key": "model", "winning_tier": "project", "winning_value": None,
+         "value_kind": "redacted", "overridden_tiers": ["user"]},
+    ]
+    html = rh._render_composed_overrides_body(overrides)
+    assert "(complex value hidden)" in html
+    assert "(redacted)" in html
+
+
+def test_composed_overrides_body_still_renders_normal_scalar_and_env_list_values():
+    """Regression pin: the P1-C defensive re-check must not break the two LEGITIMATE
+    shapes the collector actually emits -- a plain scalar (`model`) and the special-
+    cased `env` override's list of key NAMES (never values)."""
+    overrides = [
+        {"key": "model", "winning_tier": "local", "winning_value": "local-model",
+         "overridden_tiers": ["project"]},
+        {"key": "env", "winning_tier": "project", "winning_value": ["EXTRA_KEY", "GITHUB_TOKEN"],
+         "overridden_tiers": ["user"]},
+    ]
+    html = rh._render_composed_overrides_body(overrides)
+    assert "local-model" in html
+    assert "EXTRA_KEY, GITHUB_TOKEN" in html
+
+
+def test_composed_overrides_body_renders_genuine_json_null_as_null():
+    """P3 defect fix: when a settings override has a genuine JSON `null` winning value
+    (no `value_kind` marker), the renderer should display `null` (matching the JSON
+    source) instead of the Python string `None`. Regression guards: a value_kind-marked
+    record must still show its placeholder, and normal scalars must still work."""
+    overrides = [
+        # The defect case: genuine JSON null → should render as `null`
+        {"key": "model", "winning_tier": "local", "winning_value": None,
+         "overridden_tiers": ["user"]},
+        # Regression: value_kind marker should still work
+        {"key": "other", "winning_tier": "project", "winning_value": None,
+         "value_kind": "complex", "overridden_tiers": ["user"]},
+        # Regression: normal scalar should still work
+        {"key": "cleanup", "winning_tier": "local", "winning_value": "opus",
+         "overridden_tiers": ["user"]},
+        # Regression: False/0/"" should NOT be treated as null
+        {"key": "enabled", "winning_tier": "local", "winning_value": False,
+         "overridden_tiers": []},
+    ]
+    html = rh._render_composed_overrides_body(overrides)
+    # Check the defect case: should have `null` not `None`
+    assert "model = null" in html, f"Expected 'model = null' in HTML but got: {html}"
+    assert "model = None" not in html, f"Found 'model = None' (Python repr) in HTML: {html}"
+    # Regression: value_kind marker should still show placeholder
+    assert "(complex value hidden)" in html
+    # Regression: normal scalar should still work
+    assert "cleanup = opus" in html
+    # Regression: False should render as false (JSON), not treated as null
+    assert "enabled = false" in html or "enabled = False" in html
+
+
+def test_composed_settings_section_absent_without_composed_settings_key(tmp_path):
+    """C15 back-compat, mirroring T6's `tier_composition` gate: an old-shape sidecar
+    (no `composed_settings` key at all) renders with zero errors and the whole
+    composed-settings section — every one of its four cards — is simply absent, never
+    a KeyError, never a stray empty card."""
+    doc = _minimal_doc()
+    assert "composed_settings" not in doc
+    out_dir = tmp_path / "composed_settings_absent"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Composed settings (compose mode)" not in text
+    assert "MCP servers (composed)" not in text
+    assert "Hooks (composed, all tiers)" not in text
+    assert "Permissions (composed, union)" not in text
+    assert "Settings overrides (composed)" not in text
+    # the `tier-src-*` badge CSS rules are static (always in the stylesheet); what must
+    # be absent is any ELEMENT actually wearing one -- the attribute-value pattern never
+    # appears in CSS selector syntax, only in a rendered `class="..."` attribute.
+    assert 'class="badge tier-src-' not in text
+
+
+def test_composed_settings_badge_css_defined_once_no_new_theme_debt():
+    """The four `tier-src-*`/`mcp-*` badge rules reuse existing themed CSS variables
+    (`--tier-operator*`, `--tier-project*`, `--accent-2`, `--good`, `--crit` — every one
+    already defined for both light and dark) rather than introducing a new bare color,
+    and each selector is written exactly once (not duplicated per theme block, matching
+    how `.badge.tier-project` etc. are already written once and rely on `var()` for
+    theming)."""
+    style = rh.STATIC_STYLE
+    for selector in (".badge.tier-src-user{", ".badge.tier-src-project{",
+                     ".badge.tier-src-local{", ".badge.mcp-enabled{", ".badge.mcp-disabled{"):
+        assert style.count(selector) == 1
+    assert ".badge.tier-src-local{border-color:var(--accent-2);color:var(--accent-2)}" in style
+
+
+def test_one_executable_script_and_csp_hash_reconciles_with_composed_settings(tmp_path):
+    doc = _minimal_doc()
+    doc["composed_settings"] = COMPOSED_SETTINGS_FIXTURE
+    out_dir = tmp_path / "composed_csp"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    p = _ExternalRefParser()
+    p.feed(text)
+    assert p.tag_counts.get("style", 0) == 1
+    assert p.on_handlers == []
+    assert p.style_attrs == []
+    import re
+    exe_scripts = re.findall(r'<script(?![^>]*type="application/json")[^>]*>', text)
+    assert len(exe_scripts) == 1
+    m = re.search(r"style-src 'sha256-([^']+)'; script-src 'sha256-([^']+)'", text)
+    assert m is not None
+    assert m.group(1) == rh._csp_hash(rh.STATIC_STYLE)
+    assert m.group(2) == rh._csp_hash(rh.STATIC_SCRIPT)
+
+
+def test_byte_determinism_with_composed_settings_across_pythonhashseed(tmp_path):
+    doc = _minimal_doc()
+    doc["composed_settings"] = COMPOSED_SETTINGS_FIXTURE
+    out_dir = tmp_path / "composed_det"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    outs = []
+    for seed in ("0", "1"):
+        p = run_render(out_dir, "--date", "2026-07-15", "--no-friction",
+                       env={**os.environ, "PYTHONHASHSEED": seed})
+        assert p.returncode == 0, p.stderr
+        outs.append((out_dir / "harness-map-2026-07-15.html").read_bytes())
+    assert outs[0] == outs[1]
+
+
+# ============================================================= 14. T13 QA-finding fixes
+# F1: dup-web tier filter was dead (build_dupweb_model discarded a_tier/b_tier; the
+# pairs table had no tier-node wrapper). F2: render_html.main()'s write guard only
+# checked the operator root. F3: out_of_root_refs/inspected_roots/excluded_count were
+# collected but rendered nowhere.
+
+def test_build_dupweb_model_threads_tier_and_raw_path():
+    doc = _minimal_doc()
+    doc["duplication"] = {"shingle_k": 8, "metric": "containment", "threshold": 0.6,
+                           "pairs": [{"a": "rules/a.md", "b": ".claude/rules/x.md", "score": 0.9,
+                                      "shared_sample": "shared words", "evidence": "INFERRED",
+                                      "a_tier": "operator", "b_tier": "project"}]}
+    model = rh.build_dupweb_model(doc)
+    edge = model["edges"][0]
+    # existing node_key fields ("a"/"b") are UNTOUCHED (`_dup_node_key` is still called
+    # WITHOUT a tier arg, exactly as pre-F1 — an existing consumer, _collect_node_keys /
+    # the markdown export, still reads them that way; node_key tier-disambiguation for
+    # dup-web is an explicitly separate, out-of-scope concern per _dup_node_key's own
+    # docstring).
+    assert edge["a"] == "always_loaded:rules/a.md"
+    assert edge["b"] == "dup:.claude/rules/x.md"
+    # new fields carry the raw path + normalized tier
+    assert edge["a_path"] == "rules/a.md"
+    assert edge["b_path"] == ".claude/rules/x.md"
+    assert edge["a_tier"] == "operator"
+    assert edge["b_tier"] == "project"
+
+
+def test_build_dupweb_model_defaults_tier_operator_when_absent():
+    # C15 back-compat: a non-compose/pre-tier pair carries no a_tier/b_tier at all.
+    doc = _minimal_doc()
+    model = rh.build_dupweb_model(doc)
+    edge = model["edges"][0]
+    assert edge["a_tier"] == "operator"
+    assert edge["b_tier"] == "operator"
+
+
+def test_dupweb_cross_tier_pair_row_tagged_project_with_human_path_and_badge(tmp_path):
+    doc = _minimal_doc()
+    doc["duplication"] = {"shingle_k": 8, "metric": "containment", "threshold": 0.6,
+                           "pairs": [{"a": "rules/operator-only.md", "b": ".claude/rules/proj-dup.md",
+                                      "score": 0.9, "shared_sample": "dup words", "evidence": "INFERRED",
+                                      "a_tier": "operator", "b_tier": "project"}]}
+    out_dir = tmp_path / "dupweb_cross_tier"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    hyg = re.search(r'<section id="view-hygiene".*?</section>', text, re.S).group(0)
+    row = re.search(r'<tr class="tier-node tier-project">.*?</tr>', hyg, re.S)
+    assert row is not None, "cross-tier dup pair must be tagged tier-project (one endpoint is project)"
+    row_html = row.group(0)
+    # human-readable RAW paths, never the internal node-key strings
+    assert "rules/operator-only.md" in row_html
+    assert ".claude/rules/proj-dup.md" in row_html
+    assert "always_loaded:project:" not in row_html
+    assert "dup:" not in row_html
+    # project endpoint carries the standard project badge (color never the only signal)
+    assert '<span class="badge tier-project">project</span>' in row_html
+    # the tier filter's EXISTING generic dim rule already targets .tier-node.tier-project
+    # (asserted in test_tier_filter_dim_css_targets_wrapper_and_is_ordered_after_heat_css) —
+    # no new CSS needed; this proves the row actually wears that class in real output.
+    assert "body.tier-operator-only .tier-node.tier-project{opacity:.25}" in rh.STATIC_STYLE
+
+
+def test_dupweb_same_tier_pair_row_tagged_operator(tmp_path):
+    doc = _minimal_doc()
+    doc["duplication"] = {"shingle_k": 8, "metric": "containment", "threshold": 0.6,
+                           "pairs": [{"a": "rules/a.md", "b": "rules/b.md", "score": 0.9,
+                                      "shared_sample": "shared", "evidence": "INFERRED",
+                                      "a_tier": "operator", "b_tier": "operator"}]}
+    out_dir = tmp_path / "dupweb_same_tier"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    import re
+    hyg = re.search(r'<section id="view-hygiene".*?</section>', text, re.S).group(0)
+    row = re.search(r'<tr class="tier-node tier-operator">.*?rules/a\.md.*?</tr>', hyg, re.S)
+    assert row is not None
+    assert '<span class="badge tier-project">project</span>' not in row.group(0)
+
+
+def test_non_compose_dup_row_still_wears_operator_wrapper_no_new_markup_gate(tmp_path):
+    """Non-compose byte-identical, in spirit (C15): every treemap/ladder cell and the
+    length-flags table already wear an unconditional `tier-node tier-operator` wrapper
+    (T6) even outside compose mode — the dup table now matching that SAME established
+    convention is not new project-tier markup, only the badge/`tier-project` class is
+    gated on real project-tier data."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "dupweb_non_compose"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'class="tier-node tier-project"' not in text
+    assert "always_loaded:project:" not in text
+
+
+def test_render_out_dir_inside_project_containment_root_rejected_in_compose_mode(tmp_path):
+    """F2/F5: render_html.main()'s write guard used to check ONLY the operator root —
+    an --out-dir inside the composed PROJECT repo was not rejected, defeating H2 for
+    this entry point. Mirrors test_serve.py's
+    test_out_dir_inside_project_root_rejected_in_compose_mode."""
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    out_dir = proj / "leak-out"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = str(operator_root)
+    doc["inspected_roots"] = {"operator": str(operator_root.resolve()),
+                              "project_containment": str(proj.resolve()),
+                              "project_harness": str((proj / ".claude").resolve())}
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode != 0
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+
+
+def test_render_out_dir_outside_both_roots_accepted_in_compose_mode(tmp_path):
+    operator_root = tmp_path / "operator"
+    operator_root.mkdir()
+    proj = tmp_path / "projroot"
+    proj.mkdir()
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = str(operator_root)
+    doc["inspected_roots"] = {"operator": str(operator_root.resolve()),
+                              "project_containment": str(proj.resolve()),
+                              "project_harness": str((proj / ".claude").resolve())}
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    assert (out_dir / "harness-map-2026-07-15.html").is_file()
+
+
+def test_render_non_compose_out_dir_guard_unaffected_by_f2_change(tmp_path):
+    """A non-compose (no inspected_roots) sidecar must skip the new compose-only
+    project-root check entirely and still be governed only by write_html_safely's
+    existing operator-root guard — this is the SAME scenario
+    test_write_html_safely_refuses_inside_harness_root already covers; re-asserted
+    here to pin that the F2 change didn't alter non-compose behavior."""
+    fake_root = tmp_path / "fakeclaude"
+    fake_root.mkdir()
+    out_dir = fake_root / "reports"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = str(fake_root)
+    assert "inspected_roots" not in doc
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode != 0
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+
+
+def test_out_of_root_refs_card_renders_untrusted_refs_esc_html(tmp_path):
+    doc = _minimal_doc()
+    doc["inspected_roots"] = {"operator": "/fake/op", "project_containment": "/fake/proj",
+                              "project_harness": "/fake/proj/.claude"}
+    doc["out_of_root_refs"] = [
+        {"name": ".claude/rules/evil.md", "target": "/etc/<script>passwd</script>", "trusted": False},
+    ]
+    out_dir = tmp_path / "oor_card"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Out-of-root refs (1)" in text
+    assert ".claude/rules/evil.md" in text
+    # the untrusted target is esc_html'd — no raw unescaped tag reaches the HTML
+    assert "<script>passwd</script>" not in text
+    assert "&lt;script&gt;passwd&lt;/script&gt;" in text
+    assert '<span class="badge tier-dark">untrusted</span>' in text
+
+
+def test_out_of_root_refs_card_absent_without_inspected_roots(tmp_path):
+    doc = _minimal_doc()
+    assert "inspected_roots" not in doc and "out_of_root_refs" not in doc
+    out_dir = tmp_path / "oor_absent"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Out-of-root refs" not in text
+
+
+def test_transparency_note_present_in_compose_with_excluded_count_and_roots(tmp_path):
+    doc = _minimal_doc()
+    doc["inspected_roots"] = {"operator": "/fake/op", "project_containment": "/fake/proj",
+                              "project_harness": "/fake/proj/.claude"}
+    doc["always_loaded"]["totals"]["excluded_count"] = 3
+    out_dir = tmp_path / "transparency_present"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="weight-transparency-note"' in text
+    assert "3 file(s) excluded from weight" in text
+    assert "roots walked:" in text
+    assert "operator" in text and "project" in text
+
+
+def test_transparency_note_distinguishes_absent_from_zero_excluded_count(tmp_path):
+    doc = _minimal_doc()
+    doc["inspected_roots"] = {"operator": "/fake/op", "project_containment": "/fake/proj",
+                              "project_harness": "/fake/proj/.claude"}
+    doc["always_loaded"]["totals"]["excluded_count"] = 0
+    out_dir = tmp_path / "transparency_zero"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "0 file(s) excluded from weight" in text
+    assert "not measured" not in text
+
+
+def test_transparency_note_reports_not_measured_when_excluded_count_key_absent(tmp_path):
+    doc = _minimal_doc()
+    doc["inspected_roots"] = {"operator": "/fake/op", "project_containment": "/fake/proj",
+                              "project_harness": "/fake/proj/.claude"}
+    assert "excluded_count" not in doc["always_loaded"]["totals"]
+    out_dir = tmp_path / "transparency_not_measured"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "weight-exclusion count not measured" in text
+    assert "excluded from weight" not in text
+
+
+def test_transparency_note_absent_in_non_compose(tmp_path):
+    doc = _minimal_doc()
+    assert "inspected_roots" not in doc
+    out_dir = tmp_path / "transparency_absent"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="weight-transparency-note"' not in text
+    assert "roots walked:" not in text

@@ -30,7 +30,7 @@ Top-level keys are ALL present on every run. When a category has no data, its ar
     "orphan_registration_count": 0, "orphan_script_count": 0
   },
   "always_loaded": {
-    "files": [{"path": "rel", "category": "claude_md|project_claude_md|memory|rule|coding_team_rule|skill_rule",
+    "files": [{"path": "rel", "category": "claude_md|project_claude_md|project_claude_local_md|project_claude_md_nested|memory|rule|project_rule|coding_team_rule|skill_rule",
                "words": 0, "lines": 0, "tokens_est": 0, "evidence": "VERIFIED|INACCESSIBLE"}],
     "conditional_variants": [{"path": "rel", "project_slug": "", "words": 0, "lines": 0,
                               "tokens_est": 0, "evidence": "VERIFIED"}],
@@ -78,6 +78,59 @@ Top-level keys are ALL present on every run. When a category has no data, its ar
 }
 ```
 
+### Compose-mode-only fields (`--compose`, additive)
+
+When `--compose` is set, the collector emits these ADDITIONAL fields on top of everything in (A) above. They are ABSENT (not present-and-empty) on a non-compose run, so a consumer can tell "not measured" from "measured, zero." All are additive — `schema_version` stays `1`, no existing consumer shape changed.
+
+```jsonc
+{
+  "inspected_roots": {"operator": "<abs path>", "project_containment": "<abs path|null>",
+                       "project_harness": "<abs path|null>"},
+  "out_of_root_refs": [{"name": "rel", "target": "<raw readlink() string, else best-effort realpath>",
+                        "trusted": false}],
+  "tier_composition": {
+    "nodes": [{"surface": "skill|command|agent|rule|claude_md|hook", "name": "", "tier": "operator|project",
+               "path": "rel" /* repo-relative for file-backed surfaces; an inline hook with no
+                    script file carries its raw command string here instead */, "status": "effective|shadowed",
+               "shadowed_by": {"tier": "operator|project", "path": "rel"} /* | null */}],
+    /* shadow surfaces: skill, command (operator wins), agent (project wins).
+       union surfaces (never shadowed/dark): rule, claude_md, hook — every project entry is an add.
+       node `tier` is ALWAYS the binary operator|project (settings-derived nodes normalize
+       the 3-way user/project/local tier: user->operator, project/local->project). */
+    "surfaces": {"<surface>": {"merge": "union|shadow", "winner_tier": "operator|project|null",
+                                "adds": 0, "overrides": 0, "dark": 0}},
+    "participating_surfaces": ["agent", "claude_md", "command", "hook", "rule", "skill"]
+  },
+  "composed_settings": {
+    "permissions": {"allow_count": 0, "deny_count": 0, "ask_count": 0, "evidence": "VERIFIED|INACCESSIBLE"},
+    "hooks": [{"event": "", "matcher": "<raw settings value — typically a str, null when the hook
+                    omits its matcher; reported verbatim since this is a faithful read-only mirror
+                    of settings.json, not a normalizer>", "command": "", "script": "rel|null",
+               "exists": true /* |false|null */, "tier": "user|project|local", "source_file": "<abs path|null>"}],
+    "overrides": [{"key": "", "winning_tier": "user|project|local",
+                   "winning_value": "<scalar | [env-key names] | null>" /* null when the winning value is
+                       non-scalar or an oversized string — the raw value is NEVER emitted (secret-safe) */,
+                   "value_kind": "complex|redacted" /* present ONLY when winning_value is null:
+                       "complex" = non-scalar (dict/list) value hidden; "redacted" = oversized string hidden */,
+                   "overridden_tiers": ["user|project|local", "..."]}],
+    "mcp": [{"name": "", "tier": "user|project|local", "source_file": "<abs path|null>", "type": "<str|null>",
+             "enabled": true, "env_keys": ["<NAME only>"], "header_keys": ["<NAME only>"]}]
+  }
+}
+```
+
+These compose-only additions live INSIDE existing (A) arrays rather than as new top-level keys: every `always_loaded.files[]` entry AND every `conditional_variants[]` entry gains `tier` (`"operator"|"project"`), and every `duplication.pairs[]` entry gains `a_tier`/`b_tier` (`"operator"|"project"`) once the corpus runs cross-tier.
+
+- **`inspected_roots`** — names the three roots a compose run walked (the plan's "Three roots": operator-scan-root, project-containment-root, project-harness-root = `project_containment/.claude`) — today's plain `doc["root"]` is operator-scan-root only, so this is what makes a compose run's full input surface explicit.
+- **`out_of_root_refs`** — every project-tier path (file OR dir) whose symlink realpath escapes `project_containment` — NOT read, traversed, or excerpted; `trusted` is always `false` (the field exists so a future trusted-target case wouldn't need a shape change). Consumed by weight-honesty accounting (below) and by render's containment note.
+- **`tier_composition.nodes`** — the canonical tier-tagged node model for all six composed surfaces (skills/commands/agents/rules **plus** CLAUDE-files (`claude_md`) and hooks (`hook`)), one entry per (surface, tier) after per-surface shadow resolution; sorted `(path, tier)` for determinism. `tier` is ALWAYS the binary `"operator"|"project"` — settings-derived nodes (hooks) normalize the 3-way settings tier (`user`→`operator`, `project`/`local`→`project`) so a Local-tier project hook still counts as a project entry. `path` is repo-relative for file-backed surfaces; for a hook node with NO backing script file (an inline `command:` like `"echo local-only"`) `path` carries the command string instead. `status:"shadowed"` + a non-null `shadowed_by` marks a node that lost its surface's collision — a `tier:"project"` shadowed node is a **dark project skill/command** (only the shadow surfaces skills/commands can go dark; union surfaces never do), defined in the repo but never runs while the operator's (or, for agents, the user's) version wins.
+- **`tier_composition.surfaces`** — one rollup per participating surface: `merge` distinguishes **UNION** (CLAUDE.md/rules/hooks — both tiers load, `winner_tier: null`, every project entry is an `adds`, never `overrides`/`dark`) from **SHADOW** (skills/commands/agents — one winner per collision; `adds` = project entry with no operator collision, `overrides` = project won the collision, `dark` = project lost it). `winner_tier` names which tier wins a SHADOW surface's collision (`"operator"` for skills/commands, `"project"` for agents).
+- **`tier_composition.participating_surfaces`** — the alphabetically-sorted surface list the resolver covers (`agent`, `claude_md`, `command`, `hook`, `rule`, `skill`); render iterates this list rather than guessing which surfaces exist.
+- **`composed_settings`** — the settings/hooks/MCP compose chain, precedence **Local > Project > User** throughout. `permissions` UNIONS allow/deny/ask across all three tiers with deny winning any same-rule conflict (the one settings.json key that merges rather than overrides). `hooks` is a UNION (every matching hook fires regardless of tier) — each record keeps its own `tier` + `source_file` so a duplicate-looking hook is traceable to the file that registered it; `exists` is `null` when a project/local script's containment could not be verified (never silently treated as present or absent). `overrides` reports non-permission `settings.json` scalar-key winners through a small non-secret allowlist (`model`, `cleanupPeriodDays`, `sandbox`, `enabledPlugins`) plus an `env`-key-name-only special case — NEVER folded into `tier_composition`'s node adds/overrides counts, since this is scalar-key overriding, not node-surface shadowing. `mcp` lists server registrations from the three exact static projections (user `~/.claude.json:mcpServers`, local `~/.claude.json:projects[<repo>].mcpServers`, project `<repo>/.mcp.json:mcpServers`), SECRET-SAFE: `env_keys`/`header_keys` are names only, `command`/`url`/`args` are omitted entirely (a CLI arg list can legally carry an inline secret flag).
+- **`always_loaded.totals.excluded_count`** — compose-only weight-honesty count: out-of-root + inaccessible entries that would otherwise have contributed to always-loaded weight, captured as a delta around `walk_always_loaded` so nothing from later scans (duplication, node model, MCP) leaks in. Its presence (vs. absence) distinguishes "0 excluded, measured" from "not measured at all" — do not read an absent field as zero.
+- **`duplication.pairs[].a_tier` / `.b_tier`** — present only when `--compose` is set (duplication then runs across both tiers combined, per M4 — an operator rule duplicated by a project file is itself a signal). Tag order matches `a`/`b`, which are already sorted lexicographically as a pair, independent of tier.
+- **Two DISTINCT tier vocabularies — do not conflate them.** Node-level tags (`tier_composition.nodes[].tier`, `always_loaded.files[].tier`, `duplication.pairs[].a_tier`/`.b_tier`, `out_of_root_refs` implicitly) are the BINARY `"operator"|"project"` model tag. `composed_settings`'s `tier` fields (hooks, overrides, mcp) use a SEPARATE 3-way `"user"|"project"|"local"` vocabulary, because settings/MCP have a real Local-vs-Project distinction (`settings.local.json` vs `settings.json`, and `.claude.json`'s per-project `Local` entry vs `.mcp.json`'s `Project` entry) that skills/agents/commands don't — this is intentional, not an inconsistency.
+
 ### Field notes
 
 - **`headline`** — an eight-number rollup used as the diff unit between runs (see Note 3 below). Every field is a plain count, computed from the other sections.
@@ -92,7 +145,7 @@ Top-level keys are ALL present on every run. When a category has no data, its ar
 - **`promotion_candidates`** — prose in an instruction file that reads like a hard rule (`NEVER`, `ALWAYS`, `must`, a numeric cap, a required-file assertion) but has no corresponding hook enforcing it. `hook_covered` is `true` only when the collector matched it to an entry in `enforcement.hooks.registered`.
 - **`test_coverage`** — whether each hook script and each skill has an associated test, and the aggregate summary counts.
 - **`inaccessible`** — every path anywhere in the run that the collector attempted to read and could not, with the OS-level `reason`.
-- **`blind_spots`** — free-text notes on categories of content the collector structurally cannot see (e.g., runtime-only MCP server instructions, plugin-marketplace content not vendored locally).
+- **`blind_spots`** — free-text notes on categories of content the collector structurally cannot see (e.g., runtime-only MCP server instructions, plugin-marketplace content not vendored locally). In `--compose` mode one additional entry discloses that the per-file hygiene analyses (`instruction_length_flags`, staleness, `phantom_refs`, `promotion_candidates`, `test_coverage`, and the hooks-body duplication corpus) scan the **operator tier only** — project-tier files are NOT covered by them in v1, so a "0 project length flags" reading means "not scanned," not "clean." Full per-tier hygiene is deferred to v1.1.
 - **`errors`** — any collector-internal error encountered mid-run; a non-fatal error is recorded here and the run continues.
 
 ## (B) Synthesis report structures

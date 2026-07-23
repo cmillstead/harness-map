@@ -18,12 +18,18 @@ _collector = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_collector)
 _rel = _collector._rel
 
-def run_collector(root, *args, project_root=None):
+def run_collector(root, *args, project_root=None, env=None):
+    # `env` (T5): merged over the inherited os.environ (e.g. {"HOME": str(tmp_home)}) so
+    # a test can sandbox Path.home()-derived reads (collect_composed_mcp's ~/.claude.json)
+    # instead of depending on the real developer machine's file. `env=None` (the default)
+    # is passed straight through to subprocess.run, identical to every pre-T5 call site
+    # that omitted `env=` entirely (Popen's own default is "inherit the parent env").
     cmd = [sys.executable, str(COLLECTOR), "--root", str(root)]
     if project_root is not None:
         cmd += ["--project-root", str(project_root)]
     cmd += list(args)
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    run_env = dict(os.environ, **env) if env else None
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=run_env)
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
 
@@ -1492,3 +1498,1718 @@ def test_description_extraction_is_read_only(fake_harness):
     before = snap(fake_harness)
     run_collector(fake_harness)
     assert snap(fake_harness) == before   # no writes/mtime/path-set change under --root
+
+
+# ---------------------------------------------------------------------------
+# Task T2 — project-tier targeting: three-root walk + --compose flag + H1 suppression
+# ---------------------------------------------------------------------------
+
+# Regression pin (T2): default (--compose absent) collector output on `fake_harness`,
+# `generated_at`/`root` excluded (volatile) and the fixture's random project slug
+# normalized to `<SLUG>` (path-dependent — see conftest.project_slug), captured from the
+# collector BEFORE compose-mode support was added. Guards against any accidental
+# behavior change leaking into the default (operator-only) code path.
+_GOLDEN_NON_COMPOSE_DOC_JSON = '''{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill's rules dir) reflects the design's assertion and cannot be statically verified \\u2014 CC's actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan."], "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'''
+
+
+def test_non_compose_output_byte_identical_to_pre_change(fake_harness):
+    proj, slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, project_root=proj)
+    doc.pop("generated_at")
+    doc.pop("root")
+    blob = json.dumps(doc, sort_keys=True).replace(slug, "<SLUG>")
+    assert blob == _GOLDEN_NON_COMPOSE_DOC_JSON
+
+
+def test_non_compose_has_no_tier_or_inspected_roots_fields(fake_harness):
+    # tier/inspected_roots are additive-ONLY-in-compose-mode fields (P1-1) — their
+    # absence here is what test_non_compose_output_byte_identical_to_pre_change already
+    # pins structurally; this test names the specific invariant for a clearer failure.
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, project_root=proj)
+    assert "inspected_roots" not in doc
+    assert all("tier" not in f for f in doc["always_loaded"]["files"])
+    assert all("tier" not in v for v in doc["always_loaded"]["conditional_variants"])
+
+
+def test_compose_project_claude_md_counted_exactly_once_h1(fake_harness):
+    # H1: fake_harness registers the active project under root/projects/<slug>/memory/,
+    # so the LEGACY project_claude_md branch WOULD fire if not suppressed in compose mode
+    # (otherwise this test is vacuous — C20). Compose mode must emit the project
+    # CLAUDE.md exactly once, tier="project", never via the legacy branch too.
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    hits = [f for f in doc["always_loaded"]["files"] if f["category"] == "project_claude_md"]
+    assert len(hits) == 1
+    assert hits[0]["tier"] == "project"
+    assert hits[0]["path"] == "CLAUDE.md"
+
+
+def test_compose_operator_entries_tagged_tier_operator(fake_harness):
+    proj, slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    files = doc["always_loaded"]["files"]
+    root_claude = next(f for f in files if f["category"] == "claude_md")
+    assert root_claude["tier"] == "operator"
+    rule_a = next(f for f in files if f["path"] == "rules/a.md")
+    assert rule_a["tier"] == "operator"
+    active_memory = next(f for f in files if f["path"] == f"projects/{slug}/memory/MEMORY.md")
+    assert active_memory["tier"] == "operator"
+    memory_stub = next(f for f in files if f["path"] == "memory/MEMORY.md")
+    assert memory_stub["tier"] == "operator"
+
+
+def test_compose_conditional_variant_tagged_operator(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    variant = next(v for v in doc["always_loaded"]["conditional_variants"]
+                   if v["path"] == "projects/other-proj-slug/memory/MEMORY.md")
+    assert variant["tier"] == "operator"
+
+
+def test_compose_project_harness_rules_tagged_project(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True, exist_ok=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "x.md").write_text("Project rule body " * 10)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    rule = next(f for f in doc["always_loaded"]["files"] if f["category"] == "project_rule")
+    assert rule["path"] == ".claude/rules/x.md"
+    assert rule["tier"] == "project"
+
+
+def test_compose_nested_claude_md_and_local_md_counted_project_tier(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / "CLAUDE.local.md").write_text("# local overrides\n" + "word " * 20)
+    (proj / "sub").mkdir()
+    (proj / "sub" / "CLAUDE.md").write_text("# nested\n" + "word " * 20)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    by_cat_path = {(f["category"], f["path"]): f for f in doc["always_loaded"]["files"]}
+    assert by_cat_path[("project_claude_md", "CLAUDE.md")]["tier"] == "project"
+    assert by_cat_path[("project_claude_local_md", "CLAUDE.local.md")]["tier"] == "project"
+    assert by_cat_path[("project_claude_md_nested", "sub/CLAUDE.md")]["tier"] == "project"
+
+
+def test_compose_inspected_roots_present_and_correct(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    assert doc["inspected_roots"] == {
+        "operator": str(fake_harness.resolve()),
+        "project_containment": str(proj.resolve()),
+        "project_harness": str((proj / ".claude").resolve()),
+    }
+
+
+def test_operator_scan_root_resolves_from_claude_config_dir_env(tmp_path):
+    cfg_root = tmp_path / "custom-claude"
+    (cfg_root / "rules").mkdir(parents=True, exist_ok=True)
+    (cfg_root / "CLAUDE.md").write_text("# custom\n" + "word " * 20)
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg_root))
+    proc = subprocess.run([sys.executable, str(COLLECTOR)], capture_output=True, text=True,
+                          timeout=30, env=env)
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)
+    assert doc["root"] == str(cfg_root.resolve())
+
+
+def test_out_inside_operator_root_rejected_in_compose_mode(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    bad = fake_harness / "leak-compose.json"
+    proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                           "--project-root", str(proj), "--compose", "--out", str(bad)],
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0 and not bad.exists()
+
+
+def test_out_inside_project_containment_root_rejected_in_compose_mode(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    bad = proj / "leak.json"
+    proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                           "--project-root", str(proj), "--compose", "--out", str(bad)],
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0 and not bad.exists()
+
+
+def test_out_outside_both_roots_written_in_compose_mode(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    good = tmp_path / "sidecar-compose.json"
+    run_collector(fake_harness, "--compose", "--out", str(good), project_root=proj)
+    assert good.exists()
+    json.loads(good.read_text())
+
+
+def test_validate_write_target_rejects_inside_any_root(tmp_path):
+    root_a = tmp_path / "root_a"
+    root_b = tmp_path / "root_b"
+    root_a.mkdir()
+    root_b.mkdir()
+    ok, resolved = _collector.validate_write_target(str(root_b / "x.json"), [root_a, root_b])
+    assert ok is False and resolved is None
+
+
+def test_validate_write_target_accepts_outside_all_roots(tmp_path):
+    root_a = tmp_path / "root_a"
+    root_b = tmp_path / "root_b"
+    root_a.mkdir()
+    root_b.mkdir()
+    target = tmp_path / "outside.json"
+    ok, resolved = _collector.validate_write_target(str(target), [root_a, root_b])
+    assert ok is True and resolved == target.resolve()
+
+
+def test_validate_write_target_rejects_input_path_equality(tmp_path):
+    # Stands in for the real ~/.claude.json case (T5): an input path that sits OUTSIDE
+    # every dir-root must still be rejected as a write target — containment alone would
+    # wrongly allow it.
+    root_a = tmp_path / "root_a"
+    root_a.mkdir()
+    outside_input = tmp_path / "claude.json"
+    outside_input.write_text("{}")
+    ok, resolved = _collector.validate_write_target(str(outside_input), [root_a], [outside_input])
+    assert ok is False and resolved is None
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_validate_write_target_rejects_out_matching_symlinked_input_target(tmp_path):
+    # P2-B: the OLD input_paths check compared `Path(p) in (lexical, resolved)` LITERALLY
+    # without resolving `p` — a real input like `~/.claude.json` that is ITSELF a symlink
+    # to `/reports/result.json` would not be caught if `--out` names
+    # `/reports/result.json` directly (the LITERAL strings differ even though both name
+    # the same file), letting the atomic write clobber the collector's own read input.
+    real_result = tmp_path / "reports" / "result.json"
+    real_result.parent.mkdir()
+    real_result.write_text("{}")
+    claude_json_link = tmp_path / ".claude.json"
+    claude_json_link.symlink_to(real_result)
+    ok, resolved = _collector.validate_write_target(
+        str(real_result), roots=(), input_paths=(str(claude_json_link),))
+    assert ok is False and resolved is None
+
+
+def test_compose_document_deterministic_across_hashseed(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True, exist_ok=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "x.md").write_text("Project rule body " * 10)
+
+    def run_with_seed(seed):
+        env = dict(os.environ, PYTHONHASHSEED=str(seed))
+        proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                               "--project-root", str(proj), "--compose"],
+                              capture_output=True, text=True, timeout=30, env=env)
+        assert proc.returncode == 0, proc.stderr
+        doc = json.loads(proc.stdout)
+        doc.pop("generated_at")
+        return doc
+
+    d0 = run_with_seed("0")
+    d1 = run_with_seed("1")
+    assert json.dumps(d0, sort_keys=True) == json.dumps(d1, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# Task T3 — project-tier read gate: H2 containment + TOCTOU close + input-shape guard
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_compose_project_rules_dir_symlink_escaping_root_not_traversed(fake_harness, tmp_path):
+    # H2: `.claude/rules` ITSELF is a symlink resolving outside the project containment
+    # root. Must not be traversed at all — no listing, no reads, no excerpt.
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    outside = tmp_path / "outside-rules"
+    outside.mkdir()
+    (outside / "x.md").write_text("SECRET project rule body " * 10)
+    (proj / ".claude" / "rules").symlink_to(outside)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    assert not any(f["category"] == "project_rule" for f in doc["always_loaded"]["files"])
+    assert "SECRET project rule body" not in json.dumps(doc)
+    refs = {r["name"]: r for r in doc["out_of_root_refs"]}
+    assert ".claude/rules" in refs
+    assert refs[".claude/rules"]["trusted"] is False
+    assert str(outside.resolve()) in refs[".claude/rules"]["target"] or \
+           refs[".claude/rules"]["target"] == str(outside)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_compose_nested_claude_md_via_symlinked_subdir_not_traversed(fake_harness, tmp_path):
+    # H2: a project SUBDIRECTORY (not the CLAUDE.md file itself) is a symlink escaping
+    # the containment root; the nested CLAUDE.md living inside it must not be discovered.
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    outside = tmp_path / "outside-sub"
+    outside.mkdir()
+    (outside / "CLAUDE.md").write_text("SECRET nested project instructions " * 10)
+    (proj / "sub").symlink_to(outside)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    assert not any(f["category"] == "project_claude_md_nested" for f in doc["always_loaded"]["files"])
+    assert "SECRET nested project instructions" not in json.dumps(doc)
+    refs = {r["name"]: r for r in doc["out_of_root_refs"]}
+    assert "sub" in refs
+    assert refs["sub"]["trusted"] is False
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_compose_project_rule_leaf_symlink_escaping_root_not_read(fake_harness, tmp_path):
+    # H2: the DIR is in-root but ONE rule FILE inside it is a symlink escaping root.
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "safe.md").write_text("In-root rule body " * 10)
+    outside = tmp_path / "evil-rule.md"
+    outside.write_text("SECRET escaping rule body " * 10)
+    (proj / ".claude" / "rules" / "escape.md").symlink_to(outside)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    rule_paths = {f["path"] for f in doc["always_loaded"]["files"] if f["category"] == "project_rule"}
+    assert ".claude/rules/safe.md" in rule_paths       # in-root sibling still read
+    assert ".claude/rules/escape.md" not in rule_paths  # escaping leaf not read
+    assert "SECRET escaping rule body" not in json.dumps(doc)
+    refs = {r["name"]: r for r in doc["out_of_root_refs"]}
+    assert ".claude/rules/escape.md" in refs
+    assert refs[".claude/rules/escape.md"]["trusted"] is False
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_compose_operator_tier_symlink_outside_root_still_followed(fake_harness, tmp_path):
+    # Regression pin: T3 must NOT restrict the OPERATOR tier — it keeps its existing
+    # trusted symlink-following (it deploys via symlinks by design). An operator rule
+    # symlinked to a target OUTSIDE the operator root is still read and counted, and
+    # never appears in out_of_root_refs (that field is project-tier-only, H2's scope).
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    outside = tmp_path / "outside-operator-rule.md"
+    outside.write_text("Operator rule body via outside symlink " * 10)
+    (fake_harness / "rules" / "linked.md").symlink_to(outside)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    hit = next(f for f in doc["always_loaded"]["files"] if f["path"] == "rules/linked.md")
+    assert hit["tier"] == "operator"
+    assert hit["words"] > 0
+    assert not any(r["name"] == "rules/linked.md" for r in doc["out_of_root_refs"])
+
+
+def test_parse_project_settings_top_level_number_degrades_gracefully(tmp_path):
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / ".claude" / "settings.json").write_text("42")   # valid JSON, not an object
+    stat_root = os.stat(proj)
+    errors, blind_spots, refs = [], [], []
+    settings, ok = _collector.parse_project_settings(proj, proj, stat_root, errors, blind_spots, refs)
+    assert settings == {} and ok is False
+    assert any("project settings.json is not a JSON object" in e for e in errors)
+
+
+def test_parse_project_settings_top_level_array_degrades_gracefully(tmp_path):
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / ".claude" / "settings.json").write_text("[1, 2, 3]")
+    stat_root = os.stat(proj)
+    errors, blind_spots, refs = [], [], []
+    settings, ok = _collector.parse_project_settings(proj, proj, stat_root, errors, blind_spots, refs)
+    assert settings == {} and ok is False
+    assert any("project settings.json is not a JSON object" in e for e in errors)
+
+
+def test_parse_project_settings_well_formed_object_parses(tmp_path):
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({"model": "opus"}))
+    stat_root = os.stat(proj)
+    errors, blind_spots, refs = [], [], []
+    settings, ok = _collector.parse_project_settings(proj, proj, stat_root, errors, blind_spots, refs)
+    assert settings == {"model": "opus"} and ok is True
+    assert errors == []
+
+
+def test_parse_project_settings_absent_is_blind_spot_not_error(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    stat_root = os.stat(proj)
+    errors, blind_spots, refs = [], [], []
+    settings, ok = _collector.parse_project_settings(proj, proj, stat_root, errors, blind_spots, refs)
+    assert settings == {} and ok is False
+    assert errors == []
+    assert any("project settings.json not found" in b for b in blind_spots)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="platform lacks mkfifo")
+def test_parse_project_settings_fifo_does_not_hang_and_degrades(tmp_path):
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    os.mkfifo(proj / ".claude" / "settings.json")
+    stat_root = os.stat(proj)
+    errors, blind_spots, refs = [], [], []
+    settings, ok = _collector.parse_project_settings(proj, proj, stat_root, errors, blind_spots, refs)
+    assert settings == {} and ok is False
+    assert any("not a regular file" in e for e in errors)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_parse_project_settings_symlink_escaping_root_not_read(tmp_path):
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    outside = tmp_path / "evil-settings.json"
+    outside.write_text(json.dumps({"model": "SECRET-exfil"}))
+    (proj / ".claude" / "settings.json").symlink_to(outside)
+    stat_root = os.stat(proj)
+    errors, blind_spots, refs = [], [], []
+    settings, ok = _collector.parse_project_settings(proj, proj, stat_root, errors, blind_spots, refs)
+    assert settings == {} and ok is False
+    assert "SECRET-exfil" not in json.dumps(settings)
+    assert any(r["trusted"] is False for r in refs)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="platform lacks mkfifo")
+def test_read_project_file_rejects_non_regular_file_no_hang(tmp_path):
+    # TOCTOU regular-file branch: a FIFO passed directly must be rejected via the
+    # post-open fstat(S_ISREG) check, and — because the open is O_NONBLOCK — must NOT
+    # hang waiting for a writer (a plain O_RDONLY open on a writer-less FIFO blocks
+    # forever, which is exactly the invariant this closes for the project tier).
+    fifo = tmp_path / "f.fifo"
+    os.mkfifo(fifo)
+    root_stat = os.stat(tmp_path)
+    text, evidence = _collector._read_project_file(fifo, tmp_path, root_stat)
+    assert text is None and evidence == "INACCESSIBLE"
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_read_project_file_rejects_path_outside_containment_root(tmp_path):
+    # P1-A (post-hardening containment branch): a path whose realpath resolves OUTSIDE
+    # `containment_root` must be rejected even though it is a perfectly normal regular
+    # file — the containment check is re-derived from the pathname INSIDE this read, not
+    # trusted from an earlier gate call.
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("escaping content")
+    link = root / "link.md"
+    link.symlink_to(outside)
+    root_stat = os.stat(root)
+    text, evidence = _collector._read_project_file(link, root, root_stat)
+    assert text is None and evidence == "INACCESSIBLE"
+
+
+def test_read_project_file_reads_contained_regular_file(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    real = root / "real.md"
+    real.write_text("legitimate contained content")
+    root_stat = os.stat(root)
+    text, evidence = _collector._read_project_file(real, root, root_stat)
+    assert text == "legitimate contained content" and evidence == "VERIFIED"
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_read_project_file_closes_aba_symlink_race_on_realpath_check(tmp_path, monkeypatch):  # mock-ok: interposes on real fs symlink timing, not a faked dependency
+    """P1-A (CRITICAL): Codex reproduced an ABA race against the OLD design (an identity
+    `stat()` captured FIRST, THEN a separate containment `realpath()`, THEN a THIRD
+    re-open-by-pathname): an attacker who can retime a symlink swap makes the path
+    resolve OUTSIDE the containment root during the identity stat, INSIDE during the
+    containment realpath (so H2 wrongly "passes"), and back OUTSIDE before the final
+    open — the reopened OUTSIDE bytes matched the FIRST (also outside) identity stat, so
+    they were returned as VERIFIED. The `setattr` call below interposes on the
+    module-internal `_physical_key` to deterministically induce a REAL ABA symlink-swap
+    interleaving on ONE real filesystem symlink (real unlink/symlink/stat/realpath calls
+    against a real tmp_path tree) — a genuine timing race would be flaky in CI; this seam
+    forces the exact interleaving Codex reproduced instead of a sleep/thread race. Not a
+    faked dependency: no return value or side effect is faked, only WHEN the real
+    symlink target flips is controlled, on the probe path only."""
+    root = tmp_path / "root"
+    root.mkdir()
+    inside_decoy = root / "decoy.md"
+    inside_decoy.write_text("legitimate inside content")
+    outside_secret = tmp_path / "outside-secret.md"
+    outside_secret.write_text("OUTSIDE-SECRET-CONTENT")
+    link = root / "victim.md"
+    link.symlink_to(outside_secret)
+    root_stat = os.stat(root)
+
+    real_physical_key = _collector._physical_key
+
+    def _flipping_physical_key(path):
+        if Path(path) == link:
+            link.unlink()
+            link.symlink_to(inside_decoy)
+            try:
+                return real_physical_key(path)
+            finally:
+                link.unlink()
+                link.symlink_to(outside_secret)
+        return real_physical_key(path)
+
+    monkeypatch.setattr(_collector, "_physical_key", _flipping_physical_key)  # mock-ok: interposes on real fs symlink timing, not a faked dependency
+    text, evidence = _collector._read_project_file(link, root, root_stat)
+    assert text is None
+    assert evidence == "INACCESSIBLE"
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_gate_rejects_escaping_realpath(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("escaping content")
+    link = root / "link.md"
+    link.symlink_to(outside)
+    root_stat = os.stat(root)
+    contained, identity = _collector._project_tier_gate(link, root, root_stat)
+    assert contained is False and identity is None
+
+
+def test_project_tier_gate_accepts_contained_path(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    inside = root / "inside.md"
+    inside.write_text("contained content")
+    root_stat = os.stat(root)
+    contained, identity = _collector._project_tier_gate(inside, root, root_stat)
+    assert contained is True and identity is not None
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_walk_contained_dirs_closes_aba_symlink_race_on_realpath_check(tmp_path, monkeypatch):  # mock-ok: interposes on real fs symlink timing, not a faked dependency
+    """P1-A (CRITICAL, directory-traversal half): the OLD `_walk_contained_dirs` ran
+    `_project_tier_gate` (a pathname `stat()` for identity, then a separate pathname
+    `realpath()` for containment) and THEN listed the SAME pathname again
+    (`d.iterdir()`) — an attacker retiming a symlink swap could make the containment
+    check see one inode (INSIDE, so H2 "passes") and the subsequent listing see another
+    (OUTSIDE), permitting external-directory traversal after a swap. The `setattr` call
+    below interposes on the module-internal `_physical_key` to deterministically induce
+    that REAL interleaving on ONE real filesystem symlink (real unlink/symlink/stat/
+    scandir calls against a real tmp_path tree), matching the file-read ABA test's seam.
+    Not a faked dependency: only WHEN the real symlink target flips is controlled, on
+    the probe path only."""
+    root = tmp_path / "root"
+    root.mkdir()
+    inside_decoy_dir = root / "decoy-dir"
+    inside_decoy_dir.mkdir()
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "secret.md").write_text("OUTSIDE-DIR-SECRET")
+    link_dir = root / "victim-dir"
+    link_dir.symlink_to(outside_dir)
+    root_stat = os.stat(root)
+
+    real_physical_key = _collector._physical_key
+
+    def _flipping_physical_key(path):
+        if Path(path) == link_dir:
+            link_dir.unlink()
+            link_dir.symlink_to(inside_decoy_dir)
+            try:
+                return real_physical_key(path)
+            finally:
+                link_dir.unlink()
+                link_dir.symlink_to(outside_dir)
+        return real_physical_key(path)
+
+    monkeypatch.setattr(_collector, "_physical_key", _flipping_physical_key)  # mock-ok: interposes on real fs symlink timing, not a faked dependency
+    out_of_root_refs = []
+    yielded = list(_collector._walk_contained_dirs(root, root, root_stat, out_of_root_refs, set()))
+    assert link_dir not in yielded
+    assert any(r["name"].endswith("victim-dir") for r in out_of_root_refs)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_compose_project_tier_symlink_loop_does_not_hang(fake_harness, tmp_path):
+    # A project-internal (contained) symlink loop must not hang the CLAUDE.md walk —
+    # _walk_contained_dirs tracks visited physical identities and skips a re-visit.
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / "sub").mkdir()
+    (proj / "sub" / "loop").symlink_to(proj / "sub")   # self-referential, but IN-root
+    doc = run_collector(fake_harness, "--compose", project_root=proj)  # must not hang
+    assert doc["schema_version"] == 1
+
+
+def test_compose_out_of_root_refs_present_and_empty_when_no_escapes(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    assert doc["out_of_root_refs"] == []
+
+
+def test_non_compose_has_no_out_of_root_refs_field(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, project_root=proj)
+    assert "out_of_root_refs" not in doc
+
+
+def test_compose_hygiene_scans_are_operator_only_and_disclosed(fake_harness, tmp_path):
+    # T11 Fix 1: the per-file hygiene analyses (flag_long_instructions, _staleness_corpus,
+    # check_phantom_refs, collect_promotion_candidates, detect_test_coverage,
+    # _hooks_body_corpus) take no project_root and run OPERATOR-TIER-ONLY even under
+    # --compose. A genuinely oversized project-tier rule must NOT be flagged by
+    # instruction_length_flags (documents today's behavior, unchanged by this task) AND
+    # the limitation must be honestly disclosed via a blind_spots entry naming every
+    # affected analysis explicitly.
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "huge.md").write_text(
+        "\n".join(f"line {i}" for i in range(300)))
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    assert not any(f["path"].endswith("huge.md") for f in doc["instruction_length_flags"])
+    disclosure = next((b for b in doc["blind_spots"] if "OPERATOR tier only" in b), None)
+    assert disclosure is not None, "compose mode must disclose the operator-only hygiene-scan limitation"
+    for name in ("flag_long_instructions", "_staleness_corpus", "check_phantom_refs",
+                 "collect_promotion_candidates", "detect_test_coverage", "_hooks_body_corpus"):
+        assert name in disclosure, f"disclosure must name {name}"
+
+
+def test_non_compose_has_no_hygiene_scope_disclosure(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, project_root=proj)
+    assert not any("OPERATOR tier only" in b for b in doc["blind_spots"])
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_compose_document_deterministic_across_hashseed_with_escape(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    outside = tmp_path / "outside-rules-det"
+    outside.mkdir()
+    (outside / "x.md").write_text("escaping rule body " * 10)
+    (proj / ".claude" / "rules").symlink_to(outside)
+
+    def run_with_seed(seed):
+        env = dict(os.environ, PYTHONHASHSEED=str(seed))
+        proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                               "--project-root", str(proj), "--compose"],
+                              capture_output=True, text=True, timeout=30, env=env)
+        assert proc.returncode == 0, proc.stderr
+        doc = json.loads(proc.stdout)
+        doc.pop("generated_at")
+        return doc
+
+    d0 = run_with_seed("0")
+    d1 = run_with_seed("1")
+    assert json.dumps(d0, sort_keys=True) == json.dumps(d1, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# Task T4 — node model + collision-keyed shadow resolver
+# ---------------------------------------------------------------------------
+
+def _tier_node(doc, surface, name, tier):
+    return next((n for n in doc["tier_composition"]["nodes"]
+                 if n["surface"] == surface and n["name"] == name and n["tier"] == tier), None)
+
+
+def test_non_compose_has_no_tier_composition_field(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, project_root=proj)
+    assert "tier_composition" not in doc
+    assert all("a_tier" not in p and "b_tier" not in p for p in doc["duplication"]["pairs"])
+
+
+def test_tier_composition_colliding_skill_operator_wins_project_marked_dark(fake_harness, tmp_path):
+    # fake_harness already has an operator skill "demo" (skills/demo/SKILL.md).
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "skills" / "demo").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "skills" / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: project-tier shadow of the operator demo skill.\n---\nBody.\n")
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    op_node = _tier_node(doc, "skill", "demo", "operator")
+    proj_node = _tier_node(doc, "skill", "demo", "project")
+    assert op_node is not None and op_node["status"] == "effective" and op_node["shadowed_by"] is None
+    assert proj_node is not None and proj_node["status"] == "shadowed"
+    assert proj_node["shadowed_by"] == {"tier": "operator", "path": op_node["path"]}
+    skill_summary = doc["tier_composition"]["surfaces"]["skill"]
+    assert skill_summary == {"merge": "shadow", "winner_tier": "operator",
+                              "adds": 0, "overrides": 0, "dark": 1}
+
+
+def test_tier_composition_colliding_agent_project_wins_marks_override(fake_harness, tmp_path):
+    # fake_harness already has an operator agent "demo-agent" (agents/demo-agent.md).
+    # Asymmetry proof: this is the OPPOSITE winner direction from the skill test above —
+    # this test fails if someone copies the skill (operator-wins) direction onto agents.
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "agents").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "agents" / "demo-agent.md").write_text(
+        "---\nname: demo-agent\ndescription: project-tier override of the operator agent.\n---\nBody.\n")
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    op_node = _tier_node(doc, "agent", "demo-agent", "operator")
+    proj_node = _tier_node(doc, "agent", "demo-agent", "project")
+    assert proj_node is not None and proj_node["status"] == "effective" and proj_node["shadowed_by"] is None
+    assert op_node is not None and op_node["status"] == "shadowed"
+    assert op_node["shadowed_by"] == {"tier": "project", "path": proj_node["path"]}
+    agent_summary = doc["tier_composition"]["surfaces"]["agent"]
+    assert agent_summary == {"merge": "shadow", "winner_tier": "project",
+                              "adds": 0, "overrides": 1, "dark": 0}
+
+
+def test_tier_composition_colliding_command_operator_wins(fake_harness, tmp_path):
+    # fake_harness already has an operator command "demo-cmd" (commands/demo-cmd.md).
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "commands").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "commands" / "demo-cmd.md").write_text(
+        "---\nname: demo-cmd\ndescription: project-tier shadow of the operator command.\n---\nBody.\n")
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    op_node = _tier_node(doc, "command", "demo-cmd", "operator")
+    proj_node = _tier_node(doc, "command", "demo-cmd", "project")
+    assert op_node is not None and op_node["status"] == "effective"
+    assert proj_node is not None and proj_node["status"] == "shadowed"
+    assert proj_node["shadowed_by"] == {"tier": "operator", "path": op_node["path"]}
+    command_summary = doc["tier_composition"]["surfaces"]["command"]
+    assert command_summary == {"merge": "shadow", "winner_tier": "operator",
+                                "adds": 0, "overrides": 0, "dark": 1}
+
+
+def test_tier_composition_adds_overrides_counts_exact_on_mixed_fixture(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "skills" / "demo").mkdir(parents=True)          # collides -> dark
+    (proj / ".claude" / "skills" / "proj-only-skill").mkdir(parents=True)  # no collision -> add
+    (proj / ".claude" / "agents").mkdir(parents=True)
+    (proj / ".claude" / "commands").mkdir(parents=True)
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+
+    (proj / ".claude" / "skills" / "demo" / "SKILL.md").write_text("---\nname: demo\n---\nBody.\n")
+    (proj / ".claude" / "skills" / "proj-only-skill" / "SKILL.md").write_text(
+        "---\nname: proj-only-skill\n---\nBody.\n")
+    (proj / ".claude" / "agents" / "demo-agent.md").write_text("---\nname: demo-agent\n---\nBody.\n")  # collides -> override
+    (proj / ".claude" / "agents" / "proj-only-agent.md").write_text(
+        "---\nname: proj-only-agent\n---\nBody.\n")  # no collision -> add
+    (proj / ".claude" / "commands" / "demo-cmd.md").write_text("---\nname: demo-cmd\n---\nBody.\n")  # collides -> dark
+    (proj / ".claude" / "commands" / "proj-only-cmd.md").write_text(
+        "---\nname: proj-only-cmd\n---\nBody.\n")  # no collision -> add
+    # Union surface: a same-named project rule loads ALONGSIDE the operator "a.md" rule
+    # (rules/a.md exists in fake_harness) -- it is an ADD, never an override or dark.
+    (proj / ".claude" / "rules" / "a.md").write_text("Project rule body " * 10)
+    (proj / ".claude" / "rules" / "extra-rule.md").write_text("Another project rule body " * 10)
+
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    surfaces = doc["tier_composition"]["surfaces"]
+    assert surfaces["skill"] == {"merge": "shadow", "winner_tier": "operator",
+                                  "adds": 1, "overrides": 0, "dark": 1}
+    assert surfaces["agent"] == {"merge": "shadow", "winner_tier": "project",
+                                  "adds": 1, "overrides": 1, "dark": 0}
+    assert surfaces["command"] == {"merge": "shadow", "winner_tier": "operator",
+                                    "adds": 1, "overrides": 0, "dark": 1}
+    assert surfaces["rule"] == {"merge": "union", "winner_tier": None,
+                                 "adds": 2, "overrides": 0, "dark": 0}
+    # P2-A: CLAUDE files and hooks are UNION surfaces too — the fixture's project
+    # CLAUDE.md is an "add" (the operator-tier root CLAUDE.md is not); no hooks are
+    # registered anywhere in this fixture, so "hook" participates with zero counts.
+    assert surfaces["claude_md"] == {"merge": "union", "winner_tier": None,
+                                      "adds": 1, "overrides": 0, "dark": 0}
+    assert surfaces["hook"] == {"merge": "union", "winner_tier": None,
+                                 "adds": 0, "overrides": 0, "dark": 0}
+    assert doc["tier_composition"]["participating_surfaces"] == [
+        "agent", "claude_md", "command", "hook", "rule", "skill"]
+    # union: the colliding rule "a.md" must NOT be marked shadowed on either tier.
+    rule_a_project = _tier_node(doc, "rule", "a", "project")
+    assert rule_a_project["status"] == "effective" and rule_a_project["shadowed_by"] is None
+
+
+def test_tier_composition_project_claude_md_and_hook_only_still_count_as_adds(fake_harness, tmp_path):
+    # P2-A: a project whose ONLY always-loaded surfaces are a CLAUDE.md and a single
+    # registered hook (no skill/agent/command/rule) previously rendered "project adds 0"
+    # because `_SURFACE_MERGE` omitted the "claude_md" and "hook" UNION surfaces
+    # entirely — this project-tier contribution was invisible to tier_composition.
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "hooks").mkdir()
+    (proj / "hooks" / "proj-hook.py").write_text("# proj\n")
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [
+            {"type": "command", "command": "python3 ./hooks/proj-hook.py"}]}]}}))
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    tc = doc["tier_composition"]
+    assert {"claude_md", "hook"} <= set(tc["participating_surfaces"])
+    total_project_adds = sum(s["adds"] for s in tc["surfaces"].values())
+    assert total_project_adds >= 2
+    assert tc["surfaces"]["claude_md"]["merge"] == "union"
+    assert tc["surfaces"]["hook"]["merge"] == "union"
+    claude_md_project = _tier_node(doc, "claude_md", "CLAUDE", "project")
+    assert claude_md_project is not None and claude_md_project["status"] == "effective"
+    hook_project = next((n for n in tc["nodes"] if n["surface"] == "hook" and n["tier"] == "project"), None)
+    assert hook_project is not None and hook_project["path"] == "hooks/proj-hook.py"
+
+
+def test_tier_composition_hook_nodes_normalize_three_way_tier_to_binary(fake_harness, tmp_path):
+    # P2 (cross-model review): `_hook_nodes_from_composed` used to forward the settings
+    # tier (user/project/local) unchanged into the tier_composition node model, which is
+    # BINARY (operator/project) everywhere else. A local-tier hook is project-side in the
+    # binary model, but leaking "local" through meant it was never counted toward the
+    # project "adds" total (adds only counted tier == "project") and it violated the
+    # documented operator|project node vocabulary.
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "python3 hooks/op-hook.py"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    (fake_harness / "hooks" / "op-hook.py").write_text("# op\n")
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "hooks").mkdir()
+    (proj / "hooks" / "proj-hook.py").write_text("# proj\n")
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [
+            {"type": "command", "command": "python3 ./hooks/proj-hook.py"}]}]}}))
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps({
+        "hooks": {"SessionStart": [{"matcher": None, "hooks": [
+            {"type": "command", "command": "echo local-only"}]}]}}))
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    tc = doc["tier_composition"]
+    # Project + Local are both project-side of the binary operator|project model, so
+    # both count toward the union "hook" surface's project adds.
+    assert tc["surfaces"]["hook"]["adds"] == 2
+    hook_nodes = [n for n in tc["nodes"] if n["surface"] == "hook"]
+    assert {n["tier"] for n in hook_nodes} == {"operator", "project"}
+
+
+def test_tier_composition_cross_tier_duplication_detected(fake_harness, tmp_path):
+    block = _uw("z", 17)
+    (fake_harness / "rules" / "dup-op.md").write_text(block)
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "dup-proj.md").write_text(block + " " + _uw("x", 85))
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    pair = next((p for p in doc["duplication"]["pairs"]
+                 if {p["a"], p["b"]} == {"rules/dup-op.md", ".claude/rules/dup-proj.md"}), None)
+    assert pair is not None, "cross-tier duplicate pair (operator rule x project rule) must be detected"
+    assert pair["score"] >= 0.6
+    assert {pair["a_tier"], pair["b_tier"]} == {"operator", "project"}
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_tier_composition_project_skill_agent_command_dir_symlink_escaping_is_gated(fake_harness, tmp_path):
+    # Regression pin (T4 reuses T3's gate, not a fresh implementation): a project-tier
+    # skill DIR, agent FILE, and command FILE that are symlinks escaping containment must
+    # never surface as tier_composition nodes, and must be recorded as out_of_root_refs —
+    # exactly like T3's rules-dir/CLAUDE.md symlink-escape tests.
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "skills").mkdir(parents=True)
+    (proj / ".claude" / "agents").mkdir(parents=True)
+    (proj / ".claude" / "commands").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+
+    outside_skill = tmp_path / "outside-skill"
+    outside_skill.mkdir()
+    (outside_skill / "SKILL.md").write_text("SECRET escaping skill body " * 10)
+    (proj / ".claude" / "skills" / "evil-skill").symlink_to(outside_skill)
+
+    outside_agent = tmp_path / "outside-agent.md"
+    outside_agent.write_text("SECRET escaping agent body " * 10)
+    (proj / ".claude" / "agents" / "evil-agent.md").symlink_to(outside_agent)
+
+    outside_command = tmp_path / "outside-command.md"
+    outside_command.write_text("SECRET escaping command body " * 10)
+    (proj / ".claude" / "commands" / "evil-command.md").symlink_to(outside_command)
+
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    nodes = doc["tier_composition"]["nodes"]
+    assert not any(n["name"] in ("evil-skill", "evil-agent", "evil-command") for n in nodes)
+    assert "SECRET escaping" not in json.dumps(doc)
+    refs = {r["name"] for r in doc["out_of_root_refs"]}
+    assert ".claude/skills/evil-skill" in refs
+    assert ".claude/agents/evil-agent.md" in refs
+    assert ".claude/commands/evil-command.md" in refs
+
+
+def test_tier_composition_deterministic_across_hashseed(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "skills" / "demo").mkdir(parents=True)
+    (proj / ".claude" / "agents").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "skills" / "demo" / "SKILL.md").write_text("---\nname: demo\n---\nBody.\n")
+    (proj / ".claude" / "agents" / "demo-agent.md").write_text("---\nname: demo-agent\n---\nBody.\n")
+
+    def run_with_seed(seed):
+        env = dict(os.environ, PYTHONHASHSEED=str(seed))
+        proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                               "--project-root", str(proj), "--compose"],
+                              capture_output=True, text=True, timeout=30, env=env)
+        assert proc.returncode == 0, proc.stderr
+        doc = json.loads(proc.stdout)
+        doc.pop("generated_at")
+        return doc
+
+    d0 = run_with_seed("0")
+    d1 = run_with_seed("1")
+    assert json.dumps(d0, sort_keys=True) == json.dumps(d1, sort_keys=True)
+    node_paths = [(n["surface"], n["path"], n["tier"]) for n in d0["tier_composition"]["nodes"]]
+    assert node_paths == sorted(node_paths, key=lambda t: (t[1], t[2]))
+
+
+def test_resolve_tier_composition_shadow_operator_wins_marks_project_dark():
+    raw = [{"surface": "skill", "name": "x", "tier": "operator", "path": "skills/x/SKILL.md"},
+           {"surface": "skill", "name": "x", "tier": "project", "path": ".claude/skills/x/SKILL.md"}]
+    resolved, surfaces, participating = _collector._resolve_tier_composition(raw)
+    by_tier = {n["tier"]: n for n in resolved}
+    assert by_tier["operator"]["status"] == "effective"
+    assert by_tier["project"]["status"] == "shadowed"
+    assert by_tier["project"]["shadowed_by"] == {"tier": "operator", "path": "skills/x/SKILL.md"}
+    assert surfaces["skill"]["dark"] == 1 and surfaces["skill"]["overrides"] == 0
+    # participating_surfaces always lists every configured `_SURFACE_MERGE` key (P2-A
+    # added "claude_md"/"hook"), independent of which surfaces `raw` actually populates.
+    assert participating == ["agent", "claude_md", "command", "hook", "rule", "skill"]
+
+
+def test_resolve_tier_composition_shadow_project_wins_marks_operator_shadowed():
+    raw = [{"surface": "agent", "name": "x", "tier": "operator", "path": "agents/x.md"},
+           {"surface": "agent", "name": "x", "tier": "project", "path": ".claude/agents/x.md"}]
+    resolved, surfaces, _participating = _collector._resolve_tier_composition(raw)
+    by_tier = {n["tier"]: n for n in resolved}
+    assert by_tier["project"]["status"] == "effective"
+    assert by_tier["operator"]["status"] == "shadowed"
+    assert by_tier["operator"]["shadowed_by"] == {"tier": "project", "path": ".claude/agents/x.md"}
+    assert surfaces["agent"]["overrides"] == 1 and surfaces["agent"]["dark"] == 0
+
+
+def test_resolve_tier_composition_union_surface_no_shadowing_project_is_add():
+    raw = [{"surface": "rule", "name": "x", "tier": "operator", "path": "rules/x.md"},
+           {"surface": "rule", "name": "x", "tier": "project", "path": ".claude/rules/x.md"}]
+    resolved, surfaces, _participating = _collector._resolve_tier_composition(raw)
+    assert all(n["status"] == "effective" and n["shadowed_by"] is None for n in resolved)
+    assert surfaces["rule"] == {"merge": "union", "winner_tier": None, "adds": 1, "overrides": 0, "dark": 0}
+
+
+def test_resolve_tier_composition_no_collision_project_only_is_add():
+    raw = [{"surface": "command", "name": "y", "tier": "project", "path": ".claude/commands/y.md"}]
+    resolved, surfaces, _participating = _collector._resolve_tier_composition(raw)
+    assert resolved[0]["status"] == "effective" and resolved[0]["shadowed_by"] is None
+    assert surfaces["command"]["adds"] == 1 and surfaces["command"]["dark"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Task T5 — settings / hooks / MCP full-chain merge (Local > Project > User) +
+# composed weight excluded-count + secret-safe settings_overrides
+# ---------------------------------------------------------------------------
+
+def test_composed_permissions_union_deny_wins_across_tiers(fake_harness, tmp_path):
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {}, "permissions": {"allow": ["Bash(user:*)"], "deny": [], "ask": []}}))
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "permissions": {"allow": ["Bash(project:*)"], "deny": ["Bash(user:*)"], "ask": []}}))
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps({
+        "permissions": {"allow": [], "deny": [], "ask": ["Bash(local-ask:*)"]}}))
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    perms = doc["composed_settings"]["permissions"]
+    # user's "Bash(user:*)" allow is DENIED by project's deny of the same rule -> deny wins,
+    # so it does not survive into allow_count; only "Bash(project:*)" does.
+    assert perms == {"allow_count": 1, "deny_count": 1, "ask_count": 1, "evidence": "VERIFIED"}
+
+
+def test_composed_permissions_evidence_verified_for_present_but_empty_settings(fake_harness, tmp_path):
+    # P3: parse success used to be re-derived from `bool(settings_dict)` — a legitimately
+    # PRESENT, VALID, but EMPTY `{}` settings.json is falsy, so every tier here (each a
+    # real, successfully-parsed `{}`) was wrongly treated as "did not parse", flipping
+    # evidence to INACCESSIBLE even though nothing is actually wrong.
+    (fake_harness / "settings.json").write_text(json.dumps({}))
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({}))
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps({}))
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    assert doc["composed_settings"]["permissions"] == {
+        "allow_count": 0, "deny_count": 0, "ask_count": 0, "evidence": "VERIFIED"}
+
+
+def test_composed_hooks_union_across_tiers_with_source_and_tier(fake_harness, tmp_path):
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "python3 hooks/op-hook.py"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    (fake_harness / "hooks" / "op-hook.py").write_text("# op\n")
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "hooks").mkdir()
+    (proj / "hooks" / "proj-hook.py").write_text("# proj\n")
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [
+            {"type": "command", "command": "python3 ./hooks/proj-hook.py"}]}]}}))
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps({
+        "hooks": {"SessionStart": [{"matcher": None, "hooks": [
+            {"type": "command", "command": "echo local-only"}]}]}}))
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    by_tier = {h["tier"]: h for h in doc["composed_settings"]["hooks"]}
+    assert set(by_tier) == {"user", "project", "local"}
+
+    user_h = by_tier["user"]
+    assert user_h["event"] == "PreToolUse" and user_h["matcher"] == "Bash"
+    assert user_h["source_file"] == str(fake_harness / "settings.json")
+    assert user_h["script"] == "hooks/op-hook.py" and user_h["exists"] is True
+
+    proj_h = by_tier["project"]
+    assert proj_h["event"] == "PostToolUse" and proj_h["matcher"] == "Write"
+    assert proj_h["source_file"] == str(proj / ".claude" / "settings.json")
+    # project-relative resolution: resolves against the REPO root, never the operator root.
+    assert proj_h["script"] == "hooks/proj-hook.py" and proj_h["exists"] is True
+
+    local_h = by_tier["local"]
+    assert local_h["event"] == "SessionStart" and local_h["matcher"] is None
+    assert local_h["source_file"] == str(proj / ".claude" / "settings.local.json")
+    assert local_h["script"] is None and local_h["exists"] is None  # "echo ..." has no script token
+
+
+def test_settings_overrides_local_over_project_over_user(fake_harness, tmp_path):
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {}, "permissions": {"allow": [], "deny": []}, "model": "user-model"}))
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({"model": "project-model"}))
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps({"model": "local-model"}))
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    overrides = {o["key"]: o for o in doc["composed_settings"]["overrides"]}
+    assert overrides["model"]["winning_tier"] == "local"
+    assert overrides["model"]["winning_value"] == "local-model"
+    assert set(overrides["model"]["overridden_tiers"]) == {"project", "user"}
+
+
+def test_settings_overrides_project_over_user_when_local_absent(fake_harness, tmp_path):
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {}, "permissions": {"allow": [], "deny": []}, "cleanupPeriodDays": 10}))
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({"cleanupPeriodDays": 99}))
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    overrides = {o["key"]: o for o in doc["composed_settings"]["overrides"]}
+    assert overrides["cleanupPeriodDays"] == {"key": "cleanupPeriodDays", "winning_tier": "project",
+                                               "winning_value": 99, "overridden_tiers": ["user"]}
+    # a key defined at only ONE tier is not an override at all.
+    assert "sandbox" not in overrides
+
+
+def test_settings_overrides_empty_value_at_higher_precedence_still_wins(fake_harness, tmp_path):
+    # P2 (cross-model review): the "env" winner-selection used to require `s["env"]` to
+    # be truthy (non-empty) to even be considered "defining" the key — so a higher-
+    # precedence tier that explicitly sets an EMPTY env (shadowing a lower tier's
+    # non-empty env) was skipped entirely, wrongly letting the lower tier win. The winner
+    # must be picked by KEY PRESENCE, not by truthiness of the value.
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {}, "permissions": {"allow": [], "deny": []},
+        "env": {"BAZ": "user-baz"}}))
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({"env": {"FOO": "project-foo"}}))
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps({"env": {}}))
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    overrides = {o["key"]: o for o in doc["composed_settings"]["overrides"]}
+    assert overrides["env"]["winning_tier"] == "local"
+    assert overrides["env"]["winning_value"] == []
+    assert set(overrides["env"]["overridden_tiers"]) == {"project", "user"}
+
+
+def test_settings_overrides_redacts_nonscalar_value_under_allowlisted_key(fake_harness, tmp_path):
+    # P1-C (CRITICAL): the key allowlist (`_SETTINGS_OVERRIDE_ALLOWLIST`) only restricts
+    # WHICH KEY NAMES surface — it does nothing to stop an attacker from stuffing an
+    # arbitrary nested object under an allowlisted key. "model" is allowlisted, so a
+    # project settings.json defining "model" as a dict (instead of the expected string)
+    # must NOT leak that dict's contents into the emitted document.
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {}, "permissions": {"allow": [], "deny": []}, "model": "claude-opus-4-8"}))
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "model": {"token": "SECRET_SENTINEL"}}))
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    assert "SECRET_SENTINEL" not in json.dumps(doc)
+    overrides = {o["key"]: o for o in doc["composed_settings"]["overrides"]}
+    assert overrides["model"]["winning_value"] is None
+    assert overrides["model"]["value_kind"] == "complex"
+    assert overrides["model"]["winning_tier"] == "project"
+
+
+def test_composed_mcp_precedence_local_project_user(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".mcp.json").write_text(json.dumps({"mcpServers": {
+        "shared": {"type": "stdio", "command": "npx"},
+        "project-only": {"type": "stdio", "command": "npx"}}}))
+    home = tmp_path / "home"
+    home.mkdir()
+    proj_key = str(proj.resolve())
+    (home / ".claude.json").write_text(json.dumps({
+        "mcpServers": {"shared": {"type": "stdio", "command": "user-cmd"},
+                       "user-only": {"type": "stdio", "command": "user-cmd"}},
+        "projects": {proj_key: {"mcpServers": {
+            "shared": {"type": "http", "url": "https://local.example/mcp"},
+            "local-only": {"type": "http", "url": "https://local.example/mcp2"}}}}}))
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    servers = {s["name"]: s for s in doc["composed_settings"]["mcp"]}
+    assert servers["shared"]["tier"] == "local"          # local wins the 3-way collision
+    assert servers["shared"]["type"] == "http"
+    assert servers["project-only"]["tier"] == "project"
+    assert servers["user-only"]["tier"] == "user"
+    assert servers["local-only"]["tier"] == "local"
+    assert servers["shared"]["enabled"] is True           # no "disabled" key -> defaults True
+
+
+def test_composed_mcp_and_settings_overrides_never_leak_secret_values(fake_harness, tmp_path):
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {}, "permissions": {"allow": [], "deny": []},
+        "env": {"GITHUB_TOKEN": "SECRET-user-env-000"}}))
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "env": {"GITHUB_TOKEN": "SECRET-project-env-111", "EXTRA_KEY": "SECRET-project-env-222"}}))
+    (proj / ".mcp.json").write_text(json.dumps({"mcpServers": {
+        "leaky": {"type": "stdio", "command": "npx",
+                  "env": {"API_KEY": "SECRET-mcp-env-abc123"},
+                  "headers": {"Authorization": "Bearer SECRET-mcp-header-xyz789"}}}}))
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    blob = json.dumps(doc)  # search the FULL serialized document, not just the mcp/overrides sub-trees
+    for secret in ("SECRET-user-env-000", "SECRET-project-env-111", "SECRET-project-env-222",
+                   "SECRET-mcp-env-abc123", "SECRET-mcp-header-xyz789"):
+        assert secret not in blob, f"raw secret value leaked into the emitted document: {secret}"
+
+    leaky = next(s for s in doc["composed_settings"]["mcp"] if s["name"] == "leaky")
+    assert leaky["env_keys"] == ["API_KEY"]
+    assert leaky["header_keys"] == ["Authorization"]
+
+    overrides = {o["key"]: o for o in doc["composed_settings"]["overrides"]}
+    assert overrides["env"]["winning_tier"] == "project"
+    assert overrides["env"]["winning_value"] == ["EXTRA_KEY", "GITHUB_TOKEN"]   # KEY NAMES only
+    assert overrides["env"]["overridden_tiers"] == ["user"]
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_composed_weight_excluded_count_present_and_correct(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    outside = tmp_path / "outside-rule.md"
+    outside.write_text("SECRET escaping project rule body " * 10)
+    (proj / ".claude" / "rules" / "escaping.md").symlink_to(outside)
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    assert doc["always_loaded"]["totals"]["excluded_count"] == 1
+    assert any(r["name"] == ".claude/rules/escaping.md" for r in doc["out_of_root_refs"])
+    assert "SECRET escaping" not in json.dumps(doc)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_out_of_root_ref_deduped_across_recording_sites(fake_harness, tmp_path):
+    # T11 Bug 3 (T9-found): a project rule symlink escaping containment is independently
+    # discovered by BOTH the always-loaded rules walk (_walk_project_tier, via
+    # walk_always_loaded) and the duplication-corpus scan (_project_tier_duplication_corpus,
+    # via scan_duplication) -- each historically deduped ONLY against its own call-local
+    # `seen` set, so the SAME escaping path was recorded twice in out_of_root_refs. It must
+    # appear exactly once, and excluded_count must stay consistent with the deduped list.
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    outside = tmp_path / "outside-rule.md"
+    outside.write_text("SECRET escaping project rule body " * 10)
+    (proj / ".claude" / "rules" / "escaping.md").symlink_to(outside)
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    matches = [r for r in doc["out_of_root_refs"] if r["name"] == ".claude/rules/escaping.md"]
+    assert len(matches) == 1, f"escaping path recorded {len(matches)} times, expected exactly 1"
+    assert doc["always_loaded"]["totals"]["excluded_count"] == 1
+
+
+def test_composed_weight_excluded_count_zero_when_nothing_excluded(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    assert doc["always_loaded"]["totals"]["excluded_count"] == 0   # "0 (measured)", not absent
+
+
+def test_non_compose_totals_has_no_excluded_count_field(fake_harness):
+    # additive-in-compose-only (same pattern as inspected_roots/tier_composition): the
+    # field's ABSENCE here is what distinguishes "not measured" from "0 (measured)" above.
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, project_root=proj)
+    assert "excluded_count" not in doc["always_loaded"]["totals"]
+    assert "composed_settings" not in doc
+
+
+def test_out_rejects_user_claude_json_write_target_in_compose_mode(fake_harness, tmp_path):
+    # T5's `~/.claude.json` MCP input sits OUTSIDE both dir-roots, so containment alone
+    # would wrongly permit overwriting it -- iter_input_paths() must yield it so
+    # validate_write_target's input_paths clause rejects it (P1-6a).
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_user_json = home / ".claude.json"
+    original = json.dumps({"mcpServers": {}})
+    fake_user_json.write_text(original)
+    proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                           "--project-root", str(proj), "--compose", "--out", str(fake_user_json)],
+                          capture_output=True, text=True, timeout=30,
+                          env=dict(os.environ, HOME=str(home)))
+    assert proc.returncode != 0
+    assert "--out must be outside --root" in proc.stderr
+    assert fake_user_json.read_text() == original   # untouched, never overwritten
+
+
+def test_composed_settings_deterministic_across_hashseed(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "echo hi"}]}]},
+        "permissions": {"allow": ["a"], "deny": ["b"]}, "model": "m"}))
+    (proj / ".mcp.json").write_text(json.dumps({"mcpServers": {
+        "s1": {"type": "stdio", "command": "npx"}, "s2": {"type": "stdio", "command": "npx"}}}))
+    home = tmp_path / "home"
+    home.mkdir()
+
+    def run_with_seed(seed):
+        env = dict(os.environ, PYTHONHASHSEED=str(seed), HOME=str(home))
+        proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                               "--project-root", str(proj), "--compose"],
+                              capture_output=True, text=True, timeout=30, env=env)
+        assert proc.returncode == 0, proc.stderr
+        doc = json.loads(proc.stdout)
+        doc.pop("generated_at")
+        return doc
+
+    d0 = run_with_seed("0")
+    d1 = run_with_seed("1")
+    assert json.dumps(d0, sort_keys=True) == json.dumps(d1, sort_keys=True)
+
+
+def test_compose_empty_project_tier_degrades_gracefully(fake_harness, tmp_path):
+    # F6 (T13 QA P3): --compose over a project repo with NEITHER .claude/ NOR any
+    # CLAUDE.md at all -- tier_composition/composed_settings must degrade to empty
+    # lists/dicts, never crash, and never fabricate a project-tier entry out of nothing.
+    proj = tmp_path / "empty-proj"
+    proj.mkdir()
+    assert not (proj / ".claude").exists()
+    assert not (proj / "CLAUDE.md").exists()
+    home = tmp_path / "home"
+    home.mkdir()
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+    # no project-tier node anywhere in the resolved tier composition
+    assert all(n["tier"] != "project" for n in doc["tier_composition"]["nodes"])
+    # the fixture's OWN operator-tier nodes (demo skill/agent/command) still resolve
+    # normally -- "degrades gracefully" means the project side is empty, not that the
+    # whole feature goes dark
+    assert any(n["tier"] == "operator" for n in doc["tier_composition"]["nodes"])
+    # no project-tier always-loaded category leaked into files[]
+    project_categories = {"project_claude_md", "project_rule", "project_claude_local_md",
+                          "project_claude_md_nested"}
+    assert not any(f.get("category") in project_categories for f in doc["always_loaded"]["files"])
+    # composed_settings still resolves (present, not a crash) with empty project/local layers
+    cs = doc["composed_settings"]
+    assert cs["hooks"] == [] or all(h["tier"] != "project" and h["tier"] != "local" for h in cs["hooks"])
+    assert cs["overrides"] == [] or all(o["winning_tier"] == "user" for o in cs["overrides"])
+    # inspected_roots still names the (non-existent-on-disk) project roots -- the field
+    # reflects the CONFIGURED root, not whether anything was found under it
+    assert doc["inspected_roots"]["project_containment"] == str(proj.resolve())
+    assert doc["inspected_roots"]["project_harness"] == str((proj / ".claude").resolve())
+    assert doc["always_loaded"]["totals"]["excluded_count"] == 0
+
+
+def test_compose_empty_project_tier_deterministic_across_hashseed(fake_harness, tmp_path):
+    proj = tmp_path / "empty-proj"
+    proj.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+
+    def run_with_seed(seed):
+        env = dict(os.environ, PYTHONHASHSEED=str(seed), HOME=str(home))
+        proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                               "--project-root", str(proj), "--compose"],
+                              capture_output=True, text=True, timeout=30, env=env)
+        assert proc.returncode == 0, proc.stderr
+        doc = json.loads(proc.stdout)
+        doc.pop("generated_at")
+        return doc
+
+    d0 = run_with_seed("0")
+    d1 = run_with_seed("1")
+    assert json.dumps(d0, sort_keys=True) == json.dumps(d1, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# Task T8 — iter_input_paths(compose=...): the WS-B superset invariant extended to the
+# project-tier reads T2/T3/T4/T5 added (`<repo>/CLAUDE.local.md` + nested CLAUDE.md via
+# the containment-root walk, `.claude/{rules,agents,commands,skills,hooks}` membership +
+# content). serve.py's watcher relies on this being complete in compose mode.
+# ---------------------------------------------------------------------------
+
+def test_iter_input_paths_compose_false_default_unchanged(fake_harness, tmp_path):
+    # Regression pin: the NEW project-tier-harness additions must be gated on compose=True,
+    # not merely on project_root being passed (the legacy active-project CLAUDE.md meaning
+    # already uses project_root without compose -- see the pre-existing tests above).
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "x.md").write_text("project rule body " * 10)
+    paths = set(map(str, _collector.iter_input_paths(fake_harness, proj)))
+    assert str(proj / ".claude" / "rules") not in paths
+    assert str(proj / ".claude" / "rules" / "x.md") not in paths
+    # explicit compose=False is identical to the omitted default
+    paths_explicit = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=False)))
+    assert paths_explicit == paths
+
+
+def test_iter_input_paths_compose_covers_claude_local_md(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / "CLAUDE.local.md").write_text("# local\n" + "word " * 20)
+    paths = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    assert str(proj / "CLAUDE.local.md") in paths
+
+
+def test_iter_input_paths_compose_covers_nested_claude_md(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / "sub" / "deeper").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / "sub" / "deeper" / "CLAUDE.md").write_text("# nested\n" + "word " * 20)
+    paths = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    assert str(proj / "sub" / "deeper" / "CLAUDE.md") in paths
+    assert str(proj / "sub" / "deeper") in paths          # containment dir itself, membership-watched
+
+
+def test_iter_input_paths_compose_covers_project_harness_surface_dirs(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    paths = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    for d in ("rules", "agents", "commands", "skills", "hooks"):
+        assert str(proj / ".claude" / d) in paths          # membership-watched, even absent today
+
+
+def test_iter_input_paths_compose_covers_project_rule_agent_command_content(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / ".claude" / "agents").mkdir(parents=True)
+    (proj / ".claude" / "commands").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "x.md").write_text("project rule body " * 10)
+    (proj / ".claude" / "agents" / "y.md").write_text("---\nname: y\ndescription: y.\n---\nBody.\n")
+    (proj / ".claude" / "commands" / "z.md").write_text("---\nname: z\ndescription: z.\n---\nBody.\n")
+    paths = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    assert str(proj / ".claude" / "rules" / "x.md") in paths
+    assert str(proj / ".claude" / "agents" / "y.md") in paths
+    assert str(proj / ".claude" / "commands" / "z.md") in paths
+
+
+def test_iter_input_paths_compose_covers_project_skill_md(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "skills" / "demo").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "skills" / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: demo.\n---\nBody.\n")
+    paths = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    assert str(proj / ".claude" / "skills" / "demo" / "SKILL.md") in paths
+
+
+def test_iter_input_paths_compose_detects_newly_added_nested_command(fake_harness, tmp_path):
+    # WS-B superset audits BOTH roots (T8 spec): a nested command added under the PROJECT
+    # tier after the first snapshot must be in a re-computed watched set.
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "commands").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    before = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    (proj / ".claude" / "commands" / "brand_new.md").write_text(
+        "---\nname: brand_new\ndescription: new.\n---\nBody.\n")
+    after = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    assert str(proj / ".claude" / "commands" / "brand_new.md") in after
+    assert str(proj / ".claude" / "commands" / "brand_new.md") not in before
+
+
+def test_iter_input_paths_compose_detects_newly_added_nested_claude_md(fake_harness, tmp_path):
+    proj = tmp_path / "compose-proj"
+    (proj / "existing-sub").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    before = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    (proj / "existing-sub" / "brand-new-sub").mkdir()
+    (proj / "existing-sub" / "brand-new-sub" / "CLAUDE.md").write_text("# new\n" + "word " * 20)
+    after = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    assert str(proj / "existing-sub" / "brand-new-sub" / "CLAUDE.md") in after
+    assert str(proj / "existing-sub" / "brand-new-sub" / "CLAUDE.md") not in before
+
+
+def test_iter_input_paths_compose_covers_project_settings_hook_script(fake_harness, tmp_path):
+    # T5's `_compose_hooks` checks `.exists()` on a project settings.json hook command's
+    # resolved script -- the watcher must observe that script's create/delete too.
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "hooks").mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 ./hooks/proj_hook.py"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    paths = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    assert str(proj / "hooks" / "proj_hook.py") in paths
+
+
+def test_iter_input_paths_compose_is_superset_of_real_compose_build_document_reads(
+        fake_harness, tmp_path):
+    # Instrumented proof (mirrors test_iter_input_paths_is_superset_of_real_build_document_reads
+    # above, extended to the project tier): run a REAL compose build_document pass while
+    # recording every path read under project_root, then assert each is covered by
+    # iter_input_paths(compose=True)'s watched set (or a descendant of a watched dir).
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / ".claude" / "agents").mkdir(parents=True)
+    (proj / ".claude" / "commands").mkdir(parents=True)
+    (proj / ".claude" / "skills" / "demo").mkdir(parents=True)
+    (proj / "sub").mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / "CLAUDE.local.md").write_text("# local\n" + "word " * 20)
+    (proj / "sub" / "CLAUDE.md").write_text("# nested\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "x.md").write_text("project rule body " * 10)
+    (proj / ".claude" / "agents" / "y.md").write_text("---\nname: y\ndescription: y.\n---\nBody.\n")
+    (proj / ".claude" / "commands" / "z.md").write_text("---\nname: z\ndescription: z.\n---\nBody.\n")
+    (proj / ".claude" / "skills" / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: demo.\n---\nBody.\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)
+
+    recorded = []
+    real_stat = Path.stat
+    real_open = Path.open
+    real_glob = Path.glob
+    real_iterdir = Path.iterdir
+
+    def rec_stat(self, *a, **k):
+        recorded.append(Path(self))
+        return real_stat(self, *a, **k)
+
+    def rec_open(self, *a, **k):
+        recorded.append(Path(self))
+        return real_open(self, *a, **k)
+
+    def rec_glob(self, pattern, *a, **k):
+        result = list(real_glob(self, pattern, *a, **k))
+        recorded.extend(Path(p) for p in result)
+        return iter(result)
+
+    def rec_iterdir(self, *a, **k):
+        result = list(real_iterdir(self, *a, **k))
+        recorded.append(Path(self))
+        recorded.extend(result)
+        return iter(result)
+
+    try:
+        Path.stat = rec_stat
+        Path.open = rec_open
+        Path.glob = rec_glob
+        Path.iterdir = rec_iterdir
+        _collector.build_document(str(fake_harness), str(proj), compose=True)
+    finally:
+        Path.stat = real_stat
+        Path.open = real_open
+        Path.glob = real_glob
+        Path.iterdir = real_iterdir
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
+    proj_resolved = proj.resolve()
+    yielded = [Path(p) for p in _collector.iter_input_paths(fake_harness, proj, compose=True)]
+    yielded_resolved = {p.resolve() for p in yielded}
+
+    def _covered(candidate):
+        cand = candidate.resolve()
+        if cand in yielded_resolved:
+            return True
+        return any(cand == y or y in cand.parents for y in yielded_resolved)
+
+    uncovered = []
+    for path in recorded:
+        try:
+            rel = path.resolve().relative_to(proj_resolved)
+        except (ValueError, OSError):
+            continue
+        if rel == Path("."):
+            continue
+        if not _covered(path):
+            uncovered.append(str(path))
+
+    assert not uncovered, (
+        f"paths read by compose build_document under project_root but not watched: "
+        f"{sorted(set(uncovered))}")
+
+
+# ---------------------------------------------------------------------------
+# Task T9 — integration test net: ONE maximal two-tier fixture exercising T2-T8
+# together (not in isolation), plus determinism and old-shape back-compat.
+# ---------------------------------------------------------------------------
+
+# Every raw secret value planted anywhere in `_build_two_tier_maximal_fixture` (env
+# values, MCP env/header values, and the out-of-root symlink target's body) — shared
+# with test_render_html.py so the SAME sentinel list is checked at both the collector-doc
+# and rendered-HTML layers against the SAME fixture (secret-safety end-to-end, T9 spec).
+_SECRET_SENTINELS = (
+    "SECRET-user-env-000", "SECRET-project-env-111", "SECRET-project-env-222",
+    "SECRET-user-mcp-xyz", "SECRET-local-header-999", "SECRET-mcp-project-abc",
+    "SECRET escaping project rule body",
+)
+
+
+def _build_two_tier_maximal_fixture(fake_harness, tmp_path):
+    """T9's ONE maximal composed fixture. Reuses `fake_harness`'s existing operator
+    "demo" skill / "demo-agent" agent / "demo-cmd" command / "a.md" rule as the OPERATOR
+    half of every T4 collision; the project half below is named identically to exercise
+    the shadow resolver in both directions (skill/command operator-wins, agent
+    project-wins), plus project-only adds on every surface, a cross-tier duplicate rule
+    pair (M4), an out-of-root escaping rule symlink (T3/H2), and a full Local>Project>User
+    settings/hooks/MCP chain carrying a DISTINCT secret sentinel at every tier (T5) — the
+    single end-to-end exercise T9 requires. Returns `(proj, home)`; caller sandboxes HOME
+    via `env={"HOME": str(home)}` on every collector invocation (collect_composed_mcp
+    reads `Path.home() / ".claude.json"`)."""
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "skills" / "demo").mkdir(parents=True)
+    (proj / ".claude" / "skills" / "proj-only-skill").mkdir(parents=True)
+    (proj / ".claude" / "agents").mkdir(parents=True)
+    (proj / ".claude" / "commands").mkdir(parents=True)
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "hooks").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# Project instructions\n" + "word " * 20)
+
+    # --- T4 collisions: skill/command operator-wins (project dark), agent project-wins
+    # (operator shadowed) -- the asymmetry every T4 test already pins in isolation, now
+    # combined with everything else in one fixture.
+    (proj / ".claude" / "skills" / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: project-tier shadow of the operator demo skill.\n---\n"
+        "Project demo body.\n")
+    (proj / ".claude" / "skills" / "proj-only-skill" / "SKILL.md").write_text(
+        "---\nname: proj-only-skill\ndescription: project-only skill add.\n---\nBody.\n")
+    (proj / ".claude" / "agents" / "demo-agent.md").write_text(
+        "---\nname: demo-agent\ndescription: project-tier override of the operator agent.\n---\n"
+        "Project agent body.\n")
+    (proj / ".claude" / "agents" / "proj-only-agent.md").write_text(
+        "---\nname: proj-only-agent\ndescription: project-only agent add.\n---\nBody.\n")
+    (proj / ".claude" / "commands" / "demo-cmd.md").write_text(
+        "---\nname: demo-cmd\ndescription: project-tier shadow of the operator command.\n---\n"
+        "Project command body.\n")
+    (proj / ".claude" / "commands" / "proj-only-cmd.md").write_text(
+        "---\nname: proj-only-cmd\ndescription: project-only command add.\n---\nBody.\n")
+
+    # --- cross-tier duplication (M4): an operator rule fully subsumed by a project rule
+    # (containment coefficient, not Jaccard) -- same unique-word-block pattern
+    # test_tier_composition_cross_tier_duplication_detected already proved reliable.
+    dup_block = _uw("z", 17)
+    (fake_harness / "rules" / "dup-op.md").write_text(dup_block)
+    (proj / ".claude" / "rules" / "dup-proj.md").write_text(dup_block + " " + _uw("x", 85))
+
+    # --- project-only rule: a UNION-surface add (loads alongside, never shadowed/dark).
+    (proj / ".claude" / "rules" / "only-project.md").write_text("Project only rule body " * 12)
+
+    # --- out-of-root escaping symlink (T3/H2): recorded as an out_of_root_ref, NEVER
+    # read/excerpted, excluded from always_loaded weight.
+    outside = tmp_path / "outside-escaping-rule.md"
+    outside.write_text("SECRET escaping project rule body " * 10)
+    (proj / ".claude" / "rules" / "escaping.md").symlink_to(outside)
+
+    # --- settings: Local > Project > User, permissions union+deny-wins, secret env at
+    # every tier (redacted to key-names-only by `_settings_overrides`).
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "python3 hooks/op-hook.py"}]}]},
+        "permissions": {"allow": ["Bash(user:*)"], "deny": [], "ask": []},
+        "env": {"GITHUB_TOKEN": "SECRET-user-env-000"}, "model": "user-model"}))
+    (fake_harness / "hooks" / "op-hook.py").write_text("# op\n")
+
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [
+            {"type": "command", "command": "python3 ./hooks/proj-hook.py"}]}]},
+        "permissions": {"allow": ["Bash(project:*)"], "deny": ["Bash(user:*)"], "ask": []},
+        "env": {"GITHUB_TOKEN": "SECRET-project-env-111", "EXTRA_KEY": "SECRET-project-env-222"},
+        "model": "project-model"}))
+    (proj / "hooks" / "proj-hook.py").write_text("# proj\n")
+
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps({
+        "hooks": {"SessionStart": [{"matcher": None, "hooks": [
+            {"type": "command", "command": "echo local-only"}]}]},
+        "permissions": {"allow": [], "deny": [], "ask": ["Bash(local-ask:*)"]},
+        "model": "local-model"}))
+
+    # --- MCP: Local > Project > User precedence, a distinct secret env/header at every
+    # tier, plus a 3-way name collision ("shared") to prove Local wins.
+    (proj / ".mcp.json").write_text(json.dumps({"mcpServers": {
+        "shared": {"type": "stdio", "command": "npx"},
+        "project-only": {"type": "stdio", "command": "npx",
+                          "env": {"PROJ_KEY": "SECRET-mcp-project-abc"}}}}))
+    home = tmp_path / "home"
+    home.mkdir()
+    proj_key = str(proj.resolve())
+    (home / ".claude.json").write_text(json.dumps({
+        "mcpServers": {
+            "shared": {"type": "stdio", "command": "user-cmd"},
+            "user-only": {"type": "stdio", "command": "user-cmd",
+                          "env": {"USER_TOKEN": "SECRET-user-mcp-xyz"}}},
+        "projects": {proj_key: {"mcpServers": {
+            "shared": {"type": "http", "url": "https://local.example/mcp"},
+            "local-only": {"type": "http", "url": "https://local.example/mcp2",
+                           "headers": {"Authorization": "Bearer SECRET-local-header-999"}}}}}}))
+    return proj, home
+
+
+def test_maximal_two_tier_fixture_end_to_end_collector_doc(fake_harness, tmp_path):
+    proj, home = _build_two_tier_maximal_fixture(fake_harness, tmp_path)
+    doc = run_collector(fake_harness, "--compose", project_root=proj, env={"HOME": str(home)})
+
+    # --- T4 shadow resolver, both collision directions, plus every surface's adds ---
+    surfaces = doc["tier_composition"]["surfaces"]
+    assert surfaces["skill"] == {"merge": "shadow", "winner_tier": "operator",
+                                  "adds": 1, "overrides": 0, "dark": 1}
+    assert surfaces["agent"] == {"merge": "shadow", "winner_tier": "project",
+                                  "adds": 1, "overrides": 1, "dark": 0}
+    assert surfaces["command"] == {"merge": "shadow", "winner_tier": "operator",
+                                    "adds": 1, "overrides": 0, "dark": 1}
+    assert surfaces["rule"] == {"merge": "union", "winner_tier": None,
+                                 "adds": 2, "overrides": 0, "dark": 0}
+    # P2-A: CLAUDE files and hooks are UNION surfaces too — the fixture's project
+    # CLAUDE.md is an add. Hook nodes normalize settings' 3-way tier (user/project/local)
+    # to the binary operator|project node vocabulary (P2 fix, cross-model review): the
+    # fixture's Project-tier AND Local-tier hooks are both project-side, so both count.
+    assert surfaces["claude_md"] == {"merge": "union", "winner_tier": None,
+                                      "adds": 1, "overrides": 0, "dark": 0}
+    assert surfaces["hook"] == {"merge": "union", "winner_tier": None,
+                                 "adds": 2, "overrides": 0, "dark": 0}
+
+    skill_demo_proj = _tier_node(doc, "skill", "demo", "project")
+    assert skill_demo_proj["status"] == "shadowed"
+    assert skill_demo_proj["shadowed_by"]["tier"] == "operator"
+    agent_demo_op = _tier_node(doc, "agent", "demo-agent", "operator")
+    assert agent_demo_op["status"] == "shadowed"
+    assert agent_demo_op["shadowed_by"]["tier"] == "project"
+    cmd_demo_proj = _tier_node(doc, "command", "demo-cmd", "project")
+    assert cmd_demo_proj["status"] == "shadowed"
+    assert cmd_demo_proj["shadowed_by"]["tier"] == "operator"
+
+    # --- tenant isolation (C16): every add/override/dark count is a PROJECT node; an
+    # operator node is NEVER counted -- verified as an exact total, not just "some".
+    proj_nodes = [n for n in doc["tier_composition"]["nodes"] if n["tier"] == "project"]
+    total_classified = sum(s["adds"] + s["overrides"] + s["dark"] for s in surfaces.values())
+    assert len(proj_nodes) == 11
+    assert total_classified == len(proj_nodes)
+
+    # --- cross-tier duplication (M4) ---
+    dup_pair = next((p for p in doc["duplication"]["pairs"]
+                      if {p["a"], p["b"]} == {"rules/dup-op.md", ".claude/rules/dup-proj.md"}), None)
+    assert dup_pair is not None, "cross-tier duplicate pair must be detected"
+    assert dup_pair["score"] >= 0.6
+    assert {dup_pair["a_tier"], dup_pair["b_tier"]} == {"operator", "project"}
+
+    # --- out-of-root symlink: recorded, NOT read/excerpted, excluded from weight ---
+    assert any(r["name"] == ".claude/rules/escaping.md" for r in doc["out_of_root_refs"])
+    assert doc["always_loaded"]["totals"]["excluded_count"] == 1
+    assert not any(f["path"] == ".claude/rules/escaping.md" for f in doc["always_loaded"]["files"])
+
+    # --- composed permissions: union, deny wins a same-rule conflict across tiers ---
+    assert doc["composed_settings"]["permissions"] == {
+        "allow_count": 1, "deny_count": 1, "ask_count": 1, "evidence": "VERIFIED"}
+
+    # --- composed hooks: union across tiers, source-tagged, project-relative script path ---
+    by_tier = {h["tier"]: h for h in doc["composed_settings"]["hooks"]}
+    assert set(by_tier) == {"user", "project", "local"}
+    assert by_tier["user"]["script"] == "hooks/op-hook.py" and by_tier["user"]["exists"] is True
+    assert by_tier["project"]["script"] == "hooks/proj-hook.py" and by_tier["project"]["exists"] is True
+    assert by_tier["local"]["script"] is None and by_tier["local"]["exists"] is None
+
+    # --- composed overrides: Local > Project > User, secret-safe (names, never values) ---
+    overrides = {o["key"]: o for o in doc["composed_settings"]["overrides"]}
+    assert overrides["model"] == {"key": "model", "winning_tier": "local",
+                                   "winning_value": "local-model",
+                                   "overridden_tiers": ["project", "user"]}
+    assert overrides["env"]["winning_tier"] == "project"
+    assert overrides["env"]["winning_value"] == ["EXTRA_KEY", "GITHUB_TOKEN"]
+    assert overrides["env"]["overridden_tiers"] == ["user"]
+
+    # --- composed MCP: Local > Project > User precedence on a 3-way collision + solo tiers ---
+    servers = {s["name"]: s for s in doc["composed_settings"]["mcp"]}
+    assert servers["shared"]["tier"] == "local"
+    assert servers["user-only"]["tier"] == "user" and servers["user-only"]["env_keys"] == ["USER_TOKEN"]
+    assert servers["local-only"]["tier"] == "local"
+    assert servers["local-only"]["header_keys"] == ["Authorization"]
+    assert servers["project-only"]["tier"] == "project"
+    assert servers["project-only"]["env_keys"] == ["PROJ_KEY"]
+
+    # --- secret-safety end-to-end: no raw secret value anywhere in the emitted document ---
+    blob = json.dumps(doc)
+    for secret in _SECRET_SENTINELS:
+        assert secret not in blob, f"raw secret leaked into the collector document: {secret}"
+
+
+def test_maximal_two_tier_fixture_deterministic_across_hashseed(fake_harness, tmp_path):
+    proj, home = _build_two_tier_maximal_fixture(fake_harness, tmp_path)
+
+    def run_with_seed(seed):
+        env = dict(os.environ, PYTHONHASHSEED=str(seed), HOME=str(home))
+        proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+                               "--project-root", str(proj), "--compose"],
+                              capture_output=True, text=True, timeout=30, env=env)
+        assert proc.returncode == 0, proc.stderr
+        doc = json.loads(proc.stdout)
+        doc.pop("generated_at")
+        return doc
+
+    d0 = run_with_seed("0")
+    d1 = run_with_seed("1")
+    assert json.dumps(d0, sort_keys=True) == json.dumps(d1, sort_keys=True)
+    node_paths = [(n["surface"], n["path"], n["tier"]) for n in d0["tier_composition"]["nodes"]]
+    assert node_paths == sorted(node_paths, key=lambda t: (t[1], t[2]))
+
+
+def test_maximal_two_tier_fixture_non_compose_omits_every_compose_only_field(fake_harness, tmp_path):
+    # C15 back-compat, on the SAME maximal fixture the compose-mode test above exercises:
+    # the non-compose (old-shape) run must carry none of T2-T5's additive fields.
+    proj, home = _build_two_tier_maximal_fixture(fake_harness, tmp_path)
+    doc = run_collector(fake_harness, project_root=proj, env={"HOME": str(home)})
+    for key in ("tier_composition", "composed_settings", "inspected_roots", "out_of_root_refs"):
+        assert key not in doc
+    assert "excluded_count" not in doc["always_loaded"]["totals"]
+    assert all("a_tier" not in p and "b_tier" not in p for p in doc["duplication"]["pairs"])
+    # the operator-tier "demo"/"demo-agent"/"demo-cmd" collisions are invisible outside
+    # compose mode -- only the operator entries exist at all, no shadow/dark concept.
+    assert doc["headline"]["always_loaded_file_count"] >= 1
