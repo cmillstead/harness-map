@@ -86,6 +86,8 @@ Reference the two-axis grid — verbs (Afford, Inform, Constrain, Verify, Correc
 
 Glob `$OUT_DIR/harness-map-*.json` (the same report directory `OUT_DIR` used in Step A), sort by the `YYYY-MM-DD` in the filename, take the most recent sidecar strictly BEFORE today's date. Diff the headline numbers (always-loaded words/tokens, file count, dup-pair count, length-flag count, orphan counts) current-vs-prior. If no prior sidecar exists, state exactly: "First run — no prior map (baseline)."
 
+The Trend tab also grows a per-metric sparkline (last 10 runs) once the SAME `OUT_DIR` has accrued 3+ dated sidecars — another reason to keep reusing that one stable directory across runs.
+
 ## Promotion Honors Hooks-As-Last-Resort
 
 `promotion_candidates` propose extending an EXISTING hook before proposing a new one. Prose-check trigger patterns are advisory only (NEVER/ALWAYS clauses, "must"/"must not", numeric caps like "≤N lines" / ">N lines", required-file assertions) — the collector surfaces the signal; synthesis decides whether extension or a new check is warranted.

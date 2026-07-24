@@ -2677,6 +2677,82 @@ def test_trend_delta_renders_polarity_aware_class_in_gauge_card(tmp_path):
     assert "▲" in gauge.group(0) and "100" in gauge.group(0)
 
 
+# ============================================================= S2.M5 trend sparklines
+def test_sparkline_renders_with_three_sidecars(tmp_path):
+    """≥3 dated sidecars (SPEC_4 §3 gate): a sparkline appears for each of the 8
+    headline series."""
+    out_dir = tmp_path / "spark3"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-13", _minimal_doc(tokens_a=100, tokens_b=50))
+    _write_sidecar(out_dir, "2026-07-14", _minimal_doc(tokens_a=150, tokens_b=50))
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc(tokens_a=200, tokens_b=50))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert text.count('class="sparkline"') == len(rh.HEADLINE_KEYS)
+
+
+def test_sparkline_windows_to_last_ten(tmp_path):
+    """12 dated sidecars -> one series' polyline has EXACTLY 10 coordinate pairs.
+    Changing N=10 requires a spec change (SPEC_4 §3)."""
+    out_dir = tmp_path / "spark12"
+    out_dir.mkdir()
+    for i in range(12):
+        _write_sidecar(out_dir, f"2026-07-{i + 1:02d}", _minimal_doc(tokens_a=100 + i, tokens_b=50))
+    proc = run_render(out_dir, "--date", "2026-07-12", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-12.html").read_text(encoding="utf-8")
+    import re
+    m = re.search(r'id="spark-always_loaded_tokens_est"[^>]*>.*?<polyline points="([^"]*)"', text, re.S)
+    assert m is not None
+    assert len(m.group(1).split(" ")) == rh.SPARKLINE_WINDOW == 10
+
+
+def test_sparkline_absent_below_three_sidecars(tmp_path):
+    """Exactly 2 dated sidecars: no sparkline renders, but the existing Metric×dates
+    table presentation is unchanged and still present."""
+    out_dir = tmp_path / "spark2"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-14", _minimal_doc(tokens_a=100, tokens_b=50))
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc(tokens_a=200, tokens_b=50))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'class="sparkline"' not in text
+    assert "<th>Metric</th>" in text
+    assert "Always-loaded tokens (est)" in text
+
+
+def test_sparkline_dates_and_values_are_escaped(tmp_path):
+    """A hostile date/headline-value pair must never land unescaped in the sparkline
+    presentation — the sidecar filename regex constrains dates, so we inject the
+    hostile string via a headline value instead (same class of hostile-payload as
+    the XSS_PAYLOADS convention, tests/test_render_html.py:694)."""
+    payload = '</script><img onerror=alert(1)>'
+    doc1 = _minimal_doc(tokens_a=100, tokens_b=50)
+    doc2 = _minimal_doc(tokens_a=150, tokens_b=50)
+    doc3 = _minimal_doc(tokens_a=200, tokens_b=50)
+    # `orphan_registration_count` is a headline series NOT read by `_trend_delta`'s
+    # gauge-card path (GAUGE_SPECS only wires 5 of the 8 headline keys there) — this
+    # isolates the assertion to the sparkline's own escaping/robustness, not a
+    # pre-existing `_trend_delta` numeric-comparison gap on a gauge-linked key
+    # (out-of-scope for S2.M5 — reported separately).
+    doc3["headline"]["orphan_registration_count"] = payload
+    out_dir = tmp_path / "sparkxss"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-13", doc1)
+    _write_sidecar(out_dir, "2026-07-14", doc2)
+    _write_sidecar(out_dir, "2026-07-15", doc3)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert payload not in text
+    assert "&lt;" in text or "&quot;" in text or "&amp;" in text
+    # the corrupted series' own sparkline is skipped (non-numeric guard), but the
+    # other 7 headline series still render sparklines normally.
+    assert text.count('class="sparkline"') == len(rh.HEADLINE_KEYS) - 1
+
+
 def test_data_goto_cross_view_nav_removed_after_tab_merge():
     """Task B-t2 tab merge: `data-goto` only ever existed to drive the Overview
     mini-grid's "jump to Coverage tab" click — dropping the mini-grid (folded into

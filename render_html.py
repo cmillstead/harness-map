@@ -1403,6 +1403,10 @@ tr.tier-project td:first-child{border-left:3px solid var(--tier-project)}
 .tier-dark-callout h3{font-size:0.78rem;margin:0 0 6px 0;color:var(--muted);font-family:var(--mono);text-transform:uppercase;letter-spacing:.03em}
 .tier-dark-callout ul{margin:0;padding-left:18px}
 .tier-dark-callout li{margin:3px 0;font-size:0.82rem}
+/* Trend sparklines (S2.M5): inline-SVG, no external assets. `currentColor` picks up
+   the cell's text color so the mark stays legible in both themes without a new token. */
+.sparkline{color:var(--accent);vertical-align:middle}
+.sparkline-stats{margin-left:6px;font-size:0.72rem;color:var(--muted);font-variant-numeric:tabular-nums}
 /* Composed-settings source-tier badges (T7b) — the 3-way user/project/local vocabulary
    (`_normalize_settings_tier`), distinct from the `.badge.tier-operator`/`.badge.tier-project`
    pair above (the binary skills/agents/rules NODE tag). "user" and "project" reuse those same
@@ -2696,16 +2700,95 @@ def _render_bipartite_body(model):
     )
 
 
+# S2.M5 [DECISION]: the sparkline display window is the LAST N points of a series
+# (`build_trend_model` already loads every sidecar in `--out-dir`; this module adds
+# NO new I/O, it only slices the existing model). Encoded as a named constant so the
+# test suite can pin it (SPEC_4 §3).
+SPARKLINE_WINDOW = 10
+# Sparklines appear once a series has at least this many dated sidecars — below the
+# gate the existing Metric×dates table/empty-state renders alone (SPEC_4 §3).
+SPARKLINE_MIN_POINTS = 3
+_SPARKLINE_W = 120.0
+_SPARKLINE_H = 24.0
+_SPARKLINE_PAD = 2.0
+
+
+def _coerce_floats(values: list[Any]) -> list[float] | None:
+    """Coerce a headline series window to floats for sparkline geometry. Values are
+    nominally ints from the collector, but a hostile/corrupt sidecar can put a
+    non-numeric string there — returns None (never raises) if ANY value in the
+    window isn't numeric, so the caller can degrade THAT series' sparkline instead
+    of crashing (SPEC_4 §3 escaping/robustness discipline). The existing table cell
+    still renders the raw value via `esc_html` regardless of this result."""
+    out: list[float] = []
+    for v in values:
+        try:
+            out.append(float(cast(Any, v)))
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def _sparkline_svg(dom_id: str, floats: list[float]) -> str:
+    """One inline `<svg><polyline>` sparkline (no external assets, §9-R). `floats`
+    is already-coerced, already-windowed (SPARKLINE_WINDOW) geometry data — every
+    coordinate goes through `_fmt_float` (§4.6), never raw `str()`/f-string floats."""
+    lo, hi = min(floats), max(floats)
+    span = (hi - lo) or 1.0  # flat series: avoid /0, render a flat mid-height line
+    n = len(floats)
+    step = _SPARKLINE_W / (n - 1) if n > 1 else 0.0
+    points = []
+    for i, f in enumerate(floats):
+        x = i * step if n > 1 else _SPARKLINE_W / 2
+        y = _SPARKLINE_PAD + (1.0 - (f - lo) / span) * (_SPARKLINE_H - 2 * _SPARKLINE_PAD)
+        points.append(f"{_fmt_float(x)},{_fmt_float(y)}")
+    poly = " ".join(points)
+    return (
+        f'<svg class="sparkline" id="{esc_html(dom_id)}" '
+        f'viewBox="0 0 {_fmt_float(_SPARKLINE_W)} {_fmt_float(_SPARKLINE_H)}" '
+        f'width="120" height="24" role="img" aria-labelledby="{esc_html(dom_id)}-title">'
+        f'<title id="{esc_html(dom_id)}-title">trend sparkline</title>'
+        f'<polyline points="{esc_html(poly)}" fill="none" stroke="currentColor" '
+        f'stroke-width="1.5"/></svg>'
+    )
+
+
+def _sparkline_cell(series: dict[str, Any]) -> str:
+    """Sparkline + min/max/current for one headline series, windowed to the last
+    `SPARKLINE_WINDOW` points. Returns "" (no crash, no sparkline) when the window
+    contains a non-numeric value — the existing per-date table cells still show the
+    raw (escaped) value regardless."""
+    window = series["values"][-SPARKLINE_WINDOW:]
+    floats = _coerce_floats(window)
+    if floats is None or not floats:
+        return ""
+    svg = _sparkline_svg(f"spark-{series['key']}", floats)
+    stats = (
+        '<span class="sparkline-stats">'
+        f'min {esc_html(_fmt_float(min(floats)))} · '
+        f'max {esc_html(_fmt_float(max(floats)))} · '
+        f'cur {esc_html(_fmt_float(floats[-1]))}</span>'
+    )
+    return svg + stats
+
+
 def _render_trend_body(model):
     if model["first_run"]:
         body = '<p class="empty-state">first run — no baseline</p>'
     else:
+        # ≥3 dated sidecars: prepend a sparkline column ahead of the unchanged
+        # per-date columns (SPEC_4 §3) — below the gate the table renders exactly
+        # as before this milestone.
+        show_sparklines = len(model["dates"]) >= SPARKLINE_MIN_POINTS
         rows = "".join(
             f'<tr><td>{esc_html(s["label"])}</td>'
+            + (f'<td>{_sparkline_cell(s)}</td>' if show_sparklines else '')
             + "".join(f'<td>{esc_html(v)}</td>' for v in s["values"]) + '</tr>'
             for s in model["series"])
+        spark_header = '<th>Trend</th>' if show_sparklines else ''
         header = "".join(f'<th>{esc_html(d)}</th>' for d in model["dates"])
-        body = f'<div class="overflow-x"><table><tr><th>Metric</th>{header}</tr>{rows}</table></div>'
+        body = (f'<div class="overflow-x"><table><tr><th>Metric</th>{spark_header}'
+                f'{header}</tr>{rows}</table></div>')
     return f'<div class="card"><h2>Trend (8 headline metrics)</h2>{body}</div>'
 
 
