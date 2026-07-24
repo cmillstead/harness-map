@@ -241,6 +241,31 @@ def test_build_trend_model_single_sidecar_first_run():
     assert model["first_run"] is True
 
 
+def test_trend_delta_nonnumeric_headline_value_does_not_crash(tmp_path):
+    """A17: a corrupt/hostile OLDER sidecar carrying a non-numeric value on a
+    gauge-linked headline key (e.g. `always_loaded_words`) must not crash the whole
+    render — the `cur > prev` comparison in `_trend_delta` used to raise
+    TypeError('>' not supported between instances of 'str' and 'int'). It must
+    degrade to no-delta for that gauge. (The corrupt value lives on the OLDER
+    sidecar, not the selected/current one, so this isolates the `_trend_delta`
+    comparison guard from the unrelated, out-of-scope `_gauge_band` current-value
+    path, which has its own pre-existing non-numeric-value crash.)"""
+    doc1 = _minimal_doc()
+    doc1["headline"]["always_loaded_words"] = "</script>corrupt"  # hostile, non-numeric
+    doc2 = _minimal_doc()
+    out_dir = tmp_path / "a17"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-14", doc1)
+    _write_sidecar(out_dir, "2026-07-15", doc2)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "</script>corrupt" not in text  # never emitted raw
+
+    trend_model = rh.build_trend_model([("2026-07-14", doc1), ("2026-07-15", doc2)])
+    assert rh._trend_delta(trend_model, "always_loaded_words") is None
+
+
 def test_build_dupweb_model_nodes_edges_phantom_refs():
     doc = _minimal_doc()
     model = rh.build_dupweb_model(doc)

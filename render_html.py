@@ -2115,6 +2115,8 @@ def _trend_delta(trend_model, key):
     if not series or len(series["values"]) < 2:
         return None
     cur, prev = series["values"][-1], series["values"][-2]
+    if not (isinstance(cur, (int, float)) and isinstance(prev, (int, float))):
+        return None  # A17: a corrupt/hostile sidecar value is not comparable — degrade to no-delta, never crash
     if cur == prev:
         return ("= 0", "neutral")
     arrow = "▲" if cur > prev else "▼"   # ▲ / ▼
