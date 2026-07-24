@@ -23,6 +23,7 @@ import stat
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any, cast
 
 SCHEMA_VERSION = 1
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -93,7 +94,7 @@ CODEX_VERDICT_LABELS = {"APPROVED": "approved", "PASS": "pass", "REVISE": "neede
 
 
 # --------------------------------------------------------------------------- escaping
-def esc_html(value):
+def esc_html(value: Any) -> str:
     """HTML/attribute/SVG-text escaping — the single primitive for every scanned or
     telemetry string leaf (§3.1). Covers text content, attributes, and SVG text/attrs
     (shared HTML5 tokenizer). Lone UTF-16 surrogates (the collector deliberately
@@ -104,7 +105,7 @@ def esc_html(value):
     return html.escape(text, quote=True)
 
 
-def esc_json_script(value, *, ordered=True):
+def esc_json_script(value: Any, *, ordered: bool = True) -> str:
     """Fallback-only helper (§3.1) for the sole content of a `<script
     type="application/json">` data island read via `.textContent` + `JSON.parse`.
     NOT used by default — the renderer keeps dynamic data out of executable script
@@ -119,11 +120,11 @@ def _fmt_float(x):
 
 
 # --------------------------------------------------------------------- discovery / load
-def find_sidecars(out_dir):
+def find_sidecars(out_dir: Path) -> list[tuple[str, Path]]:
     """[(date_str, Path)] for every `harness-map-YYYY-MM-DD.json` in `out_dir`, sorted
     ascending by date. Filename-regex + lexicographic sort — never mtime/iterdir order
     (§4.1). Explicitly excludes `harness-synthesis-*.json` (Codex F7)."""
-    out = []
+    out: list[tuple[str, Path]] = []
     try:
         names = sorted(p.name for p in Path(out_dir).iterdir())
     except OSError:
@@ -135,7 +136,7 @@ def find_sidecars(out_dir):
     return out
 
 
-def load_sidecar(path):
+def load_sidecar(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     """(doc|None, error|None) — never raises. Structural TYPE validation (§6): top-level
     must be a dict; `schema_version` must be present."""
     try:
@@ -153,7 +154,7 @@ def load_sidecar(path):
     return doc, None
 
 
-def load_synthesis(out_dir, date):
+def load_synthesis(out_dir: Path, date: str) -> tuple[dict[str, Any] | None, str | None]:
     """(doc|None, error|None) — the synthesis sidecar is OPTIONAL; absence is not an
     error (returns (None, None)). An invalid file is an explicit unavailable state
     (§6), never a partial render."""
@@ -166,12 +167,14 @@ def load_synthesis(out_dir, date):
     return doc, None
 
 
-def select_current(sidecars, date):
+def select_current(
+    sidecars: list[tuple[str, Path]], date: str | None
+) -> tuple[str | None, dict[str, Any] | None, list[dict[str, Any]], str | None]:
     """(date_str, doc, skipped[]) — exact-match only when `date` given (typo is FATAL,
     Codex F8); otherwise the LATEST VALID sidecar, using ITS actual date consistently.
     A corrupt sidecar among several is excluded + listed in `skipped[]`; an explicit
     `--date` naming a corrupt sidecar is fatal (never silently substitutes)."""
-    skipped = []
+    skipped: list[dict[str, Any]] = []
     if date is not None:
         match = next((p for d, p in sidecars if d == date), None)
         if match is None:
@@ -277,7 +280,9 @@ def _worst_ratio(row, side):
     return worst
 
 
-def squarify(items, x, y, w, h):
+def squarify(
+    items: list[dict[str, Any]], x: float, y: float, w: float, h: float
+) -> list[dict[str, Any]]:
     """2-D squarified treemap layout (ratified §9-R A). `items`: list of dicts each
     carrying a numeric 'size' key; non-positive sizes must already be filtered out by
     the caller (Codex F12). Returns new dicts (input dicts + x/y/w/h float geometry),
@@ -332,8 +337,10 @@ def squarify(items, x, y, w, h):
 
 
 # --------------------------------------------------------------------------- transforms
-def _tokens_treemap(files, canvas_w=960.0, canvas_h=420.0):
-    by_cat = {}
+def _tokens_treemap(
+    files: list[dict[str, Any]], canvas_w: float = 960.0, canvas_h: float = 420.0
+) -> dict[str, Any]:
+    by_cat: dict[Any, list[dict[str, Any]]] = {}
     for f in files:
         by_cat.setdefault(f.get("category"), []).append(f)
     groups = []
@@ -367,9 +374,11 @@ def _tokens_treemap(files, canvas_w=960.0, canvas_h=420.0):
             "canvas_w": canvas_w, "canvas_h": canvas_h}
 
 
-def _on_demand_treemap(doc, canvas_w=960.0, canvas_h=420.0):
+def _on_demand_treemap(
+    doc: dict[str, Any], canvas_w: float = 960.0, canvas_h: float = 420.0
+) -> dict[str, Any]:
     on_demand = doc.get("on_demand", {}) or {}
-    items_by_group = {g: [] for g, _ in ON_DEMAND_GROUPS}
+    items_by_group: dict[str, list[dict[str, Any]]] = {g: [] for g, _ in ON_DEMAND_GROUPS}
     for s in on_demand.get("skills", []) or []:
         items_by_group["skill"].append({"size": s.get("words", 0), "path": s.get("name", ""),
                                          "node_key": _od_node_key(s.get("name", "")),
@@ -393,20 +402,20 @@ def _on_demand_treemap(doc, canvas_w=960.0, canvas_h=420.0):
     group_rects = squarify(sorted(group_items, key=lambda g: (-g["size"], g["category"])),
                             0.0, 0.0, canvas_w, canvas_h)
     all_cells = []
-    for g in group_rects:
-        cell_items = sorted(items_by_group[g["category"]], key=lambda i: (-i["size"], i["path"]))
-        cells = squarify(cell_items, float(g["x"]), float(g["y"]), float(g["w"]), float(g["h"]))
+    for rect in group_rects:
+        cell_items = sorted(items_by_group[rect["category"]], key=lambda i: (-i["size"], i["path"]))
+        cells = squarify(cell_items, float(rect["x"]), float(rect["y"]), float(rect["w"]), float(rect["h"]))
         for c in cells:
             # Demo parity #5 (B-t3 follow-up): a distinct but still COOL hue from the
             # always-loaded section (never crit-red/good-green — the friction-heat
             # overlay's red stroke ramp needs the base fill to stay out of its way).
             c["fill"] = "var(--accent-2)"
-            c["category"] = g["category"]
+            c["category"] = rect["category"]
         all_cells.extend(cells)
     return {"groups": group_rects, "cells": all_cells, "canvas_w": canvas_w, "canvas_h": canvas_h}
 
 
-def build_contextweight_model(doc):
+def build_contextweight_model(doc: dict[str, Any]) -> dict[str, Any]:
     """(a) Context-weight: TWO treemaps (Codex F3) — always-loaded (by category, sized
     by tokens_est) and on-demand (skills/phases/prompts/agents/memory, sized by
     words). Both squarified (§9-R A); every cell carries `node_key` for the friction
@@ -419,7 +428,7 @@ def build_contextweight_model(doc):
     }
 
 
-def build_bipartite_model(doc):
+def build_bipartite_model(doc: dict[str, Any]) -> dict[str, Any]:
     """(b) Hook wiring: registration/reachability STATUS (Codex F4) — direct edges only
     are drawn; dispatcher reachability is a badge, never a fabricated edge."""
     hooks = (doc.get("enforcement", {}) or {}).get("hooks", {}) or {}
@@ -450,7 +459,7 @@ def build_bipartite_model(doc):
             "orphan_script_count": len(orphan_scripts)}
 
 
-def build_trend_model(dated_docs):
+def build_trend_model(dated_docs: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
     """(c) Trend: 8 headline series across ALL loaded sidecars in `--out-dir`
     (filtered to the SELECTED sidecar's `root`, Codex F13)."""
     dates = [d for d, _ in dated_docs]
@@ -460,7 +469,7 @@ def build_trend_model(dated_docs):
     return {"dates": dates, "series": series, "first_run": len(dated_docs) <= 1}
 
 
-def build_dupweb_model(doc):
+def build_dupweb_model(doc: dict[str, Any]) -> dict[str, Any]:
     """(d) Duplication web: dedup node set (lex-sorted) + edges in pair order +
     phantom_refs table.
 
@@ -487,7 +496,7 @@ def build_dupweb_model(doc):
             "metric": dup.get("metric", "containment"), "phantom_refs": doc.get("phantom_refs", []) or []}
 
 
-def build_civc_model(synth):
+def build_civc_model(synth: dict[str, Any] | None) -> dict[str, Any]:
     """CIVC 6x6 grid. Absent synthesis -> graceful empty-state (`available=False`,
     §6). A malformed cell set never crashes: missing cells fall back to 'empty'.
     `verdict` is allowlisted to VERDICTS here — the ONE normalization point every
@@ -496,7 +505,7 @@ def build_civc_model(synth):
     as an extra CSS class (Codex P1 class-injection finding)."""
     if synth is None:
         return {"available": False, "cells": []}
-    by_key = {}
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for c in synth.get("civc", []) or []:
         if isinstance(c, dict) and c.get("verb") in VERBS and c.get("surface") in SURFACES:
             by_key[(c["verb"], c["surface"])] = c
@@ -513,7 +522,7 @@ def build_civc_model(synth):
     return {"available": True, "cells": cells}
 
 
-def build_dragcandidate_model(synth):
+def build_dragcandidate_model(synth: dict[str, Any] | None) -> dict[str, Any]:
     """Drag-candidate table. Absent synthesis -> graceful empty-state."""
     if synth is None:
         return {"available": False, "rows": []}
@@ -547,7 +556,11 @@ def _gauge_band(key, value):
     return bands[-1][1], bands[-1][2]
 
 
-def friction_total(joined, codex_aggregate, metrics_aggregate_only=0):
+def friction_total(
+    joined: dict[str, Any],
+    codex_aggregate: dict[str, Any],
+    metrics_aggregate_only: int = 0,
+) -> int:
     """AM-1 gauge value: total friction events across the 4 streams = joined telemetry
     records (decisions/metrics/interventions) + codex runs + metrics-eligible records
     that resolved to NO node (`metrics_aggregate_only`). This is a JOIN-EVENT count, not
@@ -582,7 +595,12 @@ def _friction_contributions(joined, footer, codex_aggregate):
     ]
 
 
-def build_overview_model(models, headline, phantom_ref_count, friction_total_value):
+def build_overview_model(
+    models: dict[str, Any],
+    headline: dict[str, Any],
+    phantom_ref_count: int,
+    friction_total_value: int,
+) -> dict[str, Any]:
     """A3/AM-2 digest — pure aggregation over already-built models. No new data derived:
     roadmap gaps = empty civc cells; weight tax = top always-loaded files by size;
     hygiene = headline counts; drag = synthesis rows; friction hero = count + band + top drag."""
@@ -616,7 +634,7 @@ def build_copy_payloads(date, models, friction, doc):
     # --- coverage matrix: markdown table (folded into the "overview" payload below) ---
     header = "| verb \\ surface | " + " | ".join(SURFACES) + " |"
     divider = "|" + "---|" * (len(SURFACES) + 1)
-    by_verb = {}
+    by_verb: dict[str, dict[str, str]] = {}
     for c in civc["cells"]:
         by_verb.setdefault(c["verb"], {})[c["surface"]] = c["verdict"]
     cov_rows = ["| " + verb + " | "
@@ -656,8 +674,8 @@ def build_copy_payloads(date, models, friction, doc):
 
 
 # ---------------------------------------------------------------------------- node index
-def _collect_node_keys(models):
-    keys = []
+def _collect_node_keys(models: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
     cw = models["context_weight"]
     for tree in (cw["always"], cw["on_demand"]):
         keys.extend(c["node_key"] for c in tree["cells"])
@@ -668,11 +686,11 @@ def _collect_node_keys(models):
     return keys
 
 
-def build_node_index(models):
+def build_node_index(models: dict[str, Any]) -> dict[str, list[str]]:
     """basename(lower) -> sorted [node_key, ...] across every rendered view, used by
     the friction join so a joined basename heats EVERY matching node (§1.3), never
     first-match-wins."""
-    index = {}
+    index: dict[str, set[str]] = {}
     for key in _collect_node_keys(models):
         b = _basename_of_node_key(key)
         index.setdefault(b, set()).add(key)
@@ -729,14 +747,16 @@ def _resolve_ref(token, root, node_index, valid_keys):
     return "matched", hits[0]
 
 
-def _split_component(component):
-    segments = []
+def _split_component(component: str) -> list[str]:
+    segments: list[str] = []
     for part in component.split(" + "):
         segments.extend(p.strip() for p in part.split(", ") if p.strip())
     return segments
 
 
-def read_jsonl(path, max_bytes=5_000_000, max_lines=20_000):
+def read_jsonl(
+    path: Path, max_bytes: int = 5_000_000, max_lines: int = 20_000
+) -> tuple[list[dict[str, Any]], int, int]:
     """(records, malformed_count, lines_nonblank) — never raises. Disclosed caps guard
     against a FIFO/device/unbounded stream hanging or OOMing the renderer.
 
@@ -753,7 +773,9 @@ def read_jsonl(path, max_bytes=5_000_000, max_lines=20_000):
     parse normally. For the common under-cap case the return is byte-for-byte the same records/
     counters as a full read, preserving serve.py's size-based stream-offset heuristic (which
     stats the file itself and never depends on this function's byte accounting)."""
-    records, malformed, nonblank = [], 0, 0
+    records: list[dict[str, Any]] = []
+    malformed = 0
+    nonblank = 0
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
@@ -813,8 +835,14 @@ def _record_date(rec):
     return None
 
 
-def join_decisions(records, node_index, current_date, root=""):
-    heat, joined = {}, {}
+def join_decisions(
+    records: list[dict[str, Any]],
+    node_index: dict[str, list[str]],
+    current_date: str,
+    root: str = "",
+) -> tuple[dict[str, int], dict[str, list[dict[str, Any]]], dict[str, int]]:
+    heat: dict[str, int] = {}
+    joined: dict[str, list[dict[str, Any]]] = {}
     valid_keys = _valid_node_keys(node_index)
     segments_total = segments_joined = segments_ambiguous = segments_unmatched = dated_in_window = 0
     for rec in records:
@@ -850,7 +878,11 @@ def _metrics_eligible(rec):
         or _num(rec.get("findings_total")) > 0
 
 
-def join_metrics(records, node_index, current_date):
+def join_metrics(
+    records: list[dict[str, Any]],
+    node_index: dict[str, list[str]],
+    current_date: str,
+) -> tuple[dict[str, int], dict[str, list[dict[str, Any]]], dict[str, int]]:
     """§C1 change 1: the blanket 'coding-team' base-node heat is GONE — an eligible
     record with no resolvable phase/agent alias no longer reattaches to the skill node
     (that was the smear: every eligible record, no matter which phase/agent it named,
@@ -858,7 +890,8 @@ def join_metrics(records, node_index, current_date):
     DIRECTLY to their canonical `on_demand:skills/coding-team/{phases,agents}/<file>` key
     and heat only if that EXACT key is a rendered node — never a basename lookup (a
     future second `planning.md` elsewhere in the tree would otherwise re-smear)."""
-    heat, joined = {}, {}
+    heat: dict[str, int] = {}
+    joined: dict[str, list[dict[str, Any]]] = {}
     valid_keys = _valid_node_keys(node_index)
     records_eligible = records_aggregate_only = dated_in_window = 0
     for rec in records:
@@ -902,8 +935,14 @@ def join_metrics(records, node_index, current_date):
                            "records_dated_in_window": dated_in_window}
 
 
-def join_interventions(records, node_index, current_date, root=""):
-    heat, joined = {}, {}
+def join_interventions(
+    records: list[dict[str, Any]],
+    node_index: dict[str, list[str]],
+    current_date: str,
+    root: str = "",
+) -> tuple[dict[str, int], dict[str, list[dict[str, Any]]], dict[str, int]]:
+    heat: dict[str, int] = {}
+    joined: dict[str, list[dict[str, Any]]] = {}
     valid_keys = _valid_node_keys(node_index)
     dated_in_window = segments_joined = segments_ambiguous = segments_unmatched = 0
     for rec in records:
@@ -929,10 +968,11 @@ def join_interventions(records, node_index, current_date, root=""):
                            "segments_ambiguous": segments_ambiguous, "segments_unmatched": segments_unmatched}
 
 
-def aggregate_codex(records, current_date):
+def aggregate_codex(records: list[dict[str, Any]], current_date: str) -> dict[str, Any]:
     """Side-panel-only aggregate (no node join — `target` names a plan file, not a
     map node, §2.2)."""
-    by_mode, by_verdict = {}, {}
+    by_mode: dict[str, int] = {}
+    by_verdict: dict[str, int] = {}
     revise_rounds = []
     runs = 0
     for rec in records:
@@ -1028,27 +1068,39 @@ def _display_path(path):
         return str(path)
 
 
-def build_friction_overlay(doc, streams, node_index, current_date, disabled):
+def build_friction_overlay(
+    doc: dict[str, Any],
+    streams: dict[str, Any],
+    node_index: dict[str, list[str]],
+    current_date: str,
+    disabled: bool,
+) -> tuple[dict[str, int], dict[str, list[dict[str, Any]]], list[dict[str, Any]], dict[str, Any]]:
     """Joins the four optional streams onto `node_index` (data join only, never a
     judgment, §2.2). Returns (heat, joined_records, sources_footer, codex_aggregate)."""
-    heat, joined = {}, {}
-    footer = []
+    heat: dict[str, int] = {}
+    joined: dict[str, list[dict[str, Any]]] = {}
+    footer: list[dict[str, Any]] = []
     root = doc.get("root") or ""
 
-    def _merge(h, j):
+    def _merge(h: dict[str, int], j: dict[str, list[dict[str, Any]]]) -> None:
         for k, v in h.items():
             heat[k] = heat.get(k, 0) + v
         for k, recs in j.items():
             joined.setdefault(k, []).extend(recs)
 
-    codex_aggregate = {"runs": 0, "by_mode": {}, "by_verdict": {}, "max_revise_round": 0}
+    codex_aggregate: dict[str, Any] = {
+        "runs": 0, "by_mode": {}, "by_verdict": {}, "max_revise_round": 0
+    }
 
     for stream in STREAM_ORDER:
         path = streams.get(stream)
         status = _stream_status(path, disabled)
-        counters = {}
+        counters: dict[str, Any] = {}
         if status == "loaded":
-            records, malformed, nonblank = read_jsonl(path)
+            # _stream_status only returns "loaded" when `path` passed its own is-not-None
+            # check — cast (not assert) so this is a pure type narrowing with zero
+            # runtime effect, matching the M1 typing-only scope.
+            records, malformed, nonblank = read_jsonl(cast(Path, path))
             counters["lines_nonblank"] = nonblank
             counters["records_parsed"] = len(records)
             counters["records_invalid"] = malformed
@@ -1072,7 +1124,12 @@ def build_friction_overlay(doc, streams, node_index, current_date, disabled):
 
 
 # ----------------------------------------------------------------------------- write safety
-def write_html_safely(out_path, text, guard_roots, input_paths=()):
+def write_html_safely(
+    out_path: Path,
+    text: str,
+    guard_roots: str | Path | list[Any] | None,
+    input_paths: tuple[Any, ...] = (),
+) -> None:
     """Hard-link-safe, TOCTOU-narrowed write (P1-B, Codex challenge): re-validates the
     RESOLVED write target against EVERY root in `guard_roots` (+ `input_paths`) via the
     shared `collector.validate_write_target` guard IMMEDIATELY before writing — no
@@ -3159,7 +3216,13 @@ VIEWS = (("view-overview", "Overview"),
          ("view-weight", "Weight"), ("view-friction", "Friction"), ("view-hygiene", "Hygiene"))
 
 
-def render_html(date, models, friction, notes, generation=None):
+def render_html(
+    date: str,
+    models: dict[str, Any],
+    friction: tuple[Any, ...],
+    notes: dict[str, Any],
+    generation: int | None = None,
+) -> str:
     """Assembles the final HTML document — a fixed named-section sequence (§4.8),
     never set/dict-driven order. 4-view IA (A1, Task B-t2 merged the former separate
     Overview/Coverage tabs into one): all views render WITHOUT `hidden` server-side
@@ -3295,7 +3358,13 @@ def default_streams():
     }
 
 
-def render_from_out_dir(out_dir, date=None, streams=None, no_friction=False, generation=None):
+def render_from_out_dir(
+    out_dir: Path,
+    date: str | None = None,
+    streams: dict[str, Any] | None = None,
+    no_friction: bool = False,
+    generation: int | None = None,
+) -> RenderContext:
     """Build the HTML IN MEMORY (D3) from the collector sidecar(s) already present in
     `out_dir` — the exact pipeline main() uses, minus the file write. Returns a frozen
     RenderContext (carries date/doc/models/node_index/friction/streams/skipped/html_text/
@@ -3317,13 +3386,17 @@ def render_from_out_dir(out_dir, date=None, streams=None, no_friction=False, gen
     sel_date, doc, skipped, err = select_current(sidecars, date)
     if err is not None:
         raise RenderError(f"fatal: {err}")
+    # select_current's contract: err is None iff sel_date/doc are both populated — cast
+    # (not assert) so this is a pure type narrowing with zero runtime effect.
+    sel_date = cast(str, sel_date)
+    doc = cast(dict[str, Any], doc)
     if doc.get("schema_version") != SCHEMA_VERSION:
         raise RenderError(
             f"fatal: selected sidecar has unsupported schema_version {doc.get('schema_version')}")
 
     # Trend series: load every OTHER sidecar too, filtered to the same root + schema version
     # (Codex F13); corrupt/incompatible ones are excluded and noted in skipped[].
-    dated_docs = []
+    dated_docs: list[tuple[str, dict[str, Any]]] = []
     for d, p in sidecars:
         if d == sel_date:
             dated_docs.append((d, doc))
@@ -3332,6 +3405,9 @@ def render_from_out_dir(out_dir, date=None, streams=None, no_friction=False, gen
         if other_err is not None:
             skipped.append({"date": d, "reason": other_err})
             continue
+        # load_sidecar's contract: other_err is None iff other_doc is populated — cast
+        # (not assert) so this is a pure type narrowing with zero runtime effect.
+        other_doc = cast(dict[str, Any], other_doc)
         if other_doc.get("schema_version") != SCHEMA_VERSION or other_doc.get("root") != doc.get("root"):
             skipped.append({"date": d, "reason": "schema_version/root mismatch with selected sidecar"})
             continue
@@ -3385,8 +3461,11 @@ def _load_sibling_collector():
     module_dir = Path(__file__).resolve().parent
     spec = importlib.util.spec_from_file_location(
         "harness_map_render_html_collector", module_dir / "collector.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # spec_from_file_location's return type is `ModuleSpec | None`; for a fixed sibling
+    # path next to this file it is never None in practice. module_from_spec/spec.loader
+    # narrow to Any once past this call, so this is the ONE ignore for the whole seam.
+    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]  # sibling loaded via importlib (render_html.py:3441)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]  # sibling loaded via importlib (render_html.py:3441)
     return module
 
 
@@ -3405,7 +3484,7 @@ def _get_sibling_collector():
     return _SIBLING_COLLECTOR_MODULE
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Render an interactive HTML map from harness-map sidecar(s).")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--date", default=None)

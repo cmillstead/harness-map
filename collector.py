@@ -17,6 +17,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 
 SCHEMA_VERSION = 1
 _FM_DESC_LINE = re.compile(r"^description:\s*(.*)$")
@@ -629,9 +630,9 @@ def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
     nested CLAUDE.md, or `.claude/rules` itself) whose realpath escapes the project
     containment root is NOT descended into; a file whose realpath escapes is NOT read.
     Both are recorded as `out_of_root_refs` (name + target, untrusted) instead."""
-    files = []
-    seen = set()
-    seen_refs = set()
+    files: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    seen_refs: set[str] = set()
     project_root = Path(project_root)
     harness_root = project_root / ".claude"
 
@@ -722,7 +723,7 @@ def _walk_operator_tier_nodes(root):
     Commands get their FIRST node collection here — no prior section inventoried
     commands/*.md as nodes at all. Operator tier keeps its existing trusted
     symlink-following (unchanged, matches every other operator-tier walk)."""
-    nodes = []
+    nodes: list[dict[str, Any]] = []
     skills_dir = root / "skills"
     if skills_dir.is_dir():
         try:
@@ -759,8 +760,8 @@ def _walk_project_tier_nodes(project_root, out_of_root_refs):
     rules-dir handling exactly (reused, not reimplemented)."""
     project_root = Path(project_root)
     harness_root = project_root / ".claude"
-    nodes = []
-    seen_refs = set()
+    nodes: list[dict[str, Any]] = []
+    seen_refs: set[str] = set()
     try:
         containment_stat = os.stat(project_root)
     except OSError:
@@ -894,7 +895,7 @@ def _hook_nodes_from_composed(composed_hooks):
 # hooks: UNION (both tiers load, no winner). This resolver keys the collision winner OFF
 # THE SURFACE — it is not one global rule; getting a surface backwards inverts the
 # "overrides M" headline count.
-_SURFACE_MERGE = {
+_SURFACE_MERGE: dict[str, dict[str, Any]] = {
     "skill": {"merge": "shadow", "winner_tier": "operator"},
     "command": {"merge": "shadow", "winner_tier": "operator"},
     "agent": {"merge": "shadow", "winner_tier": "project"},
@@ -904,7 +905,9 @@ _SURFACE_MERGE = {
 }
 
 
-def _resolve_tier_composition(raw_nodes):
+def _resolve_tier_composition(
+    raw_nodes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[str]]:
     """Per-surface shadow resolver (T4, M4/R5-A). Groups `raw_nodes` by the collision
     key (surface, name); for a SHADOW surface with both tiers present, marks the
     `_SURFACE_MERGE` winner "effective" and the loser "shadowed" (with `shadowed_by`
@@ -916,12 +919,12 @@ def _resolve_tier_composition(raw_nodes):
     defined-but-never-runs project skill/command the operator should see). Returns
     `(resolved_nodes, surfaces_summary, participating_surfaces)`; `resolved_nodes` is
     sorted by the composite determinism key `(path, tier)` (L1)."""
-    by_key = {}
+    by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for n in raw_nodes:
         by_key.setdefault((n["surface"], n["name"]), []).append(n)
 
-    resolved = []
-    surfaces_summary = {
+    resolved: list[dict[str, Any]] = []
+    surfaces_summary: dict[str, dict[str, Any]] = {
         surface: {"merge": cfg["merge"], "winner_tier": cfg["winner_tier"],
                   "adds": 0, "overrides": 0, "dark": 0}
         for surface, cfg in _SURFACE_MERGE.items()
@@ -935,7 +938,7 @@ def _resolve_tier_composition(raw_nodes):
                 if n["tier"] == "project":
                     surfaces_summary[surface]["adds"] += 1
             continue
-        by_tier = {n["tier"]: n for n in group}
+        by_tier: dict[str, dict[str, Any]] = {n["tier"]: n for n in group}
         operator_n = by_tier.get("operator")
         project_n = by_tier.get("project")
         if operator_n and project_n:
@@ -949,7 +952,11 @@ def _resolve_tier_composition(raw_nodes):
             else:
                 surfaces_summary[surface]["dark"] += 1
         else:
-            only = operator_n or project_n
+            # group is non-empty (by_key.setdefault guarantees at least one member) and
+            # by_tier's keys are only "operator"/"project", so at least one of these two
+            # .get() lookups is non-None — cast (not assert) so this stays a pure type
+            # narrowing with zero runtime effect, matching the M1 typing-only scope.
+            only = cast(dict[str, Any], operator_n or project_n)
             resolved.append({**only, "status": "effective", "shadowed_by": None})
             if only["tier"] == "project":
                 surfaces_summary[surface]["adds"] += 1
@@ -958,8 +965,14 @@ def _resolve_tier_composition(raw_nodes):
     return resolved, surfaces_summary, sorted(_SURFACE_MERGE)
 
 
-def walk_always_loaded(root, project_root, inaccessible, errors, compose=False,
-                        out_of_root_refs=None):
+def walk_always_loaded(
+    root: Path,
+    project_root: Path | None,
+    inaccessible: list[dict[str, Any]],
+    errors: list[str],
+    compose: bool = False,
+    out_of_root_refs: list[Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Collect always-loaded surfaces: harness CLAUDE.md, the active project's memory
     index only (other projects' indexes go to conditional_variants), the active
     project's own CLAUDE.md (outside --root), rules/*.md, and coding-team rules.
@@ -1140,7 +1153,9 @@ def walk_always_loaded(root, project_root, inaccessible, errors, compose=False,
     return files, conditional_variants
 
 
-def collect_descriptions(root, inaccessible):
+def collect_descriptions(
+    root: Path, inaccessible: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Collect skill/agent front-matter `description` word counts."""
     skill_descriptions = []
     agent_descriptions = []
@@ -1192,7 +1207,9 @@ def collect_descriptions(root, inaccessible):
     return skill_descriptions, agent_descriptions
 
 
-def collect_on_demand(root, project_root, inaccessible):
+def collect_on_demand(
+    root: Path, project_root: Path | None, inaccessible: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Collect on-demand bodies: skill SKILL.md bodies, skill-internal phases/prompts/agents,
     and the active project's memory bodies (excluding the always-loaded MEMORY.md index)."""
     skills = []
@@ -1276,7 +1293,9 @@ def collect_on_demand(root, project_root, inaccessible):
     return skills, skill_internal_bodies, memory_bodies
 
 
-def parse_settings(root, errors, blind_spots):
+def parse_settings(
+    root: Path, errors: list[str], blind_spots: list[str]
+) -> tuple[dict[str, Any], bool]:
     """Read + parse root/settings.json. Three distinct outcomes, all NON-fatal —
     build_document always continues and populates every settings-INDEPENDENT section
     (always_loaded, hooks, duplication, phantom_refs, ...), because `headline` is the
@@ -1378,7 +1397,7 @@ def parse_project_settings(project_root, containment_root, containment_root_stat
     return _parse_json_object_guarded(text, f"project {filename}", errors)
 
 
-def collect_permissions(settings, parsed_ok):
+def collect_permissions(settings: dict[str, Any], parsed_ok: bool) -> dict[str, Any]:
     perms = settings.get("permissions", {})
     if not isinstance(perms, dict):
         perms = {}
@@ -1413,7 +1432,9 @@ def _read_json_name_list(path, key, blind_spots):
     return names, len(names)
 
 
-def collect_config(root, settings, parsed_ok, blind_spots):
+def collect_config(
+    root: Path, settings: dict[str, Any], parsed_ok: bool, blind_spots: list[str]
+) -> dict[str, Any]:
     # secret-leak guard: never serialize env values — env_keys is names ONLY.
     env = settings.get("env", {})
     env_keys = sorted(env.keys()) if isinstance(env, dict) else []
@@ -1460,7 +1481,12 @@ def _hook_disk_files(root):
     return disk_files
 
 
-def reconcile_hooks(root, settings, inaccessible, blind_spots):
+def reconcile_hooks(
+    root: Path,
+    settings: dict[str, Any],
+    inaccessible: list[dict[str, Any]],
+    blind_spots: list[str],
+) -> dict[str, Any]:
     """Dispatcher-aware reconciliation: resolve every hook `command` registered in
     settings.json against hooks/ on disk, then fan reachability through any registered
     *-dispatcher.py's string-literal CHECKS-style list. Registration evidence (the
@@ -1651,7 +1677,9 @@ def _merge_permissions_union_deny_wins(settings_stack_with_ok):
     call already returns (and `collect_permissions`, the non-compose single-tier sibling,
     already uses correctly) — NOT dict truthiness — so "present and empty" is VERIFIED,
     never conflated with "absent or malformed"."""
-    deny, allow, ask = set(), set(), set()
+    deny: set[str] = set()
+    allow: set[str] = set()
+    ask: set[str] = set()
     any_parsed = False
     for _tier, settings, parsed_ok in settings_stack_with_ok:
         if not parsed_ok:
@@ -1692,8 +1720,8 @@ def _compose_hooks(sources, project_root, out_of_root_refs):
             containment_stat = os.stat(project_root)
         except OSError:
             containment_stat = None
-    seen_refs = set()
-    records = []
+    seen_refs: set[str] = set()
+    records: list[dict[str, Any]] = []
     for tier, settings, source_file, resolve_root in sources:
         if not settings or resolve_root is None:
             continue
@@ -1933,8 +1961,8 @@ _HOOK_SCRIPT_GLOBS = ("hooks/*.py", "hooks/*.sh")  # mirrors _hook_disk_files / 
 _HOOK_TEST_GLOBS = ("hooks/tests/*.py", "skills/*/hooks/tests/*.py")  # mirrors _hook_test_stems
 
 
-def flag_long_instructions(root):
-    flags = []
+def flag_long_instructions(root: Path) -> list[dict[str, Any]]:
+    flags: list[dict[str, Any]] = []
     # `seen` dedupes a file reachable via multiple glob paths (a deploy symlink under
     # agents/ + its canonical submodule source under skills/*/agents/). The glob order
     # below lists skills/*/agents/*.md BEFORE agents/*.md, so the canonical path (the one
@@ -2016,9 +2044,9 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
     excerpt sinks."""
     project_root = Path(project_root)
     harness_root = project_root / ".claude"
-    seen_refs = set()
-    seen_physical = set()
-    corpus = []  # [(rel_path, "project", shingle_set), ...]
+    seen_refs: set[str] = set()
+    seen_physical: set[Any] = set()
+    corpus: list[tuple[str, str, set[str]]] = []  # [(rel_path, "project", shingle_set), ...]
     try:
         containment_stat = os.stat(project_root)
     except OSError:
@@ -2074,7 +2102,13 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
     return corpus
 
 
-def scan_duplication(root, blind_spots, project_root=None, compose=False, out_of_root_refs=None):
+def scan_duplication(
+    root: Path,
+    blind_spots: list[str],
+    project_root: Path | None = None,
+    compose: bool = False,
+    out_of_root_refs: list[Any] | None = None,
+) -> dict[str, Any]:
     """Candidate near-duplicate pairs by containment coefficient (|A∩B| / min(|A|,|B|))
     over k=8 word shingles — chosen over Jaccard because it correctly flags a short file
     fully subsumed by a longer one (schema.md Note 2). SIGNALS only: this is a candidate
@@ -2210,13 +2244,17 @@ def _looks_like_path_token(token):
     return bool(_PATH_EXT_RE.fullmatch(token)) or "/" in token
 
 
-def check_phantom_refs(root, corpus_files, inaccessible):
+def check_phantom_refs(
+    root: Path,
+    corpus_files: list[tuple[str, str]],
+    inaccessible: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Backtick-quoted path and env-flag tokens that don't resolve to anything real. A
     path OUTSIDE --root is reported as kind="external" (INFERRED, resolved: null) — the
     collector never claims a file outside its scanned scope is phantom; it genuinely
     cannot see it either way, so it only classifies, never asserts absence."""
-    refs = []
-    seen = set()
+    refs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     hooks_corpus = _hooks_body_corpus(root)
 
     for rel_path, text in corpus_files:
@@ -2305,12 +2343,16 @@ def _hook_covered(excerpt, trigger_text, hooks_corpus_lower):
     return False
 
 
-def collect_promotion_candidates(root, corpus_files, settings):
+def collect_promotion_candidates(
+    root: Path,
+    corpus_files: list[tuple[str, str]],
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
     """Prose in an instruction file that reads like a hard rule (NEVER/ALWAYS/must, a
     numeric cap, a required-file assertion) but may have no corresponding hook enforcing
     it. Advisory SIGNALS only — synthesis proposes extending an EXISTING covered hook
     before creating a new one; this collector never makes that judgment itself."""
-    candidates = []
+    candidates: list[dict[str, Any]] = []
     hooks_corpus_lower = _hooks_body_corpus(root).lower()
     commands_lower = "\n".join(_iter_hook_commands(settings)).lower()
     combined_lower = hooks_corpus_lower + "\n" + commands_lower
@@ -2445,7 +2487,9 @@ def _detect_skill_test_coverage(root):
     return [{"name": d.name, "has_test": _skill_has_test_asset(d)} for d in skill_dirs]
 
 
-def detect_test_coverage(root, on_demand, errors):
+def detect_test_coverage(
+    root: Path, on_demand: dict[str, Any], errors: list[str]
+) -> dict[str, Any]:
     """Whether each hook script and each skill has an associated test ASSET — a
     PRESENCE check, not an adequacy check (the "6 of 66" reality: a tests/ dir holding
     one trivial assertion counts as covered exactly like a thorough suite). Cross-links
@@ -2473,7 +2517,12 @@ def detect_test_coverage(root, on_demand, errors):
     }
 
 
-def build_headline(always_loaded, hooks_section, instruction_length_flags, duplication_section):
+def build_headline(
+    always_loaded: dict[str, Any],
+    hooks_section: dict[str, Any],
+    instruction_length_flags: list[dict[str, Any]],
+    duplication_section: dict[str, Any],
+) -> dict[str, Any]:
     totals = always_loaded["totals"]
     return {
         "always_loaded_words": totals["words"],
@@ -2567,7 +2616,7 @@ def _compose_project_input_paths(project_root):
     `project_root` -- serve.py's watcher relies on that lexical-containment invariant to
     tier-tag the watched set (T8's `(path, tier)` contract) without a second stat pass."""
     project_root = Path(project_root)
-    paths = set()
+    paths: set[Path] = set()
     try:
         containment_stat = os.stat(project_root)
     except OSError:
@@ -2581,7 +2630,8 @@ def _compose_project_input_paths(project_root):
     #    escaping symlinked dir is not yielded (mirrors: the collector never descends into
     #    it either). Scratch out_of_root_refs/seen are discarded -- the watcher needs only
     #    the path set, not the bookkeeping build_document records for the real doc. --
-    scratch_refs, scratch_seen = [], set()
+    scratch_refs: list[Any] = []
+    scratch_seen: set[str] = set()
     for d in _walk_contained_dirs(project_root, project_root, containment_stat,
                                    scratch_refs, scratch_seen):
         paths.add(d)
@@ -2637,7 +2687,9 @@ def _compose_project_input_paths(project_root):
     return paths
 
 
-def iter_input_paths(root, project_root=None, compose=False):
+def iter_input_paths(
+    root: Path, project_root: Path | None = None, compose: bool = False
+) -> list[Path]:
     """SINGLE SOURCE OF TRUTH for the complete filesystem input surface build_document reads
     — the set a live-dashboard filesystem watcher (T4) must observe to know when a re-render
     is due. Returns a deterministic, de-duplicated, string-sorted list of Path.
@@ -2794,10 +2846,12 @@ def iter_input_paths(root, project_root=None, compose=False):
     return sorted(paths, key=str)
 
 
-def build_document(root, project_root, compose=False):
+def build_document(
+    root: Path, project_root: Path | None, compose: bool = False
+) -> dict[str, Any]:
     root = Path(root).resolve()
-    inaccessible = []
-    errors = []
+    inaccessible: list[dict[str, Any]] = []
+    errors: list[str] = []
     blind_spots = [
         "SessionStart hook emissions (runtime-only text injected at session start) are not "
         "statically collectable.",
@@ -2812,7 +2866,7 @@ def build_document(root, project_root, compose=False):
         "session-start injection set is not introspectable from disk.",
     ]
 
-    out_of_root_refs = []
+    out_of_root_refs: list[dict[str, Any]] = []
     # T5 P31/C18 (composed weight honesty): snapshot BEFORE walk_always_loaded so the
     # deltas below capture EXACTLY the out-of-root/inaccessible entries that would have
     # contributed to always_loaded weight — nothing from later scans (duplication, node
@@ -3006,7 +3060,7 @@ def build_document(root, project_root, compose=False):
     return doc
 
 
-def _empty_document(root):
+def _empty_document(root: Path) -> dict[str, Any]:
     """Full schema envelope, every top-level key present and empty (F8) — the crash-path
     fallback so main()'s top-level guard never emits a partial/silent stub. Mirrors
     build_document's REAL current shape exactly (including on_demand.memory_bodies and
@@ -3046,7 +3100,7 @@ def _default_operator_root():
     return Path(cfg) if cfg else (Path.home() / ".claude")
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Read-only harness map collector.")
     ap.add_argument("--root", default=str(_default_operator_root()))
     ap.add_argument("--project-root", default=os.getcwd())

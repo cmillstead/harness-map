@@ -24,17 +24,23 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import ModuleType
+from typing import Any, cast
 
 _MODULE_DIR = Path(__file__).resolve().parent
 
 
-def _load_sibling(name, filename):
+def _load_sibling(name: str, filename: str) -> ModuleType:
     """Loads a sibling module by absolute path (never relying on the invoking cwd or
     sys.path), mirroring the spec_from_file_location pattern the test suite already
     uses for the same modules."""
     spec = importlib.util.spec_from_file_location(name, _MODULE_DIR / filename)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # spec_from_file_location's return type is `ModuleSpec | None`; for a fixed sibling
+    # path next to this file it is never None in practice. module_from_spec/spec.loader
+    # narrow to Any once past this call, so this is the ONE ignore for the whole seam
+    # (collector/render_html below are then seen as dynamic module objects by mypy).
+    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]  # sibling loaded via importlib (serve.py:41)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]  # sibling loaded via importlib (serve.py:41)
     return module
 
 
@@ -63,7 +69,7 @@ class CollectorError(Exception):
     """Raised when collector.main() fails to produce a fresh sidecar (P30 guard)."""
 
 
-def _validate_host(host):
+def _validate_host(host: str) -> str:
     if host not in _ALLOWED_HOSTS:
         raise ValueError(f"host must be one of {sorted(_ALLOWED_HOSTS)}: {host!r}")
     return host
@@ -124,9 +130,11 @@ class _State:
     publish counter (FIX 4) baked into the served page + reported to SSE clients on connect.
     """
 
-    def __init__(self, streams, no_friction):
+    def __init__(self, streams: dict[str, Any], no_friction: bool) -> None:
         self.lock = threading.Lock()
-        self.ctx = None
+        # `ctx` holds a render_html.RenderContext once populated; render_html is loaded
+        # dynamically via `_load_sibling` (serve.py:41), so mypy sees it only as Any.
+        self.ctx: Any = None
         self.collect_count = 0
         self.streams = streams
         self.no_friction = no_friction
@@ -141,7 +149,7 @@ class _State:
         # (cheap friction-only re-render) apart from a truncation/rotation/deletion (full
         # re-collect) -- NEVER used to slice a partial tail (the cheap path always re-reads
         # each stream file in FULL, C18 parity).
-        self.stream_offsets = {}
+        self.stream_offsets: dict[str, Any] = {}
         # FIX 4 (Codex challenge): stream keys whose last-observed truncation/rotation/deletion
         # has NOT yet been consumed by a successful full `_rebuild`. Touched ONLY by the single
         # watcher thread (no lock needed). Set when `_classify_stream_sweep` reports "truncated";
@@ -149,13 +157,13 @@ class _State:
         # replaces the old "zero state.stream_offsets[key] before the rebuild" step, which made a
         # truncate-to-empty stream compare 0==0 next sweep -> "none" -> the required re-collect was
         # lost forever if that rebuild failed transiently (stale state served permanently).
-        self.pending_truncation = set()
+        self.pending_truncation: set[str] = set()
         # SSE fan-out: bounded per-client queues, mutated ONLY under clients_lock (never
         # the ctx lock, so a slow /events writer cannot block a GET `/` read). The watcher
         # compares fresh snapshots against watch_snapshot to decide when a rebuild is due.
         self.clients_lock = threading.Lock()
-        self.clients = []
-        self.watch_snapshot = {}
+        self.clients: list["queue.Queue[str]"] = []
+        self.watch_snapshot: dict[Any, Any] = {}
         # Codex r3 FIX 1: the synthesis sidecar (out_dir/harness-synthesis-<date>.json) is a
         # render INPUT that feeds the Coverage Matrix + drag MODELS, but it lives under out_dir
         # -- OUTSIDE the collector-input surface `watch_snapshot` covers AND distinct from the
@@ -164,18 +172,18 @@ class _State:
         # the server runs forces a FULL `_rebuild` (never the cheap friction-only path, which
         # reuses cached models). Seeded in build_server BEFORE the initial `_rebuild`, mirroring
         # watch_snapshot's pre-rebuild ordering; advanced only after a successful settled rebuild.
-        self.synth_snapshot = None
+        self.synth_snapshot: Any = None
 
-    def register_client(self):
+    def register_client(self) -> "queue.Queue[str]":
         """Add and return a fresh bounded (maxsize=1) queue for one SSE connection. The
         bound + Full-coalescing broadcast means a stalled client holds at most ONE pending
         refresh — a single reload subsumes every refresh it missed."""
-        client_queue = queue.Queue(maxsize=1)
+        client_queue: "queue.Queue[str]" = queue.Queue(maxsize=1)
         with self.clients_lock:
             self.clients.append(client_queue)
         return client_queue
 
-    def unregister_client(self, client_queue):
+    def unregister_client(self, client_queue: "queue.Queue[str]") -> None:
         """Remove a client's queue (idempotent — removing an already-absent queue must not
         raise, so the /events finally can call this unconditionally)."""
         with self.clients_lock:
@@ -660,6 +668,11 @@ def _watcher_loop(state, out_dir, root, project_root, stop_event, poll_seconds, 
 
 
 class RequestHandler(BaseHTTPRequestHandler):
+    # Narrows the inherited `server: BaseServer` to this server's actual concrete type
+    # (`_Server`, defined below) so `self.server.state`/etc. type-check without a cast at
+    # every call site — `_Server` IS-A `BaseServer`, so this is a type-safe narrowing.
+    server: "_Server"
+
     # Idle-connection read timeout: reaps a connect-but-never-sends-a-request-line socket
     # after 10s, so a co-resident process cannot pin ThreadingHTTPServer threads forever by
     # opening sockets and going silent (local DoS). NOTE for the forthcoming SSE /events
@@ -797,6 +810,20 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    # Set post-construction by build_server (never in __init__, so ThreadingHTTPServer's
+    # own __init__ signature/behavior stays untouched) — declared here only so
+    # RequestHandler/_watcher_loop/main() read them through a known attribute type
+    # instead of an implicit Any per call site.
+    state: "_State"
+    out_dir: Path
+    root: Path
+    project_root: Path
+    heartbeat_seconds: float
+    _poll_seconds: float
+    _debounce_seconds: float
+    _watcher_stop: threading.Event
+    _watcher_thread: threading.Thread | None
+
 
 def _build_streams(no_friction):
     """Mirrors render_html.main's --no-friction branching exactly: delegates to the
@@ -808,10 +835,20 @@ def _build_streams(no_friction):
     return render_html.default_streams()
 
 
-def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
-                  no_friction=False, streams=None, watch=False,
-                  poll_seconds=POLL_SECONDS, debounce_seconds=DEBOUNCE_SECONDS,
-                  heartbeat=HEARTBEAT_SECONDS, compose=False):
+def build_server(
+    out_dir: Path,
+    root: Path,
+    project_root: Path,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    no_friction: bool = False,
+    streams: dict[str, Any] | None = None,
+    watch: bool = False,
+    poll_seconds: float = POLL_SECONDS,
+    debounce_seconds: float = DEBOUNCE_SECONDS,
+    heartbeat: float = HEARTBEAT_SECONDS,
+    compose: bool = False,
+) -> _Server:
     """Validates `host`, builds the friction `streams` dict (unless one is supplied),
     runs one `_rebuild`, then constructs the threading server bound to shared state.
     Lets any collect/render/write exception from the initial `_rebuild` propagate, so
@@ -931,7 +968,7 @@ def _warn_if_synthesis_missing(out_dir, date):
         pass
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Serve a live harness-map dashboard over loopback HTTP.")
     ap.add_argument("--out-dir", required=True)
@@ -968,7 +1005,11 @@ def main(argv=None):
         # build_server's own both-root out-dir guard rejecting `--out-dir` up front.
         print(f"fatal: could not start server: {e}", file=sys.stderr)
         return 1
-    bound_host, bound_port = server.server_address[0], server.server_address[1]
+    # server_address's typeshed stub allows a bytes host (AF_UNIX sockets); this server
+    # only ever binds AF_INET to a validated str host (_validate_host above), so this is a
+    # pure type narrowing with zero runtime effect.
+    bound_host = cast(str, server.server_address[0])
+    bound_port = server.server_address[1]
     # Startup advisory (stderr, non-blocking): the synthesis sidecar for the date the initial
     # render selected feeds the CIVC coverage matrix + drag table. serve.py has NO model and
     # cannot generate it (that is the skill's opus Step B) -- if it is absent, warn ONCE here so
