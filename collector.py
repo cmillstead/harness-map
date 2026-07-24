@@ -13,6 +13,7 @@ import os
 import re
 import shlex
 import stat
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -1961,32 +1962,112 @@ _HOOK_SCRIPT_GLOBS = ("hooks/*.py", "hooks/*.sh")  # mirrors _hook_disk_files / 
 _HOOK_TEST_GLOBS = ("hooks/tests/*.py", "skills/*/hooks/tests/*.py")  # mirrors _hook_test_stems
 
 
-def flag_long_instructions(root: Path) -> list[dict[str, Any]]:
-    flags: list[dict[str, Any]] = []
-    # `seen` dedupes a file reachable via multiple glob paths (a deploy symlink under
-    # agents/ + its canonical submodule source under skills/*/agents/). The glob order
-    # below lists skills/*/agents/*.md BEFORE agents/*.md, so the canonical path (the one
-    # you'd actually edit to shorten the file) is seen first and reported; the deploy-symlink
-    # duplicate is skipped.
+def _deduped_instruction_files(root: Path) -> list[Path]:
+    """Shared glob-walk + dedup for the instruction-file corpus (S2.M3): the SINGLE
+    definition of "the deduped instruction-file set" consumed by BOTH
+    flag_long_instructions (line-count flags) and collect_git_age's caller (staleness
+    signal) -- add a new instruction-file glob to _INSTRUCTION_GLOBS, never inline a
+    second glob loop here or elsewhere.
+
+    `seen` dedupes a file reachable via multiple glob paths (a deploy symlink under
+    agents/ + its canonical submodule source under skills/*/agents/). The glob order
+    in _INSTRUCTION_GLOBS lists skills/*/agents/*.md BEFORE agents/*.md, so the canonical
+    path (the one you'd actually edit to shorten the file) is seen first and returned;
+    the deploy-symlink duplicate is skipped.
+
+    skills/*/rules/*.md generalizes the coding-team-only rules scan (release portability,
+    matching walk_always_loaded/scan_duplication/_staleness_corpus); listed right after
+    rules/*.md so a physically-symlinked rule is seen/returned under its rules/*.md path
+    first, same precedence as those three scans.
+
+    Filtered to files _read_text can actually read (mirrors flag_long_instructions'
+    INACCESSIBLE skip) so an unreadable instruction file is excluded from both the
+    length-flag scan and the git-age signal, consistently."""
     seen = set()
-    # skills/*/rules/*.md generalizes the coding-team-only rules scan (release portability,
-    # matching walk_always_loaded/scan_duplication/_staleness_corpus); listed right after
-    # rules/*.md so a physically-symlinked rule is seen/reported under its rules/*.md path
-    # first, same precedence as those three scans.
+    result: list[Path] = []
     for pattern in _INSTRUCTION_GLOBS:
         for fp in root.glob(pattern):
             key = _physical_key(fp)
             if key in seen:
                 continue
-            text, evidence = _read_text(fp)
+            text, _evidence = _read_text(fp)
             if text is None:
                 continue
             seen.add(key)
-            n = len(text.splitlines())
-            if n > INSTRUCTION_LINE_LIMIT:
-                flags.append({"path": _rel(root, fp), "lines": n,
-                              "threshold": INSTRUCTION_LINE_LIMIT, "evidence": evidence})
+            result.append(fp)
+    return result
+
+
+def flag_long_instructions(root: Path) -> list[dict[str, Any]]:
+    flags: list[dict[str, Any]] = []
+    for fp in _deduped_instruction_files(root):
+        text, evidence = _read_text(fp)
+        if text is None:
+            continue
+        n = len(text.splitlines())
+        if n > INSTRUCTION_LINE_LIMIT:
+            flags.append({"path": _rel(root, fp), "lines": n,
+                          "threshold": INSTRUCTION_LINE_LIMIT, "evidence": evidence})
     return flags
+
+
+# S2.M3: per-git-invocation timeout (probe + per-file `git log`), stdlib subprocess only.
+_GIT_SUBPROCESS_TIMEOUT = 2
+
+
+def _git_work_tree_available(root: Path) -> bool:
+    """Single up-front probe deciding whether `root` is a usable git work tree. Consumed
+    by collect_git_age to skip its ENTIRE per-file git-log loop when git is absent or
+    root isn't a repo (never probe per file), and by build_document to populate
+    staleness.git_age_available. Never raises: a missing git binary, a non-repo root, and
+    a timed-out probe all degrade to False -- same graceful-degradation philosophy as
+    _safe_exists (honest False beats a crash)."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=root, capture_output=True, text=True, timeout=_GIT_SUBPROCESS_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def _git_last_commit_ts(root: Path, rel_path: str) -> int | None:
+    """Unix commit timestamp of the last commit touching `rel_path`, or None when it
+    cannot be honestly determined (git error, timeout, unparseable output, or the path
+    has no commits -- e.g. untracked). NEVER falls back to filesystem mtime."""
+    try:
+        proc = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "--", rel_path],
+            cwd=root, capture_output=True, text=True, timeout=_GIT_SUBPROCESS_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.strip()
+    if not out:
+        return None
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def collect_git_age(root: Path, rel_paths: list[str]) -> dict[str, int | None]:
+    """Per-instruction-file git-age SIGNAL (S2.M3) -- last commit unix timestamp for each
+    of `rel_paths`, or None. This is a raw signal, never a "stale"/"dead" judgment; that
+    classification belongs to the model consuming this output, not the collector.
+
+    Graceful degradation (never crashes): if git is absent, `root` is not a work tree, or
+    the up-front probe errors, EVERY value is None and the per-file loop is skipped
+    entirely. Per-file failures (timeout, non-zero exit, unparseable output, untracked
+    file) independently degrade to None for that path only -- one bad file never poisons
+    the rest. NEVER falls back to mtime -- mtime lies after a copy or checkout; an honest
+    null beats plausible noise (same philosophy as _safe_exists)."""
+    if not _git_work_tree_available(root):
+        return {rel_path: None for rel_path in rel_paths}
+    return {rel_path: _git_last_commit_ts(root, rel_path) for rel_path in rel_paths}
 
 
 SHINGLE_K = 8
@@ -2720,6 +2801,12 @@ def iter_input_paths(
         can flip a phantom-ref verdict without a watched signal. In practice almost every
         referenced path already lives under a watched dir (rules/, skills/, agents/, commands/,
         hooks/); the instruction-file EDIT that introduces the ref itself IS watched.
+      * collect_git_age reads `git log` history for each instruction file — git history is
+        not a watchable filesystem input; `.git` sits in _PRUNED_WALK_DIRS, so this walk
+        structurally cannot see commits. A new commit to an already-unchanged instruction
+        file changes its git-age (staleness.last_commit_ts) with NO watched filesystem
+        signal of its own — but the instruction-file content EDIT that precedes the commit
+        IS watched, so a re-render still fires on the edit itself.
 
     `compose` (T8, default False): when True AND `project_root` is given, ALSO yields the
     project-tier reads T2/T3/T4/T5 added under the project-containment-root/project-harness-
@@ -2891,6 +2978,14 @@ def build_document(
     corpus_files = _staleness_corpus(root, inaccessible)
     phantom_refs = check_phantom_refs(root, corpus_files, inaccessible)
     promotion_candidates = collect_promotion_candidates(root, corpus_files, settings)
+    # S2.M3: git-age SIGNAL only (never a "stale" verdict) -- same deduped instruction-file
+    # set flag_long_instructions reports (_deduped_instruction_files), sorted lexicographically
+    # for deterministic output across PYTHONHASHSEED.
+    instruction_rel_paths = sorted(_rel(root, fp) for fp in _deduped_instruction_files(root))
+    staleness_section = {
+        "git_age_available": _git_work_tree_available(root),
+        "last_commit_ts": collect_git_age(root, instruction_rel_paths),
+    }
 
     totals = {
         "words": sum(f["words"] for f in files),
@@ -2939,6 +3034,7 @@ def build_document(
         "phantom_refs": phantom_refs,
         "promotion_candidates": promotion_candidates,
         "test_coverage": test_coverage_section,
+        "staleness": staleness_section,
         "inaccessible": inaccessible,
         "blind_spots": blind_spots,
         "errors": errors,
@@ -3087,6 +3183,7 @@ def _empty_document(root: Path) -> dict[str, Any]:
         "phantom_refs": [], "promotion_candidates": [],
         "test_coverage": {"hooks": [], "skills": [], "summary": {"hooks_with_test": 0,
             "hooks_total": 0, "skills_with_test": 0, "skills_total": 0}},
+        "staleness": {"git_age_available": False, "last_commit_ts": {}},
         "inaccessible": [], "blind_spots": [], "errors": [],
     }
 
