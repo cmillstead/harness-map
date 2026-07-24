@@ -19,7 +19,7 @@ harness-map is a production-grade, read-only inventory of the Claude Code harnes
 
 1. **Authority order on conflict:** SPEC_1 §2 hard invariants > recorded amendments > this file > MASTER_SPEC conventions > SPEC_2/SPEC_3 > SPEC_4–7 > the audit > existing code style > your judgment.
 2. **[DECISION] markers are final.** Do not reopen or work around them. If one blocks you, stop and ask Cevin.
-3. **Drift protocol.** Source verification is complete; there is no verify-then-build gate. If live source contradicts a spec-cited fact, record a one-line amendment and proceed per the spec's intent; halt only if the contradiction touches a SPEC_1 §2 invariant or makes a [DECISION] unimplementable (SPEC_1 §3).
+3. **Drift protocol.** Source verification is complete; there is no verify-then-build gate. If live source contradicts a spec-cited fact, record a one-line amendment and proceed per the spec's intent; halt only if the contradiction touches a SPEC_1 §2 invariant or makes a [DECISION] unimplementable (SPEC_1 §3). **Symbol names are authoritative; line numbers are advisory.** The tree has drifted far past the 2026-07-18 snapshot (collector 1,784→3,134, render 2,896→3,465, serve 832→1,001 lines — AMENDMENTS A12); at each milestone start, re-locate every cited symbol by name with Grep — never trust snapshot line numbers.
 4. **Read-only posture.** No new write paths, anywhere, ever. The collector writes only a validated outside-root `--out`; the renderer only via `write_html_safely`. `--check` writes nothing.
 5. **Envelope rule.** Every new collector field exists (null/empty) in `_empty_document`; `main()` must still emit valid JSON on any crash.
 6. **Signals vs judgments.** Collector code never classifies, condemns, or verdicts. Deterministic renderer arithmetic (joins, scores) is a data operation; verdict words stay the model's. Drag verdicts cap at `probation`; schema.md's D8 `retire safely` cap is unconditional — friction telemetry never lifts it (AMENDMENTS A4).
@@ -32,11 +32,11 @@ harness-map is a production-grade, read-only inventory of the Claude Code harnes
 
 ## Key numbers (memorize; sources cited)
 
-- SKILL.md hard cap **200** lines, working cap **195**; verified baseline **80**; total budgeted additions **≤26** (SPEC_3 §5).
+- SKILL.md hard cap **200** lines, working cap **195**; **live baseline 99** (was 80 at the 2026-07-18 snapshot — the `--serve` batch grew it; AMENDMENTS A12); budgeted additions **≤26** ⇒ ≤125 worst case (SPEC_3 §5).
 - Description rewrite target **≤70** words (from the verified 88), all 4 positive + 2 negative triggers preserved (SPEC_3 §4).
-- Test baseline: **353 items collected** (133 collector / 168 render / 47 serve / 5 release-decoupling); macOS 352 passed / 1 skipped, Linux 350 / 3 (env-conditional skips). Count only goes up; existing tests untouched.
+- Test baseline: **520 items live** (was 353 at the 2026-07-18 snapshot — AMENDMENTS A10); macOS 519 passed / 1 skipped. Count only goes up; existing tests untouched. After S1.M0: **523**.
 - Test placement (AMENDMENTS A8): renderer features → `test_render_html.py`; collector features → `test_collector.py`; only M11 adds `test_profiles.py`.
-- Phantom fix: candidate order = `root/norm` then `root/<source-dir>/norm`, `_safe_exists` tri-state preserved (SPEC_3 §1; bug at `collector.py:1166`).
+- Phantom fix: **DONE in S1.M0** — candidate order `root/norm` then `root/<source-dir>/norm`, `_safe_exists` tri-state preserved (SPEC_3 §1; fixed at `collector.py:2242`, was `:1166` at snapshot — AMENDMENTS A11).
 - Drag: `est_tokens × (1 + friction_events_30d)`, 30-day window computed POST-join, undated records excluded (SPEC_6 §1). Cost: median **events/day** (never "turns/day") over **14** days, min **3** active days (SPEC_6 §2).
 - Trend sparklines: display window **N=10** points, appear at ≥3 sidecars; loader already exists — visualization only (SPEC_4 §3, AMENDMENTS A2).
 - `--check`: exit **0/1/2**; `CHECK_BANDS` = report-template thresholds **5,000 / 12,000** tokens (NOT the renderer's `GAUGE_BANDS` 6,000/15,000 — two homes exist, AMENDMENTS A3); wall-time budget **≤5s** (SPEC_7 §1).
