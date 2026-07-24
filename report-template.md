@@ -136,4 +136,4 @@ First run — no prior map (baseline).
 
 ## Sidecar Note
 
-This run also wrote `harness-map-YYYY-MM-DD.json` (machine-readable snapshot) into the same report directory (the operator-chosen `OUT_DIR`, default `./harness-map-reports/`) as this report; the next run diffs against it.
+This run also wrote `harness-map-YYYY-MM-DD.json` (machine-readable snapshot) into the same report directory (the operator-chosen `OUT_DIR`, default `$HOME/harness-map-reports/`) as this report; the next run diffs against it.
