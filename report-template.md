@@ -99,8 +99,15 @@ Separate from the headline block above — derived from `promotion_candidates` w
 Full INACCESSIBLE list plus these standing v1 disclosures (verbatim, every report). The collector's `errors[]` MUST also render here — never omit it; a non-empty `errors[]` rendered nowhere produces a falsely-clean report, contradicting the "inaccessible ≠ clean" invariant:
 
 - Per-project `CLAUDE.md` weight NOT collected — always-loaded weight is UNDERCOUNTED.
-- Staleness = phantom-refs only; git-age correlation + retired-tool-rule detection deferred to v2.
+- Staleness now has two v2 signals (git-age + retired slash-commands) — see "Staleness Signals" below.
 - SessionStart runtime emissions + MCP instruction text not statically collectable.
+
+### Staleness Signals
+
+Two staleness signals, both review candidates — **stale ≠ dead**: the model flags these for a human to look at, it never condemns a file outright from the signal alone.
+
+- **Git age** (`staleness.last_commit_ts`) — an instruction file with no recent commit is a review candidate: still-correct-and-stable and genuinely-forgotten look identical from a timestamp alone.
+- **Retired slash commands** (`phantom_refs[]` where `kind == "slash_command"`) — a rule cites a `/command` whose two possible homes (`commands/<name>.md`, `skills/<name>/SKILL.md`) are both absent. The command may have been renamed, folded elsewhere, or genuinely dropped; treat as "verify and update or remove," not "auto-delete."
 
 | Path | Reason |
 |---|---|

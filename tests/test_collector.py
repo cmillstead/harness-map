@@ -536,6 +536,46 @@ def test_unread_env_flag_is_phantom_candidate(fake_harness):
     doc = run_collector(fake_harness)
     assert "WRITE_GUARD_ALLOW_NOWHERE" in {r["ref"] for r in doc["phantom_refs"] if r["kind"] == "env_flag"}
 
+# S2.M4: retired slash-command detection (phantom_refs kind=slash_command; SPEC_4 §2).
+def test_retired_ref_flags_missing_slash_command(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("Run `/gone-command` to fix it.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "/gone-command"]
+    assert len(hits) == 1
+    assert hits[0]["kind"] == "slash_command"
+    assert hits[0]["resolved"] is False
+    assert hits[0]["evidence"] == "VERIFIED"
+
+def test_retired_ref_ignores_existing_command(fake_harness):
+    (fake_harness / "commands" / "present.md").write_text("---\nname: present\n---\nBody.\n")
+    (fake_harness / "rules" / "a.md").write_text("Run `/present` first.")
+    doc = run_collector(fake_harness)
+    assert not any(r["ref"] == "/present" for r in doc["phantom_refs"])
+
+def test_retired_ref_ignores_existing_skill_home(fake_harness):
+    (fake_harness / "skills" / "present" / "SKILL.md").parent.mkdir(parents=True, exist_ok=True)
+    (fake_harness / "skills" / "present" / "SKILL.md").write_text("---\nname: present\n---\nBody.\n")
+    (fake_harness / "rules" / "a.md").write_text("Run `/present` first.")
+    doc = run_collector(fake_harness)
+    assert not any(r["ref"] == "/present" for r in doc["phantom_refs"])
+
+def test_retired_ref_multisegment_path_stays_external(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("Use `/usr/bin/python3` for this.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "/usr/bin/python3"]
+    assert len(hits) == 1
+    assert hits[0]["kind"] == "external"
+    assert hits[0]["resolved"] is None
+
+def test_retired_ref_ordering_is_deterministic(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text(
+        "Run `/first-gone` then `/second-gone` then `/first-gone` again.")
+    (fake_harness / "rules" / "b.md").write_text("Also see `/second-gone`.")
+    doc = run_collector(fake_harness)
+    slash_refs = [(r["source"], r["ref"]) for r in doc["phantom_refs"] if r["kind"] == "slash_command"]
+    assert slash_refs == [("rules/a.md", "/first-gone"), ("rules/a.md", "/second-gone"),
+                           ("rules/b.md", "/second-gone")]
+
 def test_prose_never_clause_is_promotion_candidate(fake_harness):
     (fake_harness / "rules" / "a.md").write_text("NEVER commit secrets. Files must be under 200 lines.")
     doc = run_collector(fake_harness)

@@ -2806,6 +2806,14 @@ def test_build_phantom_ref_brief_is_pure_and_kind_aware():
     assert "Verify the target exists" in unknown   # catch-all
 
 
+# S2.M4: retired slash-command detection (phantom_refs kind=slash_command; SPEC_4 §2).
+def test_build_phantom_ref_brief_slash_command_guidance_is_specific():
+    ref = {"source": "rules/a.md", "ref": "/gone-command", "kind": "slash_command", "resolved": False}
+    brief = rh.build_phantom_ref_brief(ref)
+    assert "Retired slash command" in brief        # slash_command-specific guidance
+    assert "Verify the target exists" not in brief  # not the default catch-all
+
+
 def test_phantom_table_has_guidance_column_and_brief(tmp_path):
     doc = _minimal_doc()   # one phantom ref
     out_dir = tmp_path / "phantom"

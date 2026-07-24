@@ -2272,6 +2272,7 @@ _PHANTOM_GUIDANCE = {
     "path": "Broken path — fix the link to point at the real file, or create the missing target if it should exist.",
     "external": "External ref — verify the target still exists and is correct, or remove the pointer.",
     "env_flag": "Env-flag ref — wire the flag to a real gate, or drop the mention.",
+    "slash_command": "Retired slash command — both homes (commands/<name>.md, skills/<name>/SKILL.md) are absent; the rule points at a command that no longer exists. Update or drop the reference.",
 }
 _PHANTOM_GUIDANCE_DEFAULT = "Verify the target exists or remove the pointer."
 

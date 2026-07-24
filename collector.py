@@ -31,6 +31,7 @@ _GENERIC_BACKTICK_RE = re.compile(r"`([^`]+)`")
 _PATH_EXT_RE = re.compile(r"[\w./~-]+\.(?:md|py|sh|json)")
 _ENV_FLAG_NAME_RE = re.compile(r"^([A-Z][A-Z0-9_]{4,})(?:=.*)?$")
 _ENV_FLAG_SHAPE_RE = re.compile(r"_ALLOW_|_SKIP_|GUARD|WRITE_")
+_SLASH_COMMAND_RE = re.compile(r"^/[a-z0-9][a-z0-9-]*$")
 _NEVER_RE = re.compile(r"\bNEVER\b")
 _ALWAYS_RE = re.compile(r"\bALWAYS\b")
 _MUST_RE = re.compile(r"\bmust\b")
@@ -2352,6 +2353,29 @@ def check_phantom_refs(
             if _looks_like_path_token(token):
                 norm = re.sub(r"^~/\.claude/?", "", token)
                 if norm.startswith("/") or norm.startswith("~"):
+                    if _SLASH_COMMAND_RE.fullmatch(norm):
+                        name = norm[1:]
+                        homes = [root / "commands" / f"{name}.md",
+                                 root / "skills" / name / "SKILL.md"]
+                        exists = False
+                        blocked = False
+                        for home in homes:
+                            present, ok = _safe_exists(home)
+                            if not ok:
+                                inaccessible.append({"path": _rel_safe(root, home), "reason": "unreadable"})
+                                blocked = True
+                                break
+                            if present:
+                                exists = True
+                                break
+                        if exists or blocked:
+                            continue
+                        key = (rel_path, norm, "slash_command")
+                        if key not in seen:
+                            seen.add(key)
+                            refs.append({"source": rel_path, "ref": norm, "kind": "slash_command",
+                                         "resolved": False, "evidence": "VERIFIED"})
+                        continue
                     key = (rel_path, norm, "external")
                     if key not in seen:
                         seen.add(key)
