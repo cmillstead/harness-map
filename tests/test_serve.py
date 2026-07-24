@@ -1051,6 +1051,122 @@ def test_startup_malformed_synthesis_clean_fatal(tmp_path, capsys):
         f"expected the clean fatal message on stderr, got {captured.err!r}"
 
 
+def test_startup_warns_when_synthesis_sidecar_absent(tmp_path):
+    # serve.py has NO model and cannot generate the synthesis sidecar (the skill's opus Step B
+    # does). When the same-date synthesis sidecar is ABSENT at startup, main() must print ONE
+    # stderr warning naming the missing file, and STILL start serving (non-blocking advisory).
+    # HERMETIC BY CONSTRUCTION (no wall-clock dependency): this test writes NO synthesis sidecar
+    # for ANY date, so whatever date the server picks at startup (it computes datetime.now() itself
+    # in _rebuild, serve.py:248), the sidecar is absent and the warning fires. We do NOT compare
+    # the warned date to a parent-computed today() -- that would race a local-midnight rollover
+    # between the parent and the subprocess; instead we assert the warning names SOME same-date
+    # `harness-synthesis-<YYYY-MM-DD>.json` (regex, date parsed from the warning itself). The
+    # "guard reuses ctx.date, never a fresh today()" invariant is pinned by the STATIC
+    # eval-criterion grep (no datetime.now()/date.today() in the guard body), which is the reliable
+    # enforcement; a no-mocks subprocess test cannot distinguish the two without freezing time.
+    import re
+    import subprocess
+    import sys
+    import threading
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "rules").mkdir()
+    (root / "rules" / "a.md").write_text("# rule a\n")
+    (root / "CLAUDE.md").write_text("# claude\n")
+    # deliberately DO NOT write ANY harness-synthesis-<date>.json
+    # Merge stderr INTO stdout (stderr=STDOUT) so the two flushed lines land in ONE ordered pipe:
+    # this lets us assert the warning line appears BEFORE the "Serving..." line (proving the
+    # flush-before-serving ordering behaviorally, not just by code placement) AND that it fires
+    # exactly once (count of warning LINES, not filename substrings -- the warning names the file
+    # twice, via {synth_path} and {synth_path.name}, so a substring count would be 2 for ONE line).
+    proc = subprocess.Popen(
+        [sys.executable, str(SERVE), "--out-dir", str(out_dir), "--root", str(root),
+         "--project-root", str(root), "--no-friction"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # Watchdog: proc.stdout.readline() blocks with NO native timeout, so a server that never
+    # prints would hang this test forever. A Timer that kills the process closes the pipe,
+    # unblocking readline() (it then returns "") so the assertion fails cleanly instead of hanging.
+    watchdog = threading.Timer(20.0, proc.kill)
+    watchdog.start()
+    lines = []
+    try:
+        while True:
+            line = proc.stdout.readline()
+            if line == "":  # EOF: process exited or was killed by the watchdog
+                break
+            lines.append(line)
+            if line.startswith("Serving http://127.0.0.1:"):
+                break
+        assert lines and lines[-1].startswith("Serving http://127.0.0.1:"), \
+            f"server must still start when synthesis is absent; got {lines!r}"
+        assert proc.poll() is None, "the missing-synthesis warning must NOT block startup"
+    finally:
+        watchdog.cancel()
+        proc.terminate()
+        proc.wait(timeout=10)
+    warn_idxs = [i for i, ln in enumerate(lines) if "no synthesis sidecar" in ln]
+    assert len(warn_idxs) == 1, \
+        f"the missing-synthesis warning must fire EXACTLY ONCE; got lines {lines!r}"
+    assert warn_idxs[0] < len(lines) - 1, \
+        f"the warning must be flushed BEFORE the 'Serving...' line; got lines {lines!r}"
+    warn_line = lines[warn_idxs[0]]
+    assert re.search(r"harness-synthesis-\d{4}-\d{2}-\d{2}\.json", warn_line), \
+        f"warning must name the missing same-date synthesis sidecar; got {warn_line!r}"
+    assert "coverage matrix" in warn_line.lower(), \
+        f"warning must say the coverage matrix will be empty; got {warn_line!r}"
+
+
+def test_startup_silent_when_synthesis_sidecar_present(tmp_path):
+    # When the same-date synthesis sidecar IS present at startup, main() must NOT print the
+    # missing-synthesis warning (the coverage matrix will render populated).
+    # HERMETIC BY CONSTRUCTION (no wall-clock race): the server picks its render date from
+    # datetime.now() itself at startup (serve.py:248); to guarantee the sidecar is present for
+    # WHATEVER date it lands on -- even across a local-midnight rollover between this setup and the
+    # subprocess -- we write valid same-date sidecars for yesterday, today, AND tomorrow. The
+    # server's date is necessarily one of {today, today+1} (it runs milliseconds later, at most one
+    # midnight can pass), all of which are covered, so the run is silent regardless of clock timing.
+    import subprocess
+    import sys
+    import threading
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "rules").mkdir()
+    (root / "rules" / "a.md").write_text("# rule a\n")
+    (root / "CLAUDE.md").write_text("# claude\n")
+    base = datetime.date.today()
+    for delta in (-1, 0, 1):  # yesterday / today / tomorrow -- covers any rollover the server hits
+        d = (base + datetime.timedelta(days=delta)).strftime("%Y-%m-%d")
+        _write_synthesis(out_dir, d, [("Afford", "context")])  # present, valid, same-date
+    proc = subprocess.Popen(
+        [sys.executable, str(SERVE), "--out-dir", str(out_dir), "--root", str(root),
+         "--project-root", str(root), "--no-friction"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Watchdog (same rationale as the absent-sidecar test): kill a never-printing server so
+    # readline() unblocks and the assertion fails cleanly instead of hanging forever.
+    watchdog = threading.Timer(20.0, proc.kill)
+    watchdog.start()
+    try:
+        line = ""
+        while True:
+            line = proc.stdout.readline()
+            if line == "":  # EOF: process exited or was killed by the watchdog
+                break
+            if line.startswith("Serving http://127.0.0.1:"):
+                break
+        assert line.startswith("Serving http://127.0.0.1:"), f"server did not start; got {line!r}"
+    finally:
+        watchdog.cancel()
+        proc.terminate()
+        proc.wait(timeout=10)
+    err = proc.stderr.read()
+    assert "no synthesis sidecar" not in err, \
+        f"no missing-synthesis warning expected when the sidecar is present; stderr was {err!r}"
+
+
 # ================================================================= T8: compose propagation
 # + compose-aware watched-set + tier-aware, containment-gated watcher + both-root guard
 

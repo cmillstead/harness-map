@@ -904,6 +904,33 @@ def build_server(out_dir, root, project_root, host="127.0.0.1", port=0,
     return server
 
 
+def _warn_if_synthesis_missing(out_dir, date):
+    """One-time startup advisory (stderr only, NEVER blocks startup): warn when the synthesis
+    sidecar the initial render SELECTED for `date` is absent, so the CIVC coverage matrix +
+    drag-candidate table render EMPTY. serve.py is stdlib-only with NO model access -- it can
+    NEVER generate the synthesis sidecar (that is the skill's opus Step B); this only reports
+    the gap. `date` MUST be the date the render actually selected (server.state.ctx.date ==
+    render_from_out_dir's sel_date), reusing `_synthesis_path` so the checked file is EXACTLY
+    the one render tried to load -- never a recomputed today(). The entire body is wrapped in a
+    bare except: a startup ADVISORY must NEVER break serving, so any fault here (a stat error on
+    the synthesis path, a BrokenPipeError/OSError writing to a closed stderr) is swallowed and
+    the server still binds + serves the deterministic dashboard."""
+    try:
+        synth_path = _synthesis_path(out_dir, date)
+        if synth_path.exists():
+            return
+        print(
+            f"harness-map: no synthesis sidecar for {date} at {synth_path} -- the CIVC coverage "
+            f"matrix and drag-candidate table will render EMPTY until you run the skill's Step B "
+            f"synthesis (writes {synth_path.name}). The deterministic dashboard "
+            f"(headline/treemap/friction) is unaffected.",
+            file=sys.stderr, flush=True)
+    except Exception:
+        # Non-blocking by construction: an advisory must never suppress the "Serving..." line or
+        # prevent serve_forever(). Swallow every fault (stat error, closed-stderr BrokenPipeError).
+        pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Serve a live harness-map dashboard over loopback HTTP.")
@@ -942,6 +969,13 @@ def main(argv=None):
         print(f"fatal: could not start server: {e}", file=sys.stderr)
         return 1
     bound_host, bound_port = server.server_address[0], server.server_address[1]
+    # Startup advisory (stderr, non-blocking): the synthesis sidecar for the date the initial
+    # render selected feeds the CIVC coverage matrix + drag table. serve.py has NO model and
+    # cannot generate it (that is the skill's opus Step B) -- if it is absent, warn ONCE here so
+    # the operator knows the matrix will be empty until Step B runs. Uses the render's ACTUAL
+    # selected date (state.ctx.date == sel_date), never a recomputed today(); emitted BEFORE the
+    # flushed "Serving..." line so a piped reader observing that line already has this warning.
+    _warn_if_synthesis_missing(server.out_dir, server.state.ctx.date)
     # FIX 5: flush explicitly -- when the server is backgrounded with stdout piped (block-
     # buffered, not a TTY), an unflushed line sits in the buffer and never reaches the reader
     # before serve_forever() blocks, breaking the "background it and read stdout for the
