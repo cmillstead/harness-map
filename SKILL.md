@@ -1,6 +1,6 @@
 ---
 name: harness-map
-description: "Use when the user asks 'map my harness', 'what loads always', 'harness system map', or 'harness drag audit' — a read-only inventory of what is configured to fire (always-loaded context, on-demand skills, enforcement hooks/permissions) plus duplication/staleness flags, a CIVC coverage matrix, and a diff vs the previous run. NOT for what actually fired (/harness-pulse) or maturity judgments (/harness-engineer) — this skill maps and flags; it never decides."
+description: "Use when the user asks 'map my harness', 'what loads always', 'harness system map', or 'harness drag audit' — a read-only inventory of what is configured to fire (always-loaded context, on-demand skills, enforcement hooks/permissions) plus duplication/staleness flags, a CIVC coverage matrix, and a diff vs the previous run. NOT for what actually fired (/harness-pulse) or maturity/design judgments (/harness-engineer) — this skill maps and flags; it never decides."
 effort: high
 ---
 
