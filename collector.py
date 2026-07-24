@@ -2239,12 +2239,21 @@ def check_phantom_refs(root, corpus_files, inaccessible):
                         refs.append({"source": rel_path, "ref": norm, "kind": "external",
                                      "resolved": None, "evidence": "INFERRED"})
                     continue
-                candidate = root / norm
-                present, ok = _safe_exists(candidate)
-                if not ok:
-                    inaccessible.append({"path": _rel_safe(root, candidate), "reason": "unreadable"})
-                    continue
-                if present:
+                src_dir = Path(rel_path).parent
+                candidates = [root / norm]
+                if str(src_dir) not in (".", ""):
+                    candidates.append(root / src_dir / norm)
+                handled = False
+                for candidate in candidates:
+                    present, ok = _safe_exists(candidate)
+                    if not ok:
+                        inaccessible.append({"path": _rel_safe(root, candidate), "reason": "unreadable"})
+                        handled = True
+                        break
+                    if present:
+                        handled = True
+                        break
+                if handled:
                     continue
                 key = (rel_path, norm, "path")
                 if key not in seen:

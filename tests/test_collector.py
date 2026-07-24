@@ -505,6 +505,24 @@ def test_missing_path_ref_is_phantom(fake_harness):
     doc = run_collector(fake_harness)
     assert "rules/ghost.md" in {r["ref"] for r in doc["phantom_refs"]}
 
+# Regression: audit 2026-07-18 P2-1 (collector.py:2242 post-drift; spec SPEC_3 §1).
+def test_phantom_ref_resolves_sibling_relative_to_source_dir(fake_harness):
+    (fake_harness / "rules" / "no-known-broken.md").write_text("No known broken code.")
+    (fake_harness / "rules" / "a.md").write_text("See `no-known-broken.md` for details.")
+    doc = run_collector(fake_harness)
+    assert "no-known-broken.md" not in {r["ref"] for r in doc["phantom_refs"]}
+
+def test_phantom_ref_still_reports_truly_absent_target(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("See `does-not-exist.md` for details.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "does-not-exist.md"]
+    assert hits and hits[0]["kind"] == "path"
+
+def test_phantom_ref_root_relative_still_resolves(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("See `memory/MEMORY.md` for details.")
+    doc = run_collector(fake_harness)
+    assert "memory/MEMORY.md" not in {r["ref"] for r in doc["phantom_refs"]}
+
 def test_unread_env_flag_is_phantom_candidate(fake_harness):
     (fake_harness / "rules" / "a.md").write_text("Bypass with `WRITE_GUARD_ALLOW_NOWHERE=1`.")
     doc = run_collector(fake_harness)
