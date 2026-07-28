@@ -2974,6 +2974,73 @@ def test_build_phantom_ref_brief_slash_command_guidance_is_specific():
     assert "Verify the target exists" not in brief  # not the default catch-all
 
 
+# S2 gate fix (R2/F1): the resolved-is-None guidance branch.
+def test_phantom_guidance_for_unverifiable_slash_command():
+    """resolved=null (the new collector shape) must NOT fall through to the legacy
+    resolved=false text, which tells the operator a valid /simplify reference points at
+    'a command that no longer exists' -- a factually false instruction (GP#15)."""
+    brief = rh.build_phantom_ref_brief(
+        {"source": "rules/defensive-simplify-guard.md", "ref": "/simplify",
+         "kind": "slash_command", "resolved": None})
+    assert "No home for this command under the scanned root" in brief
+    assert "BUILT-INS" in brief
+    assert "no longer exists" not in brief
+    assert "Verify the target exists" not in brief   # not the catch-all either
+
+def test_legacy_resolved_false_slash_command_guidance_is_preserved():
+    """Old sidecars still carry resolved=false; that rendering is unchanged."""
+    brief = rh.build_phantom_ref_brief(
+        {"source": "s", "ref": "/x", "kind": "slash_command", "resolved": False})
+    assert "Retired slash command" in brief
+
+def test_phantom_table_renders_unverifiable_not_a_bare_none(tmp_path):
+    """M3: `resolved` renders verbatim in the Resolved cell, so the new null shape would
+    print a literal Python "None" to the operator."""
+    doc = _minimal_doc()
+    doc["phantom_refs"] = [{"source": "rules/a.md", "ref": "/simplify",
+                            "kind": "slash_command", "resolved": None,
+                            "evidence": "INFERRED"}]
+    out_dir = tmp_path / "ph"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "<td>unverifiable</td>" in text
+    assert "<td>None</td>" not in text
+
+def test_unverifiable_brief_finding_is_not_a_confident_failure():
+    """R2-F6(a): resolved=null must not produce 'does not resolve to a real target'."""
+    brief = rh.build_phantom_ref_brief(
+        {"source": "rules/defensive-simplify-guard.md", "ref": "/simplify",
+         "kind": "slash_command", "resolved": None})
+    assert "does not resolve to a real target" not in brief
+    assert "could not verify" in brief
+
+def test_gauge_does_not_paint_unverifiable_rows_broken(tmp_path):
+    """R2-F6(c): a doc whose ONLY phantom row is resolved=null must not render BROKEN
+    ('BROKEN' is unique to phantom_ref_count in GAUGE_BANDS -- verified -- so the
+    absence assertion is precise). The row itself must still be visible."""
+    doc = _minimal_doc()
+    doc["phantom_refs"] = [{"source": "rules/a.md", "ref": "/simplify",
+                            "kind": "slash_command", "resolved": None,
+                            "evidence": "INFERRED"}]
+    out_dir = tmp_path / "ph2"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "BROKEN" not in text
+    assert "(unverifiable)" in text          # the drill marker -- visible, not vanished
+    # R4-2: scope to the phantom CARD and require the band SURVIVES the display/band
+    # split. Passing the formatted string as the band input would make finite_number
+    # reject it -> ("", "neutral") -> no CLEAN -- and unscoped assertions can't see that.
+    card = text.split('data-gauge="phantom_ref_count"', 1)[1][:400]
+    assert "1 (0 confirmed)" in card         # R3-2: displayed count stays the total
+    assert "CLEAN" in card                   # the band is derived from band_value=0
+
+
 def test_phantom_table_has_guidance_column_and_brief(tmp_path):
     doc = _minimal_doc()   # one phantom ref
     out_dir = tmp_path / "phantom"

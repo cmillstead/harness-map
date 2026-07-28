@@ -107,7 +107,7 @@ Full INACCESSIBLE list plus these standing v1 disclosures (verbatim, every repor
 Two staleness signals, both review candidates — **stale ≠ dead**: the model flags these for a human to look at, it never condemns a file outright from the signal alone.
 
 - **Git age** (`staleness.last_commit_ts`) — an instruction file with no recent commit is a review candidate: still-correct-and-stable and genuinely-forgotten look identical from a timestamp alone. A `null` here is NOT "very old" — read its cause from `staleness_null_reasons` (`untracked` → commit it or ignore it; `submodule_unavailable` → initialize the submodule; `budget_exhausted` → re-run, the file was never measured; `no_repo` → the scanned root is not a git work tree; `git_unavailable` → the git binary could not be run at all). Never treat a null as a staleness signal.
-- **Retired slash commands** (`phantom_refs[]` where `kind == "slash_command"`) — a rule cites a `/command` whose two possible homes (`commands/<name>.md`, `skills/<name>/SKILL.md`) are both absent. The command may have been renamed, folded elsewhere, or genuinely dropped; treat as "verify and update or remove," not "auto-delete."
+- **Retired slash commands** (`phantom_refs[]` where `kind == "slash_command"`) — a rule cites a `/command` for which no home exists **under the scanned root** (`commands/<name>.md`, `commands/<ns>/<name>.md`, `skills/<name>/SKILL.md`). This is `evidence: INFERRED`, `resolved: null` — Claude Code built-ins and plugin commands live outside the root and cannot be checked from here, so treat as "verify, then update or remove," never "auto-delete."
 
 | Path | Reason |
 |---|---|

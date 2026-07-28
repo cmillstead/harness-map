@@ -568,8 +568,11 @@ def test_retired_ref_flags_missing_slash_command(fake_harness):
     hits = [r for r in doc["phantom_refs"] if r["ref"] == "/gone-command"]
     assert len(hits) == 1
     assert hits[0]["kind"] == "slash_command"
-    assert hits[0]["resolved"] is False
-    assert hits[0]["evidence"] == "VERIFIED"
+    # A22 (scoped binding-rule-7 exemption): these two lines were introduced by e323bf9
+    # on THIS branch and have never been a merged contract. They pinned M4's mistaken
+    # belief that VERIFIED was the right label, and that belief IS the defect D2 fixes.
+    assert hits[0]["resolved"] is None
+    assert hits[0]["evidence"] == "INFERRED"
 
 def test_retired_ref_ignores_existing_command(fake_harness):
     (fake_harness / "commands" / "present.md").write_text("---\nname: present\n---\nBody.\n")
@@ -583,6 +586,55 @@ def test_retired_ref_ignores_existing_skill_home(fake_harness):
     (fake_harness / "rules" / "a.md").write_text("Run `/present` first.")
     doc = run_collector(fake_harness)
     assert not any(r["ref"] == "/present" for r in doc["phantom_refs"])
+
+# S2 gate fix (R2/F1): a /token's resolution space includes CC BUILT-INS and plugin
+# commands that live OUTSIDE --root and are structurally unenumerable from here.
+def test_slash_command_row_is_inferred_not_verified(fake_harness):
+    """The branch checked 2 of at least 6 possible homes and emitted evidence VERIFIED --
+    a positive assertion of absence over a space it cannot see. That is the defect: the
+    /simplify row was a false positive because the CLAIM was wrong, not the detection."""
+    (fake_harness / "rules" / "a.md").write_text("Run `/gone-command` to fix it.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "/gone-command"]
+    assert len(hits) == 1
+    assert hits[0]["resolved"] is None        # NOT False -- pins against a regression
+    assert hits[0]["evidence"] == "INFERRED"
+
+def test_namespaced_slash_command_resolves_to_nested_command_home(fake_harness):
+    """/paul:apply -> commands/paul/apply.md. Verified live: commands/paul/,
+    commands/base/, commands/aegis/ and the nested
+    commands/base/orientation/tasks/deep-why.md all exist in this harness."""
+    (fake_harness / "commands" / "paul").mkdir(parents=True, exist_ok=True)
+    (fake_harness / "commands" / "paul" / "apply.md").write_text("---\nname: apply\n---\nB.\n")
+    (fake_harness / "rules" / "a.md").write_text("Run `/paul:apply` next.")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"] if r["ref"] == "/paul:apply"]
+
+def test_deeply_namespaced_slash_command_resolves(fake_harness):
+    d = fake_harness / "commands" / "base" / "orientation" / "tasks"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "deep-why.md").write_text("---\nname: deep-why\n---\nB.\n")
+    (fake_harness / "rules" / "a.md").write_text("Run `/base:orientation:tasks:deep-why`.")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"]
+                if r["ref"] == "/base:orientation:tasks:deep-why"]
+
+def test_namespaced_slash_command_absent_emits_inferred_row(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("Run `/paul:nosuch` next.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "/paul:nosuch"]
+    assert len(hits) == 1
+    assert hits[0]["kind"] == "slash_command"
+    assert hits[0]["resolved"] is None and hits[0]["evidence"] == "INFERRED"
+
+def test_bare_slash_command_home_set_is_unchanged(fake_harness):
+    """A bare /foo must yield EXACTLY today's two homes -- segments[:-1] is empty."""
+    (fake_harness / "skills" / "solo").mkdir(parents=True, exist_ok=True)
+    (fake_harness / "skills" / "solo" / "SKILL.md").write_text(
+        "---\nname: solo\ndescription: d.\n---\nB.\n")
+    (fake_harness / "rules" / "a.md").write_text("Run `/solo` first.")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"] if r["ref"] == "/solo"]
 
 def test_retired_ref_multisegment_path_stays_external(fake_harness):
     (fake_harness / "rules" / "a.md").write_text("Use `/usr/bin/python3` for this.")

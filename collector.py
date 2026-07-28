@@ -32,7 +32,8 @@ _GENERIC_BACKTICK_RE = re.compile(r"`([^`]+)`")
 _PATH_EXT_RE = re.compile(r"[\w./~-]+\.(?:md|py|sh|json)")
 _ENV_FLAG_NAME_RE = re.compile(r"^([A-Z][A-Z0-9_]{4,})(?:=.*)?$")
 _ENV_FLAG_SHAPE_RE = re.compile(r"_ALLOW_|_SKIP_|GUARD|WRITE_")
-_SLASH_COMMAND_RE = re.compile(r"^/[a-z0-9][a-z0-9-]*$")
+# ^/name  or  ^/ns:name  or  ^/ns:sub:...:name  (/base:orientation:tasks:deep-why is live)
+_SLASH_COMMAND_RE = re.compile(r"^/[a-z0-9][a-z0-9-]*(?::[a-z0-9][a-z0-9-]*)*$")
 _NEVER_RE = re.compile(r"\bNEVER\b")
 _ALWAYS_RE = re.compile(r"\bALWAYS\b")
 _MUST_RE = re.compile(r"\bmust\b")
@@ -3030,9 +3031,15 @@ def check_phantom_refs(
                 norm = re.sub(r"^~/\.claude/?", "", token)
                 if norm.startswith("/") or norm.startswith("~"):
                     if _SLASH_COMMAND_RE.fullmatch(norm):
-                        name = norm[1:]
-                        homes = [root / "commands" / f"{name}.md",
-                                 root / "skills" / name / "SKILL.md"]
+                        segments = norm[1:].split(":")
+                        # Homes under --root, in check order. A BARE /foo has
+                        # segments[:-1] == [] and yields EXACTLY today's two homes, so
+                        # nothing changes for it. A namespaced /paul:apply adds the
+                        # commands/<ns>/<name>.md home (verified live for commands/paul/,
+                        # commands/base/, commands/aegis/ and the nested
+                        # commands/base/orientation/tasks/deep-why.md).
+                        homes = [root.joinpath("commands", *segments[:-1], f"{segments[-1]}.md"),
+                                 root / "skills" / segments[0] / "SKILL.md"]
                         exists = False
                         blocked = False
                         for home in homes:
@@ -3049,8 +3056,20 @@ def check_phantom_refs(
                         key = (rel_path, norm, "slash_command")
                         if key not in seen:
                             seen.add(key)
+                            # R2/F1: INFERRED + resolved null, NOT VERIFIED + false. A
+                            # /token's real resolution space is at least six homes:
+                            # commands/<name>.md, commands/<ns>/<name>.md,
+                            # skills/<name>/SKILL.md, a Claude Code BUILT-IN, a plugin
+                            # command, and a project-tier command. The last three are
+                            # structurally unenumerable from --root. Asserting absence
+                            # over a space we cannot see is a VERDICT wearing a signal's
+                            # clothes (binding rule 6). This matches the doctrine this
+                            # same function already applies to `external` in its own
+                            # docstring. The claim becomes "no home under the scanned
+                            # root" (true and verifiable) instead of "this command no
+                            # longer exists" (false for /simplify).
                             refs.append({"source": rel_path, "ref": norm, "kind": "slash_command",
-                                         "resolved": False, "evidence": "VERIFIED"})
+                                         "resolved": None, "evidence": "INFERRED"})
                         continue
                     key = (rel_path, norm, "external")
                     if key not in seen:

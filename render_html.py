@@ -2137,12 +2137,15 @@ GAUGE_SPECS = (  # (source_kind, key, label) — source_kind selects where the v
 )
 
 
-def _render_gauge(key, label, value, delta=None, has_drill=False):
+def _render_gauge(key, label, value, delta=None, has_drill=False, band_value=None):
     """A header gauge. `has_drill=True` renders a `<button>` (item 1 accordion trigger,
     `aria-expanded`/`aria-controls` wired to the shared drawer panel) instead of an inert
     `<div>` — `class="gauge gauge-{semantic}"` and `data-gauge` are preserved in both forms
-    so existing regression assertions hold either way."""
-    band, semantic = _gauge_band(key, value)
+    so existing regression assertions hold either way.
+    R4-2: `band_value`, when given, drives `_gauge_band`; `value` stays the DISPLAYED
+    text. Default None -> band follows the displayed value, so every existing call
+    site and its rendered bytes are unchanged."""
+    band, semantic = _gauge_band(key, band_value if band_value is not None else value)
     band_html = f'<div class="band">{esc_html(band)}</div>' if band else ""
     delta_html = ""
     if delta:
@@ -2202,6 +2205,7 @@ def _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate):
         refs = sorted(doc.get("phantom_refs", []) or [],
                       key=lambda r: (r.get("source", ""), r.get("ref", "")))
         items = [f'<code>{esc_html(r.get("source",""))}</code> → {esc_html(r.get("ref",""))}'
+                 + (' <em>(unverifiable)</em>' if r.get("resolved") is None else '')
                  for r in refs]
         return _drill_list(items) + tab
     if key == "friction_total":
@@ -2264,19 +2268,30 @@ def _trend_delta(trend_model, key):
     return (text, semantic)
 
 
-def _render_instrument_readout(headline, phantom_ref_count, friction_total_value,
-                               trend_model, models, doc, joined, footer, codex_aggregate):
+def _render_instrument_readout(headline, phantom_ref_count, phantom_confirmed_count,
+                               friction_total_value, trend_model, models, doc, joined,
+                               footer, codex_aggregate):
     """Item 1: every gauge is now a drill-down accordion trigger — a shared
     `.gauge-drawer` (one `.gauge-drill-panel` per gauge, closed on load) follows the
     `.gauges` row so the accordion JS (STATIC_SCRIPT) can toggle `hidden`/`aria-expanded`
-    without touching emitted bytes elsewhere."""
+    without touching emitted bytes elsewhere.
+    R2-F6/R3-2/R4-2: the phantom_ref_count card is the only gauge whose displayed value
+    and severity band diverge — `phantom_ref_count` is the total (every row the operator
+    should see counted); `phantom_confirmed_count` (resolved=False rows only) drives the
+    band, so unverifiable (resolved=null) rows never paint a false BROKEN verdict."""
     values = {"phantom_ref_count": phantom_ref_count, "friction_total": friction_total_value}
     cards, panels = [], []
     for kind, key, label in GAUGE_SPECS:
         value = values[key] if kind in ("phantom", "friction") else headline.get(key, 0)
+        band_value = None
+        if key == "phantom_ref_count":
+            band_value = phantom_confirmed_count
+            if phantom_confirmed_count != phantom_ref_count:
+                value = f"{phantom_ref_count} ({phantom_confirmed_count} confirmed)"
         delta = _trend_delta(trend_model, key) if kind == "headline" else None
         drill = _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate)
-        cards.append(_render_gauge(key, label, value, delta, has_drill=bool(drill)))
+        cards.append(_render_gauge(key, label, value, delta, has_drill=bool(drill),
+                                    band_value=band_value))
         if drill:
             panels.append(f'<div class="gauge-drill-panel" id="gdrawer-{esc_html(key)}" '
                           f'role="region" aria-label="{esc_html(label)} detail" hidden>'
@@ -2415,11 +2430,40 @@ _PHANTOM_GUIDANCE = {
 }
 _PHANTOM_GUIDANCE_DEFAULT = "Verify the target exists or remove the pointer."
 
+# S2 gate fix (R2/F1): the collector now emits resolved=null / evidence=INFERRED for
+# slash commands. The legacy resolved=false text above is kept VERBATIM for old sidecars
+# (and is pinned by an existing test). This is the honest replacement: it leads with what
+# the collector could NOT check (GP#3) and tells the operator what to DO about it (GP#15),
+# instead of instructing them to delete a valid reference.
+_PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE = (
+    "No home for this command under the scanned root (commands/<name>.md, "
+    "commands/<ns>/<name>.md, skills/<name>/SKILL.md). Claude Code BUILT-INS and plugin "
+    "commands live OUTSIDE this root and cannot be checked from here — confirm the "
+    "command is gone before updating or removing the reference."
+)
+
 
 def _phantom_guidance(kind, resolved):
     if resolved:
         return "Resolved at collection time — listed for provenance; no action needed."
+    if resolved is None and kind == "slash_command":
+        return _PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
     return _PHANTOM_GUIDANCE.get(kind, _PHANTOM_GUIDANCE_DEFAULT)
+
+
+# S2 gate fix: the tri-state `resolved` rendered verbatim, so the new null shape would
+# print a bare Python "None" in the operator-facing Resolved column. Three states, three
+# words. `unverifiable` is the honest label for null: the collector could not see the
+# whole resolution space, so it neither confirmed nor denied.
+# MUST be total. Do NOT use a dict lookup here: `resolved` arrives straight from sidecar
+# JSON, and `dict.get` HASHES its key, so a corrupt/hostile `resolved: []` or `{}` raises
+# TypeError: unhashable type. The line this replaces (`esc_html(r.get("resolved"))`)
+# accepted anything, so a dict form would ADD a fault path in the one batch whose purpose
+# is removing them.
+def _resolved_label(resolved):
+    if resolved is None:
+        return "unverifiable"
+    return "yes" if resolved is True else ("no" if resolved is False else "unverifiable")
 
 
 def build_phantom_ref_brief(ref):
@@ -2428,10 +2472,17 @@ def build_phantom_ref_brief(ref):
     source = ref.get("source", "")
     r = ref.get("ref", "")
     kind = ref.get("kind", "")
+    if ref.get("resolved") is None:
+        finding = (f"`{source}` points at `{r}` (kind: {kind}), which the collector "
+                   f"could not verify — the resolution space extends outside the "
+                   f"scanned root.\n\n")
+    else:
+        finding = (f"`{source}` points at `{r}` (kind: {kind}) which does not resolve "
+                   f"to a real target.\n\n")
     return (
         "# Fix phantom reference\n\n"
         "## Finding\n"
-        f"`{source}` points at `{r}` (kind: {kind}) which does not resolve to a real target.\n\n"
+        f"{finding}"
         "## What to do\n"
         f"{_phantom_guidance(kind, ref.get('resolved', False))}\n\n"
         "## Action\n"
@@ -2992,13 +3043,15 @@ def _render_dupweb_body(model, raw_pairs):
     if model["phantom_refs"]:
         prows = "".join(
             f'<tr><td>{esc_html(r.get("source",""))}</td><td>{esc_html(r.get("ref",""))}</td>'
-            f'<td>{esc_html(r.get("kind",""))}</td><td>{esc_html(r.get("resolved"))}</td>'
+            f'<td>{esc_html(r.get("kind",""))}</td><td>{esc_html(_resolved_label(r.get("resolved")))}</td>'
             f'<td>{esc_html(_phantom_guidance(r.get("kind",""), r.get("resolved", False)))}</td>'
             f'<td>{_render_brief_control("phantom", i, build_phantom_ref_brief(r))}</td></tr>'
             for i, r in enumerate(model["phantom_refs"]))
         phantom_body = (
             '<p class="digest">A phantom ref is a pointer in an instruction file to a '
-            'target that doesn’t resolve — a dangling link.</p>'
+            'target that doesn’t resolve — a dangling link. Rows marked "unverifiable" '
+            'could not be checked — their target space extends outside the scanned '
+            'root — and are listed for review, not asserted broken.</p>'
             '<div class="overflow-x"><table><tr><th>Source</th><th>Ref</th><th>Kind</th>'
             f'<th>Resolved</th><th>What to do</th><th>Action</th></tr>{prows}</table></div>')
     else:
@@ -3473,7 +3526,14 @@ def render_html(
     # is "absent"/"inaccessible", never "disabled") — the single derivation the Weight view's
     # toggle gate (Codex P3) reads from.
     friction_enabled = any(f["status"] != "disabled" for f in footer)
-    phantom_ref_count = len(doc.get("phantom_refs", []) or [])
+    _phantom_rows = doc.get("phantom_refs", []) or []
+    # Codex R2-F6 + R3-2: TWO values. The displayed count stays the TOTAL -- every row,
+    # verifiable or not, is a row the operator should see counted. Only the BAND (the
+    # CLEAN/BROKEN verdict) keys off the CONFIRMED count: resolved=null rows are
+    # unverifiable, and painting them BROKEN would be rule 6's forbidden verdict, cast
+    # by the renderer instead of the collector.
+    phantom_ref_count = len(_phantom_rows)                                        # display: total (unchanged)
+    phantom_confirmed_count = sum(1 for r in _phantom_rows if r.get("resolved") is False)  # band: confirmed only
     friction_total_value = friction_total(joined, codex_aggregate, _metrics_aggregate_only(footer))
     overview_model = build_overview_model(models, headline, phantom_ref_count, friction_total_value)
 
@@ -3531,8 +3591,9 @@ def render_html(
         "<header><h1>harness-map</h1>",
         f'<div class="subtitle">root: {esc_html(doc.get("root",""))} | date: {esc_html(date)} '
         f'| generated_at: {esc_html(doc.get("generated_at",""))} {warn_badge}</div></header>',
-        _render_instrument_readout(headline, phantom_ref_count, friction_total_value,
-                                   models["trend"], models, doc, joined, footer, codex_aggregate),
+        _render_instrument_readout(headline, phantom_ref_count, phantom_confirmed_count,
+                                   friction_total_value, models["trend"], models, doc, joined,
+                                   footer, codex_aggregate),
         '<div class="controls">',
         '<nav class="view-switch" role="tablist">',
         view_buttons,
