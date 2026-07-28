@@ -3716,9 +3716,10 @@ def test_index_is_o_repo_roots_not_o_files(submodule_tree):
 def test_non_repo_root_records_no_repo_not_git_unavailable(fake_harness):
     """C-f/H1: conftest.py builds fake_harness with NO `git init`, so it is a non-repo
     root -- with git installed and working perfectly. An undiscriminated short-circuit
-    would label every file `git_unavailable`, which report-template.md defines as "git
-    could not run at all". That is a MISLEADING reason, the exact class this batch exists
-    to eliminate. A clean non-zero exit means `no_repo`."""
+    would label every file `git_unavailable`, which `_git_toplevel`'s docstring in
+    collector.py defines as meaning "git could not run at all". That is a MISLEADING
+    reason, the exact class this batch exists to eliminate. A clean non-zero exit means
+    `no_repo`."""
     idx = _collector.build_git_repo_index(fake_harness, [], [])
     assert idx.available is False
     assert idx.root_reason == "no_repo"
@@ -3734,6 +3735,46 @@ def test_absent_git_binary_records_git_unavailable(fake_harness):
         os.environ["PATH"] = old
     assert idx.available is False
     assert idx.root_reason == "git_unavailable"
+
+def test_marker_walk_fallback_reuses_root_reason(fake_harness):
+    """T9 round 3, ITEM 1: `build_git_repo_index`'s bounded marker walk falls back to
+    `root_top` when it finds no nested `.git` before `stop_at`; when `root_top` is None
+    it must reuse the already-discriminated `root_reason` rather than asserting `no_repo`
+    blind. Both C-f/H1 tests above pass files=[] so the per-dir loop body never runs --
+    this test puts a REAL instruction file under fake_harness so `dirs` is non-empty and
+    the fallback branch actually executes, for both discriminated root reasons."""
+    instruction_file = fake_harness / "rules" / "a.md"
+    idx = _collector.build_git_repo_index(fake_harness, [instruction_file], [])
+    assert _collector._git_age_for_file(fake_harness, instruction_file, idx) == (
+        None, "no_repo")
+
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = ""
+    try:
+        idx_unavailable = _collector.build_git_repo_index(
+            fake_harness, [instruction_file], [])
+    finally:
+        os.environ["PATH"] = old
+    assert _collector._git_age_for_file(fake_harness, instruction_file, idx_unavailable) == (
+        None, "git_unavailable")
+
+def test_unstatable_root_records_git_error_once_not_per_dir(tmp_path):
+    """T9 round 3, ITEM 2: an os.stat(root) failure is an UNKNOWN, not a determined
+    "resolves outside the harness root" fact -- _resolves_inside_root is never even
+    called for these dirs. Real, unpatched trigger: a root path that genuinely does not
+    exist on disk. Every dir gets the honest `git_error` reason (matching root_reason)
+    and there is exactly ONE aggregate blind spot for the whole run, not one per dir."""
+    root = tmp_path / "does_not_exist"
+    files = [root / "rules" / "a.md", root / "skills" / "demo" / "b.md"]
+    blind: list[str] = []
+    idx = _collector.build_git_repo_index(root, files, blind)
+    assert idx.available is False
+    assert idx.root_reason == "git_error"
+    assert len(idx.toplevel_by_dir) == 2
+    for top, reason in idx.toplevel_by_dir.values():
+        assert top is None
+        assert reason == "git_error"
+    assert len(blind) == 1
 
 def test_build_document_still_emits_staleness_after_rewiring(fake_harness):
     """Green-gate guard for this task's build_document rewiring: `staleness` keeps its

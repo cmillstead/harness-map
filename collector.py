@@ -2323,7 +2323,12 @@ def _accept_via_gitlink(top: str, accepted: set[str],
                         gitlinks_by_toplevel: dict[str, frozenset[str]]) -> bool:
     """True when `top` is named as a mode-160000 gitlink by an ALREADY-ACCEPTED root
     (8.6 clause 2). Candidate dirs are processed shallowest-first, so a nested submodule
-    is reached transitively without recursion."""
+    is reached transitively without recursion ONLY when an instruction file also lives in
+    the intervening (outer) submodule -- a toplevel enters `accepted` when one of its own
+    dirs is processed, not merely by being an ancestor. When corpus files exist only
+    inside the INNER submodule, the outer is never accepted and the inner is refused as
+    `outside_root` (a null, not a wrong number -- the safe direction, but not the
+    transitive reach this docstring used to promise)."""
     for parent in accepted:
         try:
             rel = str(Path(top).relative_to(parent))
@@ -2430,9 +2435,21 @@ def build_git_repo_index(root: Path, files: list[Path],
     # --- nested submodule can be validated against its already-accepted parent in one pass.
     dirs = sorted({str(Path(_physical_key(fp)).parent) for fp in files},
                   key=lambda d: (d.count(os.sep), d))
+    if root_stat is None and dirs:
+        # F9: an unstat-able root is an UNKNOWN, not a determined "resolves outside the
+        # root" fact -- _resolves_inside_root was never even called for these dirs. ONE
+        # aggregate blind spot for the whole run, not one per dir, since none of them was
+        # individually evaluated (the per-dir `outside_root` message below stays exact:
+        # that path DOES call _resolves_inside_root and reports a fact it determined).
+        blind_spots.append(
+            "git-age: the harness root could not be stat'd — no directory was probed "
+            "(git topology is unknown, not confirmed outside the root)")
     for dir_key in dirs:
         dir_path = Path(dir_key)
-        if root_stat is None or not _resolves_inside_root(dir_path, root, root_stat):
+        if root_stat is None:
+            toplevel_by_dir[dir_key] = (None, root_reason or "git_error")
+            continue
+        if not _resolves_inside_root(dir_path, root, root_stat):
             toplevel_by_dir[dir_key] = (None, "outside_root")
             blind_spots.append(
                 f"git-age: {dir_key} resolves outside the harness root — not probed "
@@ -2598,8 +2615,10 @@ def collect_git_age(root: Path, files: list[Path],
 
     Graceful degradation (never crashes): when the scanned root has no confirmed toplevel,
     EVERY value is None and the per-file loop is skipped entirely. Per-file failures
-    (timeout, non-zero exit, unparseable output, untracked file) independently degrade to
-    None for that path only -- one bad file never poisons the rest.
+    (timeout, non-zero exit, unparseable output) independently degrade to None for that
+    path only -- one bad file never poisons the rest. Tracked-state detection (an
+    UNTRACKED file surfacing as its own reason rather than `no_commits`) is T10's work,
+    not yet implemented here.
 
     Iteration is over the sorted REPORTED keys (F11: sorted(files) would compare Path parts
     tuples, diverging for prefix-sibling dirs like skills/scan vs skills/scan-code, while
