@@ -426,14 +426,24 @@ def squarify(
 def _tokens_treemap(
     files: list[dict[str, Any]], canvas_w: float = 960.0, canvas_h: float = 420.0
 ) -> dict[str, Any]:
+    # QA exit gate (MEDIUM 2): `load_sidecar` does no row validation, so `files[]` can hold
+    # a NON-DICT -- on which even `f.get(...)` raises AttributeError. That is in
+    # `_RENDER_FALLBACK_ERRORS`, so T3's envelope would convert ONE malformed row into a
+    # RenderError that kills the whole dashboard, under a comment blaming a defect in this
+    # module. A row with no readable fields has no size and no path: it degrades to the
+    # disclosure built for exactly this. The TYPE name is disclosed, never the value --
+    # a hostile sidecar's contents never reach the page through this path.
+    malformed = [f for f in files if not isinstance(f, dict)]
+    rows = [f for f in files if isinstance(f, dict)]
     # R4-3: total accessor — this comprehension runs over the COMPLETE input, including
     # rows that previously never reached f["path"] (their category died at the
     # `tokens <= 0` gate before the per-file loop). load_sidecar does no row validation,
     # so a pathless row must not turn the disclosure feature into a new KeyError.
-    unrenderable = sorted((f.get("path") or "(unknown path)") for f in files
-                          if finite_number(f.get("tokens_est", 0)) is None)
+    unrenderable = sorted([(f.get("path") or "(unknown path)") for f in rows
+                           if finite_number(f.get("tokens_est", 0)) is None]
+                          + [f"(malformed entry: {type(f).__name__})" for f in malformed])
     by_cat: dict[Any, list[dict[str, Any]]] = {}
-    for f in files:
+    for f in rows:
         by_cat.setdefault(f.get("category"), []).append(f)
     groups = []
     all_cells = []
@@ -449,12 +459,19 @@ def _tokens_treemap(
     for g in group_rects:
         groups.append(g)
         # The SORT KEY must be gated too (Codex F4) — `-f.get(...)` on a str is a TypeError.
+        # QA exit gate (MEDIUM 2): the PATH accessors are gated too, at all three sites. A
+        # pathless row with a usable size clears the `tokens <= 0` gate and reaches HERE,
+        # where a bare `f["path"]` was a KeyError -> RenderError -> no dashboard. Such a
+        # row is drawable (it has area), so it is LABELLED rather than disclosed --
+        # `unrenderable` says "no usable size value", which would be false for it.
         cat_files = sorted(
             by_cat.get(g["category"], []),
-            key=lambda f: (-_gated_size(f.get("tokens_est", 0)), f["path"]))
+            key=lambda f: (-_gated_size(f.get("tokens_est", 0)), f.get("path") or "(unknown path)"))
         cell_items = [{"size": _gated_size(f.get("tokens_est", 0)),
                        "words": _gated_size(f.get("words", 0)),
-                       "path": f["path"], "node_key": _al_node_key(f["path"], f.get("tier", "operator")),
+                       "path": (f.get("path") or "(unknown path)"),
+                       "node_key": _al_node_key(f.get("path") or "(unknown path)",
+                                                f.get("tier", "operator")),
                        "tier": f.get("tier", "operator")}
                       for f in cat_files]
         cells = squarify(cell_items, float(g["x"]), float(g["y"]), float(g["w"]), float(g["h"]))
@@ -715,15 +732,39 @@ def _friction_contributions(joined, footer, codex_aggregate):
     ]
 
 
+def _phantom_counts(doc: dict[str, Any]) -> tuple[int, int]:
+    """(total, confirmed) phantom-ref counts — the ONE derivation of the R2-F6/R3-2 split.
+
+    QA exit gate (HIGH 1): the split shipped inline at the header-gauge call site only, so
+    `build_overview_model` kept banding the Overview digest on the TOTAL and painted a red
+    dot over rows the collector explicitly declined to verify — the same metric, two
+    contradictory severities on one page. Both consumers now read the pair from HERE, so a
+    third consumer cannot re-acquire the total-only half of it.
+
+    DISPLAY uses the total (every row is a row the operator should see counted); the
+    CLEAN/BROKEN BAND uses `confirmed` (resolved=False rows only), because banding a
+    resolved=null row BROKEN is a verdict the renderer has no evidence for (rule 6)."""
+    rows = doc.get("phantom_refs", []) or []
+    return len(rows), sum(1 for r in rows if r.get("resolved") is False)
+
+
 def build_overview_model(
     models: dict[str, Any],
     headline: dict[str, Any],
     phantom_ref_count: int,
     friction_total_value: int,
+    phantom_confirmed_count: int | None = None,
 ) -> dict[str, Any]:
     """A3/AM-2 digest — pure aggregation over already-built models. No new data derived:
     roadmap gaps = empty civc cells; weight tax = top always-loaded files by size;
-    hygiene = headline counts; drag = synthesis rows; friction hero = count + band + top drag."""
+    hygiene = headline counts; drag = synthesis rows; friction hero = count + band + top drag.
+
+    `phantom_confirmed_count` is the BAND input for the phantom row, mirroring
+    `_render_instrument_readout`'s `band_value` (see `_phantom_counts`). It is optional
+    ONLY because an existing assertion calls this function without it and pins the
+    `hygiene` dict by exact equality (binding rule 7 forbids editing either); None means
+    "not supplied" and preserves the pre-split behaviour of banding on the displayed
+    total. Every production call site passes it."""
     civc = models["civc"]
     roadmap_gaps = ([(c["verb"], c["surface"]) for c in civc["cells"] if c["verdict"] == "empty"]
                     if civc.get("available") else [])
@@ -738,6 +779,10 @@ def build_overview_model(
         "hygiene": {"over_cap": headline.get("instruction_files_over_200", 0),
                     "dup_pairs": headline.get("duplicate_pair_count", 0),
                     "phantom_refs": phantom_ref_count},
+        # Severity inputs that DIVERGE from the displayed number, keyed by `hygiene` key.
+        # A key absent here means displayed value == band value (the normal case).
+        "hygiene_band_values": ({} if phantom_confirmed_count is None
+                                else {"phantom_refs": phantom_confirmed_count}),
         "drag_candidates": drag_rows,
         "friction": {"count": friction_total_value, "band": band_label,
                      "semantic": band_semantic, "top_drag": drag_rows[:3]},
@@ -779,9 +824,11 @@ def build_copy_payloads(date, models, friction, doc):
                   for r in dup["phantom_refs"]]
     hygiene_md = "\n".join(hyg_lines) or "_No hygiene flags._"
     # --- overview: digest summary ---
+    payload_phantom_total, payload_phantom_confirmed = _phantom_counts(doc)
     over = build_overview_model(models, doc.get("headline", {}) or {},
-                                len(doc.get("phantom_refs", []) or []),
-                                friction_total(joined, codex_aggregate, _metrics_aggregate_only(footer)))
+                                payload_phantom_total,
+                                friction_total(joined, codex_aggregate, _metrics_aggregate_only(footer)),
+                                phantom_confirmed_count=payload_phantom_confirmed)
     overview_md = (f"# harness-map {date}\n\n"
                    f"- roadmap gaps: {len(over['roadmap_gaps'])}\n"
                    f"- friction events: {over['friction']['count']} ({over['friction']['band']})\n"
@@ -2571,8 +2618,13 @@ def _render_overview_digest(overview_model):
     else:
         tax_html = f'<li>{_sev_dot("good")}no always-loaded files</li>'
     hyg = overview_model["hygiene"]
+    # QA exit gate (HIGH 1): the dot's severity keys off the BAND value, which for phantom
+    # refs is the confirmed subset -- the displayed number stays the total. Same
+    # display/band split as the header gauge, so the two can no longer contradict.
+    hyg_bands = overview_model.get("hygiene_band_values", {})
     hyg_html = "".join(
-        f'<li>{_sev_dot(_gauge_band(band_key, hyg[mkey])[1])}{esc_html(label)}: {esc_html(hyg[mkey])}</li>'
+        f'<li>{_sev_dot(_gauge_band(band_key, hyg_bands.get(mkey, hyg[mkey]))[1])}'
+        f'{esc_html(label)}: {esc_html(hyg[mkey])}</li>'
         for mkey, band_key, label in _HYGIENE_DIGEST_SPECS)
     drag_rows = overview_model["drag_candidates"]
     if drag_rows:
@@ -3526,16 +3578,16 @@ def render_html(
     # is "absent"/"inaccessible", never "disabled") — the single derivation the Weight view's
     # toggle gate (Codex P3) reads from.
     friction_enabled = any(f["status"] != "disabled" for f in footer)
-    _phantom_rows = doc.get("phantom_refs", []) or []
     # Codex R2-F6 + R3-2: TWO values. The displayed count stays the TOTAL -- every row,
     # verifiable or not, is a row the operator should see counted. Only the BAND (the
     # CLEAN/BROKEN verdict) keys off the CONFIRMED count: resolved=null rows are
     # unverifiable, and painting them BROKEN would be rule 6's forbidden verdict, cast
-    # by the renderer instead of the collector.
-    phantom_ref_count = len(_phantom_rows)                                        # display: total (unchanged)
-    phantom_confirmed_count = sum(1 for r in _phantom_rows if r.get("resolved") is False)  # band: confirmed only
+    # by the renderer instead of the collector. Derived in `_phantom_counts` so the
+    # Overview digest below bands off the SAME pair (QA exit gate, HIGH 1).
+    phantom_ref_count, phantom_confirmed_count = _phantom_counts(doc)
     friction_total_value = friction_total(joined, codex_aggregate, _metrics_aggregate_only(footer))
-    overview_model = build_overview_model(models, headline, phantom_ref_count, friction_total_value)
+    overview_model = build_overview_model(models, headline, phantom_ref_count, friction_total_value,
+                                          phantom_confirmed_count=phantom_confirmed_count)
 
     warn_count = len(doc.get("inaccessible", []) or []) + len(doc.get("errors", []) or [])
     warn_badge = (f'<a class="warn-badge" href="#provenance" data-target="provenance">'
@@ -3722,7 +3774,10 @@ def render_from_out_dir(
         # _load_sidecar_guarded, and the SELECTED sidecar's own fault is converted at its
         # load site -- so a fault arriving HERE is a LATER-pipeline fault (a model builder,
         # the friction join, the HTML assembly) that no single sidecar can be blamed for,
-        # i.e. most likely a real defect in this module. `str(exc)` alone made a genuine
+        # i.e. most likely a real defect in this module. ONE KNOWN EXCEPTION (QA exit gate,
+        # LOW 6): a corrupt SYNTHESIS sidecar also lands here, because `load_synthesis`
+        # still calls `load_sidecar` unguarded (accepted follow-up) -- check it before
+        # hunting a renderer bug. `str(exc)` alone made a genuine
         # bug indistinguishable from corrupt input, and neither main() nor serve.py prints
         # the chained cause, so the frames go to STDERR -- never into the page (the render
         # is abandoned, nothing is written) and never into a file. The RenderError message

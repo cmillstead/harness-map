@@ -3039,6 +3039,15 @@ def test_gauge_does_not_paint_unverifiable_rows_broken(tmp_path):
     card = text.split('data-gauge="phantom_ref_count"', 1)[1][:400]
     assert "1 (0 confirmed)" in card         # R3-2: displayed count stays the total
     assert "CLEAN" in card                   # the band is derived from band_value=0
+    # QA exit gate (HIGH 1): the Overview digest bands the SAME metric and must not
+    # contradict the header gauge. Scope to the Hygiene group's phantom row -- `_sev_dot`
+    # emits only the SEMANTIC class, never a band LABEL, so the page-wide "BROKEN"
+    # assertion above is structurally blind to a red dot cast over unverified rows.
+    hygiene_group = text.split("<h3>Hygiene</h3>", 1)[1].split("</ul>", 1)[0]
+    phantom_row = next(li for li in hygiene_group.split("<li>") if "Phantom refs" in li)
+    assert "sev-good" in phantom_row         # banded on the CONFIRMED count (0), not the total
+    assert "sev-bad" not in phantom_row
+    assert "Phantom refs: 1" in phantom_row  # ...while the DISPLAYED number stays the total
 
 
 def test_phantom_table_has_guidance_column_and_brief(tmp_path):
@@ -4662,6 +4671,57 @@ def test_treemap_omission_is_rendered_not_just_modelled(tmp_path):
     html = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     assert "omitted from this map" in html
     assert "bad.md" in html
+
+
+def test_tokens_treemap_pathless_row_with_valid_size_reaches_the_cell_loop(tmp_path):
+    """QA exit gate (MEDIUM 2): the R4-3 hardening stopped at the `unrenderable`
+    comprehension. A pathless row with a USABLE size clears the `tokens <= 0` gate, so it
+    reaches the per-file loop's bare `f["path"]` subscripts (sort key, cell dict,
+    node_key) -- a KeyError inside `_RENDER_FALLBACK_ERRORS`, which T3's envelope converts
+    to RenderError and kills the WHOLE dashboard over ONE malformed row. It is drawable
+    (it has area), so it is LABELLED, not disclosed: the disclosure's message is "no
+    usable size value", which would be false for it."""
+    out = rh._tokens_treemap([
+        {"category": "rule", "tokens_est": 100, "words": 40, "tier": "operator"},
+        {"category": "rule", "tokens_est": 10, "words": 1, "path": "ok.md",
+         "tier": "operator"}])
+    assert sorted(c["path"] for c in out["cells"]) == ["(unknown path)", "ok.md"]
+    assert out["unrenderable"] == []          # drawable -> labelled, not omitted
+    assert all(c["node_key"] for c in out["cells"])
+
+
+def test_tokens_treemap_non_dict_row_degrades_to_the_disclosure():
+    """QA exit gate (MEDIUM 2): `load_sidecar` does no row validation, so `files[]` can
+    hold a non-dict. `f.get(...)` raises AttributeError -- also in
+    `_RENDER_FALLBACK_ERRORS` -- taking down the render under a comment asserting the
+    fault is "most likely a real defect in this module". A non-dict has no size and no
+    path, so it degrades to the disclosure built for exactly this."""
+    out = rh._tokens_treemap([
+        "oops",
+        {"category": "rule", "tokens_est": 10, "words": 1, "path": "ok.md",
+         "tier": "operator"}])
+    assert [c["path"] for c in out["cells"]] == ["ok.md"]      # the render SURVIVED
+    assert out["unrenderable"] == ["(malformed entry: str)"]   # and DISCLOSED it
+
+
+def test_malformed_rows_do_not_take_down_the_whole_render(tmp_path):
+    """QA exit gate (MEDIUM 2), end to end through the real CLI: one malformed row must
+    cost its own cell, never the dashboard. Both shapes in ONE sidecar, appended to
+    `_minimal_doc`'s valid `rule` members so the category's gated sum stays positive and
+    the per-file loop actually runs."""
+    out_dir = tmp_path / "malformed"
+    out_dir.mkdir()
+    doc = _minimal_doc(extra_files=[
+        {"category": "rule", "words": 1, "lines": 1, "tokens_est": 70,
+         "evidence": "VERIFIED"}])                    # (a) pathless, valid size
+    doc["always_loaded"]["files"].append("oops")      # (b) not a dict at all
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    html = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "(unknown path)" in html                   # labelled cell, still on the map
+    assert "omitted from this map" in html            # the disclosure fired...
+    assert "(malformed entry: str)" in html           # ...and NAMES the non-dict row
 
 
 def test_treemap_size_keeps_integer_presentation():

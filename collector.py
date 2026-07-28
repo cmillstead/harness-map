@@ -2008,6 +2008,20 @@ def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
         root_stat = os.stat(root)
     except OSError:
         root_stat = None
+    if root_stat is None:
+        # QA exit gate (MEDIUM 4), the class T9 round 3 fixed in build_git_repo_index (F9):
+        # an unstat-able root is an UNKNOWN, not a determined "resolves outside the root"
+        # fact -- _resolves_inside_root is never even called. Every file used to fall
+        # through the gate below and emit the per-file message, asserting containment the
+        # collector never evaluated (binding rule 6). ONE aggregate note instead, worded
+        # DISTINCTLY from that message, and emitted unconditionally: with the root
+        # unstat-able, "no instruction files exist" and "we could not look" are
+        # indistinguishable, so a glob-count gate would suppress the only honest signal.
+        msg = ("instruction files: the harness root could not be stat'd — none was read "
+               "(containment is undecidable, not confirmed outside the root)")
+        if msg not in blind_spots:      # called twice per run (two callers)
+            blind_spots.append(msg)
+        return result
     for pattern in _INSTRUCTION_GLOBS:
         # Codex #4 (S2 gate fix): sort BEFORE dedup. root.glob() yields in filesystem
         # order, so both the `seen` winner and the returned order were filesystem
@@ -2023,8 +2037,9 @@ def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
             # realpath, so this costs no second resolve. The hook walk 450 lines up
             # refuses the identical case and SAYS SO; this walk now does both too.
             try:
-                inside = root_stat is not None and _resolves_inside_root(
-                    Path(key), root, root_stat)
+                # `root_stat` is non-None here (the undecidable case returned above), so a
+                # False verdict now always comes from a containment check that actually RAN.
+                inside = _resolves_inside_root(Path(key), root, root_stat)
             except (OSError, RuntimeError):
                 inside = False
             if not inside:
@@ -2083,6 +2098,25 @@ _GIT_NULL_REASONS = (
     "git_unavailable", "no_repo", "outside_root", "untracked", "submodule_unavailable",
     "timeout", "budget_exhausted", "git_error", "unparseable", "no_commits",
 )
+
+
+def _checked_git_reason(reason: str) -> str:
+    """QA exit gate (LOW 5): the ONE place a null reason enters the sidecar, so the enum
+    above is closed by the EMIT PATH rather than by a test that only reads it afterwards
+    (its former only consumer).
+
+    Fail-CLOSED, not fatal: an off-enum value is replaced with `git_error` -- a wrong-but-
+    bounded reason costs the operator one imprecise label, whereas raising would take down
+    a whole run's git-age data over a labelling bug, and passing it through would put
+    unvetted text (git's own, which carries absolute paths and .gitmodules/.git/config
+    values) into a document that renders reasons as CSS classes and data- attrs. The
+    discard is announced on stderr -- ephemeral, operator-local, never the sidecar -- so a
+    future drift is loud without being publishable."""
+    if reason in _GIT_NULL_REASONS:
+        return reason
+    print(f"warning: internal: discarding off-enum git-age null reason {reason[:80]!r}",
+          file=sys.stderr)
+    return "git_error"
 
 # Total wall budget for the git-age subsystem, with ONE named exemption (Codex F5): the
 # deadline is computed in build_document BEFORE build_git_repo_index and threaded into
@@ -2719,7 +2753,9 @@ def collect_git_age_with_reasons(
     Returns (timestamps, null_reasons). Returning the reason map from the SAME call is what
     keeps this at one `git log` per file; a separate collect_git_age_reasons would double
     the cost. Reasons come from the closed _GIT_NULL_REASONS enum -- never git's own text,
-    which carries absolute paths and .gitmodules/.git/config values (binding rule 11).
+    which carries absolute paths and .gitmodules/.git/config values (binding rule 11). That
+    is now ENFORCED here rather than merely tested: both emit sites pass through
+    _checked_git_reason (QA exit gate, LOW 5).
 
     PURE with respect to git topology: everything comes from `index`, built once by
     build_git_repo_index, so staleness.git_age_available can never disagree with the
@@ -2742,7 +2778,7 @@ def collect_git_age_with_reasons(
         # Design §13 F2 as CORRECTED by C-f: the blanket reason is whatever the ROOT probe
         # actually found. `git_unavailable` means the git binary could not be executed;
         # a root that simply is not a work tree (git working fine) is `no_repo`.
-        blanket = index.root_reason or "no_repo"
+        blanket = _checked_git_reason(index.root_reason or "no_repo")
         return ({k: None for k in ordered}, {k: blanket for k in ordered})
 
     timestamps: dict[str, int | None] = {}
@@ -2755,7 +2791,7 @@ def collect_git_age_with_reasons(
         ts, reason = _git_age_for_file(root, by_key[key], index)
         timestamps[key] = ts
         if ts is None:
-            reasons[key] = reason or "git_error"
+            reasons[key] = _checked_git_reason(reason or "git_error")
     return timestamps, reasons
 
 
@@ -3074,7 +3110,12 @@ def check_phantom_refs(
                         for home in homes:
                             present, ok = _safe_exists(home)
                             if not ok:
-                                inaccessible.append({"path": _rel_safe(root, home), "reason": "unreadable"})
+                                # QA exit gate (MEDIUM 3): the `blocked` branch below
+                                # `continue`s BEFORE `seen` is consulted, so the same token
+                                # mentioned N times probes -- and reported -- the same home
+                                # N times. _append_inaccessible_once is T6's answer to
+                                # exactly that, and the badge counts these rows.
+                                _append_inaccessible_once(inaccessible, _rel_safe(root, home))
                                 blocked = True
                                 break
                             if present:
@@ -3114,7 +3155,10 @@ def check_phantom_refs(
                 for candidate in candidates:
                     present, ok = _safe_exists(candidate)
                     if not ok:
-                        inaccessible.append({"path": _rel_safe(root, candidate), "reason": "unreadable"})
+                        # Same shape, same fix as the slash-command probe above: `handled`
+                        # short-circuits past the `seen` guard, so a repeated ref would
+                        # re-report one unreadable candidate once per mention.
+                        _append_inaccessible_once(inaccessible, _rel_safe(root, candidate))
                         handled = True
                         break
                     if present:

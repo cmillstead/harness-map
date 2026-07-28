@@ -654,6 +654,45 @@ def test_inaccessible_namespaced_command_home_is_recorded_not_flagged(fake_harne
     assert not [r for r in doc["phantom_refs"] if r["ref"] == "/paul:apply"]
     assert any(e["path"].startswith("commands/paul") for e in doc["inaccessible"])
 
+# QA exit gate (MEDIUM 3): T6 added _append_inaccessible_once so a path reached by two
+# scans is listed ONCE. check_phantom_refs' own two probe sites still appended directly,
+# and their `blocked`/`handled` branches `continue` BEFORE the `seen` set is consulted --
+# so nothing suppressed repeats. The duplicate rows are not cosmetic: the dashboard's
+# "N warning(s)" badge counts len(doc["inaccessible"]), i.e. a wrong number in the
+# operator's face, scaling with how often the token happens to be mentioned.
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_unreadable_command_home_is_listed_once_per_path(fake_harness):
+    """The SAME token mentioned repeatedly probes the SAME home every time."""
+    (fake_harness / "rules" / "a.md").write_text(
+        "Run `/ghost` first, then `/ghost` again, and finally `/ghost`.")
+    (fake_harness / "rules" / "b.md").write_text("See `/ghost` for details.")
+    (fake_harness / "commands").chmod(0o000)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        (fake_harness / "commands").chmod(0o755)
+    rows = [e for e in doc["inaccessible"] if e["path"] == "commands/ghost.md"]
+    assert len(rows) == 1, doc["inaccessible"]
+    assert not [r for r in doc["phantom_refs"] if r["ref"] == "/ghost"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_unreadable_path_ref_candidate_is_listed_once(fake_harness):
+    """The pre-existing sibling site: the plain-path candidate probe, same shape."""
+    locked = fake_harness / "locked"
+    locked.mkdir()
+    (fake_harness / "rules" / "a.md").write_text(
+        "See `locked/x.md` and again `locked/x.md`.")
+    (fake_harness / "rules" / "b.md").write_text("Also `locked/x.md`.")
+    locked.chmod(0o000)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        locked.chmod(0o755)
+    rows = [e for e in doc["inaccessible"] if e["path"] == "locked/x.md"]
+    assert len(rows) == 1, doc["inaccessible"]
+
+
 def test_retired_ref_multisegment_path_stays_external(fake_harness):
     (fake_harness / "rules" / "a.md").write_text("Use `/usr/bin/python3` for this.")
     doc = run_collector(fake_harness)
@@ -3469,6 +3508,32 @@ def test_deduped_instruction_files_is_sorted_within_each_glob(fake_harness):
     assert rules == sorted(rules)
 
 
+def test_unstatable_root_reports_undecidable_containment_not_outside_root(tmp_path):
+    """QA exit gate (MEDIUM 4), the same class T9 round 3 fixed in build_git_repo_index
+    (test_unstatable_root_records_git_error_once_not_per_dir): when os.stat(root) fails,
+    `inside` was False for EVERY file and each one claimed "resolves outside the harness
+    root" -- a fact _resolves_inside_root was never called to support. Real, unpatched
+    trigger, same as the git-age sibling: a root that genuinely does not exist.
+
+    ONE aggregate blind spot, worded DISTINCTLY from the per-file message, and it is
+    emitted unconditionally rather than gated on the glob finding files: with the root
+    unstat-able, "no instruction files exist" and "we could not look" are
+    indistinguishable, so the note IS the finding."""
+    root = tmp_path / "does_not_exist"
+    inaccessible: list[dict] = []
+    blind: list[str] = []
+    out = _collector._deduped_instruction_files(root, inaccessible, blind)
+    assert out == []
+    assert inaccessible == []
+    assert len(blind) == 1
+    assert "could not be stat'd" in blind[0]
+    assert "undecidable" in blind[0]
+    assert "resolves outside" not in blind[0]     # never asserts a fact it did not determine
+    # called twice per run (flag_long_instructions + build_document's staleness path)
+    _collector._deduped_instruction_files(root, inaccessible, blind)
+    assert len(blind) == 1
+
+
 # S2 gate fix (Codex #6 / F7): an unreadable instruction file was dropped SILENTLY.
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
 def test_unreadable_instruction_file_is_recorded_in_inaccessible(fake_harness):
@@ -4255,6 +4320,20 @@ def test_null_reasons_invariant_holds_with_a_mixed_outcome_corpus(tmp_path):
     assert reasons["rules/untracked.md"] == "untracked"
     assert "rules/tracked.md" not in reasons
     assert set(reasons) == {k for k, v in ts.items() if v is None}
+
+def test_unknown_git_null_reason_is_gated_before_it_reaches_the_sidecar(capsys):
+    """QA exit gate (LOW 5): _GIT_NULL_REASONS was a dark constant -- its ONLY consumer was
+    the assertion above, so the "closed enum" was enforced by a test rather than by the
+    emit path, and nothing validated a reason string before it entered the sidecar. That
+    matters because these values become CSS classes / data- attrs (the build_civc_model
+    class-injection precedent) and git's own text carries absolute paths and
+    .gitmodules/.git/config values. Fail-CLOSED: an off-enum value is replaced, never
+    published, and the discard is announced on stderr rather than swallowed."""
+    for reason in _collector._GIT_NULL_REASONS:
+        assert _collector._checked_git_reason(reason) == reason      # every member passes
+    assert _collector._checked_git_reason("fatal: not a git repo: /home/u/.ssh") == "git_error"
+    assert "warning" in capsys.readouterr().err
+
 
 def test_budget_exhaustion_blind_spot_carries_the_probed_count(tmp_path):
     """T10 audit (MEDIUM): build_document's counted exhaustion disclosure had NO test --
