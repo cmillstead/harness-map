@@ -3567,6 +3567,28 @@ def default_streams():
     }
 
 
+# Control 3 (S2 gate fix, S8/S12): the RENDERER envelope. Binding rule 5 requires the
+# COLLECTOR to emit valid JSON on any crash; there was no counterpart here.
+#
+# The concrete escape: a deeply-nested sidecar raises RecursionError, which subclasses
+# RuntimeError (verified) and NOT json.JSONDecodeError -- so it escapes load_sidecar's
+# except clause, escapes render_from_out_dir, and escapes main()'s `except RenderError`.
+#
+# The conversion lives HERE, not in main(), because serve.py:264 calls
+# render_from_out_dir DIRECTLY. Converting to RenderError routes the fault into
+# containment that ALREADY exists and is already tested: main()'s handler, serve.py's
+# startup path, and serve.py's `except (CollectorError, RenderError, OSError)`
+# keep-last-good handler. (serve.py's watcher backstop already covered the
+# steady-state loop; startup was the exposed path.)
+#
+# Enumerated, never `except Exception` (code-style): these are the types an unexpected
+# sidecar/synthesis SHAPE can produce, mirroring the list serve.py already names.
+_RENDER_FALLBACK_ERRORS = (
+    RecursionError, ValueError, TypeError, KeyError, AttributeError,
+    IndexError, OverflowError, ZeroDivisionError,
+)
+
+
 def render_from_out_dir(
     out_dir: Path,
     date: str | None = None,
@@ -3581,7 +3603,43 @@ def render_from_out_dir(
     conditions. Deterministic: same sidecars + streams (+ same `generation`) -> byte-identical
     html_text (render_html() contract preserved). `generation` None (the one-shot/file:// path)
     emits NO generation meta, so that output is unchanged. `streams` None is treated as the
-    no-friction all-None dict."""
+    no-friction all-None dict.
+
+    Control 3: every UNENUMERATED fault from an unexpected sidecar/synthesis shape is
+    converted to RenderError naming the sidecar and the exception type. RenderError
+    itself passes through unchanged."""
+    try:
+        return _render_from_out_dir_inner(
+            out_dir, date=date, streams=streams, no_friction=no_friction,
+            generation=generation)
+    except RenderError:
+        raise
+    except _RENDER_FALLBACK_ERRORS as exc:
+        # Name the SIDECAR, not just the directory (Codex F2). With the degraded page
+        # dropped (F3, operator decision) this stderr line is the ONLY diagnostic the
+        # operator gets, so it must identify the unusable file by name -- GP#15, and the
+        # docstring above already promises "naming the sidecar". When --date is absent the
+        # filename was chosen by load_sidecar's glob and is not reconstructable here, so
+        # fall back to the directory rather than assert a name that may be wrong.
+        # Path() coercion mirrors the inner body's own first line: a caller passing a str
+        # must not make THIS handler raise TypeError and re-expose the traceback it exists
+        # to suppress.
+        target = (Path(out_dir) / f"harness-map-{date}.json") if date else Path(out_dir)
+        raise RenderError(
+            f"fatal: could not render {target}"
+            f": {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _render_from_out_dir_inner(
+    out_dir: Path,
+    date: str | None = None,
+    streams: dict[str, Any] | None = None,
+    no_friction: bool = False,
+    generation: int | None = None,
+) -> RenderContext:
+    """The render body; the public `render_from_out_dir` wrapper above carries the
+    documented contract and converts unenumerated faults to RenderError."""
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
         raise RenderError(f"fatal: --out-dir does not exist or is not a directory: {out_dir}")

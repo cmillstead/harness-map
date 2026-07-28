@@ -4569,3 +4569,30 @@ def test_build_dragcandidate_model_still_raises_on_mixed_type_n():
     with pytest.raises(TypeError):
         rh.build_dragcandidate_model({"drag_candidates": [
             {"n": 1, "surface": "a"}, {"n": "x", "surface": "b"}]})
+
+
+# S2 gate fix (Control 3, S8/S12): the collector has an envelope rule (binding rule 5);
+# the renderer had no counterpart.
+def test_deeply_nested_sidecar_degrades_instead_of_tracebacking(tmp_path):
+    """RecursionError subclasses RuntimeError -- NOT json.JSONDecodeError (verified) --
+    so it escaped load_sidecar's except clause, escaped render_from_out_dir, and escaped
+    main(). In serve mode that bricks startup."""
+    out_dir = tmp_path / "deep"
+    out_dir.mkdir()
+    (out_dir / "harness-map-2026-07-15.json").write_text("[" * 200000 + "]" * 200000)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 1
+    assert "Traceback" not in proc.stderr           # no raw traceback ever
+    assert "harness-map-2026-07-15.json" in proc.stderr   # names the bad sidecar
+    assert "RecursionError" in proc.stderr          # names WHAT failed (GP#15)
+
+
+def test_render_from_out_dir_converts_unenumerated_faults_to_render_error(tmp_path):
+    """The conversion must happen INSIDE render_from_out_dir: serve.py calls it directly
+    (serve.py:264), so a main()-only catch would leave --serve startup unprotected."""
+    out_dir = tmp_path / "deep2"
+    out_dir.mkdir()
+    (out_dir / "harness-map-2026-07-15.json").write_text("[" * 200000 + "]" * 200000)
+    with pytest.raises(rh.RenderError) as ei:
+        rh.render_from_out_dir(out_dir, date="2026-07-15", no_friction=True)
+    assert "RecursionError" in str(ei.value)
