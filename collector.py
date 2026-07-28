@@ -2059,8 +2059,64 @@ def flag_long_instructions(root: Path, inaccessible: list[dict[str, Any]],
     return flags
 
 
-# S2.M3: per-git-invocation timeout (probe + per-file `git log`), stdlib subprocess only.
+# S2 gate fix: per-git-invocation timeout for SINGLE-PATH calls (rev-parse, per-file log).
 _GIT_SUBPROCESS_TIMEOUT = 2
+# Batched calls scale with total tracked-file count / history depth, not one path, so a 2s
+# cap risks spurious nulls on a legitimately larger repo. Measured 0.015-0.234s on the live
+# corpus -- 20-300x headroom at 5s.
+_GIT_BATCH_TIMEOUT = 5
+
+
+def _git(args: list[str], cwd: Path, timeout: int
+         ) -> tuple[subprocess.CompletedProcess[bytes] | None, str | None]:
+    """Control 4 (S2 gate fix): the SINGLE entry point for every git invocation in this
+    module. Returns (proc, None) or (None, closed-enum reason). NEVER raises.
+
+    `--literal-pathspecs` (Codex #2): a pathspec is never glob- or magic-interpreted.
+    Verified sufficient for `*`, `?`, `[...]`, backslash escapes AND the magic forms
+    `:(glob)`, `:!`, `:/`; leading `-` is already handled by the existing `--`. The FLAG,
+    not GIT_LITERAL_PATHSPECS: passing a bare `env=` dict to subprocess.run REPLACES the
+    inherited environment (no PATH, no HOME) -- a footgun with a silent failure mode. The
+    flag is also assertable in a test.
+
+    `GIT_OPTIONAL_LOCKS=0` keeps binding rule 4's read-only posture belt-and-braces: git
+    never takes an index lock on our behalf. Set on a COPY of os.environ for the same
+    reason as above.
+
+    BYTES, never text=True (Security S14): `ls-files -z` emits PATHS, and a non-UTF-8
+    filename raises UnicodeDecodeError -- a ValueError, NOT in the (OSError,
+    TimeoutExpired) tuple every existing call site catches -- so it would escape uncaught
+    and violate the envelope rule from INSIDE the collector. Callers decode via
+    _decode_git.
+
+    `timeout` and `git_error` are returned DISTINCTLY rather than collapsed to one None:
+    guessing which failure occurred is the exact defect class this batch eliminates.
+
+    SECRET SAFETY (binding rule 11): `proc.stderr` is captured and MUST NEVER be read by
+    any caller. Git error text carries absolute paths, and submodule failures carry
+    .gitmodules / .git/config values -- this repo's .gitmodules already holds a remote URL
+    (`git@github.com:...`), and an HTTPS-with-token submodule would put
+    `https://user:token@host/...` there. Surfacing it would move credential-bearing text
+    into a published HTML document. Closed-enum reasons only."""
+    env = dict(os.environ)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        return subprocess.run(
+            ["git", "--literal-pathspecs", *args],
+            cwd=cwd, capture_output=True, timeout=timeout, env=env,
+        ), None
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except OSError:
+        return None, "git_error"
+
+
+def _decode_git(raw: bytes) -> str:
+    """Decode git stdout with surrogateescape (Security S14). Verified: `-z` ignores
+    core.quotePath (forcing `-c core.quotePath=true` still emitted raw bytes), so `-z` +
+    surrogateescape round-trips a non-UTF-8 filename EXACTLY. render_html.esc_html already
+    neutralizes lone surrogates on the render side."""
+    return raw.decode("utf-8", errors="surrogateescape")
 
 
 def _git_work_tree_available(root: Path) -> bool:
@@ -2070,30 +2126,21 @@ def _git_work_tree_available(root: Path) -> bool:
     staleness.git_age_available. Never raises: a missing git binary, a non-repo root, and
     a timed-out probe all degrade to False -- same graceful-degradation philosophy as
     _safe_exists (honest False beats a crash)."""
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=root, capture_output=True, text=True, timeout=_GIT_SUBPROCESS_TIMEOUT,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    proc, err = _git(["rev-parse", "--is-inside-work-tree"], root, _GIT_SUBPROCESS_TIMEOUT)
+    if err is not None or proc is None:
         return False
-    return proc.returncode == 0 and proc.stdout.strip() == "true"
+    return proc.returncode == 0 and _decode_git(proc.stdout).strip() == "true"
 
 
 def _git_last_commit_ts(root: Path, rel_path: str) -> int | None:
     """Unix commit timestamp of the last commit touching `rel_path`, or None when it
     cannot be honestly determined (git error, timeout, unparseable output, or the path
     has no commits -- e.g. untracked). NEVER falls back to filesystem mtime."""
-    try:
-        proc = subprocess.run(
-            ["git", "log", "-1", "--format=%ct", "--", rel_path],
-            cwd=root, capture_output=True, text=True, timeout=_GIT_SUBPROCESS_TIMEOUT,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    proc, err = _git(["log", "-1", "--format=%ct", "--", rel_path], root,
+                      _GIT_SUBPROCESS_TIMEOUT)
+    if err is not None or proc is None or proc.returncode != 0:
         return None
-    if proc.returncode != 0:
-        return None
-    out = proc.stdout.strip()
+    out = _decode_git(proc.stdout).strip()
     if not out:
         return None
     try:

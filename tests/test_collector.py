@@ -18,13 +18,37 @@ _collector = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_collector)
 _rel = _collector._rel
 
-def _git(root, *args, env=None):
+_GIT_IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+def _git(root, *args, env=None, ts=None):
     # S2.M3 test helper: drive a REAL git repo (no mocks) for the git-age staleness tests.
-    run_env = dict(os.environ, **env) if env else None
+    # S2 gate fix: `ts` pins a commit to an exact unix timestamp. F8, VERIFIED by
+    # execution: --format=%ct is the COMMITTER date, so GIT_AUTHOR_DATE alone does NOT
+    # pin it -- a test asserting 1700000000 with only GIT_AUTHOR_DATE set fails, because
+    # the committer date is `now`. Identity vars are set alongside for hermeticity.
+    extra = dict(env) if env else {}
+    if ts is not None:
+        extra.update(_GIT_IDENTITY)
+        extra["GIT_AUTHOR_DATE"] = f"@{ts} +0000"
+        extra["GIT_COMMITTER_DATE"] = f"@{ts} +0000"
+    run_env = dict(os.environ, **extra) if extra else None
     proc = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True,
                           timeout=10, env=run_env)
     assert proc.returncode == 0, proc.stderr
     return proc.stdout
+
+def _init_repo(path, files, ts=1700000000):
+    """One-commit real repo. Used by every git test in this batch."""
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q", "-b", "main", ".")
+    for rel, body in files.items():
+        p = path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+    _git(path, "add", "-A")
+    _git(path, "commit", "-qm", "c1", ts=ts)
+    return path
 
 def run_collector(root, *args, project_root=None, env=None):
     # `env` (T5): merged over the inherited os.environ (e.g. {"HOME": str(tmp_home)}) so
@@ -3446,3 +3470,53 @@ def test_containment_refusal_precedes_the_read(fake_harness, tmp_path):
     assert not any(f.name == "escape2.md" for f in files)        # excluded from the corpus
     assert any("rules/escape2.md" in b for b in blind_spots)     # refused, and it SAYS SO
     assert inaccessible == []                                    # read-first would record here
+
+
+# S2 gate fix (Control 4, Codex #2 / S13 / S14).
+def test_git_wrapper_passes_literal_pathspecs(tmp_path):
+    """Verified: without the flag, `-- 'a*.md'` glob-matches a.md; with it, nothing.
+    S13 notes this is LATENT today (no _INSTRUCTION_GLOBS entry produces a rel_path
+    starting with ':'), so the wrapper closes the class before D1/D3 add call sites."""
+    repo = _init_repo(tmp_path / "r", {"a.md": "x"})
+    proc, err = _collector._git(["ls-files", "-z", "--", "a*.md"], repo,
+                                _collector._GIT_SUBPROCESS_TIMEOUT)
+    assert err is None and proc is not None
+    assert proc.stdout == b""            # the glob did NOT match; literal did not exist
+
+def test_git_wrapper_returns_bytes_not_text(tmp_path):
+    """S14: `ls-files -z` emits PATHS. Under text=True a non-UTF-8 filename raises
+    UnicodeDecodeError -- a ValueError, NOT in the (OSError, TimeoutExpired) tuple every
+    call site catches -- so it would escape uncaught and violate the envelope rule from
+    inside the collector."""
+    repo = _init_repo(tmp_path / "r2", {"a.md": "x"})
+    proc, err = _collector._git(["ls-files", "-z"], repo, 2)
+    assert err is None and proc is not None and isinstance(proc.stdout, bytes)
+
+def test_git_wrapper_reports_timeout_distinctly_from_oserror(tmp_path):
+    """The wrapper must NOT collapse TimeoutExpired and OSError into one None -- a
+    plausible-looking guess about which failure occurred is the defect class this batch
+    exists to eliminate."""
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text("#!/bin/sh\nexec /bin/sleep 3\n")
+    (shim / "git").chmod(0o755)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(shim)
+    try:
+        proc, err = _collector._git(["ls-files"], tmp_path, 1)
+    finally:
+        os.environ["PATH"] = old
+    assert proc is None and err == "timeout"
+
+def test_git_wrapper_reports_git_error_when_binary_absent(tmp_path):
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = ""
+    try:
+        proc, err = _collector._git(["status"], tmp_path, 2)
+    finally:
+        os.environ["PATH"] = old
+    assert proc is None and err == "git_error"
+
+def test_decode_git_round_trips_non_utf8_bytes():
+    raw = b"rules/caf\xe9.md"
+    assert _collector._decode_git(raw).encode("utf-8", "surrogateescape") == raw
