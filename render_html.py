@@ -22,6 +22,7 @@ import re
 import stat
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Any, cast
 
@@ -163,8 +164,9 @@ def _gated_size(value: Any) -> float:
     display type. `size` is not purely geometry: it is also rendered as TEXT (ladder cell
     labels, the overview weight-tax list, the copy payloads), so returning a bare float
     would silently rewrite every "100 tokens" as "100.0 tokens" across the whole report —
-    caught by test_serve's byte-equality assertions. Unusable values become 0.0, which
-    squarify's `size > 0` filter drops; they are disclosed via `unrenderable` instead."""
+    caught by test_serve's byte-equality assertions. Unusable values become `0` (int, the
+    same integer presentation the accept path gives), which squarify's `size > 0` filter
+    drops; they are disclosed via `unrenderable` instead."""
     num = finite_number(value)
     if num is None:
         # T2 spec-review LOW: the rejection path must return an int-presentable
@@ -219,6 +221,25 @@ def load_sidecar(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return doc, None
 
 
+def _load_sidecar_guarded(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """(doc|None, error|None) for a sidecar the operator did NOT explicitly request —
+    the trend-series scan and `select_current`'s latest-valid fallback.
+
+    `load_sidecar` handles only OSError/json.JSONDecodeError, so a deeply-nested file
+    raises RecursionError out of `json.loads` and escapes it entirely; before this guard
+    that reached `render_from_out_dir`'s envelope and failed the ENTIRE render over a
+    file nobody asked for. Every `_RENDER_FALLBACK_ERRORS` member (defined with that
+    envelope further down) degrades HERE to the same per-file `skipped[]` reason shape
+    `load_sidecar` returns, so the documented invariant — a corrupt sidecar among several
+    is excluded and listed in `skipped[]` — finally holds for more than JSON-syntax
+    corruption. The explicitly requested date's own sidecar stays FATAL: that branch of
+    `select_current` calls `load_sidecar` directly, on purpose."""
+    try:
+        return load_sidecar(path)
+    except _RENDER_FALLBACK_ERRORS as exc:
+        return None, f"unparseable: {type(exc).__name__}: {exc}"
+
+
 def load_synthesis(out_dir: Path, date: str) -> tuple[dict[str, Any] | None, str | None]:
     """(doc|None, error|None) — the synthesis sidecar is OPTIONAL; absence is not an
     error (returns (None, None)). An invalid file is an explicit unavailable state
@@ -249,7 +270,7 @@ def select_current(
             return None, None, skipped, f"sidecar for {date} is corrupt: {err}"
         return date, doc, skipped, None
     for d, p in reversed(sidecars):
-        doc, err = load_sidecar(p)
+        doc, err = _load_sidecar_guarded(p)
         if err is not None:
             skipped.append({"date": d, "reason": err})
             continue
@@ -3596,6 +3617,20 @@ _RENDER_FALLBACK_ERRORS = (
 )
 
 
+def _render_fault_message(out_dir: Path, date: str | None, exc: BaseException) -> str:
+    """The ONE stderr line for an unenumerated render fault, shared by the two sites that
+    raise it (the selected sidecar's own load, and the top-level envelope) so their
+    wording can never drift. Names the SIDECAR, not just the directory (Codex F2): with
+    the degraded page dropped (F3, operator decision) this line is the only diagnostic the
+    operator gets, so it must identify the unusable file by name -- GP#15. When --date is
+    absent the filename was chosen by the sidecar scan and is not reconstructable here, so
+    fall back to the directory rather than assert a name that may be wrong. Path()
+    coercion mirrors the render body's own first line: a caller passing a str must not
+    make THIS helper raise TypeError and re-expose the traceback it exists to suppress."""
+    target = (Path(out_dir) / f"harness-map-{date}.json") if date else Path(out_dir)
+    return f"fatal: could not render {target}: {type(exc).__name__}: {exc}"
+
+
 def render_from_out_dir(
     out_dir: Path,
     date: str | None = None,
@@ -3622,20 +3657,17 @@ def render_from_out_dir(
     except RenderError:
         raise
     except _RENDER_FALLBACK_ERRORS as exc:
-        # Name the SIDECAR, not just the directory (Codex F2). With the degraded page
-        # dropped (F3, operator decision) this stderr line is the ONLY diagnostic the
-        # operator gets, so it must identify the unusable file by name -- GP#15, and the
-        # docstring above already promises "naming the sidecar". When --date is absent the
-        # filename was chosen by load_sidecar's glob and is not reconstructable here, so
-        # fall back to the directory rather than assert a name that may be wrong.
-        # Path() coercion mirrors the inner body's own first line: a caller passing a str
-        # must not make THIS handler raise TypeError and re-expose the traceback it exists
-        # to suppress.
-        target = (Path(out_dir) / f"harness-map-{date}.json") if date else Path(out_dir)
-        raise RenderError(
-            f"fatal: could not render {target}"
-            f": {type(exc).__name__}: {exc}"
-        ) from exc
+        # T3 harden round (LOW): per-file sidecar faults now degrade in
+        # _load_sidecar_guarded, and the SELECTED sidecar's own fault is converted at its
+        # load site -- so a fault arriving HERE is a LATER-pipeline fault (a model builder,
+        # the friction join, the HTML assembly) that no single sidecar can be blamed for,
+        # i.e. most likely a real defect in this module. `str(exc)` alone made a genuine
+        # bug indistinguishable from corrupt input, and neither main() nor serve.py prints
+        # the chained cause, so the frames go to STDERR -- never into the page (the render
+        # is abandoned, nothing is written) and never into a file. The RenderError message
+        # itself stays the same single readable line.
+        print(traceback.format_exc(), end="", file=sys.stderr)
+        raise RenderError(_render_fault_message(out_dir, date, exc)) from exc
 
 
 def _render_from_out_dir_inner(
@@ -3657,7 +3689,15 @@ def _render_from_out_dir_inner(
     if not sidecars:
         raise RenderError(f"fatal: zero sidecars found in {out_dir}")
 
-    sel_date, doc, skipped, err = select_current(sidecars, date)
+    # The SELECTED sidecar's own unenumerated fault is converted HERE rather than at the
+    # top-level envelope, so that envelope is left to later-pipeline faults (which get the
+    # traceback diagnostic). An explicit --date naming a corrupt sidecar stays FATAL --
+    # select_current's contract, never a silent substitution -- and the message keeps
+    # naming the file exactly as the envelope did before.
+    try:
+        sel_date, doc, skipped, err = select_current(sidecars, date)
+    except _RENDER_FALLBACK_ERRORS as exc:
+        raise RenderError(_render_fault_message(out_dir, date, exc)) from exc
     if err is not None:
         raise RenderError(f"fatal: {err}")
     # select_current's contract: err is None iff sel_date/doc are both populated — cast
@@ -3675,7 +3715,7 @@ def _render_from_out_dir_inner(
         if d == sel_date:
             dated_docs.append((d, doc))
             continue
-        other_doc, other_err = load_sidecar(p)
+        other_doc, other_err = _load_sidecar_guarded(p)
         if other_err is not None:
             skipped.append({"date": d, "reason": other_err})
             continue

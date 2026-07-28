@@ -4661,3 +4661,65 @@ def test_render_from_out_dir_converts_unenumerated_faults_to_render_error(tmp_pa
     with pytest.raises(rh.RenderError) as ei:
         rh.render_from_out_dir(out_dir, date="2026-07-15", no_friction=True)
     assert "RecursionError" in str(ei.value)
+
+
+# T3 harden round (MEDIUM): the Control 3 envelope above is correct but too WIDE. Two
+# call sites load sidecars the operator did NOT ask for, and load_sidecar handles only
+# OSError/json.JSONDecodeError -- so one deeply-nested UNSELECTED file took the whole
+# render down. The documented invariant ("a corrupt sidecar among several is excluded +
+# listed in skipped[]") only ever held for JSON-SYNTAX corruption.
+def test_deeply_nested_other_sidecar_is_skipped_not_fatal(tmp_path):
+    """The requested date is perfectly fine; a DIFFERENT date's sidecar -- needed only
+    for the trend series -- raises RecursionError inside json.loads. That must degrade to
+    a per-file skipped[] entry, exactly like the invalid-JSON case one screen up."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "deep_other"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    (out_dir / "harness-map-2026-07-13.json").write_text("[" * 200000 + "]" * 200000)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    out_file = out_dir / "harness-map-2026-07-15.html"
+    assert out_file.is_file()
+    text = out_file.read_text(encoding="utf-8")
+    assert "2026-07-13" in text          # disclosed in the provenance footer's skipped list
+    assert "RecursionError" in text      # and the REASON is disclosed, not swallowed
+
+
+def test_deeply_nested_newest_sidecar_falls_back_to_earlier_date(tmp_path):
+    """--date OMITTED: select_current's reverse scan hits the corrupt NEWEST file first.
+    Before the per-file guard that pre-empted the fallback entirely and no date rendered,
+    even though an older valid sidecar was sitting right there."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "deep_newest"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-14", doc)
+    (out_dir / "harness-map-2026-07-15.json").write_text("[" * 200000 + "]" * 200000)
+    proc = run_render(out_dir, "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    assert (out_dir / "harness-map-2026-07-14.html").is_file()
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+    text = (out_dir / "harness-map-2026-07-14.html").read_text(encoding="utf-8")
+    assert "2026-07-15" in text          # the skipped newest file is disclosed
+
+
+# T3 harden round (LOW): with per-file faults handled above and the SELECTED sidecar's
+# own fault converted at its load site, a fault reaching the top-level envelope is a
+# LATER-PIPELINE fault -- most likely a real defect in a build_*_model function. str(exc)
+# alone made that indistinguishable from corrupt input.
+def test_later_pipeline_fault_prints_traceback_to_stderr(tmp_path):
+    """`always_loaded` present but a string: valid JSON, valid schema_version, so it
+    passes sidecar selection and blows up inside build_contextweight_model. The operator
+    gets the frames on STDERR -- and the RenderError line itself stays unchanged."""
+    doc = _minimal_doc()
+    doc["always_loaded"] = "not a mapping"
+    out_dir = tmp_path / "pipeline_fault"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 1
+    assert "AttributeError" in proc.stderr
+    assert "Traceback" in proc.stderr
+    assert "build_contextweight_model" in proc.stderr   # the frame that actually failed
+    assert "fatal: could not render" in proc.stderr     # single-line message unchanged
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()   # never into a page
