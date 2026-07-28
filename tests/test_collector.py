@@ -3742,3 +3742,141 @@ def test_build_document_still_emits_staleness_after_rewiring(fake_harness):
     assert set(doc["staleness"]) == {"git_age_available", "last_commit_ts"}
     assert doc["staleness"]["git_age_available"] is False       # fake_harness is not a repo
     assert isinstance(doc["staleness"]["last_commit_ts"], dict)
+
+
+# ---------------------------------------------------------------------------
+# T9 harden round 2: the S17 fence proved a PATH; these pin that it now also
+# proves PROVENANCE, that root_top is containment-checked like every other
+# candidate cwd, and that both refusal paths are disclosed to the operator.
+# ---------------------------------------------------------------------------
+
+def test_git_wrapper_neutralizes_command_valued_config(tmp_path):
+    """FINDING 1a (HIGH), the direct pin that the RCE is shut. Measured on git 2.50.1:
+    `ls-files -s -z` EXECUTES core.fsmonitor -- twice -- in the repo it runs in (while
+    rev-parse and log do not), so a repository the collector was tricked into probing
+    could run an arbitrary command through the batched index read. Command-line `-c`
+    OUTRANKS repo config, so the wrapper's own options neutralize it regardless of what
+    any discovered .git/config carries. The marker file is the whole assertion: if it
+    exists, the payload ran."""
+    repo = _init_repo(tmp_path / "fsmonitor_repo", {"a.md": "x"})
+    marker = tmp_path / "COMMAND_VALUED_CONFIG_RAN"
+    payload = tmp_path / "payload.sh"
+    payload.write_text(f'#!/bin/sh\necho ran >> {marker}\nexit 1\n')
+    payload.chmod(0o755)
+    _git(repo, "config", "core.fsmonitor", f"{payload} fsmonitor")
+    proc, err = _collector._git(["ls-files", "-s", "-z"], repo,
+                                _collector._GIT_BATCH_TIMEOUT)
+    assert not marker.exists(), "core.fsmonitor executed: the RCE path is OPEN"
+    assert err is None and proc is not None and proc.returncode == 0
+    assert b"a.md" in proc.stdout          # neutralized, but the index still came back
+
+
+def test_submodule_with_foreign_gitdir_is_refused_and_disclosed(submodule_tree, tmp_path):
+    """FINDING 1b (HIGH). The gitlink fence proves a PATH is named as a submodule by an
+    accepted parent's index; it cannot prove the `.git` at that path BELONGS to that
+    parent. An attacker who can write inside the named subtree replaces `.git` with a
+    gitfile pointing at their own repository -- `--show-toplevel` still reports the
+    containing directory, so the PATH still matches the parent's gitlink entry -- and the
+    subsequent batched `ls-files` then binds to a FOREIGN repository (demonstrated end to
+    end: the attacker's index came back and an arbitrary command ran). Requiring the
+    git-common-dir to resolve inside the harness root closes it."""
+    foreign = _init_repo(tmp_path / "foreign_gitdir",
+                         {"rules/attacker.md": "attacker\n"}, ts=1600000000)
+    sub = submodule_tree / "skills" / "coding-team"
+    (sub / ".git").write_text(f"gitdir: {foreign / '.git'}\n")
+    files = [sub / "rules" / "config-files.md"]
+    blind = []
+    idx = _collector.build_git_repo_index(submodule_tree, files, blind)
+    assert _collector._git_age_for_file(submodule_tree, files[0], idx) == (
+        None, "outside_root")
+    assert any("coding-team" in b for b in blind)        # and the refusal SAYS SO
+    assert os.path.realpath(sub) not in idx.tracked_by_toplevel
+    assert os.path.realpath(foreign) not in idx.tracked_by_toplevel
+    # the decisive one: the attacker's index must never have been read at all
+    assert not any(tracked and "rules/attacker.md" in tracked
+                   for tracked in idx.tracked_by_toplevel.values())
+
+
+def test_scanned_root_inside_an_outer_repo_is_refused_and_disclosed(tmp_path):
+    """FINDING 2 (MEDIUM). `root_top` was the one candidate cwd never containment-checked,
+    contradicting build_git_repo_index's own BINDING docstring. When the scanned root is
+    not itself a repo but sits inside an outer one, every file falls through the
+    no-marker branch to `root_top` and both `ls-files` and `git log` run with cwd OUTSIDE
+    the harness root -- timestamps silently attributed from the enclosing repository, no
+    blind spot. (Realistic trigger: ~/.claude not being a repo while an enclosing
+    home-dotfiles repo exists.)"""
+    outer = _init_repo(tmp_path / "outer_repo", {"outer.md": "x"})
+    root = outer / "nested_root"
+    (root / "rules").mkdir(parents=True)
+    (root / "rules" / "a.md").write_text("y\n")
+    files = [root / "rules" / "a.md"]
+    blind = []
+    idx = _collector.build_git_repo_index(root, files, blind)
+    assert idx.available is False
+    assert idx.root_reason == "outside_root"
+    assert any("outside" in b for b in blind)
+    assert _collector._git_age_for_file(root, files[0], idx) == (None, "outside_root")
+    assert _collector.collect_git_age(root, files, idx) == {"rules/a.md": None}
+    # nothing was probed, so no work tree was ever loaded
+    assert idx.tracked_by_toplevel == {}
+
+
+def test_planted_repo_refusal_is_disclosed_as_a_blind_spot(tmp_path):
+    """FINDING 4 (LOW). The exact case the gitlink fence exists to catch -- a repository
+    planted under the scanned root that no accepted index names as a gitlink -- refused
+    correctly but left `blind_spots` EMPTY, so the operator saw a bare null with no
+    trace. The containment refusal beside it has always explained itself; this one now
+    does too."""
+    root = _init_repo(tmp_path / "planted_root", {"rules/a.md": "x"})
+    planted = _init_repo(root / "skills" / "planted", {"a.md": "y\n"}, ts=1650000000)
+    files = [planted / "a.md"]
+    blind = []
+    idx = _collector.build_git_repo_index(root, files, blind)
+    assert _collector._git_age_for_file(root, files[0], idx) == (None, "outside_root")
+    assert any("planted" in b for b in blind)
+    assert os.path.realpath(planted) not in idx.tracked_by_toplevel
+
+
+def test_gitlink_with_a_real_dot_git_directory_is_still_accepted(tmp_path):
+    """Non-regression guard for the provenance fence, pinning the shape the LIVE harness
+    actually has: all three of its gitlinks carry `.git` as a real DIRECTORY (not the
+    gitfile `git submodule add` produces), so their git-common-dir is `<subtree>/.git`.
+    That is inside the root and must keep passing -- a fence that also refused honest
+    submodules would null 33 of the corpus's timestamps."""
+    root = _init_repo(tmp_path / "dirlink_root", {"rules/a.md": "x"})
+    sub = _init_repo(root / "skills" / "vendored", {"rules/b.md": "y\n"}, ts=1660000000)
+    assert (sub / ".git").is_dir()                 # the shape this test exists to pin
+    _git(root, "add", "skills/vendored")
+    _git(root, "commit", "-qm", "gitlink", ts=1700000200)
+    files = [sub / "rules" / "b.md"]
+    blind = []
+    idx = _collector.build_git_repo_index(root, files, blind)
+    assert _collector._git_age_for_file(root, files[0], idx) == (1660000000, "")
+    assert blind == []
+    assert os.path.realpath(sub) in idx.tracked_by_toplevel
+
+
+def _fs_is_case_insensitive(probe_dir):
+    """Detect, never assume: create a lower-case file and probe its upper-case name."""
+    (probe_dir / "casecheck").write_text("x")
+    return (probe_dir / "CASECHECK").exists()
+
+
+def test_case_variant_root_still_reports_real_timestamps(tmp_path):
+    """FINDING 3 (LOW). `os.path.realpath` does NOT canonicalize case on APFS
+    (`/Users/cevin/.CLAUDE` comes back unchanged) but git's `--show-toplevel` DOES, so
+    `real.relative_to(top)` raised ValueError for EVERY file -- nulling the entire
+    git-age signal behind reason `git_error` while `git_age_available` still said True.
+    Direction was fail-safe, but the reason claimed git failed when git worked fine, which
+    is the exact defect class this batch exists to kill."""
+    probe = tmp_path / "caseprobe"
+    probe.mkdir()
+    if not _fs_is_case_insensitive(probe):
+        pytest.skip("case-sensitive filesystem: a case-variant root names a different dir")
+    _init_repo(tmp_path / "casedir", {"rules/a.md": "x"})
+    variant = tmp_path / "CASEDIR"
+    files = [variant / "rules" / "a.md"]
+    idx = _collector.build_git_repo_index(variant, files, [])
+    assert idx.available is True
+    assert _collector._git_age_for_file(variant, files[0], idx) == (1700000000, "")
+    assert _collector.collect_git_age(variant, files, idx) == {"rules/a.md": 1700000000}

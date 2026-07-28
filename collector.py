@@ -2066,6 +2066,22 @@ _GIT_SUBPROCESS_TIMEOUT = 2
 # corpus -- 20-300x headroom at 5s.
 _GIT_BATCH_TIMEOUT = 5
 
+# Harden-audit fix (T9 round 2, HIGH): command-line -c OUTRANKS repo config, so these
+# neutralize every command-valued key a discovered repository could carry. VERIFIED
+# EMPIRICALLY (git 2.50.1): `ls-files -s -z` EXECUTES core.fsmonitor -- twice -- in the
+# repo it runs in, while rev-parse and log do not. The gitlink fence accepts a submodule
+# toplevel on PATH evidence, and an attacker who can write inside that subtree controls
+# its .git/config (or replaces .git with a gitfile pointing at their own repo), so
+# without this the batched index read is arbitrary command execution. The extra keys are
+# defense in depth for subcommands added to this wrapper later.
+_GIT_SAFE_CONFIG = [
+    "-c", "core.fsmonitor=",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "diff.external=",
+    "-c", "core.pager=cat",
+    "-c", "core.sshCommand=",
+]
+
 
 def _git(args: list[str], cwd: Path, timeout: int
          ) -> tuple[subprocess.CompletedProcess[bytes] | None, str | None]:
@@ -2097,7 +2113,17 @@ def _git(args: list[str], cwd: Path, timeout: int
     .gitmodules / .git/config values -- this repo's .gitmodules already holds a remote URL
     (`git@github.com:...`), and an HTTPS-with-token submodule would put
     `https://user:token@host/...` there. Surfacing it would move credential-bearing text
-    into a published HTML document. Closed-enum reasons only."""
+    into a published HTML document. Closed-enum reasons only.
+
+    COMMAND-VALUED CONFIG (T9 harden round 2, HIGH): every invocation carries
+    `_GIT_SAFE_CONFIG`. Measured on git 2.50.1 that `ls-files -s -z` EXECUTES
+    core.fsmonitor -- twice -- in whatever repo it runs in, while `rev-parse
+    --show-toplevel`, `rev-parse --git-common-dir` and `log -1 --format=%ct` execute
+    nothing. The command line is the right layer because `-c` OUTRANKS repo config
+    unconditionally: it holds no matter which repository a call site is pointed at,
+    whereas auditing each discovered .git/config would have to be redone for every
+    subcommand added later. Verified: `git -c core.fsmonitor= ls-files -s -z` returns the
+    index with NO payload run."""
     env = dict(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     # Harden-audit fix (T8 round 2): these four vars silently redirect git away from
@@ -2110,7 +2136,7 @@ def _git(args: list[str], cwd: Path, timeout: int
         env.pop(redirect_var, None)
     try:
         return subprocess.run(
-            ["git", "--literal-pathspecs", *args],
+            ["git", *_GIT_SAFE_CONFIG, "--literal-pathspecs", *args],
             cwd=cwd, capture_output=True, timeout=timeout, env=env,
         ), None
     except subprocess.TimeoutExpired:
@@ -2196,6 +2222,50 @@ def _git_toplevel(dir_path: Path) -> tuple[str | None, str | None]:
     return (out, None) if out else (None, "no_repo")
 
 
+def _git_common_dir(dir_path: Path) -> str | None:
+    """Absolute git-common-dir for the repo at `dir_path`, or None.
+
+    Harden-audit fix (T9 round 2, HIGH): the gitlink fence proves a PATH is named as a
+    submodule by an accepted parent's index; it cannot prove the `.git` at that path
+    BELONGS to that parent. An attacker who can write inside the named subtree replaces
+    `.git` with a gitfile (`gitdir: <their repo>`) -- --show-toplevel still reports the
+    containing directory, so the path still matches -- and the subsequent batched
+    `ls-files` binds to a FOREIGN repository (demonstrated end to end). Requiring the
+    git-common-dir to resolve INSIDE the harness root closes that: the attacked submodule
+    reports `.../evil/.git` where an honest one reports a dir under the root.
+
+    VERIFIED INERT: this rev-parse form executes no command-valued config."""
+    proc, _err = _git(["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                      dir_path, _GIT_SUBPROCESS_TIMEOUT)
+    if proc is None or proc.returncode != 0:
+        return None
+    out = _decode_git(proc.stdout).strip()
+    return out or None
+
+
+def _toplevel_refusal(top: str, root: Path,
+                      root_stat: os.stat_result | None) -> str | None:
+    """None when the work tree at `top` may be probed, else a phrase saying why not.
+
+    BOTH halves are required and neither alone is sufficient (T9 harden round 2): the
+    work-tree PATH must lie inside the harness root (a `git -C` outside it binds to a
+    foreign repository -- S17), AND the git-common-dir must too (a gitfile inside an
+    accepted path can point the SAME path at someone else's repository). The phrase is
+    returned rather than a bare bool because the caller publishes it as a blind spot:
+    a silent refusal is what Finding 4 of the same audit round was about."""
+    if root_stat is None:
+        return "the harness root could not be stat'd, so containment is undecidable"
+    if not _resolves_inside_root(Path(top), root, root_stat):
+        return f"its work tree ({top}) resolves outside the harness root"
+    common_dir = _git_common_dir(Path(top))
+    if common_dir is None:
+        return f"the git directory backing {top} could not be resolved"
+    if not _resolves_inside_root(Path(common_dir), root, root_stat):
+        return (f"the git directory backing {top} ({common_dir}) resolves outside the "
+                f"harness root")
+    return None
+
+
 def _git_tracked_and_gitlinks(top: Path) -> tuple[frozenset[str], frozenset[str]] | None:
     """One batched `git ls-files -s -z` per confirmed repo root -> (tracked, gitlinks).
 
@@ -2268,11 +2338,13 @@ def build_git_repo_index(root: Path, files: list[Path],
                          blind_spots: list[str]) -> _GitRepoIndex:
     """THE only git-topology discovery in a run. O(repo roots), not O(files): the live
     114-file corpus clusters into 40 distinct physical parent dirs but only 3 repo roots,
-    so discovery is 0 walk subprocesses + 3 rev-parse + 3 ls-files = 6.
+    so discovery is 0 walk subprocesses + 3 rev-parse + 3 git-common-dir + 3 ls-files = 9.
 
-    CONTAINMENT -- BOTH fences (design §8.6, BINDING):
+    CONTAINMENT -- ALL THREE fences (design §8.6 + T9 harden round 2, BINDING):
       (1) every candidate cwd passes _resolves_inside_root against a ONCE-computed
-          root_stat, the SAME mechanism the hook walk already uses.
+          root_stat, the SAME mechanism the hook walk already uses. That INCLUDES
+          `root_top`, which was exempt until the T9 harden round found it (an enclosing
+          outer repository would otherwise supply every timestamp, undisclosed).
           NOT Path.is_relative_to: that compares a RESOLVED path against an UNRESOLVED
           root and is False for every file in every macOS temp fixture (/var ->
           /private/var), silently nulling the whole corpus (F3, reproduced).
@@ -2281,6 +2353,15 @@ def build_git_repo_index(root: Path, files: list[Path],
           not. Without this, an out-of-root symlink would bind `git -C` to a FOREIGN
           repository whose .git/config holds command-valued keys -- core.fsmonitor,
           core.hooksPath, diff.external (S17, P1).
+      (3) that toplevel's GIT-COMMON-DIR must resolve inside the root too. Clause 2
+          proves a PATH is named as a submodule; it cannot prove the `.git` there belongs
+          to that parent, and an attacker who can write in the named subtree swaps it for
+          a gitfile pointing at their own repository (demonstrated end to end). Every
+          refusal under any clause is published as a blind spot -- a fence that refuses
+          silently teaches the operator nothing.
+    Fences 1 and 3 are checked BEFORE _load_root for each candidate, because `ls-files`
+    is the call that binds to the repository (and, per _GIT_SAFE_CONFIG, the one that
+    would execute its command-valued config).
 
     Alternatives disqualified by measurement, recorded so they are not re-proposed:
       - parsing .gitmodules: N2 -- this repo has 3 gitlinks and only 1 is declared.
@@ -2324,6 +2405,20 @@ def build_git_repo_index(root: Path, files: list[Path],
         root_top, root_reason = None, "git_error"
     else:
         root_top, root_reason = _git_toplevel(Path(root_real))
+        if root_top is not None:
+            # `root_top` used to be the ONE candidate cwd exempt from the containment
+            # fence this docstring calls BINDING (T9 harden round 2, MEDIUM). When the
+            # scanned root is not itself a repo but sits inside an outer one,
+            # --show-toplevel returns the ENCLOSING work tree and every file falls
+            # through the no-marker branch below to it -- so `ls-files` and every `git
+            # log` would run with cwd outside the harness root, silently attributing
+            # timestamps from a repository the operator never asked about.
+            refusal = _toplevel_refusal(root_top, root, root_stat)
+            if refusal is not None:
+                blind_spots.append(
+                    f"git-age: the scanned root's work tree was not probed — {refusal} "
+                    f"(a `git -C` there would bind to a foreign repository)")
+                root_top, root_reason = None, "outside_root"
     available = root_top is not None
     accepted: set[str] = set()
     if root_top is not None:
@@ -2365,9 +2460,24 @@ def build_git_repo_index(root: Path, files: list[Path],
         if top not in accepted and not _accept_via_gitlink(top, accepted,
                                                            gitlinks_by_toplevel):
             # A work tree that neither IS the scanned root nor is named as a gitlink by an
-            # already-accepted root. Refuse rather than guess (8.6 clause 2).
+            # already-accepted root. Refuse rather than guess (8.6 clause 2) -- and SAY SO
+            # (T9 harden round 2, LOW): this is the exact case the fence exists to catch,
+            # and it used to leave the operator a bare null with no trace.
             toplevel_by_dir[dir_key] = (None, "outside_root")
+            blind_spots.append(
+                f"git-age: {dir_key} was not probed — its work tree ({top}) is neither "
+                f"the scanned root nor named as a gitlink by an accepted root")
             continue
+        if top not in accepted:
+            # PROVENANCE, not just path (T9 harden round 2, HIGH). The gitlink clause
+            # above proved only that an accepted parent's index names this PATH; the
+            # `.git` sitting there can still belong to someone else's repository. Checked
+            # BEFORE _load_root, because `ls-files` is the call that would bind to it.
+            refusal = _toplevel_refusal(top, root, root_stat)
+            if refusal is not None:
+                toplevel_by_dir[dir_key] = (None, "outside_root")
+                blind_spots.append(f"git-age: {dir_key} was not probed — {refusal}")
+                continue
         _load_root(top)
         accepted.add(top)
         toplevel_by_dir[dir_key] = (top, None)
@@ -2403,6 +2513,45 @@ def _git_last_commit_ts(top: Path, sub_path: str, timeout: int) -> tuple[int | N
         return None, "unparseable"
 
 
+def _relative_to_toplevel(real: Path, top: str) -> str | None:
+    """`real` expressed relative to the work tree at `top`, or None when it is not inside
+    it. ZERO subprocesses -- _git_age_for_file stays pure with respect to the index.
+
+    NOT a bare Path.relative_to (T9 harden round 2, LOW). `os.path.realpath` does NOT
+    canonicalize case on APFS (`/Users/cevin/.CLAUDE` comes back unchanged) but git's
+    `--show-toplevel` DOES, so with a case-variant --root every single file raised
+    ValueError -- the whole git-age signal vanished behind reason `git_error` while
+    `git_age_available` still reported True, blaming git for something git got right.
+
+    The fallback walks `real`'s ancestors comparing st_dev/st_ino against `top` via
+    os.path.samestat -- the SAME identity mechanism _resolves_inside_root already uses,
+    so it also covers directory hard-link and bind-mount aliases, not just case. The
+    lexical fast path stays first: when it matches, the prefix is character-identical, so
+    it cannot be a false positive, and the common case costs no stat calls at all."""
+    try:
+        return str(real.relative_to(top))
+    except ValueError:
+        pass
+    try:
+        top_stat = os.stat(top)
+    except OSError:
+        return None
+    parts: list[str] = []
+    current = real
+    while True:
+        parts.append(current.name)
+        parent = current.parent
+        if parent == current:
+            return None                  # reached the filesystem root without a match
+        try:
+            parent_stat = os.stat(parent)
+        except OSError:
+            return None
+        if os.path.samestat(parent_stat, top_stat):
+            return str(Path(*reversed(parts)))
+        current = parent
+
+
 def _git_age_for_file(root: Path, fp: Path, index: _GitRepoIndex) -> tuple[int | None, str]:
     """Resolve ONE file to (timestamp, "") or (None, reason). PURE with respect to git
     topology: every repo root comes from `index`.
@@ -2431,9 +2580,8 @@ def _git_age_for_file(root: Path, fp: Path, index: _GitRepoIndex) -> tuple[int |
     top, why = index.toplevel_by_dir.get(str(real.parent), (None, "git_error"))
     if top is None:
         return None, why or "git_error"
-    try:
-        sub = str(real.relative_to(top))
-    except ValueError:
+    sub = _relative_to_toplevel(real, top)
+    if sub is None:
         return None, "git_error"
     return _git_last_commit_ts(Path(top), sub, _GIT_SUBPROCESS_TIMEOUT)
 
