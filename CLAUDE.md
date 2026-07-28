@@ -38,7 +38,7 @@ harness-map is a production-grade, read-only inventory of the Claude Code harnes
 - Test placement (AMENDMENTS A8): renderer features → `test_render_html.py`; collector features → `test_collector.py`; only M11 adds `test_profiles.py`.
 - Phantom fix: **DONE in S1.M0** — candidate order `root/norm` then `root/<source-dir>/norm`, `_safe_exists` tri-state preserved (SPEC_3 §1; fixed at `collector.py:2242`, was `:1166` at snapshot — AMENDMENTS A11).
 - Drag: `est_tokens × (1 + friction_events_30d)`, 30-day window computed POST-join, undated records excluded (SPEC_6 §1). Cost: median **events/day** (never "turns/day") over **14** days, min **3** active days (SPEC_6 §2).
-- Trend sparklines: display window **N=10** points, appear at ≥3 sidecars; loader already exists — visualization only (SPEC_4 §3, AMENDMENTS A2).
+- Trend sparklines: display window **N=10** points, appear at ≥3 MEASURED points per series (a crashed run or a missing headline key contributes no point; sidecar count alone is not the gate); loader already exists — visualization only (SPEC_4 §3, AMENDMENTS A2).
 - `--check`: exit **0/1/2**; `CHECK_BANDS` = report-template thresholds **5,000 / 12,000** tokens (NOT the renderer's `GAUGE_BANDS` 6,000/15,000 — two homes exist, AMENDMENTS A3); wall-time budget **≤5s** (SPEC_7 §1).
 - Kill signals: >2 staleness false positives per real run; >50 mypy errors; >10 type-ignores; 1 edited existing assertion; <10 dated joinable telemetry records at M8 (RISK_REGISTER).
 
