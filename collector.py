@@ -18,7 +18,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 SCHEMA_VERSION = 1
 _FM_DESC_LINE = re.compile(r"^description:\s*(.*)$")
@@ -2127,50 +2127,341 @@ def _decode_git(raw: bytes) -> str:
     return raw.decode("utf-8", errors="surrogateescape")
 
 
-def _git_work_tree_available(root: Path) -> bool:
-    """Single up-front probe deciding whether `root` is a usable git work tree. Consumed
-    by collect_git_age to skip its ENTIRE per-file git-log loop when git is absent or
-    root isn't a repo (never probe per file), and by build_document to populate
-    staleness.git_age_available. Never raises: a missing git binary, a non-repo root, and
-    a timed-out probe all degrade to False -- same graceful-degradation philosophy as
-    _safe_exists (honest False beats a crash)."""
-    proc, err = _git(["rev-parse", "--is-inside-work-tree"], root, _GIT_SUBPROCESS_TIMEOUT)
-    if err is not None or proc is None:
-        return False
-    return proc.returncode == 0 and _decode_git(proc.stdout).strip() == "true"
+def _git_marker_root(start: Path, stop_at: str) -> tuple[Path | None, bool]:
+    """Nearest ancestor of `start` STRICTLY BELOW `stop_at` containing a `.git` entry ->
+    (dir, ok). ZERO subprocesses.
+
+    `.git` is a DIRECTORY in a normal clone and a FILE in a submodule or a linked
+    worktree, so this tests for either via the existing tri-state _safe_exists.
+
+    `stop_at` is the scanned root's realpath and is EXCLUSIVE -- the walk answers only
+    "is there a NESTED work tree between this dir and the scanned root?". Two reasons it
+    is bounded rather than climbing to the filesystem root:
+      (1) The scanned root's own toplevel is ALREADY known (one `rev-parse` in
+          build_git_repo_index, which climbs for us), so probing root/.git and everything
+          above it re-derives a known answer from extra filesystem reads -- including reads
+          ABOVE the scanned root, which the containment posture of this whole batch exists
+          to avoid.
+      (2) `.git` sits in _PRUNED_WALK_DIRS, so iter_input_paths cannot watch `root/.git`;
+          probing it would break the standing invariant (asserted by
+          test_iter_input_paths_is_superset_of_real_build_document_reads) that every path
+          build_document reads under root is watched. Every dir this walk DOES probe lies
+          under an instruction-file dir that iter_input_paths already yields.
+
+    TRI-STATE, not two-state (F5): `ok=False` means an ancestor's `.git` could not be read
+    (Path.exists() RAISES PermissionError -- it only swallows ENOENT/ENOTDIR), so the walk
+    ABORTS rather than silently attributing the file to an outer repo. The caller maps that
+    to `git_error`, NEVER to `no_repo`: "there is no enclosing work tree" is a positive
+    assertion of absence, and asserting absence over a state we could not read is the exact
+    defect class this batch exists to eliminate. `(None, True)` means the honest "no nested
+    work tree found before the boundary" -- the caller then falls back to the scanned root's
+    own toplevel, never to a guess. The filesystem-root termination is a backstop for the
+    exotic case where containment passed by inode identity through a directory hard-link /
+    bind-mount alias, so the lexical climb never meets `stop_at`."""
+    cur = start
+    while str(cur) != stop_at:
+        present, ok = _safe_exists(cur / ".git")
+        if not ok:
+            return None, False
+        if present:
+            return cur, True
+        if cur.parent == cur:
+            return None, True
+        cur = cur.parent
+    return None, True
 
 
-def _git_last_commit_ts(root: Path, rel_path: str) -> int | None:
-    """Unix commit timestamp of the last commit touching `rel_path`, or None when it
-    cannot be honestly determined (git error, timeout, unparseable output, or the path
-    has no commits -- e.g. untracked). NEVER falls back to filesystem mtime."""
-    proc, err = _git(["log", "-1", "--format=%ct", "--", rel_path], root,
-                      _GIT_SUBPROCESS_TIMEOUT)
-    if err is not None or proc is None or proc.returncode != 0:
+def _git_toplevel(dir_path: Path) -> tuple[str | None, str | None]:
+    """`git -C <dir> rev-parse --show-toplevel` -> (physical toplevel, None) or
+    (None, closed-enum reason).
+
+    SUBSUMES the DELETED _git_work_tree_available and is strictly stricter: verified that
+    in a BARE repo --show-toplevel exits 128 while --is-inside-work-tree exits 0 printing
+    "false". Returns a physical path even from a symlinked cwd, so it compares directly
+    against os.path.realpath -- which is what makes the realpath-first ordering work.
+
+    THE REASON IS DISCRIMINATED, not collapsed (correction C-f, amending design §13 F2).
+    An OSError from the wrapper means the git BINARY could not be executed -- the ONLY
+    honest producer of `git_unavailable`. A CLEAN non-zero exit means git ran perfectly and
+    reported that this is not a work tree (or is bare): that is `no_repo`. Verified live
+    that conftest.py's fake_harness has no `git init`, so EVERY fixture run takes the
+    clean-non-zero branch with git fully installed; labelling it `git_unavailable` would
+    tell the operator "git could not run at all" when git ran fine."""
+    proc, err = _git(["rev-parse", "--show-toplevel"], dir_path, _GIT_SUBPROCESS_TIMEOUT)
+    if proc is None:
+        return None, "git_unavailable" if err == "git_error" else "timeout"
+    if proc.returncode != 0:
+        return None, "no_repo"
+    out = _decode_git(proc.stdout).strip()
+    return (out, None) if out else (None, "no_repo")
+
+
+def _git_tracked_and_gitlinks(top: Path) -> tuple[frozenset[str], frozenset[str]] | None:
+    """One batched `git ls-files -s -z` per confirmed repo root -> (tracked, gitlinks).
+
+    NO PATHSPEC is passed: the whole index is cheaper (measured 0.013-0.015s, 3465 paths,
+    262,464 bytes, ~577 KB as a Python set -- ~5.9 MB estimated at 10x scale) AND
+    structurally immune to the pathspec-glob class, because there is no pathspec to
+    interpret. `-s` costs nothing measurable and buys the mode-160000 gitlink set that the
+    S17 containment fence needs HERE and that `submodule_unavailable` needs at T10.
+
+    Returns None -- NOT an empty frozenset -- when the index could not be determined. T10
+    maps None to `git_error`; an unknown index must NEVER masquerade as the definitive
+    negative `untracked` (S15, P1).
+
+    S15, restated because it is the reason this is per-ROOT: `git ls-files` does NOT
+    descend into submodules -- the parent's index reports only the gitlink (verified). A
+    parent-only set would mark 46 submodule files `untracked`, replacing an honest "we
+    don't know" with a specific WRONG answer. That is worse than shipping the blind spot."""
+    proc, _err = _git(["ls-files", "-s", "-z"], top, _GIT_BATCH_TIMEOUT)
+    if proc is None or proc.returncode != 0:
         return None
+    tracked: set[str] = set()
+    gitlinks: set[str] = set()
+    for chunk in proc.stdout.split(b"\0"):
+        if not chunk:
+            continue
+        head, _tab, raw_path = chunk.partition(b"\t")
+        if not raw_path:
+            continue
+        rel = _decode_git(raw_path)
+        tracked.add(rel)
+        if head.startswith(b"160000"):
+            gitlinks.add(rel)
+    return frozenset(tracked), frozenset(gitlinks)
+
+
+class _GitRepoIndex(NamedTuple):
+    """One-shot git topology snapshot for a run (S2 gate fix: R1/N1/#1/#5/S15/S17).
+
+    Built ONCE by build_git_repo_index and threaded into collect_git_age -- never
+    re-probed mid-run, so staleness.git_age_available can no longer disagree with the
+    timestamps it labels (Codex #5, dissolved STRUCTURALLY: _git_work_tree_available is
+    deleted, not kept)."""
+    available: bool
+    # Closed-enum reason when `available` is False, else None (C-f). A SCALAR paired with
+    # `available` at construction, so the two cannot drift apart.
+    root_reason: str | None
+    # realpath'd parent dir -> (confirmed toplevel, None) | (None, closed-enum reason).
+    # One map, not two: a parallel "why" dict could disagree with the toplevel it explains.
+    toplevel_by_dir: dict[str, tuple[str | None, str | None]]
+    tracked_by_toplevel: dict[str, frozenset[str] | None]   # None == index UNKNOWN
+    gitlinks_by_toplevel: dict[str, frozenset[str]]
+
+
+def _accept_via_gitlink(top: str, accepted: set[str],
+                        gitlinks_by_toplevel: dict[str, frozenset[str]]) -> bool:
+    """True when `top` is named as a mode-160000 gitlink by an ALREADY-ACCEPTED root
+    (8.6 clause 2). Candidate dirs are processed shallowest-first, so a nested submodule
+    is reached transitively without recursion."""
+    for parent in accepted:
+        try:
+            rel = str(Path(top).relative_to(parent))
+        except ValueError:
+            continue
+        if rel in gitlinks_by_toplevel.get(parent, frozenset()):
+            return True
+    return False
+
+
+def build_git_repo_index(root: Path, files: list[Path],
+                         blind_spots: list[str]) -> _GitRepoIndex:
+    """THE only git-topology discovery in a run. O(repo roots), not O(files): the live
+    114-file corpus clusters into 40 distinct physical parent dirs but only 3 repo roots,
+    so discovery is 0 walk subprocesses + 3 rev-parse + 3 ls-files = 6.
+
+    CONTAINMENT -- BOTH fences (design §8.6, BINDING):
+      (1) every candidate cwd passes _resolves_inside_root against a ONCE-computed
+          root_stat, the SAME mechanism the hook walk already uses.
+          NOT Path.is_relative_to: that compares a RESOLVED path against an UNRESOLVED
+          root and is False for every file in every macOS temp fixture (/var ->
+          /private/var), silently nulling the whole corpus (F3, reproduced).
+      (2) a submodule toplevel is accepted only when the PARENT index's mode-160000
+          gitlink set names it. Filesystem resolution is attacker-influenced; the index is
+          not. Without this, an out-of-root symlink would bind `git -C` to a FOREIGN
+          repository whose .git/config holds command-valued keys -- core.fsmonitor,
+          core.hooksPath, diff.external (S17, P1).
+
+    Alternatives disqualified by measurement, recorded so they are not re-proposed:
+      - parsing .gitmodules: N2 -- this repo has 3 gitlinks and only 1 is declared.
+      - `git submodule status --recursive`: N3 -- it EXITS NON-ZERO on this very repo
+        ("no submodule mapping found in .gitmodules for path
+        'skills-archive/business-team'") and reads the same incomplete file.
+      - per-file/per-dir `rev-parse --show-toplevel`: correct but +114 (or +40)
+        subprocesses; the .git-marker walk is 0.
+
+    S16 note (R5-3): the containment READ-GATE for _deduped_instruction_files lands in
+    T6 (C-q), BEFORE this function exists -- by the time paths reach here they have
+    already passed it. This function's own containment fences (above) close the
+    DOWNSTREAM half of the same class: without them, an out-of-root path would choose a
+    subprocess working directory (S17) rather than merely leak a read.
+    """
+    try:
+        root_stat: os.stat_result | None = os.stat(root)
+    except OSError:
+        root_stat = None
+
+    toplevel_by_dir: dict[str, tuple[str | None, str | None]] = {}
+    tracked_by_toplevel: dict[str, frozenset[str] | None] = {}
+    gitlinks_by_toplevel: dict[str, frozenset[str]] = {}
+
+    def _load_root(top: str) -> None:
+        if top in tracked_by_toplevel:
+            return
+        pair = _git_tracked_and_gitlinks(Path(top))
+        if pair is None:
+            tracked_by_toplevel[top] = None
+            gitlinks_by_toplevel[top] = frozenset()
+        else:
+            tracked_by_toplevel[top], gitlinks_by_toplevel[top] = pair
+
+    # --- the scanned root itself, first: it is the authority every other root is
+    # --- validated against, and it defines `available` (computed exactly ONCE).
+    root_real = os.path.realpath(root)
+    root_top: str | None
+    root_reason: str | None
+    if root_stat is None:
+        root_top, root_reason = None, "git_error"
+    else:
+        root_top, root_reason = _git_toplevel(Path(root_real))
+    available = root_top is not None
+    accepted: set[str] = set()
+    if root_top is not None:
+        _load_root(root_top)
+        accepted.add(root_top)
+
+    # --- distinct physical parent dirs, SORTED (determinism across PYTHONHASHSEED) and
+    # --- shallowest-first, so an outer root is always accepted before an inner one and a
+    # --- nested submodule can be validated against its already-accepted parent in one pass.
+    dirs = sorted({str(Path(_physical_key(fp)).parent) for fp in files},
+                  key=lambda d: (d.count(os.sep), d))
+    for dir_key in dirs:
+        dir_path = Path(dir_key)
+        if root_stat is None or not _resolves_inside_root(dir_path, root, root_stat):
+            toplevel_by_dir[dir_key] = (None, "outside_root")
+            blind_spots.append(
+                f"git-age: {dir_key} resolves outside the harness root — not probed "
+                f"(a `git -C` there would bind to a foreign repository)")
+            continue
+        marker, ok = _git_marker_root(dir_path, root_real)
+        if not ok:
+            toplevel_by_dir[dir_key] = (None, "git_error")   # F5: unreadable != absent
+            continue
+        if marker is None:
+            # No NESTED work tree between this dir and the scanned root, so the file
+            # belongs to the scanned root's own -- whose toplevel was resolved above and
+            # needs no re-probe. When the root has none, its ALREADY-DISCRIMINATED reason
+            # is reused rather than re-asserting `no_repo` over a `git_unavailable` /
+            # `timeout` state we never re-examined (C-f/H1).
+            if root_top is None:
+                toplevel_by_dir[dir_key] = (None, root_reason or "no_repo")
+            else:
+                toplevel_by_dir[dir_key] = (root_top, None)
+            continue
+        top, why = _git_toplevel(marker)
+        if top is None:
+            toplevel_by_dir[dir_key] = (None, why or "no_repo")
+            continue
+        if top not in accepted and not _accept_via_gitlink(top, accepted,
+                                                           gitlinks_by_toplevel):
+            # A work tree that neither IS the scanned root nor is named as a gitlink by an
+            # already-accepted root. Refuse rather than guess (8.6 clause 2).
+            toplevel_by_dir[dir_key] = (None, "outside_root")
+            continue
+        _load_root(top)
+        accepted.add(top)
+        toplevel_by_dir[dir_key] = (top, None)
+
+    return _GitRepoIndex(available=available, root_reason=None if available else root_reason,
+                         toplevel_by_dir=toplevel_by_dir,
+                         tracked_by_toplevel=tracked_by_toplevel,
+                         gitlinks_by_toplevel=gitlinks_by_toplevel)
+
+
+def _git_last_commit_ts(top: Path, sub_path: str, timeout: int) -> tuple[int | None, str]:
+    """(timestamp, "") or (None, closed-enum reason). NEVER falls back to filesystem mtime
+    -- mtime lies after a copy or checkout, and an honest null beats plausible noise.
+
+    Four distinct failures that all used to collapse into a bare None:
+      timeout      -- this file's `git log` exceeded the per-call cap
+      git_error    -- OSError, or a non-zero exit (verified: a zero-commit repo exits 128)
+      no_commits   -- exit 0 with EMPTY stdout: tracked but never committed (staged only).
+                      Verified live. Mapping this to `unparseable` ("stdout was not an
+                      integer") would emit a MISLEADING reason (§13 F4).
+      unparseable  -- exit 0, stdout present but not an integer."""
+    proc, err = _git(["log", "-1", "--format=%ct", "--", sub_path], top, timeout)
+    if proc is None:
+        return None, err or "git_error"
+    if proc.returncode != 0:
+        return None, "git_error"
     out = _decode_git(proc.stdout).strip()
     if not out:
-        return None
+        return None, "no_commits"
     try:
-        return int(out)
+        return int(out), ""
     except ValueError:
-        return None
+        return None, "unparseable"
 
 
-def collect_git_age(root: Path, rel_paths: list[str]) -> dict[str, int | None]:
-    """Per-instruction-file git-age SIGNAL (S2.M3) -- last commit unix timestamp for each
-    of `rel_paths`, or None. This is a raw signal, never a "stale"/"dead" judgment; that
-    classification belongs to the model consuming this output, not the collector.
+def _git_age_for_file(root: Path, fp: Path, index: _GitRepoIndex) -> tuple[int | None, str]:
+    """Resolve ONE file to (timestamp, "") or (None, reason). PURE with respect to git
+    topology: every repo root comes from `index`.
 
-    Graceful degradation (never crashes): if git is absent, `root` is not a work tree, or
-    the up-front probe errors, EVERY value is None and the per-file loop is skipped
-    entirely. Per-file failures (timeout, non-zero exit, unparseable output, untracked
-    file) independently degrade to None for that path only -- one bad file never poisons
-    the rest. NEVER falls back to mtime -- mtime lies after a copy or checkout; an honest
-    null beats plausible noise (same philosophy as _safe_exists)."""
-    if not _git_work_tree_available(root):
-        return {rel_path: None for rel_path in rel_paths}
-    return {rel_path: _git_last_commit_ts(root, rel_path) for rel_path in rel_paths}
+    ORDERING IS THE WHOLE DECISION and it is settled by measurement. Repo-root-first
+    (today) gives: submodule contents -> null, beyond-symlinked-dir -> null, leaf symlink
+    -> a WRONG value skewed up to +/-73 days. Realpath-first gives the real content
+    timestamp in all three shapes. No amount of reason-field effort can fix a non-null
+    wrong number, which is why the ORDERING flips rather than the reporting.
+
+    Reported dict keys are UNCHANGED -- the logical root-relative path stays the key; only
+    the QUERIED path is physical. This preserves the schema contract and
+    _deduped_instruction_files' deliberate canonical-path preference, which needs NO change:
+    under realpath-first the two designs align, because whichever path wins dedup resolves
+    to the same physical file.
+
+    T10 inserts the tracked-state gate between the toplevel lookup and the `git log`."""
+    real = Path(_physical_key(fp))                       # symlink resolved FIRST (N1)
+    # F10b: .get with a default, never a bare subscript -- a KeyError waiting on any
+    # divergence between the file list the index was built from and this one.
+    # Codex F9: the default is git_error, NOT no_repo. A missing index entry means the
+    # queried list diverged from the list the index was built from -- an UNKNOWN, not
+    # evidence that no repository exists. `no_repo` here would be the same
+    # unknown-as-definitive-negative overclaim as S15 (untracked) and D2 (phantom refs):
+    # a positive assertion of absence over a state that was never examined.
+    top, why = index.toplevel_by_dir.get(str(real.parent), (None, "git_error"))
+    if top is None:
+        return None, why or "git_error"
+    try:
+        sub = str(real.relative_to(top))
+    except ValueError:
+        return None, "git_error"
+    return _git_last_commit_ts(Path(top), sub, _GIT_SUBPROCESS_TIMEOUT)
+
+
+def collect_git_age(root: Path, files: list[Path],
+                    index: _GitRepoIndex) -> dict[str, int | None]:
+    """Per-instruction-file git-age SIGNAL (S2.M3; S2-gate hardening R1/N1/#5). Never a
+    "stale"/"dead" judgment -- that classification belongs to the model consuming this
+    output, not the collector (binding rule 6).
+
+    PURE with respect to git topology: everything comes from `index`, built once by
+    build_git_repo_index, so staleness.git_age_available can never disagree with the
+    timestamps it labels (Codex #5).
+
+    Graceful degradation (never crashes): when the scanned root has no confirmed toplevel,
+    EVERY value is None and the per-file loop is skipped entirely. Per-file failures
+    (timeout, non-zero exit, unparseable output, untracked file) independently degrade to
+    None for that path only -- one bad file never poisons the rest.
+
+    Iteration is over the sorted REPORTED keys (F11: sorted(files) would compare Path parts
+    tuples, diverging for prefix-sibling dirs like skills/scan vs skills/scan-code, while
+    schema.md documents lexicographic key order).
+
+    T10 widens the return to (timestamps, null_reasons) and adds the total deadline."""
+    by_key = {_rel(root, fp): fp for fp in files}
+    if not index.available:
+        return {k: None for k in sorted(by_key)}
+    return {k: _git_age_for_file(root, by_key[k], index)[0] for k in sorted(by_key)}
 
 
 SHINGLE_K = 8
@@ -3104,14 +3395,22 @@ def build_document(
     corpus_files = _staleness_corpus(root, inaccessible)
     phantom_refs = check_phantom_refs(root, corpus_files, inaccessible)
     promotion_candidates = collect_promotion_candidates(root, corpus_files, settings)
-    # S2.M3: git-age SIGNAL only (never a "stale" verdict) -- same deduped instruction-file
-    # set flag_long_instructions reports (_deduped_instruction_files), sorted lexicographically
-    # for deterministic output across PYTHONHASHSEED.
-    instruction_rel_paths = sorted(_rel(root, fp) for fp in
-                                    _deduped_instruction_files(root, inaccessible, blind_spots))
+    # S2 gate fix: git-age SIGNAL only (never a "stale" verdict). Topology is discovered
+    # ONCE and collect_git_age is pure with respect to it, so git_age_available can never
+    # disagree with the timestamps it labels (Codex #5). `available` replaces the deleted
+    # _git_work_tree_available and is NARROWER: it means "--root has a confirmed toplevel"
+    # (rev-parse --show-toplevel), where the old probe accepted anything "inside a work
+    # tree" -- verified that a BARE repo passed the old probe and fails this one.
+    # ONE _deduped_instruction_files call here feeds BOTH the index build and the age
+    # collection (it previously produced only rel-paths): it appends to `inaccessible`/
+    # `blind_spots`, so a second call would re-walk the corpus at double the I/O for an
+    # identical result. Sorting moved into collect_git_age, which keys the same
+    # lexicographic order (F11).
+    instruction_files = _deduped_instruction_files(root, inaccessible, blind_spots)
+    git_index = build_git_repo_index(root, instruction_files, blind_spots)
     staleness_section = {
-        "git_age_available": _git_work_tree_available(root),
-        "last_commit_ts": collect_git_age(root, instruction_rel_paths),
+        "git_age_available": git_index.available,
+        "last_commit_ts": collect_git_age(root, instruction_files, git_index),
     }
 
     totals = {

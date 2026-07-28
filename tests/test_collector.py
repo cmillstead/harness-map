@@ -3543,3 +3543,202 @@ def test_git_wrapper_ignores_inherited_git_dir_redirect(tmp_path):
             os.environ["GIT_DIR"] = old
     assert err is None and proc is not None
     assert proc.stdout.strip() == b"1700000000"   # repo A's commit, not repo B's
+
+
+# ---------------------------------------------------------------------------
+# S2 gate fix (D1: R1/N1/N2/N3/#5/S16/S17/F3/F5 + C-f/H1): one-shot git topology
+# ---------------------------------------------------------------------------
+
+# Local fixture, NOT an extension of conftest.py::fake_harness -- fake_harness is consumed
+# by ~490 of 538 tests, and adding a submodule-add subprocess pair to every one of them
+# costs tens of seconds for the benefit of ~6 tests.
+@pytest.fixture
+def submodule_tree(tmp_path):
+    """parent repo + real initialized submodule + a leaf symlink INTO it + a symlinked
+    directory. The two commit timestamps are DIFFERENT on purpose: a test asserting
+    1700000000 cannot pass by accidentally reading the parent's gitlink-add commit
+    (1700000100). Recipe re-verified by execution during planning (F8 / correction C-d)."""
+    origin = _init_repo(tmp_path / "sub_origin",
+                        {"rules/config-files.md": "sub rule body\n"}, ts=1700000000)
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    _git(parent, "init", "-q", "-b", "main", ".")
+    (parent / "rules").mkdir()
+    (parent / "rules" / "own.md").write_text("parent rule\n")
+    _git(parent, "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+         str(origin), "skills/coding-team")
+    # BOTH symlinks are created BEFORE the commit so they are TRACKED (mode 120000).
+    # Codex F8: creating them after `git add -A` left them untracked, so the fixture did
+    # not reproduce the tracked-symlink-blob shape N1 actually describes -- the tests
+    # still passed (realpath-first resolves into the submodule either way), which is
+    # exactly what makes an untracked fixture VACUOUS rather than red.
+    # leaf symlink in the parent pointing at a file INSIDE the submodule (the N1 shape)
+    (parent / "rules" / "linked.md").symlink_to(
+        parent / "skills" / "coding-team" / "rules" / "config-files.md")
+    # symlinked DIRECTORY (the "13 nulls" shape)
+    (parent / "skills" / "aliased").symlink_to(parent / "skills" / "coding-team")
+    _git(parent, "add", "-A")
+    _git(parent, "commit", "-qm", "parent", ts=1700000100)
+    return parent
+
+
+def test_leaf_symlink_reports_the_TARGETS_commit_not_the_symlink_blobs(submodule_tree):
+    """N1, the headline: a tracked leaf symlink made `git log` answer about the SYMLINK
+    BLOB, not the target's content -- up to 73 days too fresh (suppressing a real review
+    candidate) and 16 days too stale (manufacturing a false flag). A wrong number is
+    worse than a null: no reason field can ever describe it."""
+    files = [submodule_tree / "rules" / "linked.md"]
+    idx = _collector.build_git_repo_index(submodule_tree, files, [])
+    # Assert through _git_age_for_file, NOT collect_git_age -- see the C-i banner below.
+    ts, _r = _collector._git_age_for_file(submodule_tree, files[0], idx)
+    assert ts == 1700000000                          # the submodule's own commit
+    assert ts != 1700000100                          # NOT the parent's gitlink-add commit
+    # N1's shape is a TRACKED leaf symlink: prove the fixture actually built one.
+    staged = subprocess.run(["git", "ls-files", "--stage", "rules/linked.md"],
+                            cwd=submodule_tree, capture_output=True, text=True)
+    assert staged.stdout.startswith("120000"), f"not a tracked symlink blob: {staged.stdout!r}"
+
+def test_file_inside_submodule_gets_a_real_timestamp(submodule_tree):
+    """R1: 33 of the 47 nulls were paths directly under a gitlink."""
+    files = [submodule_tree / "skills" / "coding-team" / "rules" / "config-files.md"]
+    idx = _collector.build_git_repo_index(submodule_tree, files, [])
+    ts, _r = _collector._git_age_for_file(submodule_tree, files[0], idx)
+    assert ts == 1700000000
+
+def test_file_beyond_a_symlinked_directory_gets_a_real_timestamp(submodule_tree):
+    """R1: 13 of the 47 nulls were beyond a symlinked directory."""
+    files = [submodule_tree / "skills" / "aliased" / "rules" / "config-files.md"]
+    idx = _collector.build_git_repo_index(submodule_tree, files, [])
+    ts, _r = _collector._git_age_for_file(submodule_tree, files[0], idx)
+    assert ts == 1700000000
+
+def test_plain_in_root_file_is_unaffected(submodule_tree):
+    files = [submodule_tree / "rules" / "own.md"]
+    idx = _collector.build_git_repo_index(submodule_tree, files, [])
+    ts, _r = _collector._git_age_for_file(submodule_tree, files[0], idx)
+    assert ts == 1700000100
+
+def test_containment_uses_resolves_inside_root_not_is_relative_to(tmp_path):
+    """F3 (BLOCKER, reproduced during planning): `real.is_relative_to(root)` compares a
+    RESOLVED path against an UNRESOLVED root. On macOS (/var -> /private/var) that is
+    False for EVERY file in EVERY temp fixture -- it would silently null the entire
+    corpus in exactly the tests this batch depends on. Measured:
+      root  /var/folders/.../tmpX          realpath  /private/var/folders/.../tmpX/rules/a.md
+      is_relative_to -> False              _resolves_inside_root -> True"""
+    repo = _init_repo(tmp_path / "r", {"rules/a.md": "x"})
+    files = [repo / "rules" / "a.md"]
+    idx = _collector.build_git_repo_index(repo, files, [])
+    assert _collector._git_age_for_file(repo, files[0], idx)[0] == 1700000000
+    assert _collector._git_age_for_file(repo, files[0], idx)[1] != "outside_root"
+
+def test_out_of_root_symlink_is_never_probed_in_a_foreign_repo(tmp_path):
+    """S17 (P1): `git -C <dir> rev-parse --show-toplevel` walks UP from cwd until it finds
+    a .git, so an out-of-root symlink would bind git to a FOREIGN repository whose
+    .git/config is attacker-controllable and holds command-valued keys (core.fsmonitor,
+    core.hooksPath, diff.external)."""
+    foreign = _init_repo(tmp_path / "foreign", {"rules/evil.md": "x"})
+    root = _init_repo(tmp_path / "root", {"rules/a.md": "x"})
+    (root / "rules" / "escape.md").symlink_to(foreign / "rules" / "evil.md")
+    files = [root / "rules" / "escape.md"]
+    blind = []
+    idx = _collector.build_git_repo_index(root, files, blind)
+    assert _collector._git_age_for_file(root, files[0], idx) == (None, "outside_root")
+    assert any("outside" in b for b in blind)   # S16: the blind spot is DISCLOSED
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_unreadable_dot_git_yields_git_error_not_no_repo(tmp_path):
+    """F5: an undeterminable .git aborts the marker walk. Reporting `no_repo` would be a
+    POSITIVE ASSERTION OF ABSENCE over a state the collector could not read -- the same
+    overclaim-of-absence defect D2 exists to fix.
+
+    CHMOD THE CONTAINING DIR, NOT `.git` ITSELF -- measured during pre-flight, do not
+    "simplify" this back. `_safe_exists` returns ok=False only when `os.stat` RAISES, and
+    stat on `<dir>/.git` needs TRAVERSE on `<dir>`, not READ on `.git`. With `.git` at
+    0o000 inside a 0o755 parent, `Path.exists()` returns True (measured), the walk
+    accepts the marker, and `_git_toplevel` then takes a CLEAN non-zero exit (git prints
+    "fatal: not a git repository", exit 128 -- measured) which this plan maps to
+    `no_repo`. The test would assert git_error and get no_repo -> RED at T9's own gate.
+    Chmodding the CONTAINING dir makes stat raise PermissionError, which is the only
+    state that produces the tri-state abort. Measured with the live helpers:
+      _safe_exists(sub/.git)              -> (False, False)   # ok=False, the abort
+      _resolves_inside_root(sub, root, s) -> True             # containment still passes
+      _physical_key(sub/a.md)             -> resolves fine    # realpath needs no traverse
+    """
+    root = _init_repo(tmp_path / "r", {"rules/a.md": "x"})
+    hidden = root / "sub"
+    hidden.mkdir()
+    (hidden / "a.md").write_text("x")
+    (hidden / ".git").mkdir()
+    files = [hidden / "a.md"]
+    hidden.chmod(0o000)          # the CONTAINING dir -- see the docstring
+    try:
+        idx = _collector.build_git_repo_index(root, files, [])
+        got = _collector._git_age_for_file(root, files[0], idx)
+    finally:
+        hidden.chmod(0o755)
+    assert got == (None, "git_error")
+
+def test_bare_repo_root_is_not_available(tmp_path):
+    """_git_toplevel SUBSUMES the deleted _git_work_tree_available and is stricter.
+    Verified: in a BARE repo --show-toplevel exits 128 while --is-inside-work-tree exits
+    0 printing 'false'."""
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    _git(bare, "init", "-q", "--bare", ".")
+    assert _collector.build_git_repo_index(bare, [], []).available is False
+
+# NOTE (Codex F10, operator decision): a `hasattr` deletion test was DROPPED here by
+# operator decision -- the deletion is verified by code review + the grep in Step 6.
+# Do NOT add `test_git_work_tree_available_is_deleted` or any hasattr/structural test.
+
+def test_gitlinks_come_from_the_index_not_the_filesystem(submodule_tree):
+    """8.6 clause 2 (BINDING): a submodule root is confirmed against the parent index's
+    mode-160000 set, never accepted on filesystem resolution alone -- filesystem
+    resolution is attacker-influenced, the index is not. N2/N3 disqualify the
+    alternatives: this repo has 3 gitlinks but only 1 in .gitmodules, and `git submodule
+    status` EXITS NON-ZERO here."""
+    files = [submodule_tree / "rules" / "own.md"]
+    idx = _collector.build_git_repo_index(submodule_tree, files, [])
+    top = os.path.realpath(submodule_tree)
+    assert "skills/coding-team" in idx.gitlinks_by_toplevel[top]
+
+def test_index_is_o_repo_roots_not_o_files(submodule_tree):
+    """The 114-file live corpus clusters into 40 physical parent dirs but only 3 repo
+    roots. Discovery = 0 walk subprocesses + 3 rev-parse + 3 ls-files = 6."""
+    files = [submodule_tree / "rules" / "own.md",
+             submodule_tree / "rules" / "linked.md",
+             submodule_tree / "skills" / "coding-team" / "rules" / "config-files.md",
+             submodule_tree / "skills" / "aliased" / "rules" / "config-files.md"]
+    idx = _collector.build_git_repo_index(submodule_tree, files, [])
+    assert len(idx.tracked_by_toplevel) == 2      # parent + submodule, not 4
+
+# --- C-f / H1: `git_unavailable` must mean git could not RUN, nothing else. ---
+def test_non_repo_root_records_no_repo_not_git_unavailable(fake_harness):
+    """C-f/H1: conftest.py builds fake_harness with NO `git init`, so it is a non-repo
+    root -- with git installed and working perfectly. An undiscriminated short-circuit
+    would label every file `git_unavailable`, which report-template.md defines as "git
+    could not run at all". That is a MISLEADING reason, the exact class this batch exists
+    to eliminate. A clean non-zero exit means `no_repo`."""
+    idx = _collector.build_git_repo_index(fake_harness, [], [])
+    assert idx.available is False
+    assert idx.root_reason == "no_repo"
+
+def test_absent_git_binary_records_git_unavailable(fake_harness):
+    """The discriminating half of the pair: only an OSError from the _git wrapper (the
+    binary could not be executed) is an honest `git_unavailable`."""
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = ""
+    try:
+        idx = _collector.build_git_repo_index(fake_harness, [], [])
+    finally:
+        os.environ["PATH"] = old
+    assert idx.available is False
+    assert idx.root_reason == "git_unavailable"
+
+def test_build_document_still_emits_staleness_after_rewiring(fake_harness):
+    """Green-gate guard for this task's build_document rewiring: `staleness` keeps its
+    exact shape while its producer changes underneath."""
+    doc = run_collector(fake_harness)
+    assert set(doc["staleness"]) == {"git_age_available", "last_commit_ts"}
+    assert doc["staleness"]["git_age_available"] is False       # fake_harness is not a repo
+    assert isinstance(doc["staleness"]["last_commit_ts"], dict)
