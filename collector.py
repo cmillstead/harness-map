@@ -2100,6 +2100,14 @@ def _git(args: list[str], cwd: Path, timeout: int
     into a published HTML document. Closed-enum reasons only."""
     env = dict(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
+    # Harden-audit fix (T8 round 2): these four vars silently redirect git away from
+    # `cwd` to a different repo/index/object store -- inherited from the invoking
+    # process they would produce plausible-but-wrong timestamps for the WRONG repo,
+    # the exact defect class this batch eliminates. cwd= is the single source of
+    # repo-targeting truth for this wrapper.
+    for redirect_var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                        "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        env.pop(redirect_var, None)
     try:
         return subprocess.run(
             ["git", "--literal-pathspecs", *args],

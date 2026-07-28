@@ -3520,3 +3520,26 @@ def test_git_wrapper_reports_git_error_when_binary_absent(tmp_path):
 def test_decode_git_round_trips_non_utf8_bytes():
     raw = b"rules/caf\xe9.md"
     assert _collector._decode_git(raw).encode("utf-8", "surrogateescape") == raw
+
+
+# T8 audit round 2 (harden): an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/
+# GIT_ALTERNATE_OBJECT_DIRECTORIES must not silently redirect the wrapper away from
+# `cwd` -- that would produce plausible-but-wrong data for the WRONG repo, the exact
+# defect class this batch eliminates.
+def test_git_wrapper_ignores_inherited_git_dir_redirect(tmp_path):
+    """Without the env pop, this log answers from repo B (ts 1800000000) while claiming
+    to describe repo A (ts 1700000000) -- cwd is the single source of repo-targeting
+    truth for this wrapper."""
+    repo_a = _init_repo(tmp_path / "a", {"a.md": "x"}, ts=1700000000)
+    repo_b = _init_repo(tmp_path / "b", {"b.md": "y"}, ts=1800000000)
+    old = os.environ.get("GIT_DIR")
+    os.environ["GIT_DIR"] = str(repo_b / ".git")
+    try:
+        proc, err = _collector._git(["log", "-1", "--format=%ct"], repo_a, 2)
+    finally:
+        if old is None:
+            os.environ.pop("GIT_DIR", None)
+        else:
+            os.environ["GIT_DIR"] = old
+    assert err is None and proc is not None
+    assert proc.stdout.strip() == b"1700000000"   # repo A's commit, not repo B's
