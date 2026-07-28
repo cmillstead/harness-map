@@ -2837,6 +2837,172 @@ def test_sparkline_dates_and_values_are_escaped(tmp_path):
     assert text.count('class="sparkline"') == len(rh.HEADLINE_KEYS) - 1
 
 
+# ======================================= pre-flight exit gate: trend-series eligibility
+def _crash_envelope_doc(root="/fake/root"):
+    """The EXACT artifact `collector.main()` writes to `--out` when `build_document`
+    raises: `_empty_document`'s all-zero headline plus the crash marker in `errors[]`.
+    Built by calling the collector's OWN producer so the fixture cannot drift from it."""
+    from test_collector import _collector
+    doc = _collector._empty_document(Path(root))
+    doc["errors"].append(f"{_collector._CRASH_ERROR_PREFIX}RuntimeError('boom')")
+    return doc
+
+
+def test_crash_marker_prefix_matches_the_collector_producer():
+    """The renderer's eligibility test is a string contract with a DIFFERENT module.
+    Pin both ends: if the collector ever rewords its crash marker, this fails here
+    rather than silently re-admitting crash envelopes to the trend series."""
+    from test_collector import _collector
+    assert rh.CRASH_ERROR_PREFIX == _collector._CRASH_ERROR_PREFIX
+    doc = _crash_envelope_doc()
+    assert any(e.startswith(rh.CRASH_ERROR_PREFIX) for e in doc["errors"])
+    assert all(value == 0 for value in doc["headline"].values())
+
+
+def test_trend_excludes_a_crashed_collector_run(tmp_path):
+    """A crash envelope carries eight headline ZEROS that were never measured. Joined to
+    the series as the LATEST point they read as a collapse to zero, and for every
+    polarity=="up" metric that renders a GREEN "improving" delta -- the reassuring-
+    direction inflation the A17 guard exists to stop, arriving through a value
+    `finite_number` happily accepts. Pre-fix this returned ('▼ 250', 'good')."""
+    out_dir = tmp_path / "crashtrend"
+    out_dir.mkdir()
+    good_first = _minimal_doc(tokens_a=100, tokens_b=50)     # 150
+    good_second = _minimal_doc(tokens_a=200, tokens_b=50)    # 250
+    _write_sidecar(out_dir, "2026-07-13", good_first)
+    _write_sidecar(out_dir, "2026-07-14", good_second)
+    _write_sidecar(out_dir, "2026-07-15", _crash_envelope_doc())
+    model = rh.build_trend_model([("2026-07-13", good_first), ("2026-07-14", good_second),
+                                  ("2026-07-15", _crash_envelope_doc())])
+    assert model["dates"] == ["2026-07-13", "2026-07-14"]
+    tokens = next(s for s in model["series"] if s["key"] == "always_loaded_tokens_est")
+    assert tokens["values"] == [150, 250]
+    assert rh._trend_delta(model, "always_loaded_tokens_est") == ("▲ 100", "bad")
+
+
+def test_render_omits_a_crashed_run_from_the_trend_table(tmp_path):
+    """End to end through the real CLI: the crash envelope passes `load_sidecar`
+    (dict + schema_version) and matches `root`, so it reached `dated_docs` and got a
+    column of measured-looking zeros in the operator's trend table."""
+    out_dir = tmp_path / "crashrender"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-13", _minimal_doc(tokens_a=100, tokens_b=50))
+    _write_sidecar(out_dir, "2026-07-14", _minimal_doc(tokens_a=200, tokens_b=50))
+    _write_sidecar(out_dir, "2026-07-15", _crash_envelope_doc())
+    proc = run_render(out_dir, "--date", "2026-07-14", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-14.html").read_text(encoding="utf-8")
+    m = re.search(r'<th>Metric</th>(.*?)</tr>', text, re.S)
+    assert m is not None
+    assert "2026-07-13" in m.group(1) and "2026-07-14" in m.group(1)
+    assert "2026-07-15" not in m.group(1)
+
+
+def test_trend_keeps_a_run_whose_errors_are_benign(tmp_path):
+    """The eligibility rule is CRASH-MARKER-ONLY, deliberately. `errors[]` also carries
+    benign per-surface warnings (a failed glob, an unparseable settings.json) emitted by
+    runs that measured everything else fine -- disqualifying those would silently drop
+    most real runs from the series."""
+    warned = _minimal_doc(tokens_a=200, tokens_b=50)
+    warned["errors"] = ["rules glob failed for /x: [Errno 13] Permission denied"]
+    model = rh.build_trend_model([("2026-07-14", _minimal_doc(tokens_a=100, tokens_b=50)),
+                                  ("2026-07-15", warned)])
+    assert model["dates"] == ["2026-07-14", "2026-07-15"]
+    assert rh._trend_delta(model, "always_loaded_tokens_est") == ("▲ 100", "bad")
+
+
+def test_trend_drops_a_missing_headline_key_instead_of_zeroing_it(tmp_path):
+    """A MISSING headline key means "not measured", never 0. A fabricated zero is a
+    measurement the collector never made, and it drives both the sparkline geometry
+    and the delta verdict."""
+    partial = _minimal_doc(tokens_a=200, tokens_b=50)
+    partial["headline"].pop("duplicate_pair_count")
+    model = rh.build_trend_model([("2026-07-13", _minimal_doc(tokens_a=100, tokens_b=50)),
+                                  ("2026-07-14", partial),
+                                  ("2026-07-15", _minimal_doc(tokens_a=300, tokens_b=50))])
+    dup = next(s for s in model["series"] if s["key"] == "duplicate_pair_count")
+    assert model["dates"] == ["2026-07-13", "2026-07-14", "2026-07-15"]
+    assert dup["values"] == [1, None, 1]      # aligned with dates, hole preserved
+    assert dup["points"] == [1, 1]            # measured points only
+    assert rh._trend_delta(model, "duplicate_pair_count") == ("= 0", "neutral")
+    tokens = next(s for s in model["series"] if s["key"] == "always_loaded_tokens_est")
+    assert tokens["points"] == [150, 250, 350]
+
+
+def test_trend_table_renders_a_missing_point_as_not_measured(tmp_path):
+    """The operator-facing half: the dropped point must read as absent, never as 0."""
+    out_dir = tmp_path / "missingkey"
+    out_dir.mkdir()
+    partial = _minimal_doc(tokens_a=200, tokens_b=50)
+    partial["headline"].pop("duplicate_pair_count")
+    _write_sidecar(out_dir, "2026-07-13", _minimal_doc(tokens_a=100, tokens_b=50))
+    _write_sidecar(out_dir, "2026-07-14", partial)
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc(tokens_a=300, tokens_b=50))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    m = re.search(r'<tr><td>Duplicate pairs</td>(.*?)</tr>', text, re.S)
+    assert m is not None
+    assert rh.TREND_NOT_MEASURED_TEXT in m.group(1)
+
+
+def test_sparkline_gate_counts_measured_points_not_sidecar_count(tmp_path):
+    """SPARKLINE_MIN_POINTS is a floor on REAL points. With three sidecars but only two
+    measurements of one metric, that metric's sparkline must not render -- drawing a
+    two-point line under a >=3 gate would smuggle the dropped point back as geometry."""
+    out_dir = tmp_path / "sparkgate"
+    out_dir.mkdir()
+    partial = _minimal_doc(tokens_a=200, tokens_b=50)
+    partial["headline"].pop("duplicate_pair_count")
+    _write_sidecar(out_dir, "2026-07-13", _minimal_doc(tokens_a=100, tokens_b=50))
+    _write_sidecar(out_dir, "2026-07-14", partial)
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc(tokens_a=300, tokens_b=50))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert text.count('class="sparkline"') == len(rh.HEADLINE_KEYS) - 1
+    assert 'id="spark-duplicate_pair_count"' not in text
+
+
+# ===================================== pre-flight exit gate: one `resolved` policy
+def test_phantom_label_and_guidance_agree_on_a_hostile_resolved_value():
+    """`_resolved_label` is identity-based (True/False/anything-else); `_phantom_guidance`
+    branched on TRUTHINESS. For a non-bool truthy value out of an untrusted sidecar the
+    Resolved column printed "unverifiable" while the guidance printed "Resolved at
+    collection time -- no action needed": two contradictory statements about one row."""
+    provenance = "Resolved at collection time — listed for provenance; no action needed."
+    for hostile in ("probably", 1, [1], {"a": 1}, 0.5):
+        assert rh._resolved_label(hostile) == "unverifiable", hostile
+        assert rh._phantom_guidance("path", hostile) != provenance, hostile
+        assert rh._phantom_guidance("slash_command", hostile) == \
+            rh._PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE, hostile
+    # the three in-contract states keep their existing meanings
+    assert rh._resolved_label(True) == "yes"
+    assert rh._phantom_guidance("path", True) == provenance
+    assert rh._resolved_label(False) == "no"
+    assert rh._phantom_guidance("path", False) == rh._PHANTOM_GUIDANCE["path"]
+    assert rh._resolved_label(None) == "unverifiable"
+    assert rh._phantom_guidance("slash_command", None) == rh._PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
+
+
+def test_render_row_never_pairs_unverifiable_with_no_action_needed(tmp_path):
+    """The same disagreement observed where the operator sees it: one table row."""
+    doc = _minimal_doc()
+    doc["phantom_refs"] = [{"source": "rules/a.md", "ref": "ghost.md", "kind": "path",
+                            "resolved": "probably", "evidence": "VERIFIED"}]
+    out_dir = tmp_path / "hostileresolved"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    m = re.search(r'<tr><td>rules/a\.md</td><td>ghost\.md</td>(.*?)</tr>', text, re.S)
+    assert m is not None
+    row = m.group(1)
+    assert "unverifiable" in row
+    assert "no action needed" not in row
+
+
 def test_data_goto_cross_view_nav_removed_after_tab_merge():
     """Task B-t2 tab merge: `data-goto` only ever existed to drive the Overview
     mini-grid's "jump to Coverage tab" click — dropping the mini-grid (folded into

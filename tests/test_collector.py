@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -561,6 +562,75 @@ def test_unread_env_flag_is_phantom_candidate(fake_harness):
     (fake_harness / "rules" / "a.md").write_text("Bypass with `WRITE_GUARD_ALLOW_NOWHERE=1`.")
     doc = run_collector(fake_harness)
     assert "WRITE_GUARD_ALLOW_NOWHERE" in {r["ref"] for r in doc["phantom_refs"] if r["kind"] == "env_flag"}
+
+# Pre-flight exit gate, finding 3: the hooks body corpus is the NEGATIVE evidence for
+# env-flag phantom refs (`name not in hooks_corpus`), and it silently dropped a hook it
+# could not read -- no inaccessible row, no blind spot. One unreadable hook therefore
+# made LIVE flags look unreferenced and emitted them as resolved=False, which the
+# renderer counts as CONFIRMED and bands BROKEN. A permission glitch producing a
+# confident "broken reference" verdict is the exact "inaccessible != clean" invariant
+# this batch closed for instruction files (T6) while missing this corpus.
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_unreadable_hook_cannot_manufacture_a_confirmed_phantom_env_flag(fake_harness):
+    """The flag below IS referenced -- by the one hook the collector cannot read."""
+    (fake_harness / "rules" / "a.md").write_text("Bypass with `HARNESS_MAP_ALLOW_LIVE=1`.")
+    hook = fake_harness / "hooks" / "guard.py"
+    hook.write_text('import os\nif os.environ.get("HARNESS_MAP_ALLOW_LIVE"):\n    pass\n')
+    hook.chmod(0o000)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        hook.chmod(0o644)
+    rows = [r for r in doc["phantom_refs"] if r["ref"] == "HARNESS_MAP_ALLOW_LIVE"]
+    assert len(rows) == 1, rows
+    assert rows[0]["resolved"] is None, rows[0]          # never a confident negative
+    assert rows[0]["evidence"] == "INFERRED", rows[0]
+    assert any(e["path"] == "hooks/guard.py" for e in doc["inaccessible"]), doc["inaccessible"]
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_unreadable_hook_downgrades_every_env_flag_row_not_just_its_own(fake_harness):
+    """The corpus is a single concatenated blob: once ANY hook is unreadable the
+    negative evidence is incomplete for EVERY flag, including ones no hook mentions.
+    Confidence is a property of the corpus, not of the individual row."""
+    (fake_harness / "rules" / "a.md").write_text(
+        "Bypass with `WRITE_GUARD_ALLOW_NOWHERE=1` or `HARNESS_MAP_SKIP_OTHER=1`.")
+    hook = fake_harness / "hooks" / "guard.py"
+    hook.write_text("import os\n")
+    hook.chmod(0o000)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        hook.chmod(0o644)
+    env_rows = [r for r in doc["phantom_refs"] if r["kind"] == "env_flag"]
+    assert len(env_rows) == 2, env_rows
+    assert all(r["resolved"] is None and r["evidence"] == "INFERRED" for r in env_rows), env_rows
+
+def test_readable_hooks_corpus_still_confirms_an_unreferenced_env_flag(fake_harness):
+    """Non-regression: with a COMPLETE corpus the confident negative is preserved. The
+    downgrade is scoped to the unreadable case -- it must not blanket every run."""
+    (fake_harness / "rules" / "a.md").write_text("Bypass with `WRITE_GUARD_ALLOW_NOWHERE=1`.")
+    (fake_harness / "hooks" / "guard.py").write_text("import os\nprint(os.getcwd())\n")
+    doc = run_collector(fake_harness)
+    rows = [r for r in doc["phantom_refs"] if r["ref"] == "WRITE_GUARD_ALLOW_NOWHERE"]
+    assert len(rows) == 1, rows
+    assert rows[0]["resolved"] is False and rows[0]["evidence"] == "INFERRED"
+    assert not doc["inaccessible"], doc["inaccessible"]
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_unlistable_hooks_dir_cannot_manufacture_a_confirmed_phantom_env_flag(fake_harness):
+    """Same defect, larger blast radius: an unreadable hooks DIRECTORY yields an empty
+    corpus, so EVERY env flag in the harness reads as unreferenced at once."""
+    (fake_harness / "rules" / "a.md").write_text("Bypass with `HARNESS_MAP_ALLOW_LIVE=1`.")
+    hooks_dir = fake_harness / "hooks"
+    (hooks_dir / "guard.py").write_text('import os\nos.environ.get("HARNESS_MAP_ALLOW_LIVE")\n')
+    hooks_dir.chmod(0o000)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        hooks_dir.chmod(0o755)
+    rows = [r for r in doc["phantom_refs"] if r["ref"] == "HARNESS_MAP_ALLOW_LIVE"]
+    assert len(rows) == 1 and rows[0]["resolved"] is None, rows
+    assert any(e["path"] == "hooks" for e in doc["inaccessible"]), doc["inaccessible"]
 
 # S2.M4: retired slash-command detection (phantom_refs kind=slash_command; SPEC_4 §2).
 def test_retired_ref_flags_missing_slash_command(fake_harness):
@@ -3687,6 +3757,160 @@ def test_git_wrapper_ignores_inherited_git_dir_redirect(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight exit gate, finding 1: the T8 round-2 strip covered FOUR vars, which is
+# not the class. git also takes CONFIG from the environment (GIT_CONFIG_COUNT +
+# GIT_CONFIG_KEY_<n>/VALUE_<n>, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL/SYSTEM) and
+# three further repo-redirect vars (GIT_OBJECT_DIRECTORY, GIT_CEILING_DIRECTORIES,
+# GIT_COMMON_DIR, GIT_NAMESPACE).
+#
+# MEASURED on git 2.50.1 while writing these, and recorded because it corrects the
+# finding's stated mechanism: command-line `-c` OUTRANKS every environment config form
+# (`GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=ENVWINS git -c user.name=CLIWINS
+# config user.name` prints CLIWINS; the same holds for GIT_CONFIG_PARAMETERS), so the
+# five keys _GIT_SAFE_CONFIG pins were never reinstatable from the environment. What
+# WAS open: (a) every config key _GIT_SAFE_CONFIG does not pin -- including the
+# command-valued ones a later subcommand would execute, which is exactly the "defense
+# in depth for subcommands added to this wrapper later" _GIT_SAFE_CONFIG claims; and
+# (b) the redirect vars, which produce wrong output TODAY (the two tests below).
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _env_overrides(**pairs):
+    """Set REAL environment variables for the duration of the block, then restore them
+    exactly. `_git` reads os.environ, so the test writes os.environ -- no mocks, and the
+    same save/restore shape the PATH- and GIT_DIR-shim tests in this file already use."""
+    saved = {name: os.environ.get(name) for name in pairs}
+    os.environ.update(pairs)
+    try:
+        yield
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
+
+
+def test_git_wrapper_strips_every_repo_redirect_and_config_env_var(tmp_path):
+    """The whole strip set in ONE assertion, observed from inside the child process by a
+    real `git` shim on PATH that dumps the environment it was handed (the shim idiom the
+    timeout/unparseable tests already use -- a real executable, not a mock).
+
+    The indexed forms are the reason this cannot be a fixed list: GIT_CONFIG_KEY_<n> /
+    GIT_CONFIG_VALUE_<n> are unbounded, so the strip must drop every name with those
+    prefixes. GIT_CONFIG_KEY_7 below has no matching COUNT on purpose -- it is still
+    attacker-supplied state the wrapper must not forward."""
+    shim = tmp_path / "bin_env_dump"
+    shim.mkdir()
+    dump = tmp_path / "child_env.txt"
+    # /usr/bin/env by absolute path: PATH is replaced by the shim dir for this call.
+    (shim / "git").write_text(f'#!/bin/sh\n/usr/bin/env > "{dump}"\n')
+    (shim / "git").chmod(0o755)
+    injected = {
+        "GIT_DIR": str(tmp_path / "nowhere/.git"),
+        "GIT_WORK_TREE": str(tmp_path / "nowhere"),
+        "GIT_INDEX_FILE": str(tmp_path / "nowhere/index"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(tmp_path / "nowhere/objects"),
+        "GIT_OBJECT_DIRECTORY": str(tmp_path / "nowhere/objects"),
+        "GIT_COMMON_DIR": str(tmp_path / "nowhere/.git"),
+        "GIT_CEILING_DIRECTORIES": str(tmp_path),
+        "GIT_NAMESPACE": "evil",
+        "GIT_CONFIG": str(tmp_path / "evil.config"),
+        "GIT_CONFIG_GLOBAL": str(tmp_path / "evil.config"),
+        "GIT_CONFIG_SYSTEM": str(tmp_path / "evil.config"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_PARAMETERS": "'core.fsmonitor=/bin/echo'",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": "/bin/echo",
+        "GIT_CONFIG_KEY_1": "core.hooksPath", "GIT_CONFIG_VALUE_1": str(tmp_path),
+        "GIT_CONFIG_KEY_7": "diff.external", "GIT_CONFIG_VALUE_7": "/bin/echo",
+    }
+    with _env_overrides(PATH=str(shim), **injected):
+        proc, err = _collector._git(["rev-parse", "--show-toplevel"], tmp_path, 5)
+    assert err is None and proc is not None
+    child_names = {line.split("=", 1)[0]
+                   for line in dump.read_text().splitlines() if "=" in line}
+    leaked = sorted(name for name in injected if name in child_names)
+    assert leaked == [], f"forwarded to git: {leaked}"
+    # the wrapper's own hardening is still in place alongside the strip
+    assert child_names >= {"PATH", "GIT_OPTIONAL_LOCKS"}
+
+
+def test_git_wrapper_strips_inherited_config_injection(tmp_path):
+    """The injection CHANNEL, proven open end to end: an inherited GIT_CONFIG_COUNT set
+    reached git as real config for every key _GIT_SAFE_CONFIG does not pin. Two indices
+    are injected because the strip must be prefix-based, not a fixed name list."""
+    repo = _init_repo(tmp_path / "cfg_inject", {"a.md": "x"})
+    with _env_overrides(GIT_CONFIG_COUNT="2",
+                        GIT_CONFIG_KEY_0="harnessmap.injected", GIT_CONFIG_VALUE_0="pwned",
+                        GIT_CONFIG_KEY_1="harnessmap.second", GIT_CONFIG_VALUE_1="also"):
+        first, err_first = _collector._git(["config", "--get", "harnessmap.injected"], repo, 5)
+        second, err_second = _collector._git(["config", "--get", "harnessmap.second"], repo, 5)
+    assert err_first is None and first is not None
+    assert first.returncode != 0 and first.stdout.strip() == b""
+    assert err_second is None and second is not None
+    assert second.returncode != 0 and second.stdout.strip() == b""
+
+
+def test_git_wrapper_strips_inherited_config_parameters(tmp_path):
+    """GIT_CONFIG_PARAMETERS is the second environment config channel (git's own
+    internal `-c` transport). Same class, separate name -- stripping only the
+    COUNT/KEY/VALUE trio would leave it wide open."""
+    repo = _init_repo(tmp_path / "cfg_params", {"a.md": "x"})
+    with _env_overrides(GIT_CONFIG_PARAMETERS="'harnessmap.viaparams=pwned'"):
+        proc, err = _collector._git(["config", "--get", "harnessmap.viaparams"], repo, 5)
+    assert err is None and proc is not None
+    assert proc.returncode != 0 and proc.stdout.strip() == b""
+
+
+def test_git_wrapper_env_injected_fsmonitor_never_executes(tmp_path):
+    """The environment twin of test_git_wrapper_neutralizes_command_valued_config.
+
+    Recorded honestly: this one PASSED before the strip, because `-c core.fsmonitor=`
+    outranks GIT_CONFIG_VALUE_<n> (measured, see the block comment above) -- the
+    finding's claim that the environment could reinstate core.fsmonitor and get it
+    executed did not reproduce. It is kept as the second layer's regression pin: if a
+    `-c` entry is ever dropped from _GIT_SAFE_CONFIG, the env strip must still stop the
+    payload."""
+    repo = _init_repo(tmp_path / "env_fsmonitor", {"a.md": "x"})
+    marker = tmp_path / "ENV_CONFIG_PAYLOAD_RAN"
+    payload = tmp_path / "payload.sh"
+    payload.write_text(f'#!/bin/sh\necho ran >> {marker}\nexit 1\n')
+    payload.chmod(0o755)
+    with _env_overrides(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.fsmonitor",
+                        GIT_CONFIG_VALUE_0=f"{payload} fsmonitor"):
+        proc, err = _collector._git(["ls-files", "-s", "-z"], repo,
+                                    _collector._GIT_BATCH_TIMEOUT)
+    assert not marker.exists(), "env-injected core.fsmonitor executed"
+    assert err is None and proc is not None and proc.returncode == 0
+    assert b"a.md" in proc.stdout            # neutralized, but the index still came back
+
+
+def test_git_wrapper_ignores_inherited_ceiling_directories(tmp_path):
+    """GIT_CEILING_DIRECTORIES stops git's upward repo discovery. Inherited, it makes
+    `--show-toplevel` exit 128 from a directory that IS inside a real work tree
+    (measured), and _git_toplevel then reports the definitive negative `no_repo` --
+    a manufactured "this is not a repository" that becomes the staleness null-reason
+    for every file under it. cwd is meant to be the sole source of repo-targeting truth."""
+    repo = _init_repo(tmp_path / "ceiling_repo", {"sub/a.md": "x"})
+    with _env_overrides(GIT_CEILING_DIRECTORIES=os.path.realpath(repo)):
+        top, reason = _collector._git_toplevel(repo / "sub")
+    assert reason is None, f"manufactured a negative: {reason}"
+    assert top == os.path.realpath(repo)
+
+
+def test_git_wrapper_ignores_inherited_object_directory(tmp_path):
+    """GIT_OBJECT_DIRECTORY redirects object lookups. Inherited and pointed anywhere
+    else, `log -1 --format=%ct` fails outright ("fatal: not a git repository",
+    measured) -- every timestamp nulls out with a reason that blames the repository."""
+    repo = _init_repo(tmp_path / "objdir_repo", {"a.md": "x"}, ts=1700000000)
+    with _env_overrides(GIT_OBJECT_DIRECTORY=str(tmp_path / "nowhere_objects")):
+        proc, err = _collector._git(["log", "-1", "--format=%ct"], repo, 5)
+    assert err is None and proc is not None and proc.returncode == 0
+    assert proc.stdout.strip() == b"1700000000"
+
+
+# ---------------------------------------------------------------------------
 # S2 gate fix (D1: R1/N1/N2/N3/#5/S16/S17/F3/F5 + C-f/H1): one-shot git topology
 # ---------------------------------------------------------------------------
 
@@ -4454,3 +4678,67 @@ def test_git_last_commit_ts_reports_unparseable_on_non_integer_stdout(tmp_path):
     finally:
         os.environ["PATH"] = old
     assert ts is None and reason == "unparseable"
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight exit gate, findings 4 and 5: two reads of a git result that assert more
+# than the result supports.
+# ---------------------------------------------------------------------------
+
+def test_git_toplevel_exit_zero_with_empty_stdout_is_git_error_not_no_repo(tmp_path):
+    """Exit 0 with EMPTY stdout is an ANOMALY, not proof that the directory is not a
+    work tree -- and `no_repo` is a definitive negative that becomes the blanket
+    staleness reason for every file under it. The same module refuses this overclaim
+    elsewhere ("unknown index != untracked", "unreadable != absent"). Real git never
+    produces this shape, so a REAL git shim on PATH is the only way to reach the branch
+    (the idiom the timeout/unparseable siblings above already use)."""
+    empty_shim = tmp_path / "bin_empty_stdout"
+    empty_shim.mkdir()
+    (empty_shim / "git").write_text("#!/bin/sh\nexit 0\n")
+    (empty_shim / "git").chmod(0o755)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(empty_shim)
+    try:
+        top, reason = _collector._git_toplevel(tmp_path)
+    finally:
+        os.environ["PATH"] = old
+    assert top is None
+    assert reason == "git_error"
+
+
+def test_git_toplevel_clean_non_zero_exit_is_still_no_repo(tmp_path):
+    """Non-regression twin of the test above: a CLEAN non-zero exit means git ran
+    perfectly and reported that this is not a work tree. That reading is correct and
+    must survive -- the fix narrows to the exit-0-but-empty case only."""
+    reject_shim = tmp_path / "bin_reject"
+    reject_shim.mkdir()
+    (reject_shim / "git").write_text("#!/bin/sh\nexit 128\n")
+    (reject_shim / "git").chmod(0o755)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(reject_shim)
+    try:
+        top, reason = _collector._git_toplevel(tmp_path)
+    finally:
+        os.environ["PATH"] = old
+    assert top is None
+    assert reason == "no_repo"
+
+
+def test_git_index_path_containing_a_tab_is_not_truncated(tmp_path):
+    """`ls-files -s -z` emits `<mode> <sha> <stage>\\t<path>`, and the PATH may itself
+    contain tabs (a legal filename byte, verified on this filesystem by this fixture).
+
+    Recorded honestly: this passed BEFORE the pre-flight round too. The finding read
+    `chunk.partition(b"\\t")` as taking only the text up to the first tab; measured,
+    `bytes.partition` splits on the first tab ONLY and returns the ENTIRE remainder
+    (b'100644 <sha> 0\\ta\\tb.md' -> path b'a\\tb.md'), which is precisely the required
+    parse. Kept as the regression pin the finding was asking for: a `split(b"\\t")`
+    "cleanup" here would truncate the key, and the file would later read as
+    `untracked` -- a wrong reason, silently."""
+    name = "a\tb.md"
+    repo = _init_repo(tmp_path / "tab_path_repo", {name: "x"})
+    result = _collector._git_tracked_and_gitlinks(repo)
+    assert result is not None
+    tracked, gitlinks = result
+    assert name in tracked, sorted(tracked)
+    assert gitlinks == frozenset()

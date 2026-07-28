@@ -583,14 +583,72 @@ def build_bipartite_model(doc: dict[str, Any]) -> dict[str, Any]:
             "orphan_script_count": len(orphan_scripts)}
 
 
+# The collector's crash marker, read at the other end of a cross-module string contract
+# (collector._CRASH_ERROR_PREFIX is the writer; the two are pinned equal by a test).
+CRASH_ERROR_PREFIX = "collector crashed: "
+# What the trend table prints where a series has no measurement. NOT "0" and NOT "" — a
+# blank cell reads as a rendering bug, a zero reads as a measurement nobody made.
+TREND_NOT_MEASURED_TEXT = "—"
+
+
+def _run_was_measured(doc: dict[str, Any]) -> bool:
+    """False for a collector CRASH ENVELOPE — a run that measured nothing.
+
+    `_empty_document` sets all eight headline keys to 0 and `main()` writes that envelope
+    to `--out` as an ordinary dated sidecar, so it passes `load_sidecar` (dict +
+    schema_version) and matches on `root`. Joined to the trend series it contributes
+    eight measured-looking zeros; as the latest point that renders a GREEN "improving"
+    delta for every polarity=="up" metric — a fabricated verdict in the reassuring
+    direction, which is the failure mode the A17 numeric guard exists to prevent.
+
+    CRASH MARKER ONLY, not "errors[] is non-empty". `errors[]` also carries benign
+    per-surface warnings (a failed glob, an unparseable settings.json) from runs that
+    measured everything else correctly; disqualifying those would silently drop most real
+    runs from the series and quietly shrink the operator's history. The crash marker is
+    the one entry that means the document is an envelope rather than a measurement.
+
+    Defensive on shape (the doc is untrusted sidecar JSON): a non-list `errors` is
+    wrapped, and non-string entries are skipped rather than raising."""
+    errors = doc.get("errors") or []
+    entries = errors if isinstance(errors, list) else [errors]
+    return not any(isinstance(entry, str) and entry.startswith(CRASH_ERROR_PREFIX)
+                   for entry in entries)
+
+
 def build_trend_model(dated_docs: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
     """(c) Trend: 8 headline series across ALL loaded sidecars in `--out-dir`
-    (filtered to the SELECTED sidecar's `root`, Codex F13)."""
-    dates = [d for d, _ in dated_docs]
-    series = [{"key": key, "label": label, "polarity": polarity,
-               "values": [doc.get("headline", {}).get(key, 0) for _, doc in dated_docs]}
-              for key, label, polarity in HEADLINE_KEYS]
-    return {"dates": dates, "series": series, "first_run": len(dated_docs) <= 1}
+    (filtered to the SELECTED sidecar's `root`, Codex F13).
+
+    Each series carries TWO lists, and they are not redundant:
+      `values` is aligned 1:1 with `dates` for the per-date table, holding `None` where
+      the key was absent (the renderer prints `TREND_NOT_MEASURED_TEXT` there — the
+      model stays data, the display string stays in the renderer).
+      `points` is the measured subsequence — the ONLY input to sparkline geometry and
+      the delta verdict. A missing headline key means "not measured", so the point is
+      DROPPED rather than defaulted to 0: a sparkline over fewer real points is honest,
+      a zero is a fabricated measurement. Both are built in one pass here, so they
+      cannot disagree.
+
+    A non-numeric but PRESENT value stays in `points` deliberately: it was measured and
+    reported, it is just unusable, and `_coerce_floats`/`finite_number` already reject
+    the whole window for it. Dropping it here instead would silently narrow that
+    all-or-nothing guard into a partial line."""
+    measured = [(date, doc) for date, doc in dated_docs if _run_was_measured(doc)]
+    dates = [date for date, _ in measured]
+    series: list[dict[str, Any]] = []
+    for key, label, polarity in HEADLINE_KEYS:
+        values: list[Any] = []
+        points: list[Any] = []
+        for _date, doc in measured:
+            headline = doc.get("headline")
+            if not isinstance(headline, dict) or key not in headline:
+                values.append(None)
+                continue
+            values.append(headline[key])
+            points.append(headline[key])
+        series.append({"key": key, "label": label, "polarity": polarity,
+                       "values": values, "points": points})
+    return {"dates": dates, "series": series, "first_run": len(measured) <= 1}
 
 
 def build_dupweb_model(doc: dict[str, Any]) -> dict[str, Any]:
@@ -2274,6 +2332,21 @@ def _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate):
     return ""
 
 
+def _series_points(series: dict[str, Any]) -> list[Any]:
+    """The MEASURED points of one trend series — the single accessor every consumer of a
+    series uses (delta verdict, sparkline geometry, the column gate).
+
+    `.get` with a values-derived fallback, not `series["points"]`: this reads a MODEL
+    dict, and the same reader-tolerance the sidecar readers apply holds here — a series
+    built before `points` existed (several tests construct one literally) must degrade,
+    not raise. The fallback drops exactly the unmeasured slots `build_trend_model`
+    already excludes, so both paths yield measurements only."""
+    points = series.get("points")
+    if points is None:
+        return [value for value in series.get("values", []) if value is not None]
+    return list(points)
+
+
 def _trend_delta(trend_model, key):
     """Polarity-aware delta vs the previous sidecar: (text, semantic) tuple where
     `semantic` is one of "good"/"bad"/"neutral", or None on first run / no comparable
@@ -2283,10 +2356,17 @@ def _trend_delta(trend_model, key):
     if trend_model.get("first_run"):
         return None
     series = next((s for s in trend_model["series"] if s["key"] == key), None)
-    if not series or len(series["values"]) < 2:
+    if not series:
         return None
-    cur_f = finite_number(series["values"][-1])
-    prev_f = finite_number(series["values"][-2])
+    # `points`, not `values` (pre-flight exit gate): `values` carries a None wherever the
+    # headline key was absent, and comparing against an unmeasured slot is exactly the
+    # fabricated-verdict class this guard exists to prevent. Two real measurements are
+    # the minimum for a delta; below that there is nothing to compare.
+    points = _series_points(series)
+    if len(points) < 2:
+        return None
+    cur_f = finite_number(points[-1])
+    prev_f = finite_number(points[-2])
     if cur_f is None or prev_f is None:
         # A17 + A19b/S3 (P1): a corrupt/hostile sidecar value is not comparable —
         # degrade to no-delta. Previously a NaN produced ('▼ nan', 'good'): a GREEN
@@ -2490,10 +2570,33 @@ _PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE = (
 )
 
 
+def _resolved_state(resolved):
+    """The ONE derivation of the tri-state `resolved` — True / False / None-meaning-
+    unverifiable — for every consumer that reads it.
+
+    Pre-flight exit gate: `_resolved_label` mapped hostile shapes to "unverifiable" by
+    identity while `_phantom_guidance` branched on TRUTHINESS, so a non-bool truthy value
+    out of an untrusted sidecar made one row say "unverifiable" in the Resolved column and
+    "Resolved at collection time — no action needed" in the guidance beside it. Two
+    policies for one field is how that happens; this is the single policy.
+
+    IDENTITY, never truthiness or a dict lookup: `resolved` arrives straight from sidecar
+    JSON, so it can be any JSON value, and `dict.get` HASHES its key (a `resolved: []`
+    would raise TypeError: unhashable type). Anything that is not literally True or False
+    is a value the collector did not produce, and the honest reading of a value we cannot
+    interpret is the same as the one we could not check: unverifiable."""
+    if resolved is True:
+        return True
+    if resolved is False:
+        return False
+    return None
+
+
 def _phantom_guidance(kind, resolved):
-    if resolved:
+    state = _resolved_state(resolved)
+    if state is True:
         return "Resolved at collection time — listed for provenance; no action needed."
-    if resolved is None and kind == "slash_command":
+    if state is None and kind == "slash_command":
         return _PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
     return _PHANTOM_GUIDANCE.get(kind, _PHANTOM_GUIDANCE_DEFAULT)
 
@@ -2506,11 +2609,11 @@ def _phantom_guidance(kind, resolved):
 # JSON, and `dict.get` HASHES its key, so a corrupt/hostile `resolved: []` or `{}` raises
 # TypeError: unhashable type. The line this replaces (`esc_html(r.get("resolved"))`)
 # accepted anything, so a dict form would ADD a fault path in the one batch whose purpose
-# is removing them.
+# is removing them. Totality now comes from `_resolved_state` — the shared policy — so
+# this function only names the three states; it no longer re-derives them.
 def _resolved_label(resolved):
-    if resolved is None:
-        return "unverifiable"
-    return "yes" if resolved is True else ("no" if resolved is False else "unverifiable")
+    state = _resolved_state(resolved)
+    return {True: "yes", False: "no", None: "unverifiable"}[state]
 
 
 def build_phantom_ref_brief(ref):
@@ -2519,7 +2622,9 @@ def build_phantom_ref_brief(ref):
     source = ref.get("source", "")
     r = ref.get("ref", "")
     kind = ref.get("kind", "")
-    if ref.get("resolved") is None:
+    # Same shared policy as the table row beside it (`_resolved_state`), so the brief and
+    # the Resolved column can never describe one row differently.
+    if _resolved_state(ref.get("resolved")) is None:
         finding = (f"`{source}` points at `{r}` (kind: {kind}), which the collector "
                    f"could not verify — the resolution space extends outside the "
                    f"scanned root.\n\n")
@@ -3013,8 +3118,16 @@ def _sparkline_cell(series: dict[str, Any]) -> str:
     """Sparkline + min/max/current for one headline series, windowed to the last
     `SPARKLINE_WINDOW` points. Returns "" (no crash, no sparkline) when the window
     contains a non-numeric value — the existing per-date table cells still show the
-    raw (escaped) value regardless."""
-    window = series["values"][-SPARKLINE_WINDOW:]
+    raw (escaped) value regardless.
+
+    Pre-flight exit gate: the window is taken from `points` (measured only) and the
+    `SPARKLINE_MIN_POINTS` gate is applied HERE, per series. Sidecar count is no longer a
+    proxy for measurement count — with the gate left upstream, a series with two real
+    points among three sidecars would still be drawn, smuggling the dropped point back in
+    as geometry."""
+    window = _series_points(series)[-SPARKLINE_WINDOW:]
+    if len(window) < SPARKLINE_MIN_POINTS:
+        return ""
     floats = _coerce_floats(window)
     if floats is None or not floats:
         return ""
@@ -3032,14 +3145,19 @@ def _render_trend_body(model):
     if model["first_run"]:
         body = '<p class="empty-state">first run — no baseline</p>'
     else:
-        # ≥3 dated sidecars: prepend a sparkline column ahead of the unchanged
-        # per-date columns (SPEC_4 §3) — below the gate the table renders exactly
-        # as before this milestone.
-        show_sparklines = len(model["dates"]) >= SPARKLINE_MIN_POINTS
+        # ≥3 MEASURED points on at least one series: prepend a sparkline column ahead of
+        # the unchanged per-date columns (SPEC_4 §3) — below the gate the table renders
+        # exactly as before this milestone. Per-series, not per-sidecar (pre-flight exit
+        # gate): a series can now hold fewer points than there are dates, and
+        # `_sparkline_cell` re-applies the same floor to each cell, so a column only
+        # appears when something can actually fill it.
+        show_sparklines = any(len(_series_points(s)) >= SPARKLINE_MIN_POINTS
+                              for s in model["series"])
         rows = "".join(
             f'<tr><td>{esc_html(s["label"])}</td>'
             + (f'<td>{_sparkline_cell(s)}</td>' if show_sparklines else '')
-            + "".join(f'<td>{esc_html(v)}</td>' for v in s["values"]) + '</tr>'
+            + "".join(f'<td>{esc_html(TREND_NOT_MEASURED_TEXT if v is None else v)}</td>'
+                      for v in s["values"]) + '</tr>'
             for s in model["series"])
         spark_header = '<th>Trend</th>' if show_sparklines else ''
         header = "".join(f'<th>{esc_html(d)}</th>' for d in model["dates"])

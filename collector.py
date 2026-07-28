@@ -1967,6 +1967,10 @@ _DUP_GLOBS = ("rules/*.md", "skills/*/rules/*.md", "skills/*/SKILL.md",
               "skills/*/phases/*.md", "agents/*.md", "commands/*.md")  # scan_duplication
 _STALENESS_RULE_GLOBS = ("rules/*.md", "skills/*/rules/*.md")  # _staleness_corpus (+ CLAUDE.md)
 _HOOK_SCRIPT_GLOBS = ("hooks/*.py", "hooks/*.sh")  # mirrors _hook_disk_files / _hooks_body_corpus
+# The same two extensions as _HOOK_SCRIPT_GLOBS, in the form _hooks_body_corpus needs:
+# it lists hooks/ with os.scandir (a glob would swallow an unlistable dir) and filters
+# by suffix itself. Kept adjacent so the pair cannot drift.
+_HOOK_BODY_SUFFIXES = (".py", ".sh")
 _HOOK_TEST_GLOBS = ("hooks/tests/*.py", "skills/*/hooks/tests/*.py")  # mirrors _hook_test_stems
 
 
@@ -2150,6 +2154,41 @@ _GIT_SAFE_CONFIG = [
     "-c", "core.sshCommand=",
 ]
 
+# Harden-audit fix (T8 round 2, EXTENDED by the pre-flight exit gate): every name here
+# either RE-TARGETS git away from `cwd` or INJECTS config from the environment. Both
+# defeat this wrapper's stated invariant that cwd is the single source of repo-targeting
+# truth, and both arrive from the process that invoked the collector.
+#   - redirect class: the original four plus GIT_OBJECT_DIRECTORY and GIT_COMMON_DIR
+#     (same store/dir redirection), GIT_CEILING_DIRECTORIES (truncates `--show-toplevel`
+#     discovery, so a real work tree reports as `no_repo` -- MEASURED) and GIT_NAMESPACE.
+#   - config class: GIT_CONFIG_COUNT + the INDEXED GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n>
+#     pairs (handled by prefix below -- they are unbounded, so no fixed list can cover
+#     them), GIT_CONFIG_PARAMETERS (git's own internal `-c` transport, the same channel
+#     under another name) and GIT_CONFIG/GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM/
+#     GIT_CONFIG_NOSYSTEM, which repoint the config FILE layer at attacker-chosen files.
+#
+# MEASURED on git 2.50.1: command-line `-c` OUTRANKS every environment config form, so
+# the five keys in _GIT_SAFE_CONFIG were never reinstatable this way. What the config
+# class did reach was every OTHER key -- including command-valued ones (filter.*.clean,
+# diff.*.textconv, ...) that _GIT_SAFE_CONFIG does not pin and a subcommand added to this
+# wrapper later would execute. That is the "defense in depth for subcommands added later"
+# _GIT_SAFE_CONFIG already claims, applied to the layer it was missing.
+#
+# STRIPPED, not overridden: pointing GIT_CONFIG_GLOBAL/SYSTEM at /dev/null (or forcing
+# GIT_CONFIG_NOSYSTEM=1) would also discard the OPERATOR's real ~/.gitconfig and
+# /etc/gitconfig -- where `safe.directory` lives. Suppressing those turns repositories
+# the operator has legitimately allow-listed into exit-128 "dubious ownership" failures,
+# i.e. it converts measured timestamps into nulls. Removing the env overrides restores
+# the operator's own config exactly, and the dangerous keys are already outranked by
+# `-c` at a strictly higher precedence layer, so the override buys nothing here.
+_GIT_STRIPPED_ENV_VARS = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES", "GIT_NAMESPACE",
+    "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+)
+_GIT_STRIPPED_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
 
 def _git(args: list[str], cwd: Path, timeout: int
          ) -> tuple[subprocess.CompletedProcess[bytes] | None, str | None]:
@@ -2194,14 +2233,15 @@ def _git(args: list[str], cwd: Path, timeout: int
     index with NO payload run."""
     env = dict(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
-    # Harden-audit fix (T8 round 2): these four vars silently redirect git away from
-    # `cwd` to a different repo/index/object store -- inherited from the invoking
-    # process they would produce plausible-but-wrong timestamps for the WRONG repo,
-    # the exact defect class this batch eliminates. cwd= is the single source of
-    # repo-targeting truth for this wrapper.
-    for redirect_var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
-                        "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
-        env.pop(redirect_var, None)
+    # See _GIT_STRIPPED_ENV_VARS for why each name is in the set. The PREFIX pass is not
+    # a stylistic variant of the name pass: GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> are
+    # indexed and unbounded, so every matching name must be dropped, not a fixed list.
+    # Iterate over a LIST copy -- mutating a dict during iteration raises RuntimeError.
+    for stripped_var in _GIT_STRIPPED_ENV_VARS:
+        env.pop(stripped_var, None)
+    for name in list(env):
+        if name.startswith(_GIT_STRIPPED_ENV_PREFIXES):
+            del env[name]
     try:
         return subprocess.run(
             ["git", *_GIT_SAFE_CONFIG, "--literal-pathspecs", *args],
@@ -2280,14 +2320,23 @@ def _git_toplevel(dir_path: Path) -> tuple[str | None, str | None]:
     reported that this is not a work tree (or is bare): that is `no_repo`. Verified live
     that conftest.py's fake_harness has no `git init`, so EVERY fixture run takes the
     clean-non-zero branch with git fully installed; labelling it `git_unavailable` would
-    tell the operator "git could not run at all" when git ran fine."""
+    tell the operator "git could not run at all" when git ran fine.
+
+    Pre-flight exit gate: exit 0 with EMPTY stdout is an ANOMALY, not evidence. It used
+    to fall through to `no_repo` -- a definitive negative ("this is not a work tree")
+    asserted over a state nobody examined, which then became the blanket staleness reason
+    for every file underneath. Real git never produces that shape, so reaching it means
+    something about the invocation is not what this function assumed; `git_error` is the
+    honest unknown, and it is the same enum value the unknown-index path already uses.
+    The CLEAN non-zero exit above is untouched: that one really is a negative git
+    reported."""
     proc, err = _git(["rev-parse", "--show-toplevel"], dir_path, _GIT_SUBPROCESS_TIMEOUT)
     if proc is None:
         return None, "git_unavailable" if err == "git_error" else "timeout"
     if proc.returncode != 0:
         return None, "no_repo"
     out = _decode_git(proc.stdout).strip()
-    return (out, None) if out else (None, "no_repo")
+    return (out, None) if out else (None, "git_error")
 
 
 def _git_common_dir(dir_path: Path) -> str | None:
@@ -3013,25 +3062,63 @@ def scan_duplication(
     }
 
 
-def _hooks_body_corpus(root):
+def _hooks_body_corpus(root, inaccessible=None):
     """Concatenated hooks/*.py + hooks/*.sh bodies, ORIGINAL case, for literal env-flag
-    grep and the promotion-candidate hook_covered cross-reference.
+    grep and the promotion-candidate hook_covered cross-reference. Returns
+    `(corpus, complete)`.
     Caveat: a hook that reads the flag name from a variable rather than a literal string
     (os.environ[SOME_VAR] indirection) is invisible to this substring check — a
-    false-positive "phantom" env flag is possible. Best-effort only."""
+    false-positive "phantom" env flag is possible. Best-effort only.
+
+    `complete` (pre-flight exit gate) is the second half of that caveat, and the half
+    that was missing: this corpus is the NEGATIVE evidence for env-flag phantom refs
+    (`name not in hooks_corpus`), so a hook that could not be READ made live flags look
+    unreferenced and they were emitted as the confident `resolved: False` the renderer
+    counts as CONFIRMED. `complete=False` means "some hook body is unseen", and
+    check_phantom_refs downgrades every env-flag row to the resolved=null / INFERRED
+    treatment D2 established. Confidence is a property of the CORPUS, not of one row:
+    once any body is unseen, no flag's absence from the blob is provable.
+
+    os.scandir, not Path.glob: glob SWALLOWS a PermissionError on the directory itself
+    and yields nothing, which is indistinguishable from an empty hooks dir — the whole
+    corpus silently becoming "" is the same defect at maximum blast radius. scandir
+    raises, so an unlistable dir is recorded and disclosed like an unreadable file.
+
+    An ABSENT hooks dir is `complete=True`: a harness with no hooks has a known-empty
+    corpus, which is a fact, not a blind spot."""
     parts = []
     hooks_dir = root / "hooks"
-    if hooks_dir.is_dir():
-        for pattern in ("*.py", "*.sh"):
-            try:
-                candidates = sorted(hooks_dir.glob(pattern))
-            except OSError:
-                candidates = []
-            for fp in candidates:
-                text, _ = _read_text(fp)
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
+    present, ok = _safe_exists(hooks_dir)
+    if not ok:
+        if inaccessible is not None:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, hooks_dir))
+        return "", False
+    if not present:
+        return "", True
+    try:
+        with os.scandir(hooks_dir) as entries:
+            names = sorted(entry.name for entry in entries)
+    except OSError:
+        if inaccessible is not None:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, hooks_dir))
+        return "", False
+    complete = True
+    for name in names:
+        if not name.endswith(_HOOK_BODY_SUFFIXES):
+            continue
+        fp = hooks_dir / name
+        text, _status = _read_text(fp)
+        if text is None:
+            # Covers both a genuinely unreadable regular file and a non-file the glob
+            # would have matched (a dir/FIFO named `x.py`). Either way its body is
+            # unseen, and over-reporting an unseen body costs one INFERRED downgrade
+            # while under-reporting one costs a false confirmed verdict.
+            complete = False
+            if inaccessible is not None:
+                _append_inaccessible_once(inaccessible, _rel_safe(root, fp))
+            continue
+        parts.append(text)
+    return "\n".join(parts), complete
 
 
 def _staleness_corpus(root, inaccessible):
@@ -3079,7 +3166,7 @@ def check_phantom_refs(
     cannot see it either way, so it only classifies, never asserts absence."""
     refs: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
-    hooks_corpus = _hooks_body_corpus(root)
+    hooks_corpus, hooks_corpus_complete = _hooks_body_corpus(root, inaccessible)
 
     for rel_path, text in corpus_files:
         for m in _GENERIC_BACKTICK_RE.finditer(text):
@@ -3179,8 +3266,17 @@ def check_phantom_refs(
                     key = (rel_path, name, "env_flag")
                     if key not in seen:
                         seen.add(key)
+                        # Pre-flight exit gate: `resolved: False` here is a CONFIRMED
+                        # negative ("no hook reads this flag"), and the ONLY evidence for
+                        # it is the hooks corpus. When that corpus is incomplete the
+                        # negative is unprovable, so the row takes the resolved=null /
+                        # INFERRED treatment D2 established for slash commands: still
+                        # surfaced for review, never asserted broken, and never counted
+                        # as confirmed by the renderer's BROKEN band. The unseen hook is
+                        # in inaccessible[] alongside it (recorded by _hooks_body_corpus).
                         refs.append({"source": rel_path, "ref": name, "kind": "env_flag",
-                                     "resolved": False, "evidence": "INFERRED"})
+                                     "resolved": False if hooks_corpus_complete else None,
+                                     "evidence": "INFERRED"})
     return refs
 
 
@@ -3226,7 +3322,12 @@ def collect_promotion_candidates(
     it. Advisory SIGNALS only — synthesis proposes extending an EXISTING covered hook
     before creating a new one; this collector never makes that judgment itself."""
     candidates: list[dict[str, Any]] = []
-    hooks_corpus_lower = _hooks_body_corpus(root).lower()
+    # `complete` is unused HERE on purpose: every promotion candidate already ships as
+    # evidence=INFERRED and `hook_covered` is an advisory hint, not a verdict, so there is
+    # no confident negative to downgrade. `inaccessible` is not threaded in either — the
+    # phantom-ref pass records the very same unreadable hooks, and _append_inaccessible_once
+    # dedupes across callers, so passing it would only duplicate that work.
+    hooks_corpus_lower = _hooks_body_corpus(root)[0].lower()
     commands_lower = "\n".join(_iter_hook_commands(settings)).lower()
     combined_lower = hooks_corpus_lower + "\n" + commands_lower
 
@@ -3980,6 +4081,15 @@ def build_document(
     return doc
 
 
+# The marker `main()` writes into the crash envelope's errors[]. A NAMED constant because
+# it is a cross-module contract, not a log line: _empty_document zeroes all eight headline
+# keys, and main() writes that envelope to --out as an ordinary dated sidecar, so the
+# renderer needs a reliable way to tell "this run measured zero" from "this run measured
+# nothing". render_html.CRASH_ERROR_PREFIX is the reading end, pinned equal to this one by
+# test_crash_marker_prefix_matches_the_collector_producer.
+_CRASH_ERROR_PREFIX = "collector crashed: "
+
+
 def _empty_document(root: Path) -> dict[str, Any]:
     """Full schema envelope, every top-level key present and empty (F8) — the crash-path
     fallback so main()'s top-level guard never emits a partial/silent stub. Mirrors
@@ -4063,7 +4173,7 @@ def main(argv: list[str] | None = None) -> int:
         doc = build_document(root, args.project_root, compose=args.compose)
     except Exception as exc:  # noqa: BLE001 — collector must always emit a FULL-key valid envelope
         doc = _empty_document(root)
-        doc["errors"].append(f"collector crashed: {exc!r}")
+        doc["errors"].append(f"{_CRASH_ERROR_PREFIX}{exc!r}")
     # Serialize defensively: a lone UTF-16 surrogate (e.g. surviving json.loads out of a
     # crafted settings.json — Python allows lone surrogates in str) is unencodable as
     # UTF-8 under ensure_ascii=False. Force-detect it HERE (encode, discard the bytes) so
