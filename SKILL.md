@@ -84,7 +84,7 @@ Reference the two-axis grid — verbs (Afford, Inform, Constrain, Verify, Correc
 
 ## Diff vs Previous Run (D7)
 
-Glob `$OUT_DIR/harness-map-*.json` (the same report directory `OUT_DIR` used in Step A), sort by the `YYYY-MM-DD` in the filename, take the most recent sidecar strictly BEFORE today's date. Diff the headline numbers (always-loaded words/tokens, file count, dup-pair count, length-flag count, orphan counts) current-vs-prior. If no prior sidecar exists, state exactly: "First run — no prior map (baseline)."
+Glob `$OUT_DIR/harness-map-*.json` (the same report directory `OUT_DIR` used in Step A), sort by the `YYYY-MM-DD` in the filename, take the most recent sidecar strictly BEFORE today's date that is a MEASURED run — skip any crash-envelope sidecar (same exclusion as the Trend tab below) and continue to the next-most-recent. Diff the headline numbers (always-loaded words/tokens, file count, dup-pair count, length-flag count, orphan counts) current-vs-prior. If no prior sidecar exists, state exactly: "First run — no prior map (baseline)."; if every prior sidecar is a crash envelope, state exactly: "No comparison baseline available — every prior run crashed."
 
 The Trend tab also grows a per-metric sparkline (last 10 points) once that metric's series has 3+ MEASURED points — a crashed collector run contributes none, and a sidecar missing that headline key contributes none to THAT metric, so sidecar count alone is no longer the gate — another reason to keep reusing that one stable `OUT_DIR` across runs.
 
