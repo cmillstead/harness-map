@@ -3364,6 +3364,85 @@ def test_deduped_instruction_files_is_sorted_within_each_glob(fake_harness):
     deterministic order here."""
     for name in ("zz.md", "aa.md", "mm.md"):
         (fake_harness / "rules" / name).write_text("body " * 5)
-    files = _collector._deduped_instruction_files(fake_harness)
+    files = _collector._deduped_instruction_files(fake_harness, [], [])
     rules = [str(p) for p in files if p.parent.name == "rules"]
     assert rules == sorted(rules)
+
+
+# S2 gate fix (Codex #6 / F7): an unreadable instruction file was dropped SILENTLY.
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_unreadable_instruction_file_is_recorded_in_inaccessible(fake_harness):
+    """It was dropped from the corpus entirely: absent from instruction_length_flags,
+    absent from staleness.last_commit_ts, and therefore un-nameable by
+    staleness_null_reasons' enum. 'Why is this file missing?' had no answer."""
+    victim = fake_harness / "rules" / "locked.md"
+    victim.write_text("Rule body " * 10)
+    victim.chmod(0o000)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        victim.chmod(0o644)
+    assert "rules/locked.md" in {e["path"] for e in doc["inaccessible"]}
+    assert "rules/locked.md" not in doc["staleness"]["last_commit_ts"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_unreadable_instruction_file_recorded_exactly_once(fake_harness):
+    """_deduped_instruction_files is called by BOTH flag_long_instructions and
+    build_document's staleness path -- the record must not be duplicated."""
+    victim = fake_harness / "rules" / "locked2.md"
+    victim.write_text("Rule body " * 10)
+    victim.chmod(0o000)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        victim.chmod(0o644)
+    assert [e["path"] for e in doc["inaccessible"]].count("rules/locked2.md") == 1
+
+
+def test_out_of_root_instruction_symlink_bytes_never_reach_output(fake_harness, tmp_path):
+    """Codex R2-F7, full-CLI: recognizable foreign bytes must appear NOWHERE in the
+    emitted document, and the refusal must be disclosed as a blind spot. NOTE (R3-5):
+    this test alone cannot prove containment ran BEFORE the read -- read-then-refuse
+    emits the identical document. The marker assertion is defense-in-depth against the
+    bytes LEAKING; the ORDERING proof is the companion test below."""
+    marker = "XFOREIGNBYTESX" * 40
+    outside = tmp_path / "outside.md"
+    outside.write_text((marker + "\n") * 30)
+    (fake_harness / "rules" / "escape.md").symlink_to(outside)
+    doc = run_collector(fake_harness)
+    assert marker not in json.dumps(doc)                       # bytes NEVER reached output
+    assert any("rules/escape.md" in b for b in doc["blind_spots"])   # and it SAYS SO
+    assert "rules/escape.md" not in {e["path"] for e in doc["inaccessible"]}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_containment_refusal_precedes_the_read(fake_harness, tmp_path):
+    """R3-5 + R4-1: THE ordering discriminator, with real implementations only. The
+    out-of-root target is ALSO unreadable (0o000), so the two orderings diverge:
+      read-first        -> _read_text fails -> 'unreadable' inaccessible entry, and the
+                           containment branch is never reached -> NO blind spot
+      containment-first -> blind spot recorded, _read_text never called -> NO
+                           inaccessible entry
+    (Codex proposed a FIFO in round 3; rejected -- _read_text's is_file() guard returns
+    INACCESSIBLE for a FIFO without ever blocking, so it discriminates nothing.)
+
+    DIRECT CALL, NOT FULL CLI (round-4 finding 1): _staleness_corpus (collector.py:2295)
+    globs the SAME rules/*.md via _STALENESS_RULE_GLOBS (:1961) and reads through
+    _read_checked (:506-512), which appends an 'unreadable' entry to the SAME
+    inaccessible list -- so in a full-CLI run the entry appears REGARDLESS of
+    _deduped_instruction_files' ordering and the not-in-inaccessible assertion is red
+    at T6's own gate. The discriminator only discriminates in isolation."""
+    outside = tmp_path / "locked-outside.md"
+    outside.write_text("foreign\n")
+    outside.chmod(0o000)
+    (fake_harness / "rules" / "escape2.md").symlink_to(outside)
+    inaccessible, blind_spots = [], []
+    try:
+        files = _collector._deduped_instruction_files(
+            fake_harness, inaccessible, blind_spots)
+    finally:
+        outside.chmod(0o644)
+    assert not any(f.name == "escape2.md" for f in files)        # excluded from the corpus
+    assert any("rules/escape2.md" in b for b in blind_spots)     # refused, and it SAYS SO
+    assert inaccessible == []                                    # read-first would record here

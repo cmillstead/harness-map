@@ -504,11 +504,16 @@ def _metrics(text):
 
 
 def _read_checked(root, path, inaccessible, rel_root=None):
-    """Read text; on INACCESSIBLE append to inaccessible[] and return None. Preserves the
-    exact inaccessible-append behavior the call sites previously inlined."""
+    """Read text; on INACCESSIBLE record to inaccessible[] and return None. Preserves the
+    exact inaccessible-append behavior the call sites previously inlined.
+
+    Codex #6 (S2 gate fix): routed through _append_inaccessible_once rather than a bare
+    append — _staleness_corpus (one of this function's callers) globs the SAME rules/*.md
+    files _deduped_instruction_files now also records inaccessible entries for, so an
+    unreadable rule file reached through both paths must be recorded once, not twice."""
     text, evidence = _read_text(path)
     if evidence == "INACCESSIBLE":
-        inaccessible.append({"path": _rel(rel_root or root, path), "reason": "unreadable"})
+        _append_inaccessible_once(inaccessible, _rel(rel_root or root, path))
         return None
     return text
 
@@ -1963,7 +1968,8 @@ _HOOK_SCRIPT_GLOBS = ("hooks/*.py", "hooks/*.sh")  # mirrors _hook_disk_files / 
 _HOOK_TEST_GLOBS = ("hooks/tests/*.py", "skills/*/hooks/tests/*.py")  # mirrors _hook_test_stems
 
 
-def _deduped_instruction_files(root: Path) -> list[Path]:
+def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
+                               blind_spots: list[str]) -> list[Path]:
     """Shared glob-walk + dedup for the instruction-file corpus (S2.M3): the SINGLE
     definition of "the deduped instruction-file set" consumed by BOTH
     flag_long_instructions (line-count flags) and collect_git_age's caller (staleness
@@ -1983,9 +1989,23 @@ def _deduped_instruction_files(root: Path) -> list[Path]:
 
     Filtered to files _read_text can actually read (mirrors flag_long_instructions'
     INACCESSIBLE skip) so an unreadable instruction file is excluded from both the
-    length-flag scan and the git-age signal, consistently."""
+    length-flag scan and the git-age signal, consistently.
+
+    Codex #6 (S2 gate fix): an unreadable instruction file used to be dropped with a bare
+    `continue` -- absent from the length-flag scan, absent from staleness.last_commit_ts,
+    and therefore un-nameable by staleness_null_reasons' closed enum (which only describes
+    keys that EXIST in last_commit_ts). It is now recorded in `inaccessible[]` via
+    _append_inaccessible_once, which dedupes across this function's TWO callers
+    (flag_long_instructions and build_document's staleness path) and against any entry a
+    dispatcher read already produced for the same path. A file whose real path escapes
+    root is refused before the read and recorded as a blind spot instead, matching the
+    hook-script walk's containment gate."""
     seen = set()
     result: list[Path] = []
+    try:
+        root_stat = os.stat(root)
+    except OSError:
+        root_stat = None
     for pattern in _INSTRUCTION_GLOBS:
         # Codex #4 (S2 gate fix): sort BEFORE dedup. root.glob() yields in filesystem
         # order, so both the `seen` winner and the returned order were filesystem
@@ -1996,19 +2016,41 @@ def _deduped_instruction_files(root: Path) -> list[Path]:
             key = _physical_key(fp)
             if key in seen:
                 continue
+            seen.add(key)
+            # Codex R2-F7: containment gate BEFORE the read -- `key` is already the
+            # realpath, so this costs no second resolve. The hook walk 450 lines up
+            # refuses the identical case and SAYS SO; this walk now does both too.
+            try:
+                inside = root_stat is not None and _resolves_inside_root(
+                    Path(key), root, root_stat)
+            except (OSError, RuntimeError):
+                inside = False
+            if not inside:
+                msg = (f"instruction file {_rel_safe(root, fp)} resolves outside "
+                       f"the harness root — not read")
+                if msg not in blind_spots:      # called twice per run (two callers)
+                    blind_spots.append(msg)
+                continue
             text, _evidence = _read_text(fp)
             if text is None:
+                _append_inaccessible_once(inaccessible, _rel_safe(root, fp))
                 continue
-            seen.add(key)
             result.append(fp)
     return result
 
 
-def flag_long_instructions(root: Path) -> list[dict[str, Any]]:
+def flag_long_instructions(root: Path, inaccessible: list[dict[str, Any]],
+                           blind_spots: list[str]) -> list[dict[str, Any]]:
     flags: list[dict[str, Any]] = []
-    for fp in _deduped_instruction_files(root):
+    for fp in _deduped_instruction_files(root, inaccessible, blind_spots):
         text, evidence = _read_text(fp)
         if text is None:
+            # Codex R2-F11: this is the SECOND read of fp this run. _deduped_
+            # instruction_files read it successfully moments ago, so text=None here
+            # means the file's readability CHANGED mid-run -- still a silent-drop
+            # unless recorded. _append_inaccessible_once dedupes against the first
+            # walk's entry, so a file unreadable in BOTH walks appears exactly once.
+            _append_inaccessible_once(inaccessible, _rel_safe(root, fp))
             continue
         n = len(text.splitlines())
         if n > INSTRUCTION_LINE_LIMIT:
@@ -3001,7 +3043,7 @@ def build_document(
     hooks_section = reconcile_hooks(root, settings, inaccessible, blind_spots)
     permissions_section = collect_permissions(settings, settings_parsed_ok)
     config_section = collect_config(root, settings, settings_parsed_ok, blind_spots)
-    instruction_length_flags = flag_long_instructions(root)
+    instruction_length_flags = flag_long_instructions(root, inaccessible, blind_spots)
     duplication_section = scan_duplication(root, blind_spots, project_root=project_root,
                                             compose=compose, out_of_root_refs=out_of_root_refs)
     corpus_files = _staleness_corpus(root, inaccessible)
@@ -3010,7 +3052,8 @@ def build_document(
     # S2.M3: git-age SIGNAL only (never a "stale" verdict) -- same deduped instruction-file
     # set flag_long_instructions reports (_deduped_instruction_files), sorted lexicographically
     # for deterministic output across PYTHONHASHSEED.
-    instruction_rel_paths = sorted(_rel(root, fp) for fp in _deduped_instruction_files(root))
+    instruction_rel_paths = sorted(_rel(root, fp) for fp in
+                                    _deduped_instruction_files(root, inaccessible, blind_spots))
     staleness_section = {
         "git_age_available": _git_work_tree_available(root),
         "last_commit_ts": collect_git_age(root, instruction_rel_paths),
