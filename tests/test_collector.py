@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -635,6 +636,23 @@ def test_bare_slash_command_home_set_is_unchanged(fake_harness):
     (fake_harness / "rules" / "a.md").write_text("Run `/solo` first.")
     doc = run_collector(fake_harness)
     assert not [r for r in doc["phantom_refs"] if r["ref"] == "/solo"]
+
+# S2 gate fix (Codex #11): the A15 inaccessible-home branch, exercised through D2's new
+# namespaced path. Verified mechanic: chmod 0 on a home's PARENT makes _safe_exists return
+# ok=False, so the token is recorded in inaccessible[] and DROPPED -- inaccessible is not
+# retired, and the collector must not claim absence over a directory it cannot read.
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_inaccessible_namespaced_command_home_is_recorded_not_flagged(fake_harness):
+    ns = fake_harness / "commands" / "paul"
+    ns.mkdir(parents=True, exist_ok=True)
+    (fake_harness / "rules" / "a.md").write_text("Run `/paul:apply` next.")
+    ns.chmod(0o000)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        ns.chmod(0o755)
+    assert not [r for r in doc["phantom_refs"] if r["ref"] == "/paul:apply"]
+    assert any(e["path"].startswith("commands/paul") for e in doc["inaccessible"])
 
 def test_retired_ref_multisegment_path_stays_external(fake_harness):
     (fake_harness / "rules" / "a.md").write_text("Use `/usr/bin/python3` for this.")
@@ -4105,6 +4123,10 @@ def test_budget_exhaustion_silences_a_deterministic_suffix(tmp_path):
         os.environ["PATH"] = old
     exhausted = sorted(k for k, v in reasons.items() if v == "budget_exhausted")
     measured = sorted(k for k in (_rel(repo, f) for f in files) if k not in exhausted)
+    # T10 audit (LOW): the suffix property is VACUOUSLY true when either set is empty --
+    # on a loaded machine every file can exhaust on the first check and this would pass
+    # having proven nothing. The precondition makes that case RED instead of green.
+    assert measured and exhausted
     assert all(m < e for m in measured for e in exhausted)   # a true lexicographic suffix
 
 def test_discovery_itself_is_inside_the_budget(tmp_path):
@@ -4129,8 +4151,16 @@ def test_non_root_discovery_is_also_inside_the_budget(submodule_tree):
     """R3-3: the test above is satisfiable by the ROOT's own _load_root exhaustion alone
     -- it cannot notice the non-root branch missing. This one pins the branch that
     round 3 found unspecified: a candidate dir INSIDE a second repo root (the submodule)
-    must get the (None, "budget_exhausted") mapping BEFORE _git_toplevel runs for it,
-    and the file must surface budget_exhausted -- never git_error or no_repo."""
+    gets the (None, "budget_exhausted") mapping, and the file surfaces budget_exhausted --
+    never git_error or no_repo.
+
+    SCOPE, corrected (T10 audit, LOW): both assertions read the RESULTING mapping, so this
+    test pins the OUTCOME, not the position of the guard. A guard placed after
+    _git_toplevel and keyed on `top` would satisfy it identically; the docstring used to
+    claim it proved the guard runs BEFORE _git_toplevel, which it never did. The
+    ordering-sensitive property -- that no further subprocess runs once the deadline has
+    passed -- is pinned by test_gitlink_provenance_probe_is_also_inside_the_budget, which
+    asserts on the invocation log rather than on the mapping alone."""
     files = [submodule_tree / "skills" / "coding-team" / "rules" / "config-files.md"]
     past = time.monotonic() - 1.0
     idx = _collector.build_git_repo_index(submodule_tree, files, [], deadline=past)
@@ -4138,6 +4168,55 @@ def test_non_root_discovery_is_also_inside_the_budget(submodule_tree):
     assert idx.toplevel_by_dir.get(sub_dir) == (None, "budget_exhausted")
     assert _collector._git_age_for_file(submodule_tree, files[0], idx) == (
         None, "budget_exhausted")
+
+def test_gitlink_provenance_probe_is_also_inside_the_budget(submodule_tree, tmp_path):
+    """T10 audit (MEDIUM): the two tests above reach the guard that sits BEFORE
+    _git_toplevel, so neither can notice the SECOND ungated subprocess on the same path --
+    _toplevel_refusal's `rev-parse --git-common-dir`, run for every distinct new gitlink
+    toplevel. It sits between two correctly-gated checkpoints, so K submodule roots spent
+    up to K x 2s beyond the documented ceiling invisibly, falsifying the TOTAL-budget
+    guarantee build_git_repo_index's docstring, the commit message and the D4 tests all
+    assert.
+
+    An ALREADY-past deadline cannot reach this branch (the pre-_git_toplevel guard claims
+    the dir first), so the deadline must expire DURING discovery. A real git shim -- not a
+    mock -- sleeps 1.2s only when invoked inside the submodule work tree and then execs the
+    real binary, so `_git_toplevel` still returns the true toplevel and the gitlink clause
+    still accepts it; only the clock has moved past the deadline by the time the provenance
+    probe would run. The shim also logs every invocation, which is what turns "the mapping
+    is right" into "the subprocess never ran"."""
+    real_git = shutil.which("git")
+    assert real_git, "this test drives a real git binary, never a mock"
+    shim_dir = tmp_path / "gate_shim"
+    shim_dir.mkdir()
+    calls_log = tmp_path / "git_calls.log"
+    (shim_dir / "git").write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\t%s\\n' \"$(pwd -P)\" \"$*\" >> {calls_log}\n"
+        "case \"$(pwd -P)\" in\n"
+        "  */skills/coding-team) /bin/sleep 1.2 ;;\n"
+        "esac\n"
+        f"exec {real_git} \"$@\"\n")
+    (shim_dir / "git").chmod(0o755)
+    files = [submodule_tree / "skills" / "coding-team" / "rules" / "config-files.md"]
+    old_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(shim_dir)
+    try:
+        # 0.8s covers the three fast real-git calls that precede the submodule's own probe
+        # (measured in tens of ms) with ~0.75s of headroom, and expires inside the 1.2s
+        # sleep, which is itself well under the 2s per-call cap.
+        idx = _collector.build_git_repo_index(submodule_tree, files, [],
+                                              deadline=time.monotonic() + 0.8)
+    finally:
+        os.environ["PATH"] = old_path
+    sub_dir = str((submodule_tree / "skills" / "coding-team" / "rules").resolve())
+    assert idx.toplevel_by_dir.get(sub_dir) == (None, "budget_exhausted")
+    invocations = calls_log.read_text().splitlines()
+    assert invocations, "the shim was never used -- PATH substitution failed"
+    assert not [c for c in invocations
+                if "--git-common-dir" in c
+                and c.split("\t")[0].endswith("skills/coding-team")], (
+        "the provenance probe ran past the deadline")
 
 def test_unindexed_parent_dir_is_git_error_not_no_repo(tmp_path):
     """Codex F9: a file whose parent dir was never indexed (the queried list diverged
@@ -4157,6 +4236,54 @@ def test_null_reasons_total_invariant_holds(fake_harness):
     doc = run_collector(fake_harness)
     ts = doc["staleness"]["last_commit_ts"]
     assert set(doc["staleness_null_reasons"]) == {k for k, v in ts.items() if v is None}
+
+def test_null_reasons_invariant_holds_with_a_mixed_outcome_corpus(tmp_path):
+    """T10 audit (MEDIUM): the invariant test above runs on fake_harness, which is not a
+    git work tree, so EVERY value is null -- "a reason is never emitted for a key WITH a
+    timestamp" has no mechanism there by which it could fail, and an implementation that
+    emitted a reason for every key would pass it. This sibling runs the SAME invariant
+    against a real repo holding one tracked-and-committed file (gets a timestamp) and one
+    untracked file (gets a null plus a reason), which is the only shape where the
+    both-directions claim can actually go red."""
+    repo = _init_repo(tmp_path / "mixed_outcomes", {"rules/tracked.md": "Tracked body\n"})
+    (repo / "rules" / "untracked.md").write_text("Untracked body\n")
+    doc = run_collector(repo)
+    ts = doc["staleness"]["last_commit_ts"]
+    reasons = doc["staleness_null_reasons"]
+    assert ts["rules/tracked.md"] == 1700000000        # the half fake_harness cannot reach
+    assert ts["rules/untracked.md"] is None
+    assert reasons["rules/untracked.md"] == "untracked"
+    assert "rules/tracked.md" not in reasons
+    assert set(reasons) == {k for k, v in ts.items() if v is None}
+
+def test_budget_exhaustion_blind_spot_carries_the_probed_count(tmp_path):
+    """T10 audit (MEDIUM): build_document's counted exhaustion disclosure had NO test --
+    a wrong variable in the f-string or an inverted `if` guard turned nothing red.
+
+    ROUTE: a real repo, real git, real build_document -- only `_GIT_TOTAL_BUDGET` is set
+    to zero, restored in `finally`. That module constant is an input to the code under
+    test, not a stand-in for it (no call is intercepted and no return value is faked), and
+    reaching the same state through a sleeping shim would cost more than ten seconds of
+    wall clock per run. A real repo is required, not fake_harness: a non-repo root
+    short-circuits to the blanket `no_repo` reason and never emits budget_exhausted at
+    all."""
+    repo = _init_repo(tmp_path / "exhausted_repo",
+                      {"CLAUDE.md": "# Root\n" + "word " * 20,
+                       "rules/a.md": "Rule A body " * 10,
+                       "rules/b.md": "Rule B body " * 10})
+    original_budget = _collector._GIT_TOTAL_BUDGET
+    _collector._GIT_TOTAL_BUDGET = 0.0
+    try:
+        doc = _collector.build_document(repo, None)
+    finally:
+        _collector._GIT_TOTAL_BUDGET = original_budget
+    exhausted = [k for k, v in doc["staleness_null_reasons"].items()
+                 if v == "budget_exhausted"]
+    assert len(exhausted) >= 2          # a corpus big enough that a wrong count differs
+    spots = [b for b in doc["blind_spots"] if b.startswith("git-age: the 0s total budget")]
+    assert len(spots) == 1
+    assert f"before {len(exhausted)} instruction file(s) were probed" in spots[0]
+    assert "budget_exhausted, which is NOT a measurement" in spots[0]
 
 def test_null_reasons_uses_the_closed_enum_only(fake_harness):
     doc = run_collector(fake_harness)

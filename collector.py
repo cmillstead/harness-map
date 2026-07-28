@@ -2087,11 +2087,14 @@ _GIT_NULL_REASONS = (
 # Total wall budget for the git-age subsystem, with ONE named exemption (Codex F5): the
 # deadline is computed in build_document BEFORE build_git_repo_index and threaded into
 # BOTH discovery and the per-file loop. Covered: every per-root ls-files load, every
-# non-root toplevel discovery, every per-file log. Exempt: the scanned root's OWN
-# availability probe -- a single 2s-bounded rev-parse that defines `available`, which
-# exhaustion must never flip (a budget running out is not evidence the root is not a
-# work tree). Hard ceiling therefore = 2s exempt probe + this budget + one in-flight
-# subprocess timeout (<=5s) ~= 17s, replacing today's UNBOUNDED 230-260s worst case.
+# non-root toplevel discovery (including its provenance probe), every per-file log.
+# Exempt: the scanned root's OWN availability probe, which defines `available` -- a value
+# exhaustion must never flip (a budget running out is not evidence the root is not a work
+# tree). That probe is TWO subprocesses, not one (T10 audit, LOW): `_git_toplevel`, then
+# `_git_common_dir` via _toplevel_refusal, each capped at _GIT_SUBPROCESS_TIMEOUT, so the
+# exempt window is up to 4s. Hard ceiling therefore = 4s exempt probes + this budget + one
+# in-flight subprocess timeout (<=5s) ~= 19s, replacing today's UNBOUNDED 230-260s worst
+# case.
 # 4.5x the measured 2.24s typical; a backstop for a degenerate case (huge-history
 # submodule, network-mounted .git, hung git), not a perf target. DELIBERATELY not tied
 # to --check's <=5s: that budget covers a different, intentionally-thin path.
@@ -2546,6 +2549,15 @@ def build_git_repo_index(root: Path, files: list[Path], blind_spots: list[str],
                 f"the scanned root nor named as a gitlink by an accepted root")
             continue
         if top not in accepted:
+            # T10 audit (MEDIUM): _toplevel_refusal runs a SECOND subprocess of its own
+            # (`rev-parse --git-common-dir`, 2s-capped) for every distinct new gitlink
+            # toplevel. It sat between two gated checkpoints -- the pre-_git_toplevel guard
+            # above and _load_root's own -- so K submodule roots spent up to K x 2s past
+            # the deadline invisibly, falsifying the TOTAL budget this docstring promises.
+            # Same mapping as that guard: an unspent budget is not a containment refusal.
+            if deadline is not None and time.monotonic() >= deadline:
+                toplevel_by_dir[dir_key] = (None, "budget_exhausted")
+                continue
             # PROVENANCE, not just path (T9 harden round 2, HIGH). The gitlink clause
             # above proved only that an accepted parent's index names this PATH; the
             # `.git` sitting there can still belong to someone else's repository. Checked
@@ -2693,6 +2705,17 @@ def collect_git_age_with_reasons(
     """Per-instruction-file git-age SIGNAL (S2.M3; S2-gate hardening R1/N1/#1/#5/#7).
     Never a "stale"/"dead" judgment (binding rule 6).
 
+    APPROVED DEVIATION from the plan (binding rule 3, recorded here because a docstring is
+    where the next reader looks): the plan specified widening `collect_git_age` ITSELF to
+    return the pair. A later hardening round added two assertions that pin that function's
+    dict return by exact equality:
+        test_scanned_root_inside_an_outer_repo_is_refused_and_disclosed
+        test_case_variant_root_still_reports_real_timestamps
+    Binding rule 7 forbids editing an existing assertion -- editing one is a named kill
+    signal. So THIS is the widened function and `collect_git_age` remains a thin
+    timestamps-only view over it, which preserves the property the plan's "no second pass"
+    clause was actually protecting: still exactly one `git log` per file.
+
     Returns (timestamps, null_reasons). Returning the reason map from the SAME call is what
     keeps this at one `git log` per file; a separate collect_git_age_reasons would double
     the cost. Reasons come from the closed _GIT_NULL_REASONS enum -- never git's own text,
@@ -2741,10 +2764,16 @@ def collect_git_age(root: Path, files: list[Path], index: _GitRepoIndex,
     """Timestamps-only VIEW over collect_git_age_with_reasons.
 
     NOT a second pass: it discards the reason map produced by the SAME per-file `git log`,
-    so the cost is identical. Kept because callers that only need the timestamps (and the
-    tests that pin their contract by exact dict equality) should not have to unpack a pair
-    they will not read -- build_document, which publishes staleness_null_reasons, calls the
-    two-map form directly."""
+    so the cost is identical. build_document, which publishes staleness_null_reasons, calls
+    the two-map form directly.
+
+    WHY IT EXISTS, honestly (T10 audit, LOW): it has ZERO production callers. Its only two
+    call sites are the assertions that compare its return to a dict by exact equality --
+    test_scanned_root_inside_an_outer_repo_is_refused_and_disclosed and
+    test_case_variant_root_still_reports_real_timestamps -- and binding rule 7 forbids
+    editing an existing assertion, so this signature must survive. NAMED, not alluded to:
+    without the names a future reader deleting this view has no way to find what breaks.
+    If rule 7 is ever lifted for those two tests, this function goes with them."""
     return collect_git_age_with_reasons(root, files, index, deadline)[0]
 
 
@@ -3706,8 +3735,8 @@ def build_document(
     # ONE _deduped_instruction_files call here feeds BOTH the index build and the age
     # collection (it previously produced only rel-paths): it appends to `inaccessible`/
     # `blind_spots`, so a second call would re-walk the corpus at double the I/O for an
-    # identical result. Sorting moved into collect_git_age, which keys the same
-    # lexicographic order (F11).
+    # identical result. Sorting moved into collect_git_age_with_reasons, which keys the
+    # same lexicographic order (F11).
     instruction_files = _deduped_instruction_files(root, inaccessible, blind_spots)
     # D4/Codex F5: the deadline is computed BEFORE discovery and threaded into BOTH, so
     # the cap is TOTAL for the subsystem rather than per-call.
