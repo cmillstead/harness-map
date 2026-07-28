@@ -105,7 +105,7 @@ def esc_html(value: Any) -> str:
     except (ValueError, RecursionError) as exc:
         # Control 1 (S2 gate fix, S1/S2/S9): str() is NOT total. An int over
         # sys.get_int_max_str_digits() (4300) raises ValueError -- verified:
-        # esc_html(10**5000). A deeply self-nested structure raises RecursionError.
+        # esc_html(10**5000). A deeply nested structure raises RecursionError.
         # esc_html is the single escaping primitive on EVERY value path in this module,
         # so an unguarded str() turns one corrupt sidecar leaf into a whole-page crash.
         # This is STRICTLY BROADER than Codex #3 (_coerce_floats guards one series).

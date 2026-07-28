@@ -4391,3 +4391,16 @@ def test_esc_html_still_escapes_normal_values():
     assert rh.esc_html('<a href="x">&') == "&lt;a href=&quot;x&quot;&gt;&amp;"
     assert rh.esc_html(42) == "42"
     assert rh.esc_html("\ud800") == "\\ud800"   # existing surrogate behavior unchanged
+
+
+def test_esc_html_bounds_deeply_nested_structure_instead_of_crashing():
+    """Harden-audit fix (T1 round 2): the RecursionError branch of the Control 1 guard.
+    The trigger is DEEP, NON-CIRCULAR nesting -- a truly self-referential list prints
+    '[[...]]' via repr's re-entrancy guard and raises nothing."""
+    deep = []
+    for _ in range(100_000):
+        deep = [deep]
+    out = rh.esc_html(deep)
+    assert "unrenderable value" in out
+    assert "RecursionError" in out
+    assert "<" not in out and ">" not in out
