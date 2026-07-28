@@ -1987,7 +1987,12 @@ def _deduped_instruction_files(root: Path) -> list[Path]:
     seen = set()
     result: list[Path] = []
     for pattern in _INSTRUCTION_GLOBS:
-        for fp in root.glob(pattern):
+        # Codex #4 (S2 gate fix): sort BEFORE dedup. root.glob() yields in filesystem
+        # order, so both the `seen` winner and the returned order were filesystem
+        # dependent. D4's budget-exhaustion truncation silences a SUFFIX of this list, so
+        # an unsorted order would make "which files went unmeasured" nondeterministic.
+        # Sorted by the string form, matching build_document's rel-path sort (F11).
+        for fp in sorted(root.glob(pattern), key=str):
             key = _physical_key(fp)
             if key in seen:
                 continue

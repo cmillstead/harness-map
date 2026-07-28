@@ -3355,3 +3355,15 @@ def test_maximal_two_tier_fixture_non_compose_omits_every_compose_only_field(fak
     # the operator-tier "demo"/"demo-agent"/"demo-cmd" collisions are invisible outside
     # compose mode -- only the operator entries exist at all, no shadow/dark concept.
     assert doc["headline"]["always_loaded_file_count"] >= 1
+
+
+def test_deduped_instruction_files_is_sorted_within_each_glob(fake_harness):
+    """Codex #4: root.glob() yields in filesystem order, so `seen`-based dedup picked a
+    filesystem-order-dependent winner AND left the returned list unordered. D4's
+    budget-exhaustion truncation must silence a DETERMINISTIC suffix, which requires a
+    deterministic order here."""
+    for name in ("zz.md", "aa.md", "mm.md"):
+        (fake_harness / "rules" / name).write_text("body " * 5)
+    files = _collector._deduped_instruction_files(fake_harness)
+    rules = [str(p) for p in files if p.parent.name == "rules"]
+    assert rules == sorted(rules)
