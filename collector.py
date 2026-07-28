@@ -2131,8 +2131,9 @@ def _checked_git_reason(reason: str) -> str:
 # tree). That probe is TWO subprocesses, not one (T10 audit, LOW): `_git_toplevel`, then
 # `_git_common_dir` via _toplevel_refusal, each capped at _GIT_SUBPROCESS_TIMEOUT, so the
 # exempt window is up to 4s. Hard ceiling therefore = 4s exempt probes + this budget + one
-# in-flight subprocess timeout (<=5s) ~= 19s, replacing today's UNBOUNDED 230-260s worst
-# case.
+# in-flight subprocess timeout (<=5s) + the submodule provenance probe that can start just
+# before it (`rev-parse --verify`, <=2s -- Codex gate finding 2) ~= 21s, replacing today's
+# UNBOUNDED 230-260s worst case.
 # 4.5x the measured 2.24s typical; a backstop for a degenerate case (huge-history
 # submodule, network-mounted .git, hung git), not a perf target. DELIBERATELY not tied
 # to --check's <=5s: that budget covers a different, intentionally-thin path.
@@ -2328,19 +2329,49 @@ def _git_toplevel(dir_path: Path) -> tuple[str | None, str | None]:
     for every file underneath. Real git never produces that shape, so reaching it means
     something about the invocation is not what this function assumed; `git_error` is the
     honest unknown, and it is the same enum value the unknown-index path already uses.
-    The CLEAN non-zero exit above is untouched: that one really is a negative git
-    reported."""
+    The CLEAN non-zero exit above is untouched only where it really is a negative git
+    reported (Codex gate finding 4, narrowing it further). Git ALSO exits non-zero when it
+    REFUSES to read a repository that is plainly present: dubious ownership
+    (`safe.directory`, realistic on a shared or mounted checkout) and corrupt/unreadable
+    git metadata both land here. Reading those as `no_repo` asserts "this is not a work
+    tree" over a state git declined to determine -- and that reason then becomes the
+    blanket staleness label for every file underneath.
+
+    The discriminator is `--resolve-git-dir`, and it is neither stderr nor a stat:
+      * stderr is forbidden (binding rule 11 -- git's error text carries absolute paths and
+        .gitmodules/.git/config values), and the exit code is 128 for BOTH readings.
+      * a `Path.exists()` probe of `dir_path/".git"` would be a filesystem read of a path
+        `iter_input_paths` deliberately prunes, breaking the standing superset invariant
+        (test_iter_input_paths_is_superset_of_real_build_document_reads) -- `.git` is not a
+        harness input, and a commit must not wake the `--watch` sweep.
+    MEASURED (git 2.50.1): `rev-parse --resolve-git-dir <path>` answers from a cwd that is
+    not a repository at all, so it runs BEFORE repository setup -- which is exactly the
+    phase the ownership refusal happens in. Exit 0 means a valid git dir (or a gitfile
+    pointing at one) is sitting right there while `--show-toplevel` refused it: an
+    UNDETERMINED state, `git_error`. Exit non-zero means git found no usable repository
+    there either, which is the negative `no_repo` really does describe.
+
+    Only ONE extra subprocess, only on the already-failing branch."""
     proc, err = _git(["rev-parse", "--show-toplevel"], dir_path, _GIT_SUBPROCESS_TIMEOUT)
     if proc is None:
         return None, "git_unavailable" if err == "git_error" else "timeout"
     if proc.returncode != 0:
-        return None, "no_repo"
+        marker, marker_err = _git(["rev-parse", "--resolve-git-dir", str(dir_path / ".git")],
+                                  dir_path, _GIT_SUBPROCESS_TIMEOUT)
+        if marker is None:
+            return None, marker_err or "git_error"
+        return None, "git_error" if marker.returncode == 0 else "no_repo"
     out = _decode_git(proc.stdout).strip()
     return (out, None) if out else (None, "git_error")
 
 
-def _git_common_dir(dir_path: Path) -> str | None:
-    """Absolute git-common-dir for the repo at `dir_path`, or None.
+def _git_common_dir(dir_path: Path) -> tuple[str | None, str | None]:
+    """(absolute git-common-dir, None) or (None, closed-enum reason).
+
+    Codex gate finding 4: the reason used to be DISCARDED (a bare `str | None`), and the
+    single caller published every failure -- including a TIMEOUT and an unreadable git
+    directory -- as `outside_root`, a determined "this escaped the harness root" over a
+    state nobody determined. Same discrimination the sibling `_git_toplevel` already does.
 
     Harden-audit fix (T9 round 2, HIGH): the gitlink fence proves a PATH is named as a
     submodule by an accepted parent's index; it cannot prove the `.git` at that path
@@ -2352,39 +2383,158 @@ def _git_common_dir(dir_path: Path) -> str | None:
     reports `.../evil/.git` where an honest one reports a dir under the root.
 
     VERIFIED INERT: this rev-parse form executes no command-valued config."""
-    proc, _err = _git(["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                      dir_path, _GIT_SUBPROCESS_TIMEOUT)
-    if proc is None or proc.returncode != 0:
-        return None
+    proc, err = _git(["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                     dir_path, _GIT_SUBPROCESS_TIMEOUT)
+    if proc is None:
+        return None, err or "git_error"
+    if proc.returncode != 0:
+        return None, "git_error"
     out = _decode_git(proc.stdout).strip()
-    return out or None
+    return (out, None) if out else (None, "git_error")
 
 
-def _toplevel_refusal(top: str, root: Path,
-                      root_stat: os.stat_result | None) -> str | None:
-    """None when the work tree at `top` may be probed, else a phrase saying why not.
+class _GitlinkVoucher(NamedTuple):
+    """What an ALREADY-ACCEPTED parent repository's index says about a candidate submodule
+    toplevel. Every field comes from the parent's own `ls-files -s` output or from the
+    parent's already-validated topology -- never from the candidate, whose filesystem
+    state an attacker who can write in the subtree controls."""
+    parent_top: str
+    parent_common_dir: str | None
+    rel: str
+    sha: str                 # the mode-160000 commit the parent's index RECORDS for `rel`
 
-    BOTH halves are required and neither alone is sufficient (T9 harden round 2): the
-    work-tree PATH must lie inside the harness root (a `git -C` outside it binds to a
-    foreign repository -- S17), AND the git-common-dir must too (a gitfile inside an
-    accepted path can point the SAME path at someone else's repository). The phrase is
-    returned rather than a bare bool because the caller publishes it as a blind spot:
-    a silent refusal is what Finding 4 of the same audit round was about."""
-    if root_stat is None:
-        return "the harness root could not be stat'd, so containment is undecidable"
-    if not _resolves_inside_root(Path(top), root, root_stat):
-        return f"its work tree ({top}) resolves outside the harness root"
-    common_dir = _git_common_dir(Path(top))
-    if common_dir is None:
-        return f"the git directory backing {top} could not be resolved"
-    if not _resolves_inside_root(Path(common_dir), root, root_stat):
-        return (f"the git directory backing {top} ({common_dir}) resolves outside the "
-                f"harness root")
+
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _repo_contains_commit(top: str, sha: str) -> tuple[bool, str | None]:
+    """(contains, None) or (False, closed-enum reason) — does the repository at `top` hold
+    `sha` as a commit object?
+
+    MEASURED (git 2.50.1): `rev-parse --verify --quiet <sha>^{commit}` exits 0 printing the
+    sha when the object is present and exits 1 SILENTLY when it is not, so no stderr is
+    ever read (binding rule 11). It is the same inert rev-parse family `_git`'s docstring
+    records as executing no command-valued config, and it runs BEFORE `ls-files` -- the one
+    call measured to execute `core.fsmonitor` in whatever repo it lands in.
+
+    A malformed sha is refused without a subprocess: it can only come from a divergence
+    between this parser and git's index format, which is an UNKNOWN, and a leading `-`
+    would otherwise be read as an option."""
+    if not _GIT_SHA_RE.fullmatch(sha):
+        return False, "git_error"
+    proc, err = _git(["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"],
+                     Path(top), _GIT_SUBPROCESS_TIMEOUT)
+    if proc is None:
+        return False, err or "git_error"
+    return proc.returncode == 0, None
+
+
+def _gitlink_provenance_refusal(top: str, common_dir: str,
+                                voucher: _GitlinkVoucher) -> tuple[str, str] | None:
+    """None when the git directory at `top` is one the vouching parent accounts for, else
+    (closed-enum reason, phrase).
+
+    Codex gate finding 2 (HIGH). `_toplevel_refusal`'s two containment checks ask only
+    WHERE things sit, and both are satisfied by an attack that never leaves the root:
+    replace an accepted submodule's `.git` with `gitdir: <root>/evil/.git`, and
+    --show-toplevel still reports the gitlinked directory (so the parent's gitlink entry
+    still matches the PATH) while `ls-files`/`git log` bind to a foreign index and
+    history. Reproduced: the file's timestamp came back as the ATTACKER's commit.
+
+    TWO conjunctive tests, neither of them root-containment:
+      (a) ANCHOR. The git dir must live inside the gitlinked path ITSELF (`<top>/.git`,
+          the embedded layout -- measured live: all three of this harness's own submodules
+          carry a real `.git` DIRECTORY) or inside the PARENT's own git dir
+          (`<parent>/.git/modules/...`, the layout `git submodule add` creates -- the
+          submodule_tree fixture). An in-root redirect to an unrelated repository is
+          neither.
+      (b) INDEX PROVENANCE. The repository must contain the exact commit the parent's
+          index RECORDS for that gitlink. This is the only fact the parent's index vouches
+          for; everything else here is filesystem state.
+
+    Residual, stated rather than overclaimed: (b) alone is defeated by an attacker who
+    already holds the genuine submodule's objects and can therefore build a repository
+    containing the vouched commit -- which is why (a) is kept beside it rather than
+    replaced by it."""
+    try:
+        top_stat = os.stat(top)
+    except OSError:
+        return "git_error", f"the gitlinked path {top} could not be stat'd"
+    # (a) -- `_resolves_inside_root` is a generic containment predicate (candidate, container,
+    # container stat); the parameter is named `root` only because that was its first caller.
+    anchored = _resolves_inside_root(Path(common_dir), Path(top), top_stat)
+    if not anchored and voucher.parent_common_dir is not None:
+        try:
+            parent_gitdir_stat = os.stat(voucher.parent_common_dir)
+        except OSError:
+            return "git_error", (f"the git directory of the repository vouching for {top} "
+                                 f"could not be stat'd")
+        anchored = _resolves_inside_root(Path(common_dir),
+                                         Path(voucher.parent_common_dir), parent_gitdir_stat)
+    if not anchored:
+        return "outside_root", (
+            f"the git directory backing {top} ({common_dir}) is neither inside that "
+            f"gitlinked path nor inside the git directory of the repository whose index "
+            f"names it as a submodule")
+    # (b)
+    contains, why = _repo_contains_commit(top, voucher.sha)
+    if why is not None:
+        return why, (f"the repository at {top} could not be checked against the commit "
+                     f"its parent's index records for it")
+    if not contains:
+        return "outside_root", (
+            f"the repository backing {top} does not contain the commit its parent's index "
+            f"records for that submodule, so it is not the one the index vouches for")
     return None
 
 
-def _git_tracked_and_gitlinks(top: Path) -> tuple[frozenset[str], frozenset[str]] | None:
-    """One batched `git ls-files -s -z` per confirmed repo root -> (tracked, gitlinks).
+def _toplevel_refusal(top: str, root: Path, root_stat: os.stat_result | None,
+                      voucher: _GitlinkVoucher | None = None,
+                      common_dir_result: tuple[str | None, str | None] | None = None
+                      ) -> tuple[str, str] | None:
+    """None when the work tree at `top` may be probed, else (closed-enum reason, phrase).
+
+    THREE halves now, and no one of them is sufficient:
+      1. the work-tree PATH must lie inside the harness root (a `git -C` outside it binds
+         to a foreign repository -- S17, T9 harden round 2);
+      2. the git-common-dir must too (a gitfile inside an accepted path can point the SAME
+         path at someone else's repository);
+      3. and, for a candidate accepted via the gitlink clause, that git dir must be one the
+         vouching parent's INDEX accounts for (`_gitlink_provenance_refusal`) -- because 1
+         and 2 are both satisfied by a redirect that stays inside the root (Codex gate
+         finding 2). `voucher=None` (the scanned root's own probe) runs 1 and 2 only:
+         the root is the authority every other toplevel is validated against, so there is
+         no outer index to vouch for it.
+
+    The REASON is returned beside the phrase rather than left to the caller (Codex gate
+    finding 4): every refusal used to be published as `outside_root`, including the ones
+    that mean "could not determine". The phrase is returned rather than a bare bool because
+    the caller publishes it as a blind spot: a silent refusal is what Finding 4 of the T9
+    harden round was about.
+
+    `common_dir_result` lets a caller that already resolved (or is about to reuse) `top`'s
+    git-common-dir pass it in, so the run's subprocess count is unchanged by the provenance
+    fence. Omitted -> resolved here, which is what a direct caller wants."""
+    if root_stat is None:
+        return "git_error", "the harness root could not be stat'd, so containment is undecidable"
+    if not _resolves_inside_root(Path(top), root, root_stat):
+        return "outside_root", f"its work tree ({top}) resolves outside the harness root"
+    if common_dir_result is None:
+        common_dir_result = _git_common_dir(Path(top))
+    common_dir, why = common_dir_result
+    if common_dir is None:
+        return why or "git_error", f"the git directory backing {top} could not be resolved"
+    if not _resolves_inside_root(Path(common_dir), root, root_stat):
+        return "outside_root", (f"the git directory backing {top} ({common_dir}) resolves "
+                                f"outside the harness root")
+    if voucher is not None:
+        return _gitlink_provenance_refusal(top, common_dir, voucher)
+    return None
+
+
+def _git_index_snapshot(top: Path) -> tuple[frozenset[str], dict[str, str]] | None:
+    """One batched `git ls-files -s -z` per confirmed repo root ->
+    (tracked paths, {gitlink path: the mode-160000 commit the index RECORDS}).
 
     NO PATHSPEC is passed: the whole index is cheaper (measured 0.013-0.015s, 3465 paths,
     262,464 bytes, ~577 KB as a Python set -- ~5.9 MB estimated at 10x scale) AND
@@ -2399,12 +2549,19 @@ def _git_tracked_and_gitlinks(top: Path) -> tuple[frozenset[str], frozenset[str]
     S15, restated because it is the reason this is per-ROOT: `git ls-files` does NOT
     descend into submodules -- the parent's index reports only the gitlink (verified). A
     parent-only set would mark 46 submodule files `untracked`, replacing an honest "we
-    don't know" with a specific WRONG answer. That is worse than shipping the blind spot."""
+    don't know" with a specific WRONG answer. That is worse than shipping the blind spot.
+
+    The gitlink SHA is kept, not just the path (Codex gate finding 2): the recorded commit
+    is the ONE thing the parent's index actually vouches for about a submodule, and
+    `_gitlink_provenance_refusal` needs it to tell the vouched repository apart from a
+    foreign one sitting at the same path. `<mode> <sha> <stage>\\t<path>` -- the head is
+    split on ASCII spaces, which cannot appear in the fixed-width mode/sha/stage fields,
+    while the PATH (which may contain spaces AND tabs) stays whole in `raw_path`."""
     proc, _err = _git(["ls-files", "-s", "-z"], top, _GIT_BATCH_TIMEOUT)
     if proc is None or proc.returncode != 0:
         return None
     tracked: set[str] = set()
-    gitlinks: set[str] = set()
+    gitlink_shas: dict[str, str] = {}
     for chunk in proc.stdout.split(b"\0"):
         if not chunk:
             continue
@@ -2414,8 +2571,20 @@ def _git_tracked_and_gitlinks(top: Path) -> tuple[frozenset[str], frozenset[str]
         rel = _decode_git(raw_path)
         tracked.add(rel)
         if head.startswith(b"160000"):
-            gitlinks.add(rel)
-    return frozenset(tracked), frozenset(gitlinks)
+            fields = _decode_git(head).split()
+            gitlink_shas[rel] = fields[1] if len(fields) > 1 else ""
+    return frozenset(tracked), gitlink_shas
+
+
+def _git_tracked_and_gitlinks(top: Path) -> tuple[frozenset[str], frozenset[str]] | None:
+    """The two-SET view of `_git_index_snapshot`, kept as the narrow parse-level surface an
+    existing regression assertion reads (binding rule 7 pins its shape). Production reads
+    the snapshot directly, because it needs the gitlink SHAs the set form cannot carry."""
+    snapshot = _git_index_snapshot(top)
+    if snapshot is None:
+        return None
+    tracked, gitlink_shas = snapshot
+    return tracked, frozenset(gitlink_shas)
 
 
 class _GitRepoIndex(NamedTuple):
@@ -2433,7 +2602,11 @@ class _GitRepoIndex(NamedTuple):
     # One map, not two: a parallel "why" dict could disagree with the toplevel it explains.
     toplevel_by_dir: dict[str, tuple[str | None, str | None]]
     tracked_by_toplevel: dict[str, frozenset[str] | None]   # None == index UNKNOWN
-    gitlinks_by_toplevel: dict[str, frozenset[str]]
+    # {toplevel: {gitlink path: the mode-160000 commit that index records}}. A MAP, not a
+    # set: the recorded commit is the provenance datum _gitlink_provenance_refusal needs,
+    # and holding it beside the path keeps the two from drifting into disagreement. Every
+    # membership read (`rel in ...`) is unchanged by the widening.
+    gitlinks_by_toplevel: dict[str, dict[str, str]]
     # Roots whose per-root load was SKIPPED because the total budget expired during
     # discovery (Codex F5). Distinct from tracked_by_toplevel[top] is None, which means
     # the load RAN and failed -- conflating them would map exhaustion to git_error.
@@ -2442,23 +2615,33 @@ class _GitRepoIndex(NamedTuple):
 
 
 def _accept_via_gitlink(top: str, accepted: set[str],
-                        gitlinks_by_toplevel: dict[str, frozenset[str]]) -> bool:
-    """True when `top` is named as a mode-160000 gitlink by an ALREADY-ACCEPTED root
-    (8.6 clause 2). Candidate dirs are processed shallowest-first, so a nested submodule
-    is reached transitively without recursion ONLY when an instruction file also lives in
-    the intervening (outer) submodule -- a toplevel enters `accepted` when one of its own
-    dirs is processed, not merely by being an ancestor. When corpus files exist only
-    inside the INNER submodule, the outer is never accepted and the inner is refused as
-    `outside_root` (a null, not a wrong number -- the safe direction, but not the
-    transitive reach this docstring used to promise)."""
-    for parent in accepted:
+                        gitlinks_by_toplevel: dict[str, dict[str, str]]
+                        ) -> tuple[str, str, str] | None:
+    """(vouching parent toplevel, index path, recorded commit) when `top` is named as a
+    mode-160000 gitlink by an ALREADY-ACCEPTED root (8.6 clause 2), else None.
+
+    Candidate dirs are processed shallowest-first, so a nested submodule is reached
+    transitively without recursion ONLY when an instruction file also lives in the
+    intervening (outer) submodule -- a toplevel enters `accepted` when one of its own dirs
+    is processed, not merely by being an ancestor. When corpus files exist only inside the
+    INNER submodule, the outer is never accepted and the inner is refused as `outside_root`
+    (a null, not a wrong number -- the safe direction, but not the transitive reach this
+    docstring used to promise).
+
+    Returns the VOUCHER, not a bool (Codex gate finding 2): the caller must know WHICH
+    index vouched and what commit it recorded, because path evidence alone cannot tell the
+    vouched repository from a foreign one planted at the same path. `accepted` is iterated
+    SORTED so the chosen parent -- and therefore every refusal phrase built from it -- is
+    stable across PYTHONHASHSEED (binding rule 9)."""
+    for parent in sorted(accepted):
         try:
             rel = str(Path(top).relative_to(parent))
         except ValueError:
             continue
-        if rel in gitlinks_by_toplevel.get(parent, frozenset()):
-            return True
-    return False
+        sha = gitlinks_by_toplevel.get(parent, {}).get(rel)
+        if sha is not None:
+            return parent, rel, sha
+    return None
 
 
 def build_git_repo_index(root: Path, files: list[Path], blind_spots: list[str],
@@ -2518,7 +2701,8 @@ def build_git_repo_index(root: Path, files: list[Path], blind_spots: list[str],
 
     toplevel_by_dir: dict[str, tuple[str | None, str | None]] = {}
     tracked_by_toplevel: dict[str, frozenset[str] | None] = {}
-    gitlinks_by_toplevel: dict[str, frozenset[str]] = {}
+    gitlinks_by_toplevel: dict[str, dict[str, str]] = {}
+    common_dir_by_toplevel: dict[str, tuple[str | None, str | None]] = {}
 
     exhausted: set[str] = set()
 
@@ -2531,15 +2715,24 @@ def build_git_repo_index(root: Path, files: list[Path], blind_spots: list[str],
             # unknown index) so _git_age_for_file can say "never probed" instead of
             # "probed and failed".
             tracked_by_toplevel[top] = None
-            gitlinks_by_toplevel[top] = frozenset()
+            gitlinks_by_toplevel[top] = {}
             exhausted.add(top)
             return
-        pair = _git_tracked_and_gitlinks(Path(top))
-        if pair is None:
+        snapshot = _git_index_snapshot(Path(top))
+        if snapshot is None:
             tracked_by_toplevel[top] = None
-            gitlinks_by_toplevel[top] = frozenset()
+            gitlinks_by_toplevel[top] = {}
         else:
-            tracked_by_toplevel[top], gitlinks_by_toplevel[top] = pair
+            tracked_by_toplevel[top], gitlinks_by_toplevel[top] = snapshot
+
+    def _common_dir(top: str) -> tuple[str | None, str | None]:
+        """Memoized `_git_common_dir`. A toplevel's own common dir is resolved when IT is
+        checked, and read again as the ANCHOR when it later vouches for a nested submodule
+        (`_gitlink_provenance_refusal`) -- so in the common case, where the scanned root is
+        the only vouching parent, provenance costs ZERO extra subprocesses."""
+        if top not in common_dir_by_toplevel:
+            common_dir_by_toplevel[top] = _git_common_dir(Path(top))
+        return common_dir_by_toplevel[top]
 
     # --- the scanned root itself, first: it is the authority every other root is
     # --- validated against, and it defines `available` (computed exactly ONCE).
@@ -2558,12 +2751,18 @@ def build_git_repo_index(root: Path, files: list[Path], blind_spots: list[str],
             # through the no-marker branch below to it -- so `ls-files` and every `git
             # log` would run with cwd outside the harness root, silently attributing
             # timestamps from a repository the operator never asked about.
-            refusal = _toplevel_refusal(root_top, root, root_stat)
+            refusal = _toplevel_refusal(root_top, root, root_stat,
+                                        common_dir_result=_common_dir(root_top))
             if refusal is not None:
+                reason, phrase = refusal
                 blind_spots.append(
-                    f"git-age: the scanned root's work tree was not probed — {refusal} "
+                    f"git-age: the scanned root's work tree was not probed — {phrase} "
                     f"(a `git -C` there would bind to a foreign repository)")
-                root_top, root_reason = None, "outside_root"
+                # Codex gate finding 4: the refusal's OWN reason, not a blanket
+                # `outside_root` -- "the git dir could not be resolved" is an undetermined
+                # state, and publishing it as a containment verdict asserts a fact about
+                # the operator's harness root that nobody established.
+                root_top, root_reason = None, reason
     available = root_top is not None
     accepted: set[str] = set()
     if root_top is not None:
@@ -2620,18 +2819,18 @@ def build_git_repo_index(root: Path, files: list[Path], blind_spots: list[str],
         if top is None:
             toplevel_by_dir[dir_key] = (None, why or "no_repo")
             continue
-        if top not in accepted and not _accept_via_gitlink(top, accepted,
-                                                           gitlinks_by_toplevel):
-            # A work tree that neither IS the scanned root nor is named as a gitlink by an
-            # already-accepted root. Refuse rather than guess (8.6 clause 2) -- and SAY SO
-            # (T9 harden round 2, LOW): this is the exact case the fence exists to catch,
-            # and it used to leave the operator a bare null with no trace.
-            toplevel_by_dir[dir_key] = (None, "outside_root")
-            blind_spots.append(
-                f"git-age: {dir_key} was not probed — its work tree ({top}) is neither "
-                f"the scanned root nor named as a gitlink by an accepted root")
-            continue
         if top not in accepted:
+            vouched = _accept_via_gitlink(top, accepted, gitlinks_by_toplevel)
+            if vouched is None:
+                # A work tree that neither IS the scanned root nor is named as a gitlink by
+                # an already-accepted root. Refuse rather than guess (8.6 clause 2) -- and
+                # SAY SO (T9 harden round 2, LOW): this is the exact case the fence exists
+                # to catch, and it used to leave the operator a bare null with no trace.
+                toplevel_by_dir[dir_key] = (None, "outside_root")
+                blind_spots.append(
+                    f"git-age: {dir_key} was not probed — its work tree ({top}) is neither "
+                    f"the scanned root nor named as a gitlink by an accepted root")
+                continue
             # T10 audit (MEDIUM): _toplevel_refusal runs a SECOND subprocess of its own
             # (`rev-parse --git-common-dir`, 2s-capped) for every distinct new gitlink
             # toplevel. It sat between two gated checkpoints -- the pre-_git_toplevel guard
@@ -2641,14 +2840,24 @@ def build_git_repo_index(root: Path, files: list[Path], blind_spots: list[str],
             if deadline is not None and time.monotonic() >= deadline:
                 toplevel_by_dir[dir_key] = (None, "budget_exhausted")
                 continue
-            # PROVENANCE, not just path (T9 harden round 2, HIGH). The gitlink clause
-            # above proved only that an accepted parent's index names this PATH; the
-            # `.git` sitting there can still belong to someone else's repository. Checked
-            # BEFORE _load_root, because `ls-files` is the call that would bind to it.
-            refusal = _toplevel_refusal(top, root, root_stat)
+            # PROVENANCE, not just path (T9 harden round 2, HIGH; completed by Codex gate
+            # finding 2). The gitlink clause above proved only that an accepted parent's
+            # index names this PATH; the `.git` sitting there can still belong to someone
+            # else's repository -- and the T9 containment checks alone are all satisfied by
+            # a `gitdir:` redirect that stays INSIDE the root. The voucher carries what the
+            # parent's index actually attests: the recorded commit, plus the parent's own
+            # git dir as the anchor. Checked BEFORE _load_root, because `ls-files` is the
+            # call that would bind to it (and the one measured to execute core.fsmonitor).
+            parent_top, rel, sha = vouched
+            parent_common_dir, _parent_why = _common_dir(parent_top)
+            refusal = _toplevel_refusal(
+                top, root, root_stat,
+                voucher=_GitlinkVoucher(parent_top, parent_common_dir, rel, sha),
+                common_dir_result=_common_dir(top))
             if refusal is not None:
-                toplevel_by_dir[dir_key] = (None, "outside_root")
-                blind_spots.append(f"git-age: {dir_key} was not probed — {refusal}")
+                reason, phrase = refusal
+                toplevel_by_dir[dir_key] = (None, reason)
+                blind_spots.append(f"git-age: {dir_key} was not probed — {phrase}")
                 continue
         _load_root(top)
         accepted.add(top)
@@ -2772,7 +2981,7 @@ def _git_age_for_file(root: Path, fp: Path, index: _GitRepoIndex) -> tuple[int |
     if tracked is None:
         return None, "git_error"          # unknown index != untracked (S15, P1)
     if sub not in tracked:
-        gitlinks = index.gitlinks_by_toplevel.get(top, frozenset())
+        gitlinks = index.gitlinks_by_toplevel.get(top, {})
         if any(sub == g or sub.startswith(g + "/") for g in gitlinks):
             return None, "submodule_unavailable"
         return None, "untracked"

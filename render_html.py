@@ -157,8 +157,27 @@ def finite_number(value: Any) -> float | None:
     return coerced
 
 
+def nonneg_number(value: Any) -> float | None:
+    """`finite_number` narrowed to the NON-NEGATIVE domain — the gate for SIZES and
+    COUNTS (Codex gate finding 5).
+
+    `finite_number` accepts negatives BY DESIGN and must keep doing so: a trend delta is
+    legitimately negative, and an existing assertion pins `-5` as passing. But a negative
+    is nonsensical wherever the value means "how much" or "how many", and there it does
+    real damage in the reassuring direction:
+      * `tokens_est` rows of +10 and -10 in one category sum to zero, so the whole
+        category died at `_tokens_treemap`'s `tokens <= 0` gate WITHOUT entering
+        `unrenderable` — silently deleting the drawable row beside it.
+      * a headline count of -1 satisfies `value <= 0` and paints the green CLEAN /
+        COMPLIANT / LEAN verdict.
+    So the narrowing lives at the call sites where the domain says non-negative, never in
+    `finite_number` itself."""
+    num = finite_number(value)
+    return None if num is None or num < 0 else num
+
+
 def _gated_size(value: Any) -> float:
-    """`finite_number` for treemap `size`/`words`, preserving INTEGER presentation.
+    """`nonneg_number` for treemap `size`/`words`, preserving INTEGER presentation.
 
     NOT a seventh bespoke guard — it delegates to the one gate and only fixes the value's
     display type. `size` is not purely geometry: it is also rendered as TEXT (ladder cell
@@ -167,7 +186,7 @@ def _gated_size(value: Any) -> float:
     caught by test_serve's byte-equality assertions. Unusable values become `0` (int, the
     same integer presentation the accept path gives), which squarify's `size > 0` filter
     drops; they are disclosed via `unrenderable` instead."""
-    num = finite_number(value)
+    num = nonneg_number(value)
     if num is None:
         # T2 spec-review LOW: the rejection path must return an int-presentable
         # value too, same as the accept path below -- a bare 0.0 here survives on a
@@ -259,7 +278,21 @@ def select_current(
     """(date_str, doc, skipped[]) — exact-match only when `date` given (typo is FATAL,
     Codex F8); otherwise the LATEST VALID sidecar, using ITS actual date consistently.
     A corrupt sidecar among several is excluded + listed in `skipped[]`; an explicit
-    `--date` naming a corrupt sidecar is fatal (never silently substitutes)."""
+    `--date` naming a corrupt sidecar is fatal (never silently substitutes).
+
+    VALID here excludes a collector CRASH ENVELOPE (Codex gate finding 1). `_run_was_measured`
+    was applied to the trend series only, so a crash envelope that happened to be the
+    NEWEST file was still SELECTED — and `_empty_document`'s eight fabricated zeros then
+    rendered as LEAN / COMPLIANT / CLEAN with "No hygiene flags": a confident all-clear
+    for a run that measured nothing. That is the identical defect the trend fix closed,
+    left half-applied one function upstream.
+
+    Neither branch degrades SILENTLY, because "inaccessible != clean" is this codebase's
+    core invariant. The fallback branch skips to the next older MEASURED sidecar and
+    publishes the skip in `skipped[]` (rendered in the provenance footer), exactly as it
+    already does for a corrupt file; if nothing measured survives, the error names every
+    skip. The explicit-`--date` branch is FATAL instead of substituting, because F8
+    forbids answering with a date the operator did not ask for."""
     skipped: list[dict[str, Any]] = []
     if date is not None:
         match = next((p for d, p in sidecars if d == date), None)
@@ -268,14 +301,32 @@ def select_current(
         doc, err = load_sidecar(match)
         if err is not None:
             return None, None, skipped, f"sidecar for {date} is corrupt: {err}"
+        # load_sidecar's contract: err is None iff doc is populated.
+        if not _run_was_measured(cast(dict[str, Any], doc)):
+            return None, None, skipped, f"sidecar for {date} is a {CRASH_ENVELOPE_REASON}"
         return date, doc, skipped, None
     for d, p in reversed(sidecars):
         doc, err = _load_sidecar_guarded(p)
         if err is not None:
             skipped.append({"date": d, "reason": err})
             continue
+        if not _run_was_measured(cast(dict[str, Any], doc)):
+            skipped.append({"date": d, "reason": CRASH_ENVELOPE_REASON})
+            continue
         return d, doc, skipped, None
-    return None, None, skipped, "no valid sidecar found"
+    return None, None, skipped, _no_valid_sidecar_message(skipped)
+
+
+def _no_valid_sidecar_message(skipped: list[dict[str, Any]]) -> str:
+    """The fatal message when every candidate was excluded. `skipped[]` is returned but
+    NOT rendered on this path — there is no page to render it into — so the reasons ride
+    the message instead. Without them, a directory holding nothing but crash envelopes
+    reported the same bare line as an empty one, and the operator could not tell "your
+    collector has been crashing" from "you have no data"."""
+    if not skipped:
+        return "no valid sidecar found"
+    detail = "; ".join(f'{s.get("date", "")}: {s.get("reason", "")}' for s in skipped)
+    return f"no valid sidecar found ({detail})"
 
 
 # --------------------------------------------------------------------------- node keys
@@ -439,8 +490,12 @@ def _tokens_treemap(
     # rows that previously never reached f["path"] (their category died at the
     # `tokens <= 0` gate before the per-file loop). load_sidecar does no row validation,
     # so a pathless row must not turn the disclosure feature into a new KeyError.
+    # Codex gate finding 5: `nonneg_number`, not `finite_number`. A NEGATIVE tokens_est
+    # passes the finite gate, contributes negatively to the category sum, and could take
+    # the whole category below the `tokens <= 0` gate below -- deleting drawable rows with
+    # no trace. It has no area either way, so it belongs in this disclosure.
     unrenderable = sorted([(f.get("path") or "(unknown path)") for f in rows
-                           if finite_number(f.get("tokens_est", 0)) is None]
+                           if nonneg_number(f.get("tokens_est", 0)) is None]
                           + [f"(malformed entry: {type(f).__name__})" for f in malformed])
     by_cat: dict[Any, list[dict[str, Any]]] = {}
     for f in rows:
@@ -500,8 +555,10 @@ def _on_demand_treemap(
         squarify). An item with no usable size has no AREA and cannot be drawn, so it is
         DISCLOSED rather than dropped — without this, gating alone would trade the
         str-sum TypeError for exactly the silent deletion S4 names (squarify filters
-        `size > 0`, which is False for NaN)."""
-        if finite_number(raw_size) is None:
+        `size > 0`, which is False for NaN). Codex gate finding 5: the gate is
+        `nonneg_number` — a negative word count has no area either, and would otherwise
+        skew its group's sum silently."""
+        if nonneg_number(raw_size) is None:
             unrenderable.append(path or "(unknown path)")
             return
         items_by_group[group].append({"size": _gated_size(raw_size), "path": path,
@@ -586,9 +643,24 @@ def build_bipartite_model(doc: dict[str, Any]) -> dict[str, Any]:
 # The collector's crash marker, read at the other end of a cross-module string contract
 # (collector._CRASH_ERROR_PREFIX is the writer; the two are pinned equal by a test).
 CRASH_ERROR_PREFIX = "collector crashed: "
-# What the trend table prints where a series has no measurement. NOT "0" and NOT "" — a
-# blank cell reads as a rendering bug, a zero reads as a measurement nobody made.
-TREND_NOT_MEASURED_TEXT = "—"
+# What the page prints where a metric has no measurement. NOT "0" and NOT "" — a blank
+# cell reads as a rendering bug, a zero reads as a measurement nobody made.
+# Codex gate finding 3: ONE constant for every surface. The trend table learned this
+# treatment first; the CURRENT gauge and the Overview digest kept doing `.get(key, 0)`,
+# so a schema-1 sidecar lacking a headline key was honestly unmeasured in the trend and
+# simultaneously `0 / CLEAN` in the gauge — the same contradiction-on-one-page shape as
+# the phantom-gauge bug. Two homes for the string would let them drift apart again.
+NOT_MEASURED_TEXT = "—"
+# The trend table's original name for it, kept because existing assertions read it.
+TREND_NOT_MEASURED_TEXT = NOT_MEASURED_TEXT
+
+# What `skipped[]` records for a sidecar that is a collector CRASH ENVELOPE rather than a
+# measurement (Codex gate finding 1). Shared by the skip path and the fatal message so a
+# reader of either learns the same thing.
+CRASH_ENVELOPE_REASON = (
+    "collector crash envelope — the run measured nothing, so its all-zero headline is "
+    "not a measurement"
+)
 
 
 def _run_was_measured(doc: dict[str, Any]) -> bool:
@@ -740,9 +812,15 @@ def _gauge_band(key, value):
     no severity). First band whose `upper` is None or value <= upper wins. Control 2: a
     non-finite/non-numeric value is NOT silently banded — NaN compares False against
     every `upper` and fell through to the LAST band ('HEAVY','bad'), inventing a severity
-    verdict from corruption."""
+    verdict from corruption.
+
+    Codex gate finding 5: the gate is `nonneg_number`. EVERY key in GAUGE_BANDS is a size
+    or a count, so a negative is corruption of the same class as a NaN — and a strictly
+    more dangerous one, because it lands in the REASSURING direction: `-1 <= 0` painted
+    the green CLEAN / COMPLIANT / LEAN verdict. It gets the same no-verdict neutral a NaN
+    already gets, while the raw value still DISPLAYS, so the operator sees the -1."""
     bands = GAUGE_BANDS.get(key)
-    num = finite_number(value)
+    num = nonneg_number(value)
     if not bands or num is None:
         return ("", "neutral")
     for upper, label, semantic in bands:
@@ -834,8 +912,12 @@ def build_overview_model(
     return {
         "roadmap_gaps": roadmap_gaps,
         "weight_tax": weight_tax,
-        "hygiene": {"over_cap": headline.get("instruction_files_over_200", 0),
-                    "dup_pairs": headline.get("duplicate_pair_count", 0),
+        # Codex gate finding 3: same rule as the header gauge — an absent headline key is
+        # UNMEASURED, not 0. The digest's severity dot reads these through `_gauge_band`,
+        # which gives the non-numeric marker a neutral no-verdict, so an unmeasured metric
+        # can no longer wear a green dot beside a `—` in the trend table.
+        "hygiene": {"over_cap": headline.get("instruction_files_over_200", NOT_MEASURED_TEXT),
+                    "dup_pairs": headline.get("duplicate_pair_count", NOT_MEASURED_TEXT),
                     "phantom_refs": phantom_ref_count},
         # Severity inputs that DIVERGE from the displayed number, keyed by `hygiene` key.
         # A key absent here means displayed value == band value (the normal case).
@@ -2409,7 +2491,13 @@ def _render_instrument_readout(headline, phantom_ref_count, phantom_confirmed_co
     values = {"phantom_ref_count": phantom_ref_count, "friction_total": friction_total_value}
     cards, panels = [], []
     for kind, key, label in GAUGE_SPECS:
-        value = values[key] if kind in ("phantom", "friction") else headline.get(key, 0)
+        # Codex gate finding 3: an ABSENT headline key means "not measured", never 0. The
+        # trend already read it that way, so `.get(key, 0)` here put both readings of the
+        # same metric on one page: `—` in the trend table, `0 / CLEAN` in the gauge.
+        # NOT_MEASURED_TEXT is non-numeric, so `_gauge_band` gives it the same no-verdict
+        # neutral it gives any unusable value — no band is painted at all.
+        value = values[key] if kind in ("phantom", "friction") \
+            else headline.get(key, NOT_MEASURED_TEXT)
         band_value = None
         if key == "phantom_ref_count":
             band_value = phantom_confirmed_count

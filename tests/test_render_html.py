@@ -5016,3 +5016,153 @@ def test_later_pipeline_fault_prints_traceback_to_stderr(tmp_path):
     assert "build_contextweight_model" in proc.stderr   # the frame that actually failed
     assert "fatal: could not render" in proc.stderr     # single-line message unchanged
     assert not (out_dir / "harness-map-2026-07-15.html").exists()   # never into a page
+
+
+# ===================================================================================
+# Codex cross-model gate (final round). Three renderer findings, each a variant of the
+# ONE invariant this dashboard is built on: inaccessible is not clean, and a value
+# nobody measured must never be presented as a measurement.
+# ===================================================================================
+
+def test_crash_envelope_as_newest_sidecar_is_not_selected_as_the_current_run(tmp_path):
+    """Codex gate finding 1 (HIGH). The trend series learned to exclude a crash envelope
+    (`_run_was_measured`), but sidecar SELECTION never did. With the crash envelope as
+    the NEWEST file, `select_current`'s latest-valid fallback picked it and the whole
+    dashboard rendered `_empty_document`'s fabricated zeros as LEAN / COMPLIANT / CLEAN
+    with "no hygiene flags" -- a confident all-clear for a run that measured nothing.
+
+    The pre-existing crash test selects the PRECEDING good date explicitly, so it passed
+    with this fully broken."""
+    out_dir = tmp_path / "crash_newest"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-14", _minimal_doc(tokens_a=200, tokens_b=50))
+    _write_sidecar(out_dir, "2026-07-15", _crash_envelope_doc())
+    proc = run_render(out_dir, "--no-friction")          # no --date: newest wins
+    assert proc.returncode == 0, proc.stderr
+    # the MEASURED run is the one rendered; the crash envelope never becomes a page
+    assert (out_dir / "harness-map-2026-07-14.html").is_file()
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+    text = (out_dir / "harness-map-2026-07-14.html").read_text(encoding="utf-8")
+    # and the skip is DISCLOSED, never silent -- the operator must learn the newest run
+    # exists and why it was passed over
+    assert "2026-07-15" in text
+    assert "crash envelope" in text
+
+
+def test_render_refuses_when_every_sidecar_is_a_crash_envelope(tmp_path):
+    """Codex gate finding 1, the degenerate half: with nothing measured anywhere there is
+    no honest dashboard to draw, so the render is FATAL rather than a fabricated all-clear
+    over `_empty_document`'s zeros. The message names the date and the reason."""
+    out_dir = tmp_path / "crash_only"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _crash_envelope_doc())
+    proc = run_render(out_dir, "--no-friction")
+    assert proc.returncode == 1
+    assert "no valid sidecar found" in proc.stderr
+    assert "crash envelope" in proc.stderr
+    assert "2026-07-15" in proc.stderr
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+
+
+def test_explicit_date_naming_a_crash_envelope_is_fatal_not_a_clean_page(tmp_path):
+    """Codex gate finding 1, explicit-`--date` half. Codex F8 forbids silently
+    substituting another date for one the operator NAMED, so the honest answer here is
+    the same one a corrupt sidecar already gets: fatal, with the reason. What it must
+    never be is a page of zeros banded CLEAN."""
+    out_dir = tmp_path / "crash_named"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-14", _minimal_doc())
+    _write_sidecar(out_dir, "2026-07-15", _crash_envelope_doc())
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 1
+    assert "crash envelope" in proc.stderr
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+    # and NOT silently substituted with the good neighbour
+    assert not (out_dir / "harness-map-2026-07-14.html").exists()
+
+
+def test_missing_headline_key_is_unmeasured_in_the_gauge_not_zero(tmp_path):
+    """Codex gate finding 3 (HIGH). The trend learned that an absent headline key means
+    "not measured"; the CURRENT gauge still did `headline.get(key, 0)`, so ONE page
+    showed the metric as unmeasured in the trend table and simultaneously as `0 / CLEAN`
+    in the gauge -- the same contradiction-on-one-page shape as the phantom-gauge bug."""
+    doc = _minimal_doc()
+    doc["headline"].pop("duplicate_pair_count")
+    out_dir = tmp_path / "missing_headline"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    gauge = re.search(
+        r'<button class="gauge gauge-(\w+)" data-gauge="duplicate_pair_count".*?</button>',
+        text, re.S)
+    assert gauge is not None
+    assert gauge.group(1) == "neutral"                       # no severity verdict at all
+    assert f'<div class="v">{rh.NOT_MEASURED_TEXT}</div>' in gauge.group(0)
+    assert "CLEAN" not in gauge.group(0)
+    assert '<div class="v">0</div>' not in gauge.group(0)
+
+
+def test_missing_headline_key_is_unmeasured_in_the_overview_digest(tmp_path):
+    """Codex gate finding 3, the digest half (`build_overview_model`). Same key, same
+    page, same rule -- a `.get(..., 0)` here reads as a measurement nobody made."""
+    model = rh.build_overview_model(
+        {"civc": {"available": False, "cells": []},
+         "context_weight": {"always": {"cells": []}},
+         "drag": {"available": False, "rows": []}},
+        {"instruction_files_over_200": 2},        # duplicate_pair_count ABSENT
+        0, 0, phantom_confirmed_count=0)
+    assert model["hygiene"]["dup_pairs"] == rh.NOT_MEASURED_TEXT
+    assert model["hygiene"]["over_cap"] == 2      # present keys are untouched
+    html = rh._render_overview_digest(model)
+    assert f"Duplicate pairs: {rh.NOT_MEASURED_TEXT}" in html
+    assert "Duplicate pairs: 0" not in html
+    # an unmeasured metric carries NO severity dot verdict
+    dup_li = re.search(r'<li><span class="sev-dot sev-(\w+)"[^>]*></span>Duplicate pairs:',
+                       html)
+    assert dup_li is not None and dup_li.group(1) == "neutral"
+
+
+def test_negative_size_is_disclosed_not_silently_dropped():
+    """Codex gate finding 5 (MEDIUM). `finite_number(-5)` passes BY DESIGN (deltas are
+    legitimately negative), so `tokens_est` rows of +10 and -10 in one category summed to
+    zero and the whole category was dropped by the `tokens <= 0` gate WITHOUT entering
+    `unrenderable` -- a silent suppression of the drawable row beside it."""
+    files = [{"path": "good.md", "category": "claude_md", "tokens_est": 10, "words": 5},
+             {"path": "bad.md", "category": "claude_md", "tokens_est": -10, "words": 5}]
+    model = rh._tokens_treemap(files)
+    assert "bad.md" in model["unrenderable"]
+    assert any(c["path"] == "good.md" for c in model["cells"])   # not silently suppressed
+    assert all(c["path"] != "bad.md" for c in model["cells"])
+
+
+def test_negative_on_demand_size_is_disclosed():
+    """Same domain rule on the on-demand treemap: a negative word count has no area."""
+    doc = {"on_demand": {"skills": [{"name": "neg", "words": -7, "tier": "operator"}],
+                         "skill_internal_bodies": [], "memory_bodies": []}}
+    model = rh._on_demand_treemap(doc)
+    assert "neg" in model["unrenderable"]
+
+
+def test_negative_headline_count_does_not_band_clean():
+    """Codex gate finding 5, the banding half: a headline count of -1 satisfied
+    `value <= 0` and painted the reassuring green CLEAN/COMPLIANT/LEAN verdict. Counts
+    and sizes have no negative domain, so the honest answer is the SAME no-verdict
+    neutral a NaN already gets."""
+    assert rh._gauge_band("duplicate_pair_count", -1) == ("", "neutral")
+    assert rh._gauge_band("instruction_files_over_200", -1) == ("", "neutral")
+    assert rh._gauge_band("always_loaded_tokens_est", -5) == ("", "neutral")
+    assert rh._gauge_band("friction_total", -1) == ("", "neutral")
+    # non-negative values band exactly as before
+    assert rh._gauge_band("duplicate_pair_count", 0) == ("CLEAN", "good")
+    assert rh._gauge_band("always_loaded_tokens_est", 100) == ("LEAN", "good")
+
+
+def test_finite_number_still_accepts_negatives():
+    """The domain gate is ADDITIVE — `finite_number`'s contract is untouched, because a
+    negative delta is legitimate. Only the size/count call sites narrow."""
+    assert rh.finite_number(-5) == -5.0
+    assert rh.nonneg_number(-5) is None
+    assert rh.nonneg_number(0) == 0.0
+    assert rh.nonneg_number(5) == 5.0

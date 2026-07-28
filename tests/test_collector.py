@@ -4742,3 +4742,147 @@ def test_git_index_path_containing_a_tab_is_not_truncated(tmp_path):
     tracked, gitlinks = result
     assert name in tracked, sorted(tracked)
     assert gitlinks == frozenset()
+
+
+# ===================================================================================
+# Codex cross-model gate (final round). Two collector findings, both instances of the
+# same overclaim: presenting an UNDETERMINED state as a determined fact.
+# ===================================================================================
+
+def test_submodule_gitdir_redirected_INSIDE_the_root_is_refused(submodule_tree):
+    """Codex gate finding 2 (HIGH). The T9 fence checks that the work tree AND the
+    git-common-dir both resolve inside the harness root. Containment is necessary but not
+    sufficient: an attacker who can write in the gitlinked subtree points `.git` at a
+    foreign repository that also lives INSIDE the root, and BOTH checks pass.
+
+    The pre-existing `test_submodule_with_foreign_gitdir_is_refused_and_disclosed` places
+    the foreign repo OUTSIDE the root, so it exercises CONTAINMENT and passed under the
+    broken implementation. This is the PROVENANCE case: the question is whether the git
+    dir is the one the PARENT REPO'S INDEX vouches for, not merely where it sits.
+
+    The attacker repo deliberately tracks the SAME relative path as the real submodule,
+    so the pre-fix failure is a FALSE TIMESTAMP (1600000000, the attacker's commit) --
+    not merely a missing one."""
+    foreign = _init_repo(submodule_tree / "evil",
+                         {"rules/config-files.md": "attacker\n"}, ts=1600000000)
+    sub = submodule_tree / "skills" / "coding-team"
+    (sub / ".git").write_text(f"gitdir: {foreign / '.git'}\n")
+    files = [sub / "rules" / "config-files.md"]
+    blind = []
+    idx = _collector.build_git_repo_index(submodule_tree, files, blind)
+    ts, reason = _collector._git_age_for_file(submodule_tree, files[0], idx)
+    assert ts != 1600000000, "the attacker's history supplied the timestamp"
+    assert (ts, reason) == (None, "outside_root")
+    assert any("coding-team" in b for b in blind)          # the refusal SAYS SO
+    # the decisive one: the attacker's index must never have been read at all
+    assert os.path.realpath(sub) not in idx.tracked_by_toplevel
+    assert not any(tracked and "rules/config-files.md" in tracked
+                   for top, tracked in idx.tracked_by_toplevel.items()
+                   if top != os.path.realpath(submodule_tree))
+
+
+def test_a_real_submodule_still_reports_its_own_commit_under_the_provenance_fence(
+        submodule_tree):
+    """The fence must not turn the LEGITIMATE case into a null -- that is the
+    false-positive kill signal. `git submodule add` produces a `.git` gitfile pointing
+    into the parent's own `.git/modules/...`, and the parent's index records the exact
+    commit the submodule holds; both halves of the provenance test are satisfied."""
+    files = [submodule_tree / "skills" / "coding-team" / "rules" / "config-files.md"]
+    blind = []
+    idx = _collector.build_git_repo_index(submodule_tree, files, blind)
+    ts, reason = _collector._git_age_for_file(submodule_tree, files[0], idx)
+    assert (ts, reason) == (1700000000, "")
+    assert blind == []
+
+
+def test_gitlink_shas_are_carried_from_the_parent_index(submodule_tree):
+    """The provenance datum itself: `ls-files -s` mode-160000 entries carry the commit
+    the parent VOUCHES for, and the index snapshot keeps it (a set of paths cannot)."""
+    files = [submodule_tree / "skills" / "coding-team" / "rules" / "config-files.md"]
+    idx = _collector.build_git_repo_index(submodule_tree, files, [])
+    top = os.path.realpath(submodule_tree)
+    recorded = idx.gitlinks_by_toplevel[top]["skills/coding-team"]
+    expected = subprocess.run(["git", "rev-parse", "HEAD"],
+                              cwd=submodule_tree / "skills" / "coding-team",
+                              capture_output=True, text=True, timeout=30).stdout.strip()
+    assert recorded == expected
+
+
+def test_git_toplevel_refusing_a_valid_git_dir_is_git_error_not_no_repo(tmp_path):
+    """Codex gate finding 4 (MEDIUM). ANY non-zero `rev-parse --show-toplevel` was read as
+    `no_repo` -- a determined "this is not a work tree", which then became the blanket
+    staleness reason for every file underneath. Git also exits non-zero when it REFUSES a
+    repository that is plainly there: dubious ownership (`safe.directory`, realistic on a
+    shared or mounted checkout) and unreadable git metadata both land on 128.
+
+    REAL git, real repo, no shim: `core.bare=true` beside a perfectly valid `.git` gives
+    the exact shape those refusals give -- `--show-toplevel` exits 128 while
+    `--resolve-git-dir` (which answers BEFORE repository setup, and so before the
+    ownership check) exits 0. That pair is the discriminator; stderr is not, because
+    binding rule 11 forbids reading it."""
+    refused = _init_repo(tmp_path / "refused", {"a.md": "x"})
+    _git(refused, "config", "core.bare", "true")
+    top, reason = _collector._git_toplevel(refused)
+    assert top is None
+    assert reason == "git_error"
+
+
+def test_a_truly_bare_repo_is_still_no_repo(tmp_path):
+    """Non-regression twin: `_git_toplevel`'s docstring records that a BARE repo exiting
+    128 is a negative git really did determine, and that reading must survive. A bare repo
+    has no `.git` to resolve, so the new discriminator agrees -- verified by execution."""
+    bare = tmp_path / "bare_repo"
+    bare.mkdir()
+    _git(bare, "init", "-q", "--bare", ".")
+    top, reason = _collector._git_toplevel(bare)
+    assert top is None
+    assert reason == "no_repo"
+
+
+def test_refused_root_repo_is_git_error_not_no_repo(tmp_path):
+    """Codex gate finding 4, end to end. `available` still goes False (correct -- nothing
+    could be probed), but the reason published for every file must say "could not
+    determine", not assert that the operator's harness root is not a work tree."""
+    root = _init_repo(tmp_path / "refused_root", {"rules/a.md": "x"})
+    _git(root, "config", "core.bare", "true")
+    files = [root / "rules" / "a.md"]
+    blind = []
+    idx = _collector.build_git_repo_index(root, files, blind)
+    assert idx.available is False
+    assert idx.root_reason == "git_error"
+    assert _collector._git_age_for_file(root, files[0], idx) == (None, "git_error")
+
+
+def test_unresolvable_git_common_dir_is_not_reported_as_outside_root(tmp_path):
+    """Codex gate finding 4, second half. A TIMEOUT or error resolving
+    `--git-common-dir` was discarded and became the phrase "could not be resolved", which
+    the caller then published as `outside_root` -- a determined "this escaped the harness
+    root" over a state nobody determined. The refusal now carries its own closed-enum
+    reason beside the phrase."""
+    root = _init_repo(tmp_path / "cd_root", {"rules/a.md": "x"})
+    root_stat = os.stat(root)
+    reject_shim = tmp_path / "bin_reject_cd"
+    reject_shim.mkdir()
+    (reject_shim / "git").write_text("#!/bin/sh\nexit 128\n")
+    (reject_shim / "git").chmod(0o755)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(reject_shim)
+    try:
+        refusal = _collector._toplevel_refusal(str(root), root, root_stat)
+    finally:
+        os.environ["PATH"] = old
+    assert refusal is not None
+    reason, phrase = refusal
+    assert reason == "git_error"                 # NOT outside_root
+    assert "could not be resolved" in phrase
+
+
+def test_outside_root_work_tree_still_reports_outside_root(tmp_path):
+    """Non-regression twin: a genuinely determined containment failure keeps its
+    determined reason. Finding 4 narrows the UNDETERMINED cases only."""
+    root = _init_repo(tmp_path / "in_root", {"rules/a.md": "x"})
+    outside = _init_repo(tmp_path / "way_outside", {"b.md": "y"})
+    refusal = _collector._toplevel_refusal(str(outside), root, os.stat(root))
+    assert refusal is not None
+    assert refusal[0] == "outside_root"
+    assert "resolves outside the harness root" in refusal[1]
