@@ -4,6 +4,7 @@ Real fixtures only (no mocks — the renderer is pure stdlib). Reuses `run_colle
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from html.parser import HTMLParser
@@ -248,8 +249,11 @@ def test_trend_delta_nonnumeric_headline_value_does_not_crash(tmp_path):
     TypeError('>' not supported between instances of 'str' and 'int'). It must
     degrade to no-delta for that gauge. (The corrupt value lives on the OLDER
     sidecar, not the selected/current one, so this isolates the `_trend_delta`
-    comparison guard from the unrelated, out-of-scope `_gauge_band` current-value
-    path, which has its own pre-existing non-numeric-value crash.)"""
+    comparison guard from the unrelated `_gauge_band` current-value path. That path
+    USED TO crash on a non-numeric value too, before Control 2 -- it now returns
+    `("", "neutral")` for `_gauge_band("always_loaded_words", "corrupt")` instead
+    of raising, so this test's isolation is no longer covering a live crash there,
+    just a separate code path.)"""
     doc1 = _minimal_doc()
     doc1["headline"]["always_loaded_words"] = "</script>corrupt"  # hostile, non-numeric
     doc2 = _minimal_doc()
@@ -465,6 +469,29 @@ def test_gauge_drilldown_words_gauge_shows_word_count_not_tokens(tmp_path):
     tokens_panel = re.search(r'id="gdrawer-always_loaded_tokens_est"[^>]*>(.*?)</div>', text, re.S).group(1)
     claude_md_tokens_line = re.search(r'<code>CLAUDE\.md</code>[^<]*', tokens_panel).group(0)
     assert "100" in claude_md_tokens_line
+
+
+def test_gauge_drilldown_corrupt_words_renders_int_zero_not_float(tmp_path):
+    """T2 spec-review LOW: a row with a VALID `tokens_est` but a CORRUPT `words` value
+    survives `_tokens_treemap`'s `unrenderable` gate (which only keys on `tokens_est`)
+    and must still present its gated-but-unusable `words` as the integer "0", not the
+    float "0.0" -- the exact "100 tokens -> 100.0 tokens" symptom `_gated_size` exists
+    to prevent, surviving on its least-travelled (rejection) branch."""
+    import re
+
+    extra_files = [{"path": "rules/corrupt-words.md", "category": "rule", "words": "not-a-number",
+                    "lines": 3, "tokens_est": 77, "evidence": "VERIFIED"}]
+    doc = _minimal_doc(extra_files=extra_files)
+    out_dir = tmp_path / "gdrill-corrupt-words"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    words_panel = re.search(r'id="gdrawer-always_loaded_words"[^>]*>(.*?)</div>', text, re.S).group(1)
+    corrupt_line = re.search(r'<code>rules/corrupt-words\.md</code>[^<]*', words_panel).group(0)
+    assert corrupt_line.endswith(" — 0")
+    assert "0.0" not in corrupt_line
 
 
 # --- overview digest model ---
@@ -2733,6 +2760,38 @@ def test_sparkline_windows_to_last_ten(tmp_path):
     assert len(m.group(1).split(" ")) == rh.SPARKLINE_WINDOW == 10
 
 
+def test_sparkline_window_pins_the_LAST_ten_values_not_the_first(tmp_path):
+    """Codex #9: the sibling count-only assertion cannot distinguish
+    values[-10:] from values[:10] -- ten evenly-spaced ascending points normalize to
+    identical polyline geometry. The min/max/cur stats carry the ABSOLUTE values.
+
+    Fixture: 12 sidecars, tokens_a = 100+i, tokens_b = 50 -> always_loaded_tokens_est
+    series [150..161].  last-10 = [152..161];  first-10 (the bug) = [150..159].
+    Both strings measured against live code."""
+    out_dir = tmp_path / "spark12values"
+    out_dir.mkdir()
+    for i in range(12):
+        _write_sidecar(out_dir, f"2026-07-{i + 1:02d}",
+                       _minimal_doc(tokens_a=100 + i, tokens_b=50))
+    proc = run_render(out_dir, "--date", "2026-07-12", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-12.html").read_text(encoding="utf-8")
+    m = re.search(
+        r'id="spark-always_loaded_tokens_est".*?</svg>'
+        r'<span class="sparkline-stats">(.*?)</span>', text, re.S)
+    assert m is not None
+    assert m.group(1) == "min 152.00 · max 161.00 · cur 161.00"
+    assert "min 150.00" not in m.group(1)   # the values[:10] bug shape
+
+
+def test_sparkline_flat_series_renders_at_the_bottom_not_mid_height():
+    """Codex #8: pins the ACTUAL geometry the corrected comment now describes."""
+    svg = rh._sparkline_svg("spark-x", [5.0, 5.0, 5.0])
+    m = re.search(r'points="([^"]*)"', svg)
+    assert m is not None
+    assert all(p.split(",")[1] == "22.00" for p in m.group(1).split(" "))
+
+
 def test_sparkline_absent_below_three_sidecars(tmp_path):
     """Exactly 2 dated sidecars: no sparkline renders, but the existing Metric×dates
     table presentation is unchanged and still present."""
@@ -4561,11 +4620,17 @@ def test_build_dragcandidate_model_still_raises_on_mixed_type_n():
     """Site (f) of Control 2 is NOT applied — pinned here so the reason is not lost.
 
     Two existing serve tests use a mixed int/str `n` as their deliberate
-    "unenumerated exception" injection vector (test_watcher_survives_uncaught_exception,
+    exception injection vector (test_watcher_survives_uncaught_exception,
     test_startup_malformed_synthesis_clean_fatal). Gating this sort key makes the render
     succeed, which breaks the first and HANGS the second. This test documents the
     surviving TypeError so a future change to the sort key fails HERE, next to the
-    explanation, instead of silently wedging the serve suite."""
+    explanation, instead of silently wedging the serve suite.
+
+    After T3 (commit f601ba2) this TypeError IS one of the enumerated
+    `_RENDER_FALLBACK_ERRORS` and converts to RenderError once it reaches
+    `render_from_out_dir` — but this test calls `build_dragcandidate_model` directly,
+    BELOW that wrapper, so the raw TypeError still surfaces here unchanged; the two
+    serve tests above are what exercise the wrapped, converted path."""
     with pytest.raises(TypeError):
         rh.build_dragcandidate_model({"drag_candidates": [
             {"n": 1, "surface": "a"}, {"n": "x", "surface": "b"}]})

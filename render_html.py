@@ -167,7 +167,12 @@ def _gated_size(value: Any) -> float:
     squarify's `size > 0` filter drops; they are disclosed via `unrenderable` instead."""
     num = finite_number(value)
     if num is None:
-        return 0.0
+        # T2 spec-review LOW: the rejection path must return an int-presentable
+        # value too, same as the accept path below -- a bare 0.0 here survives on a
+        # field the `unrenderable` disclosure doesn't key on (e.g. `words` beside a
+        # valid `tokens_est`) and renders the literal "0.0" text this gate exists
+        # to prevent.
+        return 0
     return int(num) if num.is_integer() else num
 
 
@@ -2859,7 +2864,9 @@ def _sparkline_svg(dom_id: str, floats: list[float]) -> str:
     is already-coerced, already-windowed (SPARKLINE_WINDOW) geometry data — every
     coordinate goes through `_fmt_float` (§4.6), never raw `str()`/f-string floats."""
     lo, hi = min(floats), max(floats)
-    span = (hi - lo) or 1.0  # flat series: avoid /0, render a flat mid-height line
+    span = (hi - lo) or 1.0  # flat series: avoid /0. NOTE the line renders at the BOTTOM
+                             # (y = H - PAD = 22.0), not mid-height -- (f - lo) is 0 for
+                             # every point, so the normalized term is 1.0. Verified.
     n = len(floats)
     step = _SPARKLINE_W / (n - 1) if n > 1 else 0.0
     points = []
