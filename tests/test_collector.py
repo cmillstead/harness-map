@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import pytest
 from pathlib import Path
 
@@ -1675,7 +1676,12 @@ def test_description_extraction_is_read_only(fake_harness):
 # to include the new additive `staleness` top-level key -- every other byte is unchanged
 # from the pre-M3 golden. This is a fixture-data update for a spec-sanctioned additive
 # schema change, not an edit to the assertion itself (`blob == _GOLDEN_...` is unchanged).
-_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan."], "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
+# S2 D5: regenerated again, same rule and same reason, for the additive sibling
+# `staleness_null_reasons` (the envelope rule puts it in EVERY run, including this
+# fixture's). Verified mechanically: comparing the two literals path-by-path, the REMOVED
+# set is empty and every ADDED path starts with `.staleness_null_reasons` -- no existing
+# value changed. fake_harness is not a git work tree, so every reason is `no_repo`.
+_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan."], "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "staleness_null_reasons": {"agents/demo-agent.md": "no_repo", "commands/demo-cmd.md": "no_repo", "rules/a.md": "no_repo", "rules/b.md": "no_repo", "skills/coding-team/rules/c.md": "no_repo", "skills/demo/SKILL.md": "no_repo", "skills/demo/phases/p1.md": "no_repo"}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
 
 
 def test_non_compose_output_byte_identical_to_pre_change(fake_harness):
@@ -3921,3 +3927,227 @@ def test_case_variant_root_still_reports_real_timestamps(tmp_path):
     assert idx.available is True
     assert _collector._git_age_for_file(variant, files[0], idx) == (1700000000, "")
     assert _collector.collect_git_age(variant, files, idx) == {"rules/a.md": 1700000000}
+
+
+# ---------------------------------------------------------------------------
+# S2 gate fix (D3/D4/D5: #1/#7/F4/F10/F11 + C-f/H1 end-to-end): tracked state,
+# the total deadline, and the closed reason enum.
+#
+# DRIFT NOTE (binding rule 3): the plan widened `collect_git_age` itself to
+# return (timestamps, reasons). T9's harden rounds landed AFTER that plan and
+# added two assertions comparing `collect_git_age`'s return to a dict by exact
+# equality (test_scanned_root_inside_an_outer_repo_is_refused_and_disclosed,
+# test_case_variant_root_still_reports_real_timestamps). Editing either is the
+# kill signal, so the widened function is `collect_git_age_with_reasons` and
+# `collect_git_age` stays as a timestamps-only VIEW over it -- still ONE
+# `git log` per file, which is the property the plan's "no second pass" clause
+# was protecting.
+# ---------------------------------------------------------------------------
+
+def test_deleted_then_recreated_untracked_reports_null_not_a_stale_lie(tmp_path):
+    """Codex #1: `git log` answers from HISTORY, not tracked state. Verified end-to-end:
+    after `git rm` + commit + recreate-untracked, `git log -1` still returns a timestamp
+    while `git ls-files` correctly excludes the path."""
+    repo = _init_repo(tmp_path / "r", {"rules/a.md": "x", "rules/b.md": "y"})
+    _git(repo, "rm", "-q", "rules/a.md")
+    _git(repo, "commit", "-qm", "drop", ts=1700000200)
+    (repo / "rules" / "a.md").write_text("recreated")
+    files = [repo / "rules" / "a.md", repo / "rules" / "b.md"]
+    idx = _collector.build_git_repo_index(repo, files, [])
+    ts, reasons = _collector.collect_git_age_with_reasons(repo, files, idx)
+    assert ts["rules/a.md"] is None
+    assert reasons["rules/a.md"] == "untracked"
+    assert ts["rules/b.md"] == 1700000000
+
+def test_unknown_index_reports_git_error_never_untracked(tmp_path):
+    """S15 (P1): an index that could not be determined must NOT masquerade as the
+    definitive negative `untracked`. _git_tracked_and_gitlinks returns None (not an empty
+    frozenset) precisely so this distinction survives."""
+    repo = _init_repo(tmp_path / "r", {"rules/a.md": "x"})
+    files = [repo / "rules" / "a.md"]
+    idx = _collector.build_git_repo_index(repo, files, [])
+    top = next(iter(idx.tracked_by_toplevel))
+    broken = idx._replace(tracked_by_toplevel={**idx.tracked_by_toplevel, top: None})
+    assert _collector._git_age_for_file(repo, files[0], broken) == (None, "git_error")
+
+def test_tracked_but_never_committed_reports_no_commits(tmp_path):
+    """F4 (tenth enum value). VERIFIED live: for a staged-but-uncommitted path in a repo
+    WITH commits, `git log -1 --format=%ct` exits 0 with EMPTY stdout. Mapping that to
+    `unparseable` ('stdout was not an integer') would emit a MISLEADING reason -- exactly
+    the defect class this batch exists to eliminate."""
+    repo = _init_repo(tmp_path / "r", {"rules/a.md": "x"})
+    (repo / "rules" / "new.md").write_text("staged only")
+    _git(repo, "add", "rules/new.md")
+    files = [repo / "rules" / "new.md"]
+    idx = _collector.build_git_repo_index(repo, files, [])
+    ts, reasons = _collector.collect_git_age_with_reasons(repo, files, idx)
+    assert ts["rules/new.md"] is None
+    assert reasons["rules/new.md"] == "no_commits"
+
+def test_zero_commit_repo_staged_file_reports_git_error(tmp_path):
+    """Planning correction C-c: a staged file IS in ls-files, so the flow reaches
+    `git log`, which exits 128 (verified) -> git_error."""
+    repo = tmp_path / "zc"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main", ".")
+    (repo / "rules").mkdir()
+    (repo / "rules" / "a.md").write_text("x")
+    _git(repo, "add", "rules/a.md")
+    files = [repo / "rules" / "a.md"]
+    idx = _collector.build_git_repo_index(repo, files, [])
+    ts, reasons = _collector.collect_git_age_with_reasons(repo, files, idx)
+    assert ts["rules/a.md"] is None and reasons["rules/a.md"] == "git_error"
+
+def test_uninitialized_submodule_reports_submodule_unavailable(tmp_path):
+    """The deinit trap: `git -C <deinit'd submodule> rev-parse --is-inside-work-tree`
+    still prints true (git walks up to the PARENT's .git) and `git log` exits 0 with empty
+    stdout -- degrading to the exact same silent-empty path as today's bug. The
+    mode-160000 gitlink set is the discriminator."""
+    origin = _init_repo(tmp_path / "o", {"rules/c.md": "x"}, ts=1700000000)
+    parent = tmp_path / "p"
+    parent.mkdir()
+    _git(parent, "init", "-q", "-b", "main", ".")
+    _git(parent, "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+         str(origin), "sub")
+    _git(parent, "add", "-A")
+    _git(parent, "commit", "-qm", "p", ts=1700000100)
+    _git(parent, "submodule", "deinit", "-f", "sub")
+    (parent / "sub").mkdir(exist_ok=True)
+    (parent / "sub" / "orphan.md").write_text("x")
+    files = [parent / "sub" / "orphan.md"]
+    idx = _collector.build_git_repo_index(parent, files, [])
+    ts, reasons = _collector.collect_git_age_with_reasons(parent, files, idx)
+    assert ts["sub/orphan.md"] is None
+    assert reasons["sub/orphan.md"] == "submodule_unavailable"
+
+def test_budget_exhaustion_uses_a_past_deadline_never_wall_clock_racing(tmp_path):
+    """D4 determinism: a wall-clock cutoff is a genuinely new category of non-determinism
+    that the SIX *_deterministic_across_hashseed tests do not exempt. This asserts only
+    the SHAPE of degraded output against an already-past deadline, never a timing."""
+    repo = _init_repo(tmp_path / "r", {"rules/a.md": "x", "rules/b.md": "y",
+                                       "rules/c.md": "z"})
+    files = sorted(repo.glob("rules/*.md"))
+    idx = _collector.build_git_repo_index(repo, files, [])
+    ts, reasons = _collector.collect_git_age_with_reasons(repo, files, idx,
+                                                          deadline=time.monotonic() - 1.0)
+    assert all(v is None for v in ts.values())
+    assert set(reasons.values()) == {"budget_exhausted"}
+
+def test_budget_exhaustion_silences_a_deterministic_suffix(tmp_path):
+    """Codex #4's ordering constraint made observable: the SKIPPED set must be a
+    lexicographic suffix, never a filesystem-order artifact. Uses a REAL sleeping git shim
+    (no mocks) and asserts only the suffix property, never a specific cut point."""
+    repo = _init_repo(tmp_path / "r", {f"rules/{c}.md": c for c in "abcdef"})
+    files = sorted(repo.glob("rules/*.md"))
+    idx = _collector.build_git_repo_index(repo, files, [])
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text("#!/bin/sh\n/bin/sleep 0.3\nexit 0\n")
+    (shim / "git").chmod(0o755)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(shim)
+    try:
+        _ts, reasons = _collector.collect_git_age_with_reasons(
+            repo, files, idx, deadline=time.monotonic() + 0.5)
+    finally:
+        os.environ["PATH"] = old
+    exhausted = sorted(k for k, v in reasons.items() if v == "budget_exhausted")
+    measured = sorted(k for k in (_rel(repo, f) for f in files) if k not in exhausted)
+    assert all(m < e for m in measured for e in exhausted)   # a true lexicographic suffix
+
+def test_discovery_itself_is_inside_the_budget(tmp_path):
+    """Codex F5: the two tests above build the index BEFORE setting a deadline, so
+    neither can notice discovery escaping the cap. This one threads a past deadline into
+    build_git_repo_index and pins all three F5 semantics: `available` stays True (the
+    root's own probe is exempt -- exhaustion is not evidence the root is not a work
+    tree), the skipped root is RECORDED in exhausted_roots, and _git_age_for_file maps
+    it to budget_exhausted -- not git_error, which would misreport a budget decision as
+    a git failure. The direct _git_age_for_file call is deliberate: collect_git_age's
+    own loop-level deadline check would satisfy a reasons[] assertion without ever
+    exercising the exhausted_roots path."""
+    repo = _init_repo(tmp_path / "r", {"rules/a.md": "x"})
+    files = [repo / "rules" / "a.md"]
+    past = time.monotonic() - 1.0
+    idx = _collector.build_git_repo_index(repo, files, [], deadline=past)
+    assert idx.available is True
+    assert idx.exhausted_roots
+    assert _collector._git_age_for_file(repo, files[0], idx) == (None, "budget_exhausted")
+
+def test_non_root_discovery_is_also_inside_the_budget(submodule_tree):
+    """R3-3: the test above is satisfiable by the ROOT's own _load_root exhaustion alone
+    -- it cannot notice the non-root branch missing. This one pins the branch that
+    round 3 found unspecified: a candidate dir INSIDE a second repo root (the submodule)
+    must get the (None, "budget_exhausted") mapping BEFORE _git_toplevel runs for it,
+    and the file must surface budget_exhausted -- never git_error or no_repo."""
+    files = [submodule_tree / "skills" / "coding-team" / "rules" / "config-files.md"]
+    past = time.monotonic() - 1.0
+    idx = _collector.build_git_repo_index(submodule_tree, files, [], deadline=past)
+    sub_dir = str((submodule_tree / "skills" / "coding-team" / "rules").resolve())
+    assert idx.toplevel_by_dir.get(sub_dir) == (None, "budget_exhausted")
+    assert _collector._git_age_for_file(submodule_tree, files[0], idx) == (
+        None, "budget_exhausted")
+
+def test_unindexed_parent_dir_is_git_error_not_no_repo(tmp_path):
+    """Codex F9: a file whose parent dir was never indexed (the queried list diverged
+    from the list the index was built from) is an UNKNOWN. Labeling it no_repo would be
+    a positive assertion of absence over a state that was never examined -- the S15
+    class. The repo here EXISTS, which is what makes no_repo a lie and git_error honest."""
+    repo = _init_repo(tmp_path / "r", {"rules/a.md": "x"})
+    idx = _collector.build_git_repo_index(repo, [repo / "rules" / "a.md"], [])
+    (repo / "other").mkdir()
+    stranger = repo / "other" / "b.md"
+    stranger.write_text("x")
+    assert _collector._git_age_for_file(repo, stranger, idx) == (None, "git_error")
+
+def test_null_reasons_total_invariant_holds(fake_harness):
+    """The load-bearing invariant, in one assertion: a reason for EXACTLY the null keys,
+    never for a key with a timestamp, never for a key absent from last_commit_ts."""
+    doc = run_collector(fake_harness)
+    ts = doc["staleness"]["last_commit_ts"]
+    assert set(doc["staleness_null_reasons"]) == {k for k, v in ts.items() if v is None}
+
+def test_null_reasons_uses_the_closed_enum_only(fake_harness):
+    doc = run_collector(fake_harness)
+    assert set(doc["staleness_null_reasons"].values()) <= set(_collector._GIT_NULL_REASONS)
+    assert len(_collector._GIT_NULL_REASONS) == 10      # F4: TEN, not nine
+
+def test_null_reasons_present_and_empty_in_the_envelope(tmp_path):
+    doc = _collector._empty_document(tmp_path)
+    assert doc["staleness_null_reasons"] == {}
+    # binding rule 7: the pre-existing exact-equality assertion on doc["staleness"]
+    # must still pass UNTOUCHED -- that is why this is a SIBLING.
+    assert doc["staleness"] == {"git_age_available": False, "last_commit_ts": {}}
+
+def test_null_reason_keys_are_sorted(fake_harness):
+    doc = run_collector(fake_harness)
+    assert list(doc["staleness_null_reasons"]) == sorted(doc["staleness_null_reasons"])
+
+def test_last_commit_ts_key_order_matches_documented_rel_path_sort(tmp_path):
+    """F11: sorted(files) sorts Path objects by their parts tuple, which DIVERGES from
+    rel-path string order for prefix-sibling directories -- schema.md documents 'Keys are
+    sorted lexicographically'."""
+    repo = _init_repo(tmp_path / "r", {"skills/scan/SKILL.md": "a",
+                                       "skills/scan-code/SKILL.md": "b"})
+    files = [repo / "skills" / "scan" / "SKILL.md",
+             repo / "skills" / "scan-code" / "SKILL.md"]
+    idx = _collector.build_git_repo_index(repo, files, [])
+    ts, _r = _collector.collect_git_age_with_reasons(repo, files, idx)
+    assert list(ts) == sorted(ts)
+
+# --- C-f / H1 end-to-end: the discriminating pair, through the real CLI. ---
+def test_non_repo_root_emits_no_repo_for_every_file(fake_harness):
+    """C-f/H1: fake_harness has NO `git init` and git is installed and working, so the
+    honest blanket reason is `no_repo`. Reporting `git_unavailable` would tell the
+    operator "git could not run at all" -- false, and the exact misleading-reason class
+    this batch exists to eliminate."""
+    doc = run_collector(fake_harness)
+    assert doc["staleness"]["git_age_available"] is False
+    assert set(doc["staleness_null_reasons"].values()) == {"no_repo"}
+
+def test_absent_git_emits_git_unavailable_for_every_file(fake_harness):
+    """The other half of the pair. `run_collector` already merges `env` over os.environ,
+    and the collector itself still launches because it is invoked through the absolute
+    sys.executable."""
+    doc = run_collector(fake_harness, env={"PATH": ""})
+    assert doc["staleness"]["git_age_available"] is False
+    assert set(doc["staleness_null_reasons"].values()) == {"git_unavailable"}

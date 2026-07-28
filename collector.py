@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -2066,6 +2067,35 @@ _GIT_SUBPROCESS_TIMEOUT = 2
 # corpus -- 20-300x headroom at 5s.
 _GIT_BATCH_TIMEOUT = 5
 
+# D5 (S2 gate fix): the CLOSED enum. Free text is forbidden -- the in-repo precedent is
+# decisive (build_civc_model documents a P1 class-injection finding fixed by allowlisting
+# `verdict`, so a crafted value "can never ride through as an extra CSS class"), and
+# reasons naturally want to become CSS classes and data- attrs. Additionally, git error
+# text carries absolute paths and .gitmodules/.git/config values, so surfacing stderr
+# would move credential-bearing text into a published HTML document. Any variable text
+# goes to errors[] / inaccessible[], which already route through esc_html.
+#
+# TEN values, not nine (F4): `no_commits` exists because mapping a tracked-but-never-
+# committed path to `unparseable` ("stdout was not an integer") would be a MISLEADING
+# reason. Sized so D3 and D4 land without a second schema change.
+_GIT_NULL_REASONS = (
+    "git_unavailable", "no_repo", "outside_root", "untracked", "submodule_unavailable",
+    "timeout", "budget_exhausted", "git_error", "unparseable", "no_commits",
+)
+
+# Total wall budget for the git-age subsystem, with ONE named exemption (Codex F5): the
+# deadline is computed in build_document BEFORE build_git_repo_index and threaded into
+# BOTH discovery and the per-file loop. Covered: every per-root ls-files load, every
+# non-root toplevel discovery, every per-file log. Exempt: the scanned root's OWN
+# availability probe -- a single 2s-bounded rev-parse that defines `available`, which
+# exhaustion must never flip (a budget running out is not evidence the root is not a
+# work tree). Hard ceiling therefore = 2s exempt probe + this budget + one in-flight
+# subprocess timeout (<=5s) ~= 17s, replacing today's UNBOUNDED 230-260s worst case.
+# 4.5x the measured 2.24s typical; a backstop for a degenerate case (huge-history
+# submodule, network-mounted .git, hung git), not a perf target. DELIBERATELY not tied
+# to --check's <=5s: that budget covers a different, intentionally-thin path.
+_GIT_TOTAL_BUDGET = 10.0
+
 # Harden-audit fix (T9 round 2, HIGH): command-line -c OUTRANKS repo config, so these
 # neutralize every command-valued key a discovered repository could carry. VERIFIED
 # EMPIRICALLY (git 2.50.1): `ls-files -s -z` EXECUTES core.fsmonitor -- twice -- in the
@@ -2317,6 +2347,11 @@ class _GitRepoIndex(NamedTuple):
     toplevel_by_dir: dict[str, tuple[str | None, str | None]]
     tracked_by_toplevel: dict[str, frozenset[str] | None]   # None == index UNKNOWN
     gitlinks_by_toplevel: dict[str, frozenset[str]]
+    # Roots whose per-root load was SKIPPED because the total budget expired during
+    # discovery (Codex F5). Distinct from tracked_by_toplevel[top] is None, which means
+    # the load RAN and failed -- conflating them would map exhaustion to git_error.
+    # TRAILING DEFAULT: every pre-D4 constructor stays valid unchanged.
+    exhausted_roots: frozenset[str] = frozenset()
 
 
 def _accept_via_gitlink(top: str, accepted: set[str],
@@ -2339,8 +2374,8 @@ def _accept_via_gitlink(top: str, accepted: set[str],
     return False
 
 
-def build_git_repo_index(root: Path, files: list[Path],
-                         blind_spots: list[str]) -> _GitRepoIndex:
+def build_git_repo_index(root: Path, files: list[Path], blind_spots: list[str],
+                         deadline: float | None = None) -> _GitRepoIndex:
     """THE only git-topology discovery in a run. O(repo roots), not O(files): the live
     114-file corpus clusters into 40 distinct physical parent dirs but only 3 repo roots,
     so discovery is 0 walk subprocesses + 3 rev-parse + 3 git-common-dir + 3 ls-files = 9.
@@ -2381,6 +2416,13 @@ def build_git_repo_index(root: Path, files: list[Path],
     already passed it. This function's own containment fences (above) close the
     DOWNSTREAM half of the same class: without them, an out-of-root path would choose a
     subprocess working directory (S17) rather than merely leak a read.
+
+    `deadline` (a time.monotonic() instant, D4/Codex F5) makes DISCOVERY part of the same
+    total budget the per-file loop obeys -- a budget that covered only the `git log` calls
+    would not be total, since discovery is itself unbounded subprocess work. The scanned
+    root's OWN availability probe is the single named exemption (see _GIT_TOTAL_BUDGET):
+    exhaustion must never flip `available`, because a budget running out is not evidence
+    that the root is not a work tree.
     """
     try:
         root_stat: os.stat_result | None = os.stat(root)
@@ -2391,8 +2433,19 @@ def build_git_repo_index(root: Path, files: list[Path],
     tracked_by_toplevel: dict[str, frozenset[str] | None] = {}
     gitlinks_by_toplevel: dict[str, frozenset[str]] = {}
 
+    exhausted: set[str] = set()
+
     def _load_root(top: str) -> None:
         if top in tracked_by_toplevel:
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            # The batched index read is the expensive half of discovery, so the budget is
+            # checked HERE rather than after it. Recorded in `exhausted` (not just as an
+            # unknown index) so _git_age_for_file can say "never probed" instead of
+            # "probed and failed".
+            tracked_by_toplevel[top] = None
+            gitlinks_by_toplevel[top] = frozenset()
+            exhausted.add(top)
             return
         pair = _git_tracked_and_gitlinks(Path(top))
         if pair is None:
@@ -2470,6 +2523,12 @@ def build_git_repo_index(root: Path, files: list[Path],
             else:
                 toplevel_by_dir[dir_key] = (root_top, None)
             continue
+        # R3-3: guard keyed on the CANDIDATE DIR, before _git_toplevel runs -- `top`
+        # does not exist yet. The (None, "budget_exhausted") mapping rides the existing
+        # `top is None -> why` return in _git_age_for_file; no new branch needed there.
+        if deadline is not None and time.monotonic() >= deadline:
+            toplevel_by_dir[dir_key] = (None, "budget_exhausted")
+            continue
         top, why = _git_toplevel(marker)
         if top is None:
             toplevel_by_dir[dir_key] = (None, why or "no_repo")
@@ -2502,7 +2561,8 @@ def build_git_repo_index(root: Path, files: list[Path],
     return _GitRepoIndex(available=available, root_reason=None if available else root_reason,
                          toplevel_by_dir=toplevel_by_dir,
                          tracked_by_toplevel=tracked_by_toplevel,
-                         gitlinks_by_toplevel=gitlinks_by_toplevel)
+                         gitlinks_by_toplevel=gitlinks_by_toplevel,
+                         exhausted_roots=frozenset(exhausted))
 
 
 def _git_last_commit_ts(top: Path, sub_path: str, timeout: int) -> tuple[int | None, str]:
@@ -2585,7 +2645,14 @@ def _git_age_for_file(root: Path, fp: Path, index: _GitRepoIndex) -> tuple[int |
     under realpath-first the two designs align, because whichever path wins dedup resolves
     to the same physical file.
 
-    T10 inserts the tracked-state gate between the toplevel lookup and the `git log`."""
+    THE TRACKED-STATE GATE (D3, Codex #1) sits between the toplevel lookup and the `git
+    log`, because `git log` answers from HISTORY, not from tracked state: a file deleted
+    in one commit and then recreated UNTRACKED still has a commit, so the unguarded call
+    reports a real timestamp for a path git no longer tracks -- a STALE LIE, and a wrong
+    number no reason field can ever describe. Index membership converts it to an honest
+    null. A path missing from the index but named by (or living under) a mode-160000
+    gitlink is `submodule_unavailable`, not `untracked`: the parent's `ls-files` never
+    descends into a submodule, so absence there says nothing about the file itself."""
     real = Path(_physical_key(fp))                       # symlink resolved FIRST (N1)
     # F10b: .get with a default, never a bare subscript -- a KeyError waiting on any
     # divergence between the file list the index was built from and this one.
@@ -2597,17 +2664,38 @@ def _git_age_for_file(root: Path, fp: Path, index: _GitRepoIndex) -> tuple[int |
     top, why = index.toplevel_by_dir.get(str(real.parent), (None, "git_error"))
     if top is None:
         return None, why or "git_error"
+    if top in index.exhausted_roots:
+        # ORDERING MATTERS: this precedes the unknown-index branch below, because an
+        # exhausted root ALSO has tracked_by_toplevel[top] is None -- checking that first
+        # would mislabel every budget decision as a git failure (Codex F5).
+        return None, "budget_exhausted"    # discovery never ran -- NOT a git failure
     sub = _relative_to_toplevel(real, top)
     if sub is None:
         return None, "git_error"
+    tracked = index.tracked_by_toplevel.get(top)
+    if tracked is None:
+        return None, "git_error"          # unknown index != untracked (S15, P1)
+    if sub not in tracked:
+        gitlinks = index.gitlinks_by_toplevel.get(top, frozenset())
+        if any(sub == g or sub.startswith(g + "/") for g in gitlinks):
+            return None, "submodule_unavailable"
+        return None, "untracked"
     return _git_last_commit_ts(Path(top), sub, _GIT_SUBPROCESS_TIMEOUT)
 
 
-def collect_git_age(root: Path, files: list[Path],
-                    index: _GitRepoIndex) -> dict[str, int | None]:
-    """Per-instruction-file git-age SIGNAL (S2.M3; S2-gate hardening R1/N1/#5). Never a
-    "stale"/"dead" judgment -- that classification belongs to the model consuming this
-    output, not the collector (binding rule 6).
+def collect_git_age_with_reasons(
+    root: Path,
+    files: list[Path],
+    index: _GitRepoIndex,
+    deadline: float | None = None,
+) -> tuple[dict[str, int | None], dict[str, str]]:
+    """Per-instruction-file git-age SIGNAL (S2.M3; S2-gate hardening R1/N1/#1/#5/#7).
+    Never a "stale"/"dead" judgment (binding rule 6).
+
+    Returns (timestamps, null_reasons). Returning the reason map from the SAME call is what
+    keeps this at one `git log` per file; a separate collect_git_age_reasons would double
+    the cost. Reasons come from the closed _GIT_NULL_REASONS enum -- never git's own text,
+    which carries absolute paths and .gitmodules/.git/config values (binding rule 11).
 
     PURE with respect to git topology: everything comes from `index`, built once by
     build_git_repo_index, so staleness.git_age_available can never disagree with the
@@ -2615,20 +2703,48 @@ def collect_git_age(root: Path, files: list[Path],
 
     Graceful degradation (never crashes): when the scanned root has no confirmed toplevel,
     EVERY value is None and the per-file loop is skipped entirely. Per-file failures
-    (timeout, non-zero exit, unparseable output) independently degrade to None for that
-    path only -- one bad file never poisons the rest. Tracked-state detection (an
-    UNTRACKED file surfacing as its own reason rather than `no_commits`) is T10's work,
-    not yet implemented here.
+    (timeout, non-zero exit, untracked, unparseable output) independently degrade to None
+    for that path only -- one bad file never poisons the rest.
 
-    Iteration is over the sorted REPORTED keys (F11: sorted(files) would compare Path parts
-    tuples, diverging for prefix-sibling dirs like skills/scan vs skills/scan-code, while
-    schema.md documents lexicographic key order).
-
-    T10 widens the return to (timestamps, null_reasons) and adds the total deadline."""
-    by_key = {_rel(root, fp): fp for fp in files}
+    `deadline` is a time.monotonic() instant. Files not yet probed when it passes get None +
+    "budget_exhausted" and are NOT probed. Exhaustion does NOT flip git_age_available (that
+    field means "--root has a confirmed toplevel", a different fact). Iteration is over the
+    sorted REPORTED keys (F11: sorted(files) would compare Path parts tuples, diverging for
+    prefix-sibling dirs like skills/scan vs skills/scan-code, while schema.md documents
+    lexicographic key order), so the skipped set is a deterministic suffix."""
+    by_key: dict[str, Path] = {_rel(root, fp): fp for fp in files}
+    ordered = sorted(by_key)
     if not index.available:
-        return {k: None for k in sorted(by_key)}
-    return {k: _git_age_for_file(root, by_key[k], index)[0] for k in sorted(by_key)}
+        # Design §13 F2 as CORRECTED by C-f: the blanket reason is whatever the ROOT probe
+        # actually found. `git_unavailable` means the git binary could not be executed;
+        # a root that simply is not a work tree (git working fine) is `no_repo`.
+        blanket = index.root_reason or "no_repo"
+        return ({k: None for k in ordered}, {k: blanket for k in ordered})
+
+    timestamps: dict[str, int | None] = {}
+    reasons: dict[str, str] = {}
+    for key in ordered:
+        if deadline is not None and time.monotonic() >= deadline:
+            timestamps[key] = None
+            reasons[key] = "budget_exhausted"
+            continue
+        ts, reason = _git_age_for_file(root, by_key[key], index)
+        timestamps[key] = ts
+        if ts is None:
+            reasons[key] = reason or "git_error"
+    return timestamps, reasons
+
+
+def collect_git_age(root: Path, files: list[Path], index: _GitRepoIndex,
+                    deadline: float | None = None) -> dict[str, int | None]:
+    """Timestamps-only VIEW over collect_git_age_with_reasons.
+
+    NOT a second pass: it discards the reason map produced by the SAME per-file `git log`,
+    so the cost is identical. Kept because callers that only need the timestamps (and the
+    tests that pin their contract by exact dict equality) should not have to unpack a pair
+    they will not read -- build_document, which publishes staleness_null_reasons, calls the
+    two-map form directly."""
+    return collect_git_age_with_reasons(root, files, index, deadline)[0]
 
 
 SHINGLE_K = 8
@@ -3574,11 +3690,26 @@ def build_document(
     # identical result. Sorting moved into collect_git_age, which keys the same
     # lexicographic order (F11).
     instruction_files = _deduped_instruction_files(root, inaccessible, blind_spots)
-    git_index = build_git_repo_index(root, instruction_files, blind_spots)
+    # D4/Codex F5: the deadline is computed BEFORE discovery and threaded into BOTH, so
+    # the cap is TOTAL for the subsystem rather than per-call.
+    git_deadline = time.monotonic() + _GIT_TOTAL_BUDGET
+    git_index = build_git_repo_index(root, instruction_files, blind_spots,
+                                     deadline=git_deadline)
+    git_age, git_age_null_reasons = collect_git_age_with_reasons(
+        root, instruction_files, git_index, deadline=git_deadline)
     staleness_section = {
         "git_age_available": git_index.available,
-        "last_commit_ts": collect_git_age(root, instruction_files, git_index),
+        "last_commit_ts": git_age,
     }
+    exhausted_count = sum(1 for r in git_age_null_reasons.values()
+                          if r == "budget_exhausted")
+    if exhausted_count:
+        # D4: exhaustion must be DISCLOSED with a count, never silently truncated.
+        blind_spots.append(
+            f"git-age: the {_GIT_TOTAL_BUDGET:.0f}s total budget was exhausted before "
+            f"{exhausted_count} instruction file(s) were probed — their last_commit_ts is "
+            f"null with reason budget_exhausted, which is NOT a measurement. Re-run, or "
+            f"raise the budget.")
 
     totals = {
         "words": sum(f["words"] for f in files),
@@ -3628,6 +3759,14 @@ def build_document(
         "promotion_candidates": promotion_candidates,
         "test_coverage": test_coverage_section,
         "staleness": staleness_section,
+        # D5 (S2 gate fix, ADDITIVE, no schema_version bump per 8.2). A SIBLING, not
+        # nested: an existing test asserts doc["staleness"] by EXACT DICT EQUALITY with an
+        # INLINE literal, so any nested key would force editing an existing assertion
+        # (binding rule 7). Sibling costs only naming cohesion.
+        # TOTAL INVARIANT: an entry for exactly those last_commit_ts keys whose value is
+        # null -- never for a key with a timestamp, never for a key absent from
+        # last_commit_ts.
+        "staleness_null_reasons": git_age_null_reasons,
         "inaccessible": inaccessible,
         "blind_spots": blind_spots,
         "errors": errors,
@@ -3777,6 +3916,7 @@ def _empty_document(root: Path) -> dict[str, Any]:
         "test_coverage": {"hooks": [], "skills": [], "summary": {"hooks_with_test": 0,
             "hooks_total": 0, "skills_with_test": 0, "skills_total": 0}},
         "staleness": {"git_age_available": False, "last_commit_ts": {}},
+        "staleness_null_reasons": {},
         "inaccessible": [], "blind_spots": [], "errors": [],
     }
 
