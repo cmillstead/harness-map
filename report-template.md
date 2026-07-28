@@ -102,16 +102,24 @@ Full INACCESSIBLE list plus these standing v1 disclosures (verbatim, every repor
 - Staleness now has two v2 signals (git-age + retired slash-commands) — see "Staleness Signals" below.
 - SessionStart runtime emissions + MCP instruction text not statically collectable.
 
-### Staleness Signals
-
-Two staleness signals, both review candidates — **stale ≠ dead**: the model flags these for a human to look at, it never condemns a file outright from the signal alone.
-
-- **Git age** (`staleness.last_commit_ts`) — an instruction file with no recent commit is a review candidate: still-correct-and-stable and genuinely-forgotten look identical from a timestamp alone. A `null` here is NOT "very old" — read its cause from `staleness_null_reasons` (`untracked` → commit it or ignore it; `submodule_unavailable` → initialize the submodule; `budget_exhausted` → re-run, the file was never measured; `no_repo` → the scanned root is not a git work tree; `git_unavailable` → the git binary could not be run at all). Never treat a null as a staleness signal.
-- **Retired slash commands** (`phantom_refs[]` where `kind == "slash_command"`) — a rule cites a `/command` for which no home exists **under the scanned root** (`commands/<name>.md`, `commands/<ns>/<name>.md`, `skills/<name>/SKILL.md`). This is `evidence: INFERRED`, `resolved: null` — Claude Code built-ins and plugin commands live outside the root and cannot be checked from here, so treat as "verify, then update or remove," never "auto-delete."
+### Inaccessible Paths
 
 | Path | Reason |
 |---|---|
 | {path} | {reason} |
+
+### Staleness Signals
+
+Two staleness signals, both review candidates — **stale ≠ dead**: the model flags these for a human to look at, it never condemns a file outright from the signal alone.
+
+- **Git age** (`staleness.last_commit_ts`) — an instruction file with no recent commit is a review candidate: still-correct-and-stable and genuinely-forgotten look identical from a timestamp alone. A `null` here is NOT "very old" — read its cause from `staleness_null_reasons` (`untracked` → commit it or ignore it; `submodule_unavailable` → initialize the submodule; `budget_exhausted` → re-run, the file was never measured; `no_repo` → the scanned root is not a git work tree; `git_unavailable` → the git binary could not be run at all). The remaining five closed-enum values — `outside_root`, `timeout`, `git_error`, `unparseable`, `no_commits` — cover the rarer edge cases (work tree resolves outside `--root`, a per-file git call exceeded its cap, git exited non-zero or with unparseable output, or the path is tracked but has no commit yet); see `schema.md`'s full ten-value enum for exact meaning. Never treat a null as a staleness signal.
+- **Retired slash commands** (`phantom_refs[]` where `kind == "slash_command"`) — a rule cites a `/command` for which no home exists **under the scanned root** (`commands/<ns>/…/<name>.md` at any nesting depth, a bare `/name` yielding `commands/<name>.md`; and `skills/<seg0>/SKILL.md`, keyed on the command's first segment/namespace, not its own name). This is `evidence: INFERRED`, `resolved: null` — Claude Code built-ins and plugin commands live outside the root and cannot be checked from here, so treat as "verify, then update or remove," never "auto-delete."
+
+#### Git-Age Null Reasons
+
+| Path | Null Reason |
+|---|---|
+| {path} | {null_reason} |
 
 ### Collector Errors
 
