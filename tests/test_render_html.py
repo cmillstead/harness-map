@@ -4375,3 +4375,19 @@ def test_transparency_note_absent_in_non_compose(tmp_path):
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     assert 'id="weight-transparency-note"' not in text
     assert "roots walked:" not in text
+
+
+# S2 gate fix (Control 1, S1/S2/S9): esc_html's str() is not total.
+def test_esc_html_bounds_oversized_int_instead_of_raising():
+    """str(int) raises ValueError above sys.get_int_max_str_digits() (4300). esc_html is
+    on EVERY value path, so an unguarded str() turns one corrupt leaf into a page crash."""
+    out = rh.esc_html(10 ** 5000)
+    assert "unrenderable value" in out
+    assert "ValueError" in out
+    assert "<" not in out and ">" not in out   # the marker itself is escape-safe
+
+
+def test_esc_html_still_escapes_normal_values():
+    assert rh.esc_html('<a href="x">&') == "&lt;a href=&quot;x&quot;&gt;&amp;"
+    assert rh.esc_html(42) == "42"
+    assert rh.esc_html("\ud800") == "\\ud800"   # existing surrogate behavior unchanged

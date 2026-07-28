@@ -100,7 +100,19 @@ def esc_html(value: Any) -> str:
     (shared HTML5 tokenizer). Lone UTF-16 surrogates (the collector deliberately
     preserves them — Codex F9) are neutralized to a deterministic backslash escape
     BEFORE html.escape, since json.dumps/str() pass them through untouched otherwise."""
-    text = str(value)
+    try:
+        text = str(value)
+    except (ValueError, RecursionError) as exc:
+        # Control 1 (S2 gate fix, S1/S2/S9): str() is NOT total. An int over
+        # sys.get_int_max_str_digits() (4300) raises ValueError -- verified:
+        # esc_html(10**5000). A deeply self-nested structure raises RecursionError.
+        # esc_html is the single escaping primitive on EVERY value path in this module,
+        # so an unguarded str() turns one corrupt sidecar leaf into a whole-page crash.
+        # This is STRICTLY BROADER than Codex #3 (_coerce_floats guards one series).
+        # Degrade to a VISIBLE marker built only from type names (both are Python
+        # identifiers, so the marker itself needs no further escaping) -- never a silent
+        # empty string, which would look like a legitimately blank field.
+        return f"[unrenderable value: {type(value).__name__} ({type(exc).__name__})]"
     text = re.sub(r"[\ud800-\udfff]", lambda m: f"\\u{ord(m.group(0)):04x}", text)
     return html.escape(text, quote=True)
 
