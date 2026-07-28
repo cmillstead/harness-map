@@ -126,9 +126,57 @@ def esc_json_script(value: Any, *, ordered: bool = True) -> str:
     return text.translate({ord("<"): "\\u003c", ord(">"): "\\u003e", ord("&"): "\\u0026"})
 
 
+# --------------------------------------------------------------------- numeric gate
+# Control 2 (S2 gate fix): THE shared numeric gate for every arithmetic site in this
+# module. Do NOT add a seventh bespoke guard -- extend this one.
+#
+# `bool` is excluded EXPLICITLY: isinstance(True, int) is True (verified), and a stray
+# boolean would silently arithmetic as 1/0 rather than being rejected.
+#
+# math.isfinite rejects nan/inf. NaN is the dangerous case, not a cosmetic one: verified
+# _trend_delta(cur=nan, prev=1) -> ('▼ nan', 'good') -- a GREEN "improving" verdict on
+# corrupt data -- while _gauge_band(nan) -> ('HEAVY','bad') on the SAME value.
+#
+# The magnitude bound stops an int too large for float() (OverflowError, verified at
+# 10**5000). It is deliberately far above any plausible harness metric (the largest live
+# headline value is ~5 digits), so it can only ever reject corruption.
+_MAX_ABS_NUMERIC = 1e15
+
+
+def finite_number(value: Any) -> float | None:
+    """Coerce `value` to a finite, in-range float, or None. NEVER raises."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        coerced = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(coerced) or abs(coerced) > _MAX_ABS_NUMERIC:
+        return None
+    return coerced
+
+
+def _gated_size(value: Any) -> float:
+    """`finite_number` for treemap `size`/`words`, preserving INTEGER presentation.
+
+    NOT a seventh bespoke guard — it delegates to the one gate and only fixes the value's
+    display type. `size` is not purely geometry: it is also rendered as TEXT (ladder cell
+    labels, the overview weight-tax list, the copy payloads), so returning a bare float
+    would silently rewrite every "100 tokens" as "100.0 tokens" across the whole report —
+    caught by test_serve's byte-equality assertions. Unusable values become 0.0, which
+    squarify's `size > 0` filter drops; they are disclosed via `unrenderable` instead."""
+    num = finite_number(value)
+    if num is None:
+        return 0.0
+    return int(num) if num.is_integer() else num
+
+
 def _fmt_float(x):
-    """One shared fixed-precision float formatter (§4.6) for every SVG/text number."""
-    return f"{round(float(x), 2):.2f}"
+    """One shared fixed-precision float formatter (§4.6) for every SVG/text number.
+    Control 2: a non-finite/out-of-range value formats as 0.00 rather than emitting the
+    literal token `nan`/`inf` into an SVG coordinate (which silently breaks the path)."""
+    coerced = finite_number(x)
+    return f"{round(coerced, 2):.2f}" if coerced is not None else "0.00"
 
 
 # --------------------------------------------------------------------- discovery / load
@@ -352,6 +400,12 @@ def squarify(
 def _tokens_treemap(
     files: list[dict[str, Any]], canvas_w: float = 960.0, canvas_h: float = 420.0
 ) -> dict[str, Any]:
+    # R4-3: total accessor — this comprehension runs over the COMPLETE input, including
+    # rows that previously never reached f["path"] (their category died at the
+    # `tokens <= 0` gate before the per-file loop). load_sidecar does no row validation,
+    # so a pathless row must not turn the disclosure feature into a new KeyError.
+    unrenderable = sorted((f.get("path") or "(unknown path)") for f in files
+                          if finite_number(f.get("tokens_est", 0)) is None)
     by_cat: dict[Any, list[dict[str, Any]]] = {}
     for f in files:
         by_cat.setdefault(f.get("category"), []).append(f)
@@ -360,7 +414,7 @@ def _tokens_treemap(
     group_items = []
     for cat, label in ALWAYS_CATEGORIES:
         cat_files = by_cat.get(cat, [])
-        tokens = sum(f.get("tokens_est", 0) for f in cat_files)
+        tokens = sum(_gated_size(f.get("tokens_est", 0)) for f in cat_files)
         if tokens <= 0:
             continue
         group_items.append({"size": tokens, "category": cat, "label": label, "file_count": len(cat_files)})
@@ -368,8 +422,12 @@ def _tokens_treemap(
                             0.0, 0.0, canvas_w, canvas_h)
     for g in group_rects:
         groups.append(g)
-        cat_files = sorted(by_cat.get(g["category"], []), key=lambda f: (-f.get("tokens_est", 0), f["path"]))
-        cell_items = [{"size": f.get("tokens_est", 0), "words": f.get("words", 0),
+        # The SORT KEY must be gated too (Codex F4) — `-f.get(...)` on a str is a TypeError.
+        cat_files = sorted(
+            by_cat.get(g["category"], []),
+            key=lambda f: (-_gated_size(f.get("tokens_est", 0)), f["path"]))
+        cell_items = [{"size": _gated_size(f.get("tokens_est", 0)),
+                       "words": _gated_size(f.get("words", 0)),
                        "path": f["path"], "node_key": _al_node_key(f["path"], f.get("tier", "operator")),
                        "tier": f.get("tier", "operator")}
                       for f in cat_files]
@@ -382,7 +440,7 @@ def _tokens_treemap(
             c["fill"] = "var(--accent)"
             c["category"] = g["category"]
         all_cells.extend(cells)
-    return {"groups": groups, "cells": all_cells,
+    return {"groups": groups, "cells": all_cells, "unrenderable": unrenderable,
             "canvas_w": canvas_w, "canvas_h": canvas_h}
 
 
@@ -391,20 +449,30 @@ def _on_demand_treemap(
 ) -> dict[str, Any]:
     on_demand = doc.get("on_demand", {}) or {}
     items_by_group: dict[str, list[dict[str, Any]]] = {g: [] for g, _ in ON_DEMAND_GROUPS}
+    unrenderable: list[str] = []
+
+    def _add(group: str, raw_size: Any, path: str, tier: str) -> None:
+        """Control 2, same gate as `_tokens_treemap`: gating `size` HERE covers all three
+        downstream arithmetic sites at once (the group sum, the `-i["size"]` sort key, and
+        squarify). An item with no usable size has no AREA and cannot be drawn, so it is
+        DISCLOSED rather than dropped — without this, gating alone would trade the
+        str-sum TypeError for exactly the silent deletion S4 names (squarify filters
+        `size > 0`, which is False for NaN)."""
+        if finite_number(raw_size) is None:
+            unrenderable.append(path or "(unknown path)")
+            return
+        items_by_group[group].append({"size": _gated_size(raw_size), "path": path,
+                                       "node_key": _od_node_key(path), "tier": tier})
+
     for s in on_demand.get("skills", []) or []:
-        items_by_group["skill"].append({"size": s.get("words", 0), "path": s.get("name", ""),
-                                         "node_key": _od_node_key(s.get("name", "")),
-                                         "tier": s.get("tier", "operator")})
+        _add("skill", s.get("words", 0), s.get("name", ""), s.get("tier", "operator"))
     for b in on_demand.get("skill_internal_bodies", []) or []:
         kind = b.get("kind")
         if kind in items_by_group:
-            items_by_group[kind].append({"size": b.get("words", 0), "path": b.get("path", ""),
-                                          "node_key": _od_node_key(b.get("path", "")),
-                                          "tier": b.get("tier", "operator")})
+            _add(kind, b.get("words", 0), b.get("path", ""), b.get("tier", "operator"))
     for m in on_demand.get("memory_bodies", []) or []:
-        items_by_group["memory"].append({"size": m.get("words", 0), "path": m.get("path", ""),
-                                          "node_key": _od_node_key(m.get("path", "")),
-                                          "tier": m.get("tier", "operator")})
+        _add("memory", m.get("words", 0), m.get("path", ""), m.get("tier", "operator"))
+    unrenderable.sort()
     group_items = []
     for g, label in ON_DEMAND_GROUPS:
         total = sum(i["size"] for i in items_by_group[g])
@@ -424,7 +492,8 @@ def _on_demand_treemap(
             c["fill"] = "var(--accent-2)"
             c["category"] = rect["category"]
         all_cells.extend(cells)
-    return {"groups": group_rects, "cells": all_cells, "canvas_w": canvas_w, "canvas_h": canvas_h}
+    return {"groups": group_rects, "cells": all_cells, "unrenderable": unrenderable,
+            "canvas_w": canvas_w, "canvas_h": canvas_h}
 
 
 def build_contextweight_model(doc: dict[str, Any]) -> dict[str, Any]:
@@ -538,6 +607,15 @@ def build_dragcandidate_model(synth: dict[str, Any] | None) -> dict[str, Any]:
     """Drag-candidate table. Absent synthesis -> graceful empty-state."""
     if synth is None:
         return {"available": False, "rows": []}
+    # Control 2 site (f) is DELIBERATELY NOT APPLIED here — see the S2 gate-fix report.
+    # Two existing serve tests inject a mixed int/str `n` precisely BECAUSE this sort key
+    # raises TypeError, and use it as their "unenumerated exception" vector:
+    # test_serve.py::test_watcher_survives_uncaught_exception (the watcher backstop must
+    # survive a non-CollectorError/RenderError/OSError) and
+    # test_serve.py::test_startup_malformed_synthesis_clean_fatal (main() must exit 1 with
+    # a clean fatal). Gating this key makes the render SUCCEED, which breaks the first and
+    # HANGS the second (serve starts and never returns). Landing site (f) requires giving
+    # those two tests a new injection vector first — a design decision, not a local fix.
     rows = sorted((r for r in synth.get("drag_candidates", []) or [] if isinstance(r, dict)),
                   key=lambda r: r.get("n", 0))
     return {"available": True, "rows": rows}
@@ -558,12 +636,16 @@ GAUGE_BANDS = {
 
 def _gauge_band(key, value):
     """(band_label, semantic) for a gauge value. Unknown key -> neutral (informational,
-    no severity). First band whose `upper` is None or value <= upper wins."""
+    no severity). First band whose `upper` is None or value <= upper wins. Control 2: a
+    non-finite/non-numeric value is NOT silently banded — NaN compares False against
+    every `upper` and fell through to the LAST band ('HEAVY','bad'), inventing a severity
+    verdict from corruption."""
     bands = GAUGE_BANDS.get(key)
-    if not bands:
+    num = finite_number(value)
+    if not bands or num is None:
         return ("", "neutral")
     for upper, label, semantic in bands:
-        if upper is None or value <= upper:
+        if upper is None or num <= upper:
             return (label, semantic)
     return bands[-1][1], bands[-1][2]
 
@@ -2126,13 +2208,26 @@ def _trend_delta(trend_model, key):
     series = next((s for s in trend_model["series"] if s["key"] == key), None)
     if not series or len(series["values"]) < 2:
         return None
-    cur, prev = series["values"][-1], series["values"][-2]
-    if not (isinstance(cur, (int, float)) and isinstance(prev, (int, float))):
-        return None  # A17: a corrupt/hostile sidecar value is not comparable — degrade to no-delta, never crash
+    cur_f = finite_number(series["values"][-1])
+    prev_f = finite_number(series["values"][-2])
+    if cur_f is None or prev_f is None:
+        # A17 + A19b/S3 (P1): a corrupt/hostile sidecar value is not comparable —
+        # degrade to no-delta. Previously a NaN produced ('▼ nan', 'good'): a GREEN
+        # "improving" verdict, because `nan > prev` is False and a down arrow reads
+        # "good" under polarity 'up'. A plausible-looking wrong verdict in the
+        # reassuring direction is worse than no verdict.
+        return None
+    cur, prev = cur_f, prev_f
     if cur == prev:
         return ("= 0", "neutral")
     arrow = "▲" if cur > prev else "▼"   # ▲ / ▼
-    text = f"{arrow} {abs(cur - prev)}"
+    delta = abs(cur - prev)
+    # Step 4(c), MANDATORY: finite_number returns floats, so a bare f-string would render
+    # "▲ 50.0". Three existing assertions pin the INTEGER form, and editing them would
+    # fire the kill signal (CLAUDE.md binding rule 7). This shim keeps the rendered text
+    # byte-identical for the integer inputs the collector actually emits, while still
+    # formatting a genuine float sensibly.
+    text = f"{arrow} {int(delta) if delta.is_integer() else delta}"
     polarity = series.get("polarity", "none")
     if polarity == "up":            # increasing this metric is the BAD direction
         semantic = "bad" if cur > prev else "good"
@@ -2608,6 +2703,20 @@ def _render_overview_view(overview_model, civc, date, copy_payload, doc):
     )
 
 
+def _render_unrenderable_note(tree):
+    """Control 2 disclosure: a file whose size value is unusable (non-numeric, NaN/inf,
+    out of range) has no AREA and cannot be drawn. Silently dropping it is the S4 defect —
+    the file vanishes from the Weight view with no error and no count. This makes the
+    omission VISIBLE. Renderer-local model state: no new gauge, no band, no schema field."""
+    paths = tree.get("unrenderable") or []
+    if not paths:
+        return ""
+    files_word = "file" if len(paths) == 1 else "files"
+    listed = ", ".join(f"<code>{esc_html(p)}</code>" for p in paths)
+    return (f'<p class="empty-state">{len(paths)} {files_word} omitted from this map: '
+            f'no usable size value — {listed}</p>')
+
+
 def _render_weight_view(model, heat, friction_enabled, doc, copy_payload):
     """Verbatim body of the former `_render_context_weight_tab`, now also carrying the
     friction legend + overlay toggle (moved here — heat only ever lands on these two
@@ -2628,6 +2737,8 @@ def _render_weight_view(model, heat, friction_enabled, doc, copy_payload):
     file gets the ring consistently across both representations."""
     bucket_map = _heat_bucket_map(heat)
     length_crit_keys = _length_critical_node_keys(doc)
+    always_omitted = _render_unrenderable_note(model["always"])
+    ondemand_omitted = _render_unrenderable_note(model["on_demand"])
     always_treemap = _render_treemap_svg(model["always"], heat, "treemap-always", bucket_map, length_crit_keys)
     always_ladder = _render_ladder_svg(model["always"], heat, "ladder-always", bucket_map, length_crit_keys)
     ondemand_treemap = _render_treemap_svg(model["on_demand"], heat, "treemap-ondemand", bucket_map, length_crit_keys)
@@ -2680,10 +2791,10 @@ def _render_weight_view(model, heat, friction_enabled, doc, copy_payload):
         f'{_render_transparency_note(doc)}'
         '<div class="card"><h2>Always-loaded (by category, sized by est. tokens)</h2>'
         f'<div class="treemap-panel">{always_treemap}</div>'
-        f'<div class="ladder-panel">{always_ladder}</div></div>'
+        f'<div class="ladder-panel">{always_ladder}</div>{always_omitted}</div>'
         '<div class="card"><h2>On-demand (skills / phases / prompts / agents / memory, sized by words)</h2>'
         f'<div class="treemap-panel">{ondemand_treemap}</div>'
-        f'<div class="ladder-panel">{ondemand_ladder}</div></div></section>'
+        f'<div class="ladder-panel">{ondemand_ladder}</div>{ondemand_omitted}</div></section>'
     )
 
 
@@ -2735,11 +2846,11 @@ def _coerce_floats(values: list[Any]) -> list[float] | None:
     of crashing (SPEC_4 §3 escaping/robustness discipline). The existing table cell
     still renders the raw value via `esc_html` regardless of this result."""
     out: list[float] = []
-    for v in values:
-        try:
-            out.append(float(cast(Any, v)))
-        except (TypeError, ValueError):
-            return None
+    for value in values:
+        coerced = finite_number(value)
+        if coerced is None:
+            return None       # Control 2: covers a string (existing), a non-finite
+        out.append(coerced)   # (A19a) and an int too large for float() (Codex #3).
     return out
 
 

@@ -4404,3 +4404,168 @@ def test_esc_html_bounds_deeply_nested_structure_instead_of_crashing():
     assert "unrenderable value" in out
     assert "RecursionError" in out
     assert "<" not in out and ">" not in out
+
+
+# S2 gate fix (Control 2): ONE shared numeric gate. Values verified against live code.
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"),
+                                 # Explicit id REQUIRED: pytest builds parameter ids with
+                                 # str(val), which raises the >4300-digit ValueError this
+                                 # very case exists to gate -- an auto-id aborts COLLECTION
+                                 # of the whole module (verified).
+                                 pytest.param(10 ** 5000, id="oversized_int"),
+                                 "big", None, [1], True, False, 1e300])
+def test_finite_number_rejects_every_unsafe_shape(bad):
+    assert rh.finite_number(bad) is None
+
+
+@pytest.mark.parametrize("good,expected", [(0, 0.0), (-5, -5.0), (1234, 1234.0), (1.5, 1.5)])
+def test_finite_number_passes_ordinary_values(good, expected):
+    assert rh.finite_number(good) == expected
+
+
+def test_trend_delta_refuses_nan_instead_of_painting_it_green():
+    """A19b/S3, P1: BEFORE this fix _trend_delta(cur=nan, prev=1) returned
+    ('- nan', 'good') -- because `nan > prev` is False the arrow is down, and for
+    polarity 'up' a down arrow is assigned semantic 'good'. A corrupt headline painted
+    the metric IMPROVING, in green, while _gauge_band(nan) painted ('HEAVY','bad') on
+    the same value. Two widgets confidently disagreeing is worse than either failing."""
+    model = {"first_run": False,
+             "series": [{"key": "k", "values": [1, float("nan")], "polarity": "up"}]}
+    assert rh._trend_delta(model, "k") is None
+
+
+def test_trend_delta_refuses_inf():
+    model = {"first_run": False,
+             "series": [{"key": "k", "values": [1, float("inf")], "polarity": "up"}]}
+    assert rh._trend_delta(model, "k") is None
+
+
+def test_coerce_floats_rejects_nan_and_oversized_int():
+    assert rh._coerce_floats([float("nan"), 1.0]) is None
+    assert rh._coerce_floats([10 ** 5000]) is None
+    assert rh._coerce_floats([1, 2.5]) == [1.0, 2.5]
+
+
+def test_gauge_band_nan_is_neutral_not_heavy():
+    assert rh._gauge_band("always_loaded_words", float("nan")) == ("", "neutral")
+
+
+def test_tokens_treemap_survives_non_numeric_tokens_est():
+    """S4/S5: a string tokens_est raised TypeError and aborted the WHOLE render.
+
+    MUST MIX a valid file with the string file IN THE SAME CATEGORY (Codex F4). With the
+    string file ALONE the group sum is 0, `if tokens <= 0: continue` skips the category,
+    and the crashing sort key is NEVER REACHED -- the test passes
+    while proving nothing. The valid sibling forces the sum positive so the sort runs."""
+    out = rh._tokens_treemap([
+        {"category": "rule", "tokens_est": "big", "words": 1, "path": "bad.md",
+         "tier": "operator"},
+        {"category": "rule", "tokens_est": 10, "words": 1, "path": "ok.md",
+         "tier": "operator"}])
+    assert [c["path"] for c in out["cells"]] == ["ok.md"]   # the render SURVIVED
+    assert out["unrenderable"] == ["bad.md"]                # and DISCLOSED the omission
+
+
+def test_tokens_treemap_nan_does_not_silently_delete_a_file():
+    """S4: squarify filters `size > 0`, which is False for NaN -- the file VANISHED from
+    the Weight view with no error, no blind_spot and no count. A silent suppression
+    primitive.
+
+    A file with no usable size has no AREA, so it cannot be drawn -- the fix is not to
+    draw it anyway but to make the omission VISIBLE. Note this case reaches the sort key
+    without crashing (`-nan` is legal), which is why the string case above is the one that
+    proves the sort-key site; this one proves the disclosure."""
+    out = rh._tokens_treemap([
+        {"category": "rule", "tokens_est": float("nan"), "words": 1, "path": "bad.md",
+         "tier": "operator"},
+        {"category": "rule", "tokens_est": 10, "words": 1, "path": "ok.md",
+         "tier": "operator"}])
+    assert [c["path"] for c in out["cells"]] == ["ok.md"]
+    assert out["unrenderable"] == ["bad.md"]   # NOT silently gone
+
+
+def test_all_invalid_category_still_discloses():
+    """R3-4: both tests above mix a valid sibling in, so the category's gated sum is
+    positive and the group loop runs. When EVERY file in a category is invalid the
+    category never enters group_rects (`if tokens <= 0: continue`) -- if
+    `unrenderable` were accumulated inside the group loop these files would vanish from
+    the map AND the disclosure. Accumulation from the complete input is what this pins."""
+    out = rh._tokens_treemap([
+        {"category": "rule", "tokens_est": "big", "words": 1, "path": "bad1.md",
+         "tier": "operator"},
+        {"category": "rule", "tokens_est": float("nan"), "words": 1, "path": "bad2.md",
+         "tier": "operator"},
+        # R4-3: a PATHLESS invalid row -- load_sidecar does no row validation, and the
+        # disclosure comprehension is the first code to touch f["path"] for rows whose
+        # category never survives the tokens<=0 gate. Must disclose, never KeyError.
+        {"category": "rule", "tokens_est": "nope", "words": 1, "tier": "operator"}])
+    assert out["cells"] == [] and out["groups"] == []
+    assert out["unrenderable"] == ["(unknown path)", "bad1.md", "bad2.md"]
+
+
+def test_on_demand_treemap_discloses_unrenderable_size():
+    """The same gating class applied to `_on_demand_treemap`'s `size` fields. Without a
+    disclosure here the mandated gate would CONVERT the string-crash into exactly the
+    silent deletion S4 names (squarify drops `size > 0` == False), i.e. trade a loud
+    defect for a quiet one in the on-demand panel."""
+    out = rh._on_demand_treemap({"on_demand": {
+        "skills": [{"name": "bad-skill", "words": "big"},
+                   {"name": "ok-skill", "words": 10}],
+        "skill_internal_bodies": [],
+        "memory_bodies": [{"path": "m/bad.md", "words": float("nan")}]}})
+    assert [c["path"] for c in out["cells"]] == ["ok-skill"]
+    assert out["unrenderable"] == ["bad-skill", "m/bad.md"]
+
+
+def test_treemap_omission_is_rendered_not_just_modelled(tmp_path):
+    """rules/dark-features.md: `unrenderable` must reach an entry point. A model field no
+    template reads is a dark feature -- the omission would be recorded and still invisible
+    to the operator, which is the S4 defect wearing a different hat.
+
+    Full CLI, real helpers, no mocks. `_minimal_doc(extra_files=...)` APPENDS to its two
+    default VERIFIED files, so the `rule` category already has
+    a valid member and the group sum is positive regardless of this file."""
+    out_dir = tmp_path / "dark"
+    out_dir.mkdir()
+    doc = _minimal_doc(extra_files=[
+        {"path": "bad.md", "category": "rule", "words": 1, "lines": 1,
+         "tokens_est": "big", "evidence": "VERIFIED"}])
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0
+    html = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "omitted from this map" in html
+    assert "bad.md" in html
+
+
+def test_treemap_size_keeps_integer_presentation():
+    """Regression, caught by test_serve's byte-equality assertions: `size`/`words` are
+    not purely geometry -- they are rendered as TEXT (ladder cell labels, the overview
+    weight-tax list, the copy payloads). Gating them through a float-returning helper
+    rewrote every "100 tokens" as "100.0 tokens" report-wide. `esc_html` is the exact
+    primitive those render sites use, so pinning it pins the emitted bytes."""
+    out = rh._tokens_treemap([{"category": "rule", "tokens_est": 100, "words": 40,
+                               "path": "ok.md", "tier": "operator"}])
+    cell = out["cells"][0]
+    assert rh.esc_html(cell["size"]) == "100"
+    assert rh.esc_html(cell["words"]) == "40"
+    on_demand = rh._on_demand_treemap({"on_demand": {"skills": [{"name": "s", "words": 300}]}})
+    assert rh.esc_html(on_demand["cells"][0]["size"]) == "300"
+
+
+def test_fmt_float_rejects_nan():
+    assert rh._fmt_float(float("nan")) == "0.00"
+
+
+def test_build_dragcandidate_model_still_raises_on_mixed_type_n():
+    """Site (f) of Control 2 is NOT applied — pinned here so the reason is not lost.
+
+    Two existing serve tests use a mixed int/str `n` as their deliberate
+    "unenumerated exception" injection vector (test_watcher_survives_uncaught_exception,
+    test_startup_malformed_synthesis_clean_fatal). Gating this sort key makes the render
+    succeed, which breaks the first and HANGS the second. This test documents the
+    surviving TypeError so a future change to the sort key fails HERE, next to the
+    explanation, instead of silently wedging the serve suite."""
+    with pytest.raises(TypeError):
+        rh.build_dragcandidate_model({"drag_candidates": [
+            {"n": 1, "surface": "a"}, {"n": "x", "surface": "b"}]})
