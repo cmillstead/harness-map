@@ -4151,3 +4151,48 @@ def test_absent_git_emits_git_unavailable_for_every_file(fake_harness):
     doc = run_collector(fake_harness, env={"PATH": ""})
     assert doc["staleness"]["git_age_available"] is False
     assert set(doc["staleness_null_reasons"].values()) == {"git_unavailable"}
+
+
+# S2 gate fix (Codex #10): the OSError / TimeoutExpired branches were untested.
+#
+# NOTE: the full-CLI empty-PATH test that used to sit here has been REMOVED. It was a
+# strict duplicate of T10's `test_absent_git_emits_git_unavailable_for_every_file`, which
+# asserts the same two facts plus one and already uses the correct kwarg. The three
+# direct-call tests below are what this task actually adds.
+
+def test_git_last_commit_ts_reports_timeout_with_a_real_sleeping_shim(tmp_path):
+    """A REAL git shim, not a mock: `/bin/sleep 3` (absolute -- a bare `sleep` fails under
+    an emptied PATH) against the per-call cap."""
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text("#!/bin/sh\nexec /bin/sleep 3\n")
+    (shim / "git").chmod(0o755)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(shim)
+    try:
+        ts, reason = _collector._git_last_commit_ts(tmp_path, "a.md", 1)
+    finally:
+        os.environ["PATH"] = old
+    assert ts is None and reason == "timeout"
+
+def test_git_last_commit_ts_reports_git_error_when_binary_absent(tmp_path):
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = ""
+    try:
+        ts, reason = _collector._git_last_commit_ts(tmp_path, "a.md", 2)
+    finally:
+        os.environ["PATH"] = old
+    assert ts is None and reason == "git_error"
+
+def test_git_last_commit_ts_reports_unparseable_on_non_integer_stdout(tmp_path):
+    shim = tmp_path / "bin2"
+    shim.mkdir()
+    (shim / "git").write_text("#!/bin/sh\necho not-a-number\n")
+    (shim / "git").chmod(0o755)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(shim)
+    try:
+        ts, reason = _collector._git_last_commit_ts(tmp_path, "a.md", 2)
+    finally:
+        os.environ["PATH"] = old
+    assert ts is None and reason == "unparseable"
