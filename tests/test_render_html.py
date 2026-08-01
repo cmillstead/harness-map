@@ -5228,3 +5228,70 @@ def test_aggregate_codex_does_not_drop_a_calendar_invalid_record():
     assert rh.aggregate_codex(invalid, "2026-07-15")["runs"] == 1
     future = [{"mode": "plan", "verdict": "SHIP", "ts": "2099-12-31T00:00:00Z"}]
     assert rh.aggregate_codex(future, "2026-07-15")["runs"] == 0
+
+
+# ---------------------------------- S6a: date-provenance counters + rename (finding #12)
+def _one_stream_render(tmp_path, name, stream_flag, lines, date="2026-07-15"):
+    """Render `_minimal_doc` with exactly ONE telemetry stream wired from an explicit
+    fixture path (never a default), returning the rendered HTML text."""
+    out_dir = tmp_path / name
+    out_dir.mkdir()
+    _write_sidecar(out_dir, date, _minimal_doc())
+    stream = tmp_path / f"{name}.jsonl"
+    stream.write_text("".join(json.dumps(r) + "\n" for r in lines))
+    proc = run_render(out_dir, "--date", date, stream_flag, str(stream))
+    assert proc.returncode == 0, proc.stderr
+    return (out_dir / f"harness-map-{date}.html").read_text()
+
+
+def test_interventions_sentence_says_dated_never_in_window(tmp_path):
+    """T2.1 — naming guard. The old wording asserted a 30-day bound the code never had:
+    the join only excludes FUTURE dates. The phrase must be gone from the WHOLE document,
+    not just the interventions row — the decisions branch carried it too."""
+    text = _one_stream_render(tmp_path, "dated", "--interventions-file", [
+        {"timestamp": "2026-07-14T10:00:00", "memory_file": "feedback_note.md"},
+        {"timestamp": "2026-07-13T10:00:00", "memory_file": "feedback_note.md"},
+    ])
+    assert "2 records parsed, 2 dated" in text
+    assert "in window" not in text
+
+
+def test_interventions_counts_undated_invalid_and_conflicting(tmp_path):
+    """T2.2/T2.3/T2.4 — the three disclosed counters. First-match-wins still returns the
+    `date` value for the conflicting record; the disagreement is COUNTED, not swallowed."""
+    text = _one_stream_render(tmp_path, "prov", "--interventions-file", [
+        {"memory_file": "feedback_note.md"},                              # undated
+        {"date": "2026-13-45", "memory_file": "feedback_note.md"},        # invalid calendar
+        {"date": "2026-07-01", "timestamp": "2026-07-14T00:00:00",
+         "memory_file": "feedback_note.md"},                              # conflicting
+    ])
+    assert "records_undated" in text and "records_invalid_date" in text
+    assert "records_conflicting_date" in text
+    assert "1 undated" in text and "1 invalid" in text and "1 conflicting" in text
+
+
+def test_interventions_future_dated_record_is_skipped_and_counted(tmp_path):
+    """T2.5 — the future guard does not merely exclude a record from a COUNT: it skips the
+    whole record, so it never heats a node. Before S6a the guard was DEAD for this stream
+    because no interventions record was ever dated. A skipped record must not vanish
+    unremarked."""
+    text = _one_stream_render(tmp_path, "future", "--interventions-file", [
+        {"timestamp": "2099-12-31T00:00:00", "memory_file": "feedback_note.md"},
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "feedback_note.md"},
+    ])
+    assert "2 records parsed, 1 dated" in text
+    assert "1 skipped as future-dated" in text
+
+
+def test_stream_card_numeral_and_sentence_agree(tmp_path):
+    """T2.6 — the defect §4.3a names: wiring the path WITHOUT the timestamp fix ships a
+    card reading `3` above a sentence reading `0 in window`. Two numbers, one card, one
+    dataset, disagreeing — the confidently-disagreeing-widgets class."""
+    text = _one_stream_render(tmp_path, "agree", "--interventions-file", [
+        {"timestamp": f"2026-07-1{i}T00:00:00", "memory_file": "feedback_note.md"}
+        for i in (1, 2, 3)
+    ])
+    assert "3 records parsed, 3 dated" in text
+    card = re.search(r'<div class="stream-card"><div class="count">(\d+)</div>'
+                     r'<h3>Interventions</h3>', text)
+    assert card is not None and card.group(1) == "3"

@@ -1194,10 +1194,50 @@ def _record_date_info(rec):
 
 
 def _record_date(rec):
-    """The date half of `_record_date_info`, kept as the single-value accessor the join
-    functions and `aggregate_codex` already call. One home, two readers — never a second
-    extractor (§4.3 rejects a per-join normalizer for exactly this reason)."""
+    """The date half of `_record_date_info`, kept as the single-value accessor
+    `aggregate_codex` already calls. One home, two readers — never a second extractor
+    (§4.3 rejects a per-join normalizer for exactly this reason)."""
     return _record_date_info(rec)[0]
+
+
+# Sentinel: `_accumulate_date` returns this when the record must be skipped entirely. A
+# future-dated record is not merely excluded from a count -- it never joins and never heats
+# a node (pre-existing, correct: never attribute friction that has not happened yet). None
+# is already taken by "undated", which does NOT skip, so the two need distinct values.
+_SKIP_FUTURE = object()
+
+
+def _new_date_counters():
+    """The five date-provenance counters, in a FIXED insertion order so the rendered raw
+    counters are byte-deterministic across PYTHONHASHSEED."""
+    return {"records_dated_as_of": 0, "records_undated": 0, "records_invalid_date": 0,
+            "records_conflicting_date": 0, "records_skipped_future": 0}
+
+
+def _accumulate_date(rec, current_date, counters):
+    """Read one record's date, fold its provenance into `counters`, and say whether the
+    caller must skip it. The ONE place the five counters are incremented, so the three
+    stream joins can never disagree.
+
+    `records_dated_as_of` is deliberately NOT called `..._in_window`: the joins have no
+    30-day lower bound, they only exclude FUTURE dates. The live minimum interventions
+    timestamp is 2026-06-07 against a current date of 2026-07-31 -- 54 days back and
+    counted. A real inclusive 30-day counter belongs to M8, where a window actually exists.
+    # Changing these counter NAMES requires a spec change (S6 §4.3, finding #12)."""
+    date, status, conflict = _record_date_info(rec)
+    if conflict:
+        counters["records_conflicting_date"] += 1
+    if status == "invalid":
+        counters["records_invalid_date"] += 1
+    elif status == "undated":
+        counters["records_undated"] += 1
+    if date is None:
+        return None
+    if date > current_date:
+        counters["records_skipped_future"] += 1
+        return _SKIP_FUTURE
+    counters["records_dated_as_of"] += 1
+    return date
 
 
 def join_decisions(
@@ -1209,13 +1249,12 @@ def join_decisions(
     heat: dict[str, int] = {}
     joined: dict[str, list[dict[str, Any]]] = {}
     valid_keys = _valid_node_keys(node_index)
-    segments_total = segments_joined = segments_ambiguous = segments_unmatched = dated_in_window = 0
+    segments_total = segments_joined = segments_ambiguous = segments_unmatched = 0
+    prov = _new_date_counters()
     for rec in records:
-        d = _record_date(rec)
-        if d is not None:
-            if d > current_date:
-                continue
-            dated_in_window += 1
+        d = _accumulate_date(rec, current_date, prov)
+        if d is _SKIP_FUTURE:
+            continue
         component = rec.get("component")
         if not isinstance(component, str) or not component.strip():
             continue
@@ -1232,8 +1271,8 @@ def join_decisions(
             heat[key] = heat.get(key, 0) + 1
             joined.setdefault(key, []).append(rec)
     return heat, joined, {"segments_total": segments_total, "segments_joined": segments_joined,
-                           "segments_ambiguous": segments_ambiguous, "segments_unmatched": segments_unmatched,
-                           "records_dated_in_window": dated_in_window}
+                           "segments_ambiguous": segments_ambiguous,
+                           "segments_unmatched": segments_unmatched, **prov}
 
 
 def _metrics_eligible(rec):
@@ -1258,13 +1297,11 @@ def join_metrics(
     heat: dict[str, int] = {}
     joined: dict[str, list[dict[str, Any]]] = {}
     valid_keys = _valid_node_keys(node_index)
-    records_eligible = records_aggregate_only = dated_in_window = 0
+    records_eligible = records_aggregate_only = 0
+    prov = _new_date_counters()
     for rec in records:
-        d = _record_date(rec)
-        if d is not None:
-            if d > current_date:
-                continue
-            dated_in_window += 1
+        if _accumulate_date(rec, current_date, prov) is _SKIP_FUTURE:
+            continue
         if not _metrics_eligible(rec):
             continue
         records_eligible += 1
@@ -1296,8 +1333,7 @@ def join_metrics(
         if not attributed:
             records_aggregate_only += 1
     return heat, joined, {"records_eligible": records_eligible,
-                           "records_aggregate_only": records_aggregate_only,
-                           "records_dated_in_window": dated_in_window}
+                           "records_aggregate_only": records_aggregate_only, **prov}
 
 
 def join_interventions(
@@ -1309,13 +1345,11 @@ def join_interventions(
     heat: dict[str, int] = {}
     joined: dict[str, list[dict[str, Any]]] = {}
     valid_keys = _valid_node_keys(node_index)
-    dated_in_window = segments_joined = segments_ambiguous = segments_unmatched = 0
+    segments_joined = segments_ambiguous = segments_unmatched = events_backfilled = 0
+    prov = _new_date_counters()
     for rec in records:
-        d = _record_date(rec)
-        if d is not None:
-            if d > current_date:
-                continue
-            dated_in_window += 1
+        if _accumulate_date(rec, current_date, prov) is _SKIP_FUTURE:
+            continue
         mem = rec.get("memory_file")
         if not isinstance(mem, str) or not mem.strip():
             continue
@@ -1327,10 +1361,14 @@ def join_interventions(
             segments_unmatched += 1
             continue
         segments_joined += 1
+        if rec.get("backfilled") is True:
+            events_backfilled += 1
         heat[key] = heat.get(key, 0) + 1
         joined.setdefault(key, []).append(rec)
-    return heat, joined, {"records_dated_in_window": dated_in_window, "segments_joined": segments_joined,
-                           "segments_ambiguous": segments_ambiguous, "segments_unmatched": segments_unmatched}
+    return heat, joined, {"segments_joined": segments_joined,
+                           "segments_ambiguous": segments_ambiguous,
+                           "segments_unmatched": segments_unmatched,
+                           "events_backfilled": events_backfilled, **prov}
 
 
 def aggregate_codex(records: list[dict[str, Any]], current_date: str) -> dict[str, Any]:
@@ -1381,17 +1419,25 @@ def _friction_sentence(f, codex_aggregate):
         return f"{label} — telemetry file exists but is not a readable file."
     if f["stream"] == "decisions":
         total, joined = f.get("segments_total", 0), f.get("segments_joined", 0)
-        window, ambiguous = f.get("records_dated_in_window", 0), f.get("segments_ambiguous", 0)
+        dated, ambiguous = f.get("records_dated_as_of", 0), f.get("segments_ambiguous", 0)
         return (f"{label} — {joined} of {total} component references matched to map "
-                f"components ({window} records in window; {ambiguous} ambiguous).")
+                f"components ({dated} records dated; {ambiguous} ambiguous).")
     if f["stream"] == "metrics":
         eligible, agg_only = f.get("records_eligible", 0), f.get("records_aggregate_only", 0)
         attributed, invalid = eligible - agg_only, f.get("records_invalid", 0)
         return (f"{label} — {attributed} of {eligible} eligible pipeline records attributed "
                 f"to phase/agent components ({agg_only} aggregate-only); {invalid} invalid lines.")
     if f["stream"] == "interventions":
-        parsed, window = f.get("records_parsed", 0), f.get("records_dated_in_window", 0)
-        return f"{label} — {parsed} records parsed, {window} in window."
+        parsed, dated = f.get("records_parsed", 0), f.get("records_dated_as_of", 0)
+        bits = [f"{label} — {parsed} records parsed, {dated} dated"]
+        for count_key, word in (("records_undated", "undated"),
+                                ("records_invalid_date", "invalid"),
+                                ("records_conflicting_date", "conflicting"),
+                                ("records_skipped_future", "skipped as future-dated")):
+            n = f.get(count_key, 0)
+            if n:
+                bits.append(f"{n} {word}")
+        return "; ".join(bits) + "."
     # codex — aggregate-only, no node join (§2.2)
     runs = codex_aggregate["runs"]
     return f"{label} — {runs} records, aggregate-only (target is a plan filename, not a map component)."
