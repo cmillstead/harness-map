@@ -1341,7 +1341,7 @@ def join_metrics(
     heat: dict[str, int] = {}
     joined: dict[str, list[dict[str, Any]]] = {}
     valid_keys = _valid_node_keys(node_index)
-    records_eligible = records_aggregate_only = 0
+    records_eligible = records_aggregate_only = records_invalid_shape = 0
     prov = _new_date_counters()
     for rec in records:
         if _accumulate_date(rec, current_date, prov) is _SKIP_FUTURE:
@@ -1350,6 +1350,12 @@ def join_metrics(
             continue
         records_eligible += 1
         attributed = False
+        # A field that is ABSENT is a legitimate older record shape and never counts. A
+        # field that is PRESENT but the wrong type is a contract violation: the join
+        # below silently skips it (post-exec Codex finding, S6a) and the record loses
+        # that half of its attribution with no trace anywhere else -- `bad_shape` makes
+        # that loss disclosed instead of silent.
+        bad_shape = False
         phases = rec.get("phases_used")
         if isinstance(phases, list):
             for p in phases:
@@ -1361,6 +1367,8 @@ def join_metrics(
                     heat[key] = heat.get(key, 0) + 1
                     joined.setdefault(key, []).append(rec)
                     attributed = True
+        elif "phases_used" in rec:
+            bad_shape = True
         agents = rec.get("agents_dispatched")
         if isinstance(agents, dict):
             for a, count in agents.items():
@@ -1374,10 +1382,15 @@ def join_metrics(
                     heat[key] = heat.get(key, 0) + 1
                     joined.setdefault(key, []).append(rec)
                     attributed = True
+        elif "agents_dispatched" in rec:
+            bad_shape = True
+        if bad_shape:
+            records_invalid_shape += 1
         if not attributed:
             records_aggregate_only += 1
     return heat, joined, {"records_eligible": records_eligible,
-                           "records_aggregate_only": records_aggregate_only, **prov}
+                           "records_aggregate_only": records_aggregate_only,
+                           "records_invalid_shape": records_invalid_shape, **prov}
 
 
 def join_interventions(
@@ -1565,10 +1578,18 @@ def _friction_sentence(f, codex_aggregate):
     if f["stream"] == "metrics":
         eligible, agg_only = f.get("records_eligible", 0), f.get("records_aggregate_only", 0)
         attributed, invalid = eligible - agg_only, _displayed_invalid_count(f)
-        return _sentence_with_note(
-            f"{label} — {_lb(attributed, trunc)} of {_lb(eligible, trunc)} eligible pipeline "
-            f"records attributed to phase/agent components ({_lb(agg_only, trunc)} "
-            f"aggregate-only); {_lb(invalid, trunc)} invalid lines.", f)
+        sentence = (f"{label} — {_lb(attributed, trunc)} of {_lb(eligible, trunc)} eligible pipeline "
+                    f"records attributed to phase/agent components ({_lb(agg_only, trunc)} "
+                    f"aggregate-only); {_lb(invalid, trunc)} invalid lines")
+        malformed = f.get("records_invalid_shape", 0)
+        if malformed:
+            # Disclosure, not a new failure mode: these records already counted toward
+            # `eligible`/`agg_only` above -- this clause names WHY some of them lost
+            # phase/agent attribution (a contract-violating field shape) rather than
+            # letting that loss vanish silently into the aggregate-only bucket.
+            sentence += (f"; {_lb(malformed, trunc)} of {_lb(eligible, trunc)} records "
+                         f"malformed (phase/agent attribution incomplete)")
+        return _sentence_with_note(sentence + ".", f)
     if f["stream"] == "interventions":
         parsed, dated = f.get("records_parsed", 0), f.get("records_dated_as_of", 0)
         bits = [f"{label} — {_lb(parsed, trunc)} records parsed, {_lb(dated, trunc)} dated"]

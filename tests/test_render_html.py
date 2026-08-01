@@ -762,6 +762,54 @@ def test_join_metrics_clean_run_not_eligible():
     assert extra["records_eligible"] == 0
 
 
+def test_join_metrics_bad_phases_shape_counted_agent_heat_still_joins():
+    """Post-exec Codex finding, S6a: `phases_used` present but not a list (the real witness
+    at `harness-metrics.jsonl:33` carried an int) is silently skipped by the phase join --
+    `records_invalid_shape` discloses that loss instead of letting it vanish. The agents
+    half, being well-formed, still attributes normally: one malformed field must not
+    suppress the other field's real heat."""
+    node_index = {
+        "execution.md": ["on_demand:skills/coding-team/phases/execution.md"],
+        "ct-implementer.md": ["on_demand:skills/coding-team/agents/ct-implementer.md"],
+    }
+    records = [{"date": "2026-07-01", "phases_used": 6,
+                "agents_dispatched": {"builder": 2}, "rework_iterations": 1}]
+    heat, joined, extra = rh.join_metrics(records, node_index, "2026-07-15")
+    assert heat == {"on_demand:skills/coding-team/agents/ct-implementer.md": 1}
+    assert extra["records_invalid_shape"] == 1
+
+
+def test_join_metrics_bad_agents_shape_counted():
+    """`agents_dispatched` present but not a dict is the mirror-image contract violation."""
+    node_index = {"execution.md": ["on_demand:skills/coding-team/phases/execution.md"]}
+    records = [{"date": "2026-07-01", "phases_used": ["execute"],
+                "agents_dispatched": ["builder"], "rework_iterations": 1}]
+    heat, joined, extra = rh.join_metrics(records, node_index, "2026-07-15")
+    assert heat == {"on_demand:skills/coding-team/phases/execution.md": 1}
+    assert extra["records_invalid_shape"] == 1
+
+
+def test_join_metrics_both_fields_malformed_counted_once():
+    """A record must count once toward `records_invalid_shape` even when BOTH attribution
+    fields are malformed -- the disclosure is "how many records lost attribution", not "how
+    many fields were malformed"."""
+    records = [{"date": "2026-07-01", "phases_used": 6,
+                "agents_dispatched": "builder", "rework_iterations": 1}]
+    heat, joined, extra = rh.join_metrics(records, {}, "2026-07-15")
+    assert heat == {}
+    assert extra["records_invalid_shape"] == 1
+
+
+def test_join_metrics_absent_attribution_fields_not_counted_as_invalid_shape():
+    """An ABSENT field is a legitimate older record shape, never a contract violation --
+    without this test the counter could silently become a "records missing optional
+    fields" tally instead of a shape-violation tally."""
+    records = [{"date": "2026-07-01", "rework_iterations": 1}]
+    heat, joined, extra = rh.join_metrics(records, {}, "2026-07-15")
+    assert extra["records_invalid_shape"] == 0
+    assert extra["records_aggregate_only"] == 1
+
+
 # ================================================== C3: composed overlay no-smear proofs
 def test_build_friction_overlay_single_path_event_heats_exactly_one_node(tmp_path):
     """Integration proof (through the COMPOSED `build_friction_overlay` entry point, not
@@ -1320,6 +1368,28 @@ def test_metrics_stream_renders_attribution_sentence(tmp_path):
     assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     assert "eligible pipeline records attributed to phase/agent components" in text
+
+
+def test_metrics_sentence_discloses_shape_malformed_records(tmp_path):
+    """The disclosure clause names the record that lost attribution to a bad field shape,
+    not just the field type -- the shape of the real witness at
+    `harness-metrics.jsonl:33` (`"phases_used": 6`, an int where the contract wants a
+    list)."""
+    text = _one_stream_render(tmp_path, "shapebad", "--metrics-file", [
+        {"date": "2026-07-01", "rework_iterations": 1, "phases_used": 6,
+         "agents_dispatched": {"builder": 1}},
+    ])
+    assert "1 of 1 records malformed (phase/agent attribution incomplete)" in text
+
+
+def test_metrics_sentence_omits_malformed_clause_when_all_well_formed(tmp_path):
+    """The clause is conditional, not always-on boilerplate: an all-well-formed stream
+    must render neither the counter nor the words."""
+    text = _one_stream_render(tmp_path, "shapegood", "--metrics-file", [
+        {"date": "2026-07-01", "rework_iterations": 1, "phases_used": ["execute"],
+         "agents_dispatched": {"builder": 1}},
+    ])
+    assert "records malformed" not in text
 
 
 def test_codex_aggregate_renders_english_sentence(tmp_path):

@@ -304,6 +304,25 @@ does not surface per-provenance counts.
      Verified 2026-07-31 — a plan reviewer read the sentence above as documenting an invented
      field, so this citation is here to stop the same conclusion being reached twice. -->
 
+**`records_invalid_shape` (metrics stream only).** `join_metrics` consumes exactly two
+attribution fields, `phases_used` (must be a list) and `agents_dispatched` (must be a
+dict); either one present with the WRONG TYPE is silently skipped by the join with no
+trace elsewhere (post-exec Codex finding, S6a) — a record can lose half or all of its
+phase/agent attribution and nothing else in the footer says so. `records_invalid_shape`
+counts, once per record, every eligible record where `phases_used` is present but not a
+list OR `agents_dispatched` is present but not a dict (a record with both malformed still
+counts once — the disclosure is "how many records lost attribution", not "how many fields
+were malformed"). A field that is ABSENT is a legitimate older record shape and is never
+counted; only present-with-wrong-type counts. It is accumulated only for records that
+reach the attribution stage (after the eligibility and future-date filters), so it is
+always a subset of `records_eligible` and the two reconcile. A record counted here
+contributes NO phase/agent heat for its malformed field(s) — it still counts toward
+`records_eligible`/`records_aggregate_only` as before, and toward `records_invalid_shape`
+on top, so a reader can see the dashboard's attribution numbers are PARTIAL for that
+record, not silently wrong. Surfaced in the metrics friction sentence only when non-zero:
+`"; N of M records malformed (phase/agent attribution incomplete)"`, `N` and `M` both lower
+bounds under truncation like every other count on that sentence.
+
 | Counter | Meaning |
 |---|---|
 | `records_dated_as_of` | records carrying a valid, non-future date. **Deliberately NOT `..._in_window`**: the joins have no 30-day lower bound, they only exclude future dates. A real inclusive window counter belongs to M8, where a window exists. |
