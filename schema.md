@@ -210,6 +210,102 @@ The synthesis pass (B) is not just a report — it also writes a machine-readabl
 
 Per Note (B) above, `retire safely` is disallowed in v1 (no-usage) runs — cap `outcome` at `probation` for any drag candidate that would otherwise warrant retirement.
 
+## (D) Friction telemetry streams
+
+`render_html.py` optionally reads four append-only JSONL streams and joins them onto the
+rendered map nodes. These are RENDERER inputs, not collector inputs: `collector.iter_input_paths`
+deliberately excludes them (it reaches the memory directory only via `*.md` globs, never
+`*.jsonl`), so appending to a stream takes the cheap friction-only rebuild rather than a full
+re-collect. The renderer never writes to any of them.
+
+| Stream | Default path | Join |
+|---|---|---|
+| `decisions` | `~/.claude/harness-decisions.jsonl` | `component` → map node, via `_resolve_ref` |
+| `metrics` | `~/.claude/harness-metrics.jsonl` | `phases_used` / `agents_dispatched` → coding-team phase/agent nodes |
+| `interventions` | `~/.claude/projects/<slug>/memory/interventions.jsonl` | `memory_file` → map node, via `_resolve_ref` |
+| `codex` | `~/.claude/harness-codex.jsonl` | none — aggregate only (`target` names a plan file, not a map node) |
+
+`<slug>` is the CC per-project memory directory name: the harness root's absolute path with
+every `/` and `.` replaced by `-`. It is DERIVED from `$HOME` at call time, never a literal.
+The interventions default is offered **only when the selected scan root IS the harness root**,
+and only when the memory DIRECTORY exists; any other root yields `null` for this stream, so a
+foreign-root run can never ingest this harness's interventions log.
+
+### Interventions record shape
+
+```jsonc
+{
+  "timestamp": "2026-06-07T19:31:04.917406+00:00",  // ISO-8601; the ONLY date key this stream uses
+  "session_id": "<uuid>",                            // never rendered
+  "memory_file": "feedback_proactive-solutions.md",  // BARE BASENAME, not a path
+  "name": "<slug>", "description": "<prose>", "type": "feedback",
+  "rule_summary": "<prose>", "rationale_snippet": "<prose>",
+  "application_snippet": "<prose>",
+  "related_memories": ["<wikilink target>", ...],    // NOT joined — see below
+  "backfilled": true                                 // optional; present on reconstructed records
+}
+```
+
+No record prose reaches the HTML: `joined[node_key]` is consumed only as `len(records)`.
+
+**`related_memories` is not joined and is not part of the contract.** Measured: 79 wikilink
+targets fan out to 67 additional events across 38 nodes; unioned with `memory_file` that is 115
+events across 64 nodes from 48 records — 2.4× amplification. A one-to-many fan-out manufactures
+events that never happened. It is an editorial cross-reference, not evidence of an occurrence.
+
+**Attribution is INFERRED, never VERIFIED.** `memory_file` is a bare basename, which is not
+stable identity over time: delete a file, let a different file with the same basename later
+become the sole match, and every historical record silently reassigns to the new node. The
+footer discloses this, and basename-attributed events must not enter consequential arithmetic
+(they are excluded from M8's drag composite by construction — S6 §4.4 / AMENDMENTS A30).
+
+### Which keys carry a record's date
+
+`_record_date` reads, in this FIRST-MATCH-WINS order: `date`, `ts`, `verified_date`, `timestamp`.
+`timestamp`'s TAIL position is load-bearing — any record resolving via an earlier key returns
+before `timestamp` is consulted, which freezes the three pre-S6a streams by construction rather
+than by their current key sets. The matched `YYYY-MM-DD` prefix is validated as a real calendar
+date (`datetime.date.fromisoformat`); a structurally-shaped but calendar-invalid value such as
+`2026-13-45` is treated as UNDATED and is never compared against the current date.
+
+A record dated in the FUTURE is skipped entirely — no join, no heat — never merely excluded from
+a count.
+
+### Per-stream footer counters
+
+Every stream's footer entry carries `stream`, `status`, `path_display`, and — when
+`status == "loaded"` — `lines_nonblank`, `records_parsed`, `records_invalid`, and
+`truncated_at_cap` (only if the read stopped at a cap).
+
+The date-provenance counters below are carried by the **three joined streams only**
+(`decisions`, `metrics`, `interventions`). `codex` is aggregate-only: it never joins to a
+node and reports `records_aggregate_only` instead. It applies the SAME date rules — a
+calendar-invalid date is treated as undated and a future-dated record is skipped — it just
+does not surface per-provenance counts.
+
+<!-- `records_aggregate_only` is PRE-EXISTING, not introduced by S6a: set in the codex branch
+     of `build_friction_overlay` and by `join_metrics` for the metrics stream; consumed by the
+     friction sentence, the copy payload and the component table; pinned by existing
+     assertions in tests/test_render_html.py. No S6a task implements it because none needs to.
+     Verified 2026-07-31 — a plan reviewer read the sentence above as documenting an invented
+     field, so this citation is here to stop the same conclusion being reached twice. -->
+
+| Counter | Meaning |
+|---|---|
+| `records_dated_as_of` | records carrying a valid, non-future date. **Deliberately NOT `..._in_window`**: the joins have no 30-day lower bound, they only exclude future dates. A real inclusive window counter belongs to M8, where a window exists. |
+| `records_undated` | no recognised date key at all |
+| `records_invalid_date` | a recognised key matched the structural date shape but is not a real calendar date |
+| `records_conflicting_date` | `date` and `timestamp` both present with valid but DIFFERENT dates. Scoped to that one pair: `date` and `verified_date` legitimately differ on the decisions stream. First-match-wins still returns the `date` value; the disagreement is counted, not swallowed. |
+| `records_skipped_future` | records skipped entirely because their date is after the render date |
+| `events_backfilled` | interventions only — joined events whose record is `backfilled: true` |
+| `attribution_evidence` | interventions only — always `"INFERRED"` (see above) |
+
+And on every stream, joined or not:
+
+| Counter | Meaning |
+|---|---|
+| `truncated_at_cap` | **present only when the read stopped at a cap**: `"bytes"`, `"lines"`, or `"bytes+lines"`. The two caps (`max_bytes=5_000_000`, `max_lines=20_000`) are independent — a stream of many compact records trips the line cap without approaching the byte cap. Every count derived from a truncated stream renders as a lower bound (`≥N`) **on every surface that displays it** — stream card, per-component join table, friction-gauge decomposition and its INFERRED-attribution note, footer sentence, and the clipboard copy payload — and its severity band is SUPPRESSED entirely: a partial read must never paint green. The footer's collapsed **raw-counters `<details>`** is a `json.dumps` of the whole counter dict, so it keeps its integer values and instead carries a lead-in line stating that every count below it is a lower bound. |
+
 ## Notes
 
 1. **Signals vs. judgments.** The collector emits SIGNALS (A) — it counts, reads, and classifies mechanically (file categories, evidence labels, line thresholds). The model produces JUDGMENTS (B) — CIVC classification, drag outcomes, "give it one home" decisions. The collector never classifies a verb coverage or condemns a duplicate pair as dead weight; it only reports that the pair exists above threshold.
