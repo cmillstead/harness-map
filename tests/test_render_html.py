@@ -5845,3 +5845,94 @@ def test_truncated_stream_raw_counters_detail_states_the_lower_bound(tmp_path):
         {"timestamp": "2026-07-14T00:00:00", "memory_file": "feedback_note.md"},
     ])
     assert "every count below is a LOWER BOUND" not in clean
+
+
+# ------------------------------------- S6a: attribution disclosure (finding #11, §4.2)
+def test_interventions_footer_labels_attribution_inferred(tmp_path):
+    """T6.1/T6.2 — VERIFIED means 'read the actual bytes that establish the claim'.
+    Basename matching does not establish node identity, so INFERRED is the honest label.
+    The footer must also disclose that attribution can REATTRIBUTE across a
+    delete-and-recreate -- the failure the anti-smear rule does nothing about, because that
+    rule guards against multiple CURRENT matches, not identity over time."""
+    text = _one_stream_render(tmp_path, "infer", "--interventions-file", [
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "feedback_note.md"},
+    ])
+    assert "attribution_evidence" in text and "INFERRED" in text
+    assert "joined on `memory_file`" in text or "joined on memory_file" in text
+    assert "a rule written in response to friction, not a rule that caused it" in text
+    assert "basename" in text and "delete-and-recreate" in text
+
+
+def test_interventions_footer_shows_the_backfilled_split(tmp_path):
+    """T6.3 — 30 of the 48 live records are backfilled. Excluding them drops 62% of the
+    signal and makes the number JUMP the moment someone runs a backfill -- a definition
+    change masquerading as a trend. Count them, display the split."""
+    text = _one_stream_render(tmp_path, "backfill", "--interventions-file", [
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "feedback_note.md",
+         "backfilled": True},
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "feedback_note.md"},
+    ])
+    assert "2 events (1 observed, 1 backfilled)" in text
+
+
+def test_interventions_footer_surfaces_unmatched_as_a_deletion_signal(tmp_path):
+    """T6.4 — a record whose memory file was DELETED persists while the node vanishes, so
+    the segment becomes `unmatched`. That is a deletion signal, which is interesting to an
+    operator auditing their own harness -- it must appear in WORDS, not only inside the
+    collapsed raw-counters detail."""
+    text = _one_stream_render(tmp_path, "unmatched", "--interventions-file", [
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "no-such-memory-file.md"},
+    ])
+    assert "1 unmatched (the named memory file is no longer a node on this map)" in text
+
+
+def test_friction_total_drill_discloses_inferred_contribution(tmp_path):
+    """T6.5 — §14, corrected: `friction_total` is NOT exempt from the no-consequential-
+    arithmetic rule. It is arithmetic and it drives a gauge, so accepting basename-injected
+    inflation there while prohibiting it in §4.2 cannot stand. Where the aggregate would
+    otherwise present as a DETERMINED count, it does not.
+
+    The three-term decomposition itself is untouched -- it must keep reconciling exactly to
+    friction_total (its documented invariant)."""
+    text = _one_stream_render(tmp_path, "drill", "--interventions-file", [
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "feedback_note.md"},
+    ])
+    panel = re.search(r'id="gdrawer-friction_total"[^>]*>(.*?)</div>', text, re.S)
+    assert panel is not None
+    assert "INFERRED" in panel.group(1) and "basename" in panel.group(1)
+
+
+def test_truncated_drill_note_is_lower_bounded(tmp_path):
+    """T6.6 — the drill note this task adds is a friction-derived count on a NEW display
+    surface, so it takes the same lower bound as every other one (finding #13). A bare
+    `Includes 20005 events` beside a suppressed severity band and five `≥` surfaces is the
+    single worst place to print an exact-looking number: this note's entire purpose is to
+    say the aggregate is not what it appears.
+
+    Uses Task 5's `_truncated_render` fixture -- a real over-cap file, never a patched
+    constant. The note only renders when interventions actually contributed, which the
+    fixture's 20,000 joinable records guarantee."""
+    text = _truncated_render(tmp_path, "drillnote")
+    panel = re.search(r'id="gdrawer-friction_total"[^>]*>(.*?)</div>', text, re.S)
+    assert panel is not None
+    note = re.search(r'<p class="gauge-drill-note">Includes (≥?[\d,]+) events', panel.group(1))
+    assert note is not None, "gauge-drill note disappeared or was renamed"
+    assert note.group(1).startswith("≥"), (
+        f"the drill note renders a bare count for a TRUNCATED stream: {note.group(1)}")
+
+
+def test_truncated_backfilled_split_is_lower_bounded(tmp_path):
+    """T6.7 — CARRIED FORWARD from Task 5. T5.9's third clause asserted an
+    `≥N events (≥N observed, ≥N backfilled)` split against a surface that did not exist
+    yet, so Task 5 correctly dropped it; Task 6 builds the surface and owes the assertion.
+
+    T6.3 above pins the split UNTRUNCATED (bare numbers) and T6.6 pins the drill NOTE under
+    truncation. Neither pins the split itself under truncation, and that is exactly where a
+    half-bounded rendering does the most damage: a `≥20000 events` beside a bare
+    `20000 observed, 0 backfilled` reads as though the split were exact when only the total
+    was bounded. All THREE numbers take the lower bound together."""
+    text = _truncated_render(tmp_path, "truncsplit")
+    m = re.search(r'(≥?[\d,]+) events \((≥?[\d,]+) observed, (≥?[\d,]+) backfilled\)', text)
+    assert m is not None, "the observed/backfilled split did not render for a truncated stream"
+    assert all(g.startswith("≥") for g in m.groups()), (
+        f"a truncated split rendered bare numbers: {m.group(0)}")

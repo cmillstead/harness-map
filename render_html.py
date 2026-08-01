@@ -1383,7 +1383,7 @@ def join_interventions(
     node_index: dict[str, list[str]],
     current_date: str,
     root: str = "",
-) -> tuple[dict[str, int], dict[str, list[dict[str, Any]]], dict[str, int]]:
+) -> tuple[dict[str, int], dict[str, list[dict[str, Any]]], dict[str, int | str]]:
     heat: dict[str, int] = {}
     joined: dict[str, list[dict[str, Any]]] = {}
     valid_keys = _valid_node_keys(node_index)
@@ -1407,10 +1407,21 @@ def join_interventions(
             events_backfilled += 1
         heat[key] = heat.get(key, 0) + 1
         joined.setdefault(key, []).append(rec)
-    return heat, joined, {"segments_joined": segments_joined,
-                           "segments_ambiguous": segments_ambiguous,
-                           "segments_unmatched": segments_unmatched,
-                           "events_backfilled": events_backfilled, **prov}
+    return heat, joined, {
+        "segments_joined": segments_joined,
+        "segments_ambiguous": segments_ambiguous,
+        "segments_unmatched": segments_unmatched,
+        "events_backfilled": events_backfilled,
+        # Finding #11: node attribution here is by BASENAME, which is not stable identity
+        # over time -- delete foo.md, let a different foo.md later become the sole match,
+        # and every historical intervention silently reassigns. VERIFIED means "read the
+        # bytes that establish the claim"; basename matching does not, so INFERRED is the
+        # honest label. This is the machine-readable half; _friction_sentence carries the
+        # human half. The durable fix is writer-side (store a stable node identity in the
+        # record) and is outside the skill dir -- binding rule 12, S6 §14 Deferred.
+        "attribution_evidence": "INFERRED",
+        **prov,
+    }
 
 
 def aggregate_codex(records: list[dict[str, Any]], current_date: str) -> dict[str, Any]:
@@ -1540,7 +1551,27 @@ def _friction_sentence(f, codex_aggregate):
             n = f.get(count_key, 0)
             if n:
                 bits.append(f"{_lb(n, trunc)} {word}")
-        return _sentence_with_note("; ".join(bits) + ".", f)
+        joined_events = f.get("segments_joined", 0)
+        backfilled = f.get("events_backfilled", 0)
+        if joined_events:
+            # All three numbers take the lower bound together (finding #5 propagation): a
+            # `≥N events` beside a bare `M observed` reads as though the split were exact.
+            bits.append(f"{_lb(joined_events, trunc)} events "
+                        f"({_lb(joined_events - backfilled, trunc)} observed, "
+                        f"{_lb(backfilled, trunc)} backfilled)")
+        unmatched = f.get("segments_unmatched", 0)
+        if unmatched:
+            bits.append(f"{_lb(unmatched, trunc)} unmatched (the named memory file is no "
+                        f"longer a node on this map)")
+        # `_sentence_with_note` is NOT optional here: it is what appends the truncation
+        # clause Task 5 pinned (T5.4). The attribution clause follows it as a semicolon
+        # continuation (lowercase opener) rather than a new sentence, so it reads as one
+        # provenance statement rather than an abrupt capitalized fragment.
+        sentence = _sentence_with_note("; ".join(bits) + ".", f)
+        body = sentence[:-1] if sentence.endswith(".") else sentence
+        return (f"{body}; joined on `memory_file` — a rule written in response to friction, "
+                "not a rule that caused it. Attribution is by basename and is labelled "
+                "INFERRED: it can reattribute across a delete-and-recreate.")
     # codex — aggregate-only, no node join (§2.2)
     runs = codex_aggregate["runs"]
     return _sentence_with_note(
@@ -1648,9 +1679,14 @@ def build_friction_overlay(
                 _merge(h, j)
                 counters.update(extra)
             elif stream == "interventions":
-                h, j, extra = join_interventions(records, node_index, current_date, root)
+                # `extra_i` gets its own name rather than reusing `extra`: mypy fixes a
+                # reused local's declared type from its first assignment in the function
+                # (dict[str, int] from the decisions/metrics branches above), and
+                # join_interventions's widened dict[str, int | str] return would conflict
+                # with that declared type under dict's invariance.
+                h, j, extra_i = join_interventions(records, node_index, current_date, root)
                 _merge(h, j)
-                counters.update(extra)
+                counters.update(extra_i)
             elif stream == "codex":
                 codex_aggregate = aggregate_codex(records, current_date)
                 counters["records_aggregate_only"] = codex_aggregate["runs"]
@@ -2630,7 +2666,18 @@ def _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate):
         trunc = _any_stream_truncated(footer)
         items = [f'{esc_html(label)}: {esc_html(_lb(n, trunc))}'
                  for label, n in _friction_contributions(joined, footer, codex_aggregate)]
-        return _drill_list(items) + tab
+        # Finding #11 / §14: friction_total is arithmetic and it drives a gauge, so it is
+        # NOT exempt from the basename-attribution prohibition. Where the aggregate would
+        # otherwise present as a DETERMINED count, it says so. The decomposition above is
+        # untouched and still reconciles exactly to friction_total. The note is a
+        # friction-derived count like any other and takes the same lower bound.
+        interventions_events = next(
+            (f.get("segments_joined", 0) for f in footer if f["stream"] == "interventions"), 0)
+        note = (f'<p class="gauge-drill-note">Includes '
+                f'{esc_html(_lb(interventions_events, trunc))} '
+                f'events attributed by basename — evidence INFERRED, not VERIFIED.</p>'
+                ) if interventions_events else ""
+        return _drill_list(items) + note + tab
     if key in ("always_loaded_words", "always_loaded_tokens_est"):
         # Codex/QA finding 2: `always_loaded_words` must sort and display each
         # contributor's WORD count, not its token estimate — the two fields diverge
