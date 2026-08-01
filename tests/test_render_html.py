@@ -4,6 +4,7 @@ Real fixtures only (no mocks — the renderer is pure stdlib). Reuses `run_colle
 import importlib.util
 import json
 import os
+import pwd
 import re
 import subprocess
 import sys
@@ -5477,3 +5478,89 @@ def test_default_interventions_fails_closed_when_the_sidecar_root_is_absent(tmp_
     assert proc.returncode == 0, proc.stderr
     text = (out_dir / "harness-map-2026-07-15.html").read_text()
     assert "Interventions — stream not provided" in text
+
+
+def test_default_interventions_fails_closed_when_the_sidecar_root_is_not_a_string(tmp_path):
+    """T3.12 (S6a Task 3 audit, MEDIUM, harden). A non-string truthy `doc["root"]` (e.g. a
+    sidecar field that came back as an int, list, or dict instead of a path string) cannot
+    establish "the selected root IS the harness root" either -- same asymmetry as an absent
+    root above -- but before this fix `Path(doc_root)` raised TypeError for a non-string
+    truthy value, crashing the ENTIRE render instead of just dropping the default stream.
+    Falsy non-strings (0, "", [], {}, False) were already fine because `doc_root and ...`
+    short-circuits; only truthy non-strings reached `Path(doc_root)`. The `isinstance` guard
+    treats a non-string root exactly like an absent one: fails closed, does not raise."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    mem = claude / "projects" / _slug(claude) / "memory"
+    mem.mkdir(parents=True)
+    (mem / "interventions.jsonl").write_text(
+        json.dumps({"timestamp": "2026-07-14T00:00:00",
+                    "memory_file": "feedback_note.md"}) + "\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = 5
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                      env={**os.environ, "HOME": str(home)})
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text()
+    assert "Interventions — stream not provided" in text
+
+
+def test_render_html_and_collector_derive_the_same_project_slug(tmp_path):
+    """The interventions default is reachable only if render_html's slug rule stays
+    byte-identical to collector.py's. Drift renders 'stream not provided' silently --
+    the directory gate makes it MORE silent, since without it you would at least see a
+    bogus path in the footer. Nothing else pins these two copies together.
+    # Changing this requires a spec change (S6 §4.1)."""
+    collector_mod = rh._get_sibling_collector()
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    candidates = [
+        tmp_path,
+        tmp_path / "some-project-dir" / "nested",
+        account_home / ".claude",
+    ]
+    for p in candidates:
+        assert rh._project_slug(p) == collector_mod._project_slug(p)
+
+
+def test_no_absolute_home_literal_in_runtime_modules():
+    """PUBLICATION REQUIREMENT (operator directive 2026-07-31): this skill is being
+    extracted to a PUBLIC repo. A `/Users/` literal in a runtime module would ship the
+    operator's username and home-directory layout into it -- a release blocker, not a
+    hermeticity nicety. Verified: test_release_decoupling.py reads only SKILL.md,
+    report-template.md and civc-reference.md, so nothing in the existing suite would catch
+    this.
+
+    Scoped to the three RUNTIME modules on purpose. The test tree is deliberately excluded:
+    tests/test_render_html.py:18 pins a real sample path (REAL_SAMPLE) and the whole-tree
+    pre-publication scan is separate, larger scope (S6 §14).
+
+    TWO patterns, because one is not enough. A CC project slug is the absolute path with
+    "/" and "." replaced by "-", so it leaks the same username while containing no "/Users/"
+    substring at all. The second assertion derives the RUNNING machine's own slug and
+    asserts its absence, which makes the check portable: on any machine, a runtime module
+    must not contain that machine's home-derived identifier.
+    The account home is read from the PASSWORD DATABASE, never from `Path.home()`.
+    `Path.home()` reads $HOME, and this module's session-scoped autouse fixture
+    (tests/test_render_html.py:26) rewrites $HOME to a tmp_path_factory directory for every
+    test here -- so a Path.home()-derived slug is a RANDOM TEMP SLUG, and asserting its
+    absence from the source is trivially true and can never catch the real leak this guard
+    exists to stop. pwd.getpwuid(os.getuid()).pw_dir is stdlib (binding rule 9) and is
+    unaffected by the fixture. Do NOT reintroduce Path.home() here. This is a TEST-SIDE
+    derivation only: `default_streams` and `_project_slug` still derive from Path.home() at
+    call time, which is correct and is what the §9-R D hermeticity contract requires --
+    the guard needs a home the fixture cannot rewrite, the runtime needs one it can.
+    # Changing this scope requires a spec change (S6 §4.1).
+    # Changing this home derivation requires a spec change (S6 §4.1)."""
+    skill_dir = RENDER.parent
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    home_slug = _slug(account_home / ".claude")
+    for name in ("render_html.py", "collector.py", "serve.py"):
+        text = (skill_dir / name).read_text()
+        assert "/Users/" not in text, (
+            f"{name} contains a /Users/ literal -- derive the path from $HOME at call time")
+        assert home_slug not in text, (
+            f"{name} contains this machine's derived project slug ({home_slug}) -- it leaks "
+            f"the username without matching a /Users/ grep; derive it at call time")

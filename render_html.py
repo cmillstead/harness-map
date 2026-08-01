@@ -4018,9 +4018,9 @@ def _project_slug(project_root: Path) -> str:
     never a literal: a real slug is machine-specific, it would break the §9-R D hermeticity
     contract, and (PUBLICATION REQUIREMENT, operator directive 2026-07-31) it would ship the
     operator's username and home-directory layout into a PUBLIC repo. Note a hardcoded slug
-    would NOT contain the substring "/Users/" -- it is dash-separated -- so it slips past a
-    naive path-literal grep while leaking the same information; the guard test therefore
-    checks for the running machine's own derived slug as well.
+    would NOT contain the absolute-path prefix that guard greps for -- it is dash-separated
+    -- so it slips past a naive path-literal grep while leaking the same information; the
+    guard test therefore checks for the running machine's own derived slug as well.
     `tests/test_release_decoupling.py` does not read this module, so that guard is a
     separate test (see test_no_absolute_home_literal_in_runtime_modules)."""
     return re.sub(r"[/.]", "-", os.path.abspath(str(project_root)))
@@ -4041,14 +4041,19 @@ def default_streams(root: Path | None = None) -> dict[str, Path | None]:
     run can never ingest this harness's interventions log. That is enforced by the
     comparison below, NOT asserted in prose -- the slug alone gives no containment at all,
     because it is derived from $HOME unconditionally. `root=None` means "the harness root",
-    which is today's behaviour, so an unupdated caller is unchanged.
+    which is today's behaviour, so an unupdated caller is still treated as scanning the
+    harness root.
 
     Also gated on the memory DIRECTORY existing (not the file): under a fake or foreign
     $HOME the directory is absent and the value stays None, matching pre-S6 behaviour and
     keeping test_default_streams_keys_and_paths green without an exemption. Where the
     directory exists the path is returned unconditionally, exactly like the other three
     streams, so serve.py's absent->present sweep can still see the file being CREATED.
-    This directory gate is a deliberate ASYMMETRY with the other three streams."""
+    This directory gate is a deliberate ASYMMETRY with the other three streams: `_stream_status`
+    already reports "absent" for a non-existent path, so the gate's real observable cost is
+    (a) the footer shows "(not provided)" rather than the path, and (b) serve gains a
+    directory-creation blind spot -- if projects/<slug>/memory/ does not exist at server
+    start, interventions stays None for the whole process lifetime and no sweep recovers it."""
     claude = Path.home() / ".claude"
     selected = (Path(root) if root is not None else claude).resolve()
     mem_dir = claude / "projects" / _project_slug(claude) / "memory"
@@ -4082,7 +4087,9 @@ def _contain_default_interventions(streams, doc_root):
     FAILS CLOSED on an unknown root. The guarantee is "non-None ONLY when the selected root
     IS the harness root" -- so an absent or unreadable `doc["root"]` cannot establish it and
     must yield None. Returning the default unchanged there would let a missing field bypass
-    the whole containment, which is the "add doubt, never remove it" asymmetry inverted.
+    the whole containment, which is the "add doubt, never remove it" asymmetry inverted. A
+    non-string `doc["root"]` (an int, list, or dict from a malformed sidecar) is treated as
+    absent for the same reason, rather than raising out of `Path(doc_root)`.
 
     Returns a NEW dict; never mutates the caller's."""
     configured = streams.get("interventions")
@@ -4090,7 +4097,8 @@ def _contain_default_interventions(streams, doc_root):
         return streams
     if Path(configured) != default_streams()["interventions"]:
         return streams                      # explicitly overridden -> untouched
-    if doc_root and Path(doc_root).resolve() == (Path.home() / ".claude").resolve():
+    if (isinstance(doc_root, str) and doc_root
+            and Path(doc_root).resolve() == (Path.home() / ".claude").resolve()):
         return streams                      # harness root -> the default stands
     return {**streams, "interventions": None}
 
@@ -4346,7 +4354,9 @@ def main(argv: list[str] | None = None) -> int:
     # and re-checks `guard_roots` fresh, immediately before writing.
     inspected_roots = doc.get("inspected_roots")
     project_containment_root = inspected_roots.get("project_containment") if inspected_roots else None
-    guard_roots = [r for r in (doc.get("root"), project_containment_root) if r]
+    sidecar_root = doc.get("root")
+    sidecar_root = sidecar_root if isinstance(sidecar_root, str) else None
+    guard_roots = [r for r in (sidecar_root, project_containment_root) if r]
     try:
         write_html_safely(out_path, html_text, guard_roots)
     except RenderError as e:

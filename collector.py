@@ -2900,10 +2900,10 @@ def _relative_to_toplevel(real: Path, top: str) -> str | None:
     it. ZERO subprocesses -- _git_age_for_file stays pure with respect to the index.
 
     NOT a bare Path.relative_to (T9 harden round 2, LOW). `os.path.realpath` does NOT
-    canonicalize case on APFS (`/Users/cevin/.CLAUDE` comes back unchanged) but git's
-    `--show-toplevel` DOES, so with a case-variant --root every single file raised
-    ValueError -- the whole git-age signal vanished behind reason `git_error` while
-    `git_age_available` still reported True, blaming git for something git got right.
+    canonicalize case on APFS (a path whose case differs from the on-disk name comes back
+    unchanged) but git's `--show-toplevel` DOES, so with a case-variant --root every single
+    file raised ValueError -- the whole git-age signal vanished behind reason `git_error`
+    while `git_age_available` still reported True, blaming git for something git got right.
 
     The fallback walks `real`'s ancestors comparing st_dev/st_ino against `top` via
     os.path.samestat -- the SAME identity mechanism _resolves_inside_root already uses,
