@@ -5462,6 +5462,51 @@ def test_decisions_counts_undated_invalid_and_conflicting(tmp_path):
     assert "&quot;records_conflicting_date&quot;: 1" in text
 
 
+def test_first_date_shaped_key_wins_even_when_calendar_invalid():
+    """Post-exec Codex round 2, finding 1. `date` is calendar-invalid; `timestamp` is
+    valid. First-match-wins is absolute (§4.3): the malformed higher-priority `date` key
+    is never skipped in favor of the later valid `timestamp` -- the record is `invalid`,
+    not silently rescued as `dated` via a lower-priority key."""
+    rec = {"date": "2026-13-45", "timestamp": "2026-08-02T00:00:00"}
+    assert rh._record_date_info(rec) == (None, "invalid", False)
+
+
+def test_valid_first_key_still_wins_over_later_keys():
+    """Anti-vacuity for the fix above: a genuinely valid first key must still win, and
+    `conflict` detection (computed AFTER the loop, from `date`/`timestamp` directly) must
+    still fire -- proving the `break` did not disable it."""
+    rec = {"date": "2026-07-14", "timestamp": "2026-07-20T00:00:00"}
+    assert rh._record_date_info(rec) == ("2026-07-14", "dated", True)
+
+
+def test_invalid_later_key_does_not_taint_a_valid_first_key():
+    """The mirror case: a valid first key wins outright even though a LATER key is
+    calendar-invalid -- the loop never reaches `timestamp` at all once `date` matches."""
+    rec = {"date": "2026-07-14", "timestamp": "2026-13-45"}
+    assert rh._record_date_info(rec) == ("2026-07-14", "dated", False)
+
+
+def test_record_with_no_date_shaped_key_is_undated():
+    """Anti-vacuity for the other branch: a record with no recognised date key at all is
+    `undated`, not `invalid` -- `saw_structural` must stay False."""
+    rec = {"memory_file": "x.md"}
+    assert rh._record_date_info(rec) == (None, "undated", False)
+
+
+def test_invalid_first_key_record_counted_in_invalid_not_dated(tmp_path):
+    """End-to-end: a record whose FIRST date-shaped key (`date`) is calendar-invalid but
+    whose `timestamp` is valid must land in `records_invalid_date`, not in
+    `records_dated_as_of` -- proving the fix reaches the rendered raw counters, not just
+    the pure-function unit tests above."""
+    text = _one_stream_render(tmp_path, "invalid-first-key", "--interventions-file", [
+        {"date": "2026-13-45", "timestamp": "2026-08-02T00:00:00",
+         "memory_file": "feedback_note.md"},                                # invalid
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "feedback_note.md"},  # dated
+    ], date="2026-08-02")
+    assert "&quot;records_invalid_date&quot;: 1" in text
+    assert "&quot;records_dated_as_of&quot;: 1" in text
+
+
 def test_interventions_future_dated_record_is_skipped_and_counted(tmp_path):
     """T2.5 — the future guard does not merely exclude a record from a COUNT: it skips the
     whole record, so it never heats a node. Before S6a the guard was DEAD for this stream

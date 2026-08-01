@@ -327,7 +327,7 @@ bounds under truncation like every other count on that sentence.
 |---|---|
 | `records_dated_as_of` | records carrying a valid, non-future date. **Deliberately NOT `..._in_window`**: the joins have no 30-day lower bound, they only exclude future dates. A real inclusive window counter belongs to M8, where a window exists. |
 | `records_undated` | no recognised date key at all |
-| `records_invalid_date` | a recognised key matched the structural date shape but is not a real calendar date |
+| `records_invalid_date` | the record's FIRST recognised date key (first-match-wins order) matched the structural date shape but is not a real calendar date. A later key carrying a valid date does not rescue the record — the malformed higher-priority key is never skipped in favor of it. |
 | `records_conflicting_date` | `date` and `timestamp` both present with valid but DIFFERENT dates. Scoped to that one pair: `date` and `verified_date` legitimately differ on the decisions stream. First-match-wins still returns the `date` value; the disagreement is counted, not swallowed. |
 | `records_skipped_future` | records skipped entirely because their date is after the render date |
 | `events_backfilled` | interventions only — joined events whose record is `backfilled: true` |

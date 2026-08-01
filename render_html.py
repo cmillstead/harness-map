@@ -1178,12 +1178,14 @@ def read_jsonl(
 
 
 # The keys that carry a record's date, in FIRST-MATCH-WINS order. `timestamp` is LAST and
-# its tail position is LOAD-BEARING: _record_date_info returns on the first VALID match, so
-# any record that already resolves via date/ts/verified_date returns before `timestamp` is
-# consulted. That is what freezes the three pre-S6 streams by CONSTRUCTION, not merely
-# because no decisions/metrics/codex record happens to carry `timestamp` today (measured:
-# 0 of 182, AMENDMENTS A27). Prepending, or a per-stream date-key map, forfeits that
-# guarantee and creates a second home for one rule (cf. A3's two-band-homes wart).
+# its tail position is LOAD-BEARING: _record_date_info returns on the first DATE-SHAPED
+# match (valid or not — a malformed higher-priority key is never skipped in favor of a
+# later valid one), so any record that already resolves via date/ts/verified_date returns
+# before `timestamp` is consulted. That is what freezes the three pre-S6 streams by
+# CONSTRUCTION, not merely because no decisions/metrics/codex record happens to carry
+# `timestamp` today (measured: 0 of 182, AMENDMENTS A27). Prepending, or a per-stream
+# date-key map, forfeits that guarantee and creates a second home for one rule (cf. A3's
+# two-band-homes wart).
 # Changing this tuple or its ORDER requires a spec change (S6 §4.3).
 _DATE_KEYS = ("date", "ts", "verified_date", "timestamp")
 
@@ -1212,8 +1214,13 @@ def _record_date_info(rec):
 
     status is one of:
       "dated"   — a recognised key carried a valid calendar date (returned as `date`)
-      "invalid" — a recognised key matched DATE_RE but is not a real calendar date; the
-                  record is treated as UNDATED and is never compared against current_date
+      "invalid" — the FIRST recognised key carrying anything date-shaped was not a real
+                  calendar date. A later valid key does NOT rescue the record: first-match-
+                  wins is absolute (§4.3), and silently preferring a lower-priority key
+                  would swallow a malformed higher-priority one with no trace -- the same
+                  silent-degradation defect `records_invalid_shape` fixed for `phases_used`.
+                  The record is treated as UNDATED, is never compared against current_date,
+                  and is counted in `records_invalid_date`.
       "undated" — no recognised key carried anything date-shaped at all
 
     `conflict` is True iff BOTH `date` and `timestamp` are present with valid but DIFFERENT
@@ -1228,8 +1235,8 @@ def _record_date_info(rec):
         val = rec.get(key)
         if isinstance(val, str) and DATE_RE.match(val):
             saw_structural = True
-            if date is None:
-                date = _date_prefix(val)
+            date = _date_prefix(val)
+            break
     if date is None:
         return (None, "invalid" if saw_structural else "undated", False)
     d_date, d_ts = _date_prefix(rec.get("date")), _date_prefix(rec.get("timestamp"))
