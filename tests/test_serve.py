@@ -1446,6 +1446,49 @@ def test_write_guard_roots_refuses_a_nonstring_sidecar_root(tmp_path):
         srv._write_guard_roots(ctx)
 
 
+def test_write_guard_roots_folds_in_the_floor_root_for_falsy_sidecar_root(tmp_path):
+    """S6a guard-fix v2 -- the FALSY half of the fail-open A26 (above) only closed for
+    the wrong-type case. `_write_guard_roots` used to return an EMPTY list when
+    `ctx.doc["root"]` was falsy (absent/null/"") on a non-compose ctx -- the ORDINARY
+    shape, since `inspected_roots` is compose-only -- and `write_html_safely` skips
+    containment validation entirely on an empty guard list. The fix folds in a permanent
+    floor root (`Path.home() / ".claude"`), ADDITIVE to the sidecar-derived roots, so the
+    returned list is never empty on a falsy root. Uses the REAL `_home` env-var swap
+    (never a mock) so `Path.home()` inside `serve.py` resolves to the fixture during the
+    block. Then proves the floor actually blocks a write inside it via the SAME
+    `except Exception` shape `_watcher_loop`'s degrade handler uses verbatim (see
+    `test_guard_rejection_survives_watcher_degrade_handler_not_bare_systemexit` above) --
+    a catchable `RenderError`, never `SystemExit`, and no file written."""
+    home = tmp_path / "home"
+    home.mkdir()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc.pop("root")
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    with _home(home):
+        ctx = srv.render_html.render_from_out_dir(
+            out_dir, date="2026-07-15", streams=None, no_friction=True)
+        roots = srv._write_guard_roots(ctx)
+        assert roots == [str(home / ".claude")], \
+            "the floor root must be the ONLY entry when both sidecar-derived roots are absent"
+        floor_target = home / ".claude" / "harness-map-out"
+        floor_target.mkdir(parents=True)
+        html_path = floor_target / "harness-map-2026-07-15.html"
+        caught = None
+        try:
+            srv.render_html.write_html_safely(html_path, ctx.html_text, roots)
+        except Exception as exc:  # mirrors _watcher_loop's own degrade handler verbatim
+            caught = exc
+        assert caught is not None, \
+            "the floor must raise something an `except Exception` handler can catch"
+        assert isinstance(caught, srv.render_html.RenderError)
+        assert not isinstance(caught, SystemExit), \
+            "SystemExit is a BaseException -- it would escape every watcher degrade handler"
+        assert not html_path.exists(), \
+            "the floor must still block the write, not just become catchable"
+
+
 # ================================================================= T9: integration test net
 # The SAME maximal two-tier fixture test_collector.py/test_render_html.py exercise, served
 # live via `build_server` (in-process, matching every other serve.py test -- serve.py never

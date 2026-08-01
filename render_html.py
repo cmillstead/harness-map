@@ -4559,7 +4559,41 @@ def main(argv: list[str] | None = None) -> int:
     if sidecar_root is not None and not isinstance(sidecar_root, str):
         print(f"fatal: sidecar root field is not a string: {sidecar_root!r}", file=sys.stderr)
         return 1
-    guard_roots = [r for r in (sidecar_root, project_containment_root) if r]
+    # A26 fixed the wrong-type case above; it left the FALSY case open. `sidecar_root`
+    # legitimately falls out of `guard_roots` below when it is "", None, or absent (T3.11
+    # requires exactly that -- a genuinely unknown root must drop the DEFAULT-derived
+    # interventions stream via `_contain_default_interventions`, not refuse the whole
+    # render: stream-selection containment and write-time containment are different jobs).
+    # On a non-compose run `project_containment_root` is also None, so both truthy roots
+    # can be absent at once -- the truthiness filter below used to empty `guard_roots`
+    # entirely in that case, reproducing on the FALSY path exactly the fail-open A26
+    # closed on the WRONG-TYPE path: an empty `guard_roots` makes write_html_safely skip
+    # containment validation altogether.
+    #
+    # Fix: fold in a permanent FLOOR root this process independently knows to be true --
+    # "this run must never write inside its own harness" -- ADDITIVE to, never a
+    # replacement for, the sidecar-derived roots above. Both are enforced whenever the
+    # sidecar root is usable; the floor alone still guards when it is not. This does not
+    # revive the fallback A26 rejected: A26 rejected substituting Path.home()/".claude"
+    # for CONTAINMENT VERIFICATION -- treating an unverifiable sidecar-reported root AS IF
+    # it were the scanned root, which fabricates the very fact the guard exists to check.
+    # The floor asserts nothing about what the sidecar scanned; it only asserts a fact
+    # independent of the sidecar entirely ("this process must never write inside
+    # ~/.claude"), so it is additive, never a substitute for the sidecar root when that
+    # root IS known.
+    #
+    # Residual (disclosed, not closed): a falsy sidecar root plus an `--out-dir` inside
+    # some OTHER mapped harness root (not `~/.claude`) still writes -- the floor cannot
+    # guard a root the sidecar failed to report. Closing that needs the sidecar to report
+    # its root reliably, not a wider guess here.
+    floor_root = str(Path.home() / ".claude")
+    guard_roots = [r for r in (sidecar_root, project_containment_root, floor_root) if r]
+    if not guard_roots:
+        # Unreachable today (floor_root is always non-empty) -- kept so a future refactor
+        # that drops the floor fails CLOSED (hard error) instead of silently reverting to
+        # the fail-open above.
+        print("fatal: no guard roots available to validate the write against", file=sys.stderr)
+        return 1
     try:
         write_html_safely(out_path, html_text, guard_roots)
     except RenderError as e:

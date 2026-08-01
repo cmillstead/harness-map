@@ -226,12 +226,30 @@ def _write_guard_roots(ctx):
     `RenderError` from this write-time re-validation as a normal, catchable render
     failure (see their docstrings) -- it degrades to keep-last-good / fall back to a
     full rebuild, same as any other write-time guard rejection, and never crashes the
-    watcher thread or the server."""
+    watcher thread or the server.
+
+    Also folds in a permanent FLOOR root (`Path.home() / ".claude"`), ADDITIVE to the
+    sidecar-derived roots above -- closes the FALSY-root half of the same fail-open (a
+    falsy/absent `ctx.doc["root"]`, the ordinary shape on a non-compose ctx, used to
+    empty this list entirely, and `write_html_safely` skips validation on an empty
+    guard list). This does not reopen A26, which rejected using this same expression as
+    a fallback for VERIFYING an unparseable root -- it never asserts anything about what
+    the sidecar scanned, only a fact independent of the sidecar entirely ("this process
+    must never write inside ~/.claude"). Full reasoning, kept in lockstep rather than
+    duplicated at length here: render_html.py::main()'s matching comment. Residual: a
+    falsy `root` plus a write inside some OTHER mapped harness root the sidecar failed
+    to report is still unguarded -- only `~/.claude` is covered by the floor."""
     root = ctx.doc.get("root")
     if root is not None and not isinstance(root, str):
         raise render_html.RenderError(f"refusing to write: sidecar root field is not a string: {root!r}")
     inspected_roots = ctx.doc.get("inspected_roots") or {}
-    return [r for r in (root, inspected_roots.get("project_containment")) if r]
+    floor_root = str(Path.home() / ".claude")
+    roots = [r for r in (root, inspected_roots.get("project_containment"), floor_root) if r]
+    if not roots:
+        # Unreachable today (floor_root always non-empty); fails CLOSED if the floor is
+        # ever refactored away, per render_html.py::main()'s matching comment.
+        raise render_html.RenderError("refusing to write: no guard roots available to validate against")
+    return roots
 
 
 def _rebuild(state, out_dir, root, project_root, compose=False):

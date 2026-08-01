@@ -5538,6 +5538,68 @@ def test_nonstring_sidecar_root_does_not_write_inside_the_would_be_guarded_root(
     assert "root field is not a string" in proc.stderr
 
 
+@pytest.mark.parametrize("mutate,label", [
+    (lambda doc: doc.pop("root"), "absent"),
+    (lambda doc: doc.__setitem__("root", None), "null"),
+    (lambda doc: doc.__setitem__("root", ""), "empty-string"),
+])
+def test_write_guard_floor_refuses_falsy_root_write_inside_home_claude(tmp_path, mutate, label):
+    """S6a guard-fix v2. A26 (above) closed the WRONG-TYPE half of the write-time
+    containment fail-open; this half is the FALSY one. `sidecar_root` legitimately falls
+    out of `guard_roots` when it is "" / None / absent (T3.11, above, requires exactly
+    that for STREAM-SELECTION containment), and on a non-compose run
+    `project_containment_root` is also always None -- so both truthy roots can be absent
+    at once, and the old truthiness filter emptied `guard_roots` to `[]` in that case,
+    reproducing the exact fail-open A26 closed on the wrong-type path: `write_html_safely`
+    skips containment validation entirely on an empty guard list. The fix folds in a
+    permanent floor root (`Path.home() / ".claude"`), ADDITIVE to the sidecar-derived
+    roots, so `guard_roots` is never empty. Pins all three falsy shapes refusing the
+    write when `--out-dir` resolves inside the floor: rc 1, no HTML written, stderr
+    names the guarded root."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    claude.mkdir(parents=True)
+    out_dir = claude / "harness-map-out"       # INSIDE the floor root
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    mutate(doc)
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                      env={**os.environ, "HOME": str(home)})
+    assert proc.returncode == 1, proc.stdout
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+    assert "refusing to write inside a guarded root" in proc.stderr, proc.stderr
+
+
+# The T3.11 shape above (falsy root, `--out-dir` at `tmp_path / "out"`, provably outside
+# every guarded root including the floor) already pins that this case still succeeds
+# (rc 0, default interventions stream dropped) -- not duplicated here.
+
+
+def test_write_guard_floor_residual_other_mapped_root_still_writes(tmp_path):
+    """Documents the CURRENT DISCLOSED behavior (S6a guard-fix v2 residual) rather than
+    leaving it implicit: the floor root added above is exactly `Path.home() / ".claude"`
+    -- it cannot know about some OTHER mapped harness root the sidecar failed to report.
+    A falsy sidecar root plus `--out-dir` inside a DIFFERENT root (not `$HOME/.claude`)
+    still writes, uncaught, exactly as before this fix. Closure condition: the sidecar
+    reliably reporting the root it scanned -- not reachable in this scenario, since the
+    whole point is a root the running process has no record of."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)     # the floor root -- stays untouched, empty
+    other_root = tmp_path / "some-other-mapped-harness-root"
+    out_dir = other_root / "harness-map-out"   # INSIDE the OTHER root, not the floor
+    out_dir.mkdir(parents=True)
+    doc = _minimal_doc()
+    doc.pop("root")
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                      env={**os.environ, "HOME": str(home)})
+    assert proc.returncode == 0, proc.stderr
+    assert (out_dir / "harness-map-2026-07-15.html").exists(), (
+        "documents the disclosed residual: the floor only guards ~/.claude, not other "
+        "mapped harness roots the sidecar failed to report")
+
+
 def test_render_html_and_collector_derive_the_same_project_slug(tmp_path):
     """The interventions default is reachable only if render_html's slug rule stays
     byte-identical to collector.py's. Drift renders 'stream not provided' silently --
