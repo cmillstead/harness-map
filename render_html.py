@@ -4012,18 +4012,87 @@ class RenderContext:
     html_bytes: bytes        # html_text.encode("utf-8", "backslashreplace") — the served bytes
 
 
-def default_streams():
+def _project_slug(project_root: Path) -> str:
+    """The CC per-project memory directory name: the absolute path with every "/" and "."
+    replaced by "-". Mirrors collector.py's own slug rule. DERIVED from $HOME at call time,
+    never a literal: a real slug is machine-specific, it would break the §9-R D hermeticity
+    contract, and (PUBLICATION REQUIREMENT, operator directive 2026-07-31) it would ship the
+    operator's username and home-directory layout into a PUBLIC repo. Note a hardcoded slug
+    would NOT contain the substring "/Users/" -- it is dash-separated -- so it slips past a
+    naive path-literal grep while leaking the same information; the guard test therefore
+    checks for the running machine's own derived slug as well.
+    `tests/test_release_decoupling.py` does not read this module, so that guard is a
+    separate test (see test_no_absolute_home_literal_in_runtime_modules)."""
+    return re.sub(r"[/.]", "-", os.path.abspath(str(project_root)))
+
+
+def default_streams(root: Path | None = None) -> dict[str, Path | None]:
     """The default friction-telemetry stream paths: real ~/.claude JSONL paths, resolved
-    through $HOME at CALL time (never frozen at import — §9-R D hermeticity contract).
+    through $HOME at CALL time (never frozen at import -- §9-R D hermeticity contract).
     Shared by main()'s CLI-override branch and serve.py's _build_streams so the two
-    default-path sets can never drift apart."""
-    home = Path.home()
+    default-path sets can never drift apart.
+
+    The interventions stream is the harness directory's own per-project memory log: the
+    harness is edited AS a project, so its interventions land under
+    projects/<slug-of-the-harness-root>/memory/.
+
+    CONTAINMENT (binding, finding #3): `root` is the SELECTED scan root. The interventions
+    default is non-None ONLY when the selected root IS the harness root, so a foreign-root
+    run can never ingest this harness's interventions log. That is enforced by the
+    comparison below, NOT asserted in prose -- the slug alone gives no containment at all,
+    because it is derived from $HOME unconditionally. `root=None` means "the harness root",
+    which is today's behaviour, so an unupdated caller is unchanged.
+
+    Also gated on the memory DIRECTORY existing (not the file): under a fake or foreign
+    $HOME the directory is absent and the value stays None, matching pre-S6 behaviour and
+    keeping test_default_streams_keys_and_paths green without an exemption. Where the
+    directory exists the path is returned unconditionally, exactly like the other three
+    streams, so serve.py's absent->present sweep can still see the file being CREATED.
+    This directory gate is a deliberate ASYMMETRY with the other three streams."""
+    claude = Path.home() / ".claude"
+    selected = (Path(root) if root is not None else claude).resolve()
+    mem_dir = claude / "projects" / _project_slug(claude) / "memory"
     return {
-        "decisions": home / ".claude" / "harness-decisions.jsonl",
-        "metrics": home / ".claude" / "harness-metrics.jsonl",
-        "codex": home / ".claude" / "harness-codex.jsonl",
-        "interventions": None,
+        "decisions": claude / "harness-decisions.jsonl",
+        "metrics": claude / "harness-metrics.jsonl",
+        "codex": claude / "harness-codex.jsonl",
+        "interventions": (
+            (mem_dir / "interventions.jsonl")
+            if selected == claude.resolve() and mem_dir.is_dir()
+            else None
+        ),
     }
+
+
+def _contain_default_interventions(streams, doc_root):
+    """Re-apply §4.1's containment once the SELECTED ROOT is actually known.
+
+    render_html.py has NO --root argument (its parser declares --out-dir, --date, the four
+    --*-file flags and --no-friction), and main() builds `streams` BEFORE any sidecar is
+    loaded -- so the CLI path cannot pass a root to default_streams(). The scanned root is
+    recorded authoritatively in the sidecar, and this is the first point it is available.
+    Adding a --root flag was rejected: it would be a SECOND source of truth for a value the
+    sidecar already carries.
+
+    Applies to the DEFAULT-derived path only, identified by equality with
+    default_streams()'s own value. An explicit --interventions-file naming a different file
+    is never dropped -- the operator asked for it by name. An explicit flag naming exactly
+    the default path IS contained; that is the safe direction.
+
+    FAILS CLOSED on an unknown root. The guarantee is "non-None ONLY when the selected root
+    IS the harness root" -- so an absent or unreadable `doc["root"]` cannot establish it and
+    must yield None. Returning the default unchanged there would let a missing field bypass
+    the whole containment, which is the "add doubt, never remove it" asymmetry inverted.
+
+    Returns a NEW dict; never mutates the caller's."""
+    configured = streams.get("interventions")
+    if configured is None:
+        return streams
+    if Path(configured) != default_streams()["interventions"]:
+        return streams                      # explicitly overridden -> untouched
+    if doc_root and Path(doc_root).resolve() == (Path.home() / ".claude").resolve():
+        return streams                      # harness root -> the default stands
+    return {**streams, "interventions": None}
 
 
 # Control 3 (S2 gate fix, S8/S12): the RENDERER envelope. Binding rule 5 requires the
@@ -4178,6 +4247,8 @@ def _render_from_out_dir_inner(
 
     if streams is None or no_friction:
         streams = {"decisions": None, "metrics": None, "interventions": None, "codex": None}
+    else:
+        streams = _contain_default_interventions(streams, doc.get("root"))
     friction = build_friction_overlay(doc, streams, node_index, sel_date, no_friction)
 
     html_text = render_html(sel_date, models, friction, {"doc": doc, "skipped": skipped},

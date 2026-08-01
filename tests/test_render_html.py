@@ -44,6 +44,40 @@ def run_render(out_dir, *args, env=None, extra=None):
     return proc
 
 
+def _slug(path):
+    """Independent re-derivation of the CC per-project memory dir name, mirroring
+    test_collector.py::_active_slug's precedent. Deliberately a SECOND implementation:
+    importing render_html's own helper would make every slug assertion circular.
+    # Changing this rule requires a spec change (S6 §4.1)."""
+    return re.sub(r"[/.]", "-", os.path.abspath(str(path)))
+
+
+def _default_streams_under_home(home, root=None):
+    """`default_streams()` evaluated in a SUBPROCESS with its own $HOME, returned as
+    {name: str-or-None}.
+
+    Why a subprocess: the module-level $HOME fixture is SESSION-SCOPED and SHARED. A test
+    that created ~/.claude/projects/<slug>/memory/ inside it would make
+    test_default_streams_keys_and_paths see the directory and break through test-ordering
+    pollution. Its own $HOME is the only hermetic form. env is {**os.environ, "HOME": ...}
+    — a bare {"HOME": ...} would strip PATH/PYTHONHASHSEED from the child."""
+    code = (
+        "import importlib.util, json, sys\n"
+        "spec = importlib.util.spec_from_file_location('rh', sys.argv[1])\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "root = sys.argv[2] or None\n"
+        "out = {k: (None if v is None else str(v)) for k, v in m.default_streams(root).items()}\n"
+        "sys.stdout.write(json.dumps(out))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(RENDER), "" if root is None else str(root)],
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ, "HOME": str(home)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
 class _ExternalRefParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -5295,3 +5329,151 @@ def test_stream_card_numeral_and_sentence_agree(tmp_path):
     card = re.search(r'<div class="stream-card"><div class="count">(\d+)</div>'
                      r'<h3>Interventions</h3>', text)
     assert card is not None and card.group(1) == "3"
+
+
+# --------------------------------------------- S6a: the default interventions path (§4.1)
+def test_default_streams_derives_interventions_path_from_home(tmp_path):
+    """T3.2/T3.4 — the slug is DERIVED from $HOME at call time, never a literal.
+    `-Users-cevin--claude` is machine-specific; a literal would also ship the operator's
+    username into a PUBLIC repo (§4.1 publication requirement). The expected value is
+    re-derived here by an INDEPENDENT implementation (`_slug`), so the assertion is not
+    circular."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    (claude / "projects" / _slug(claude) / "memory").mkdir(parents=True)
+    streams = _default_streams_under_home(home)
+    assert streams["interventions"] == str(
+        claude / "projects" / _slug(claude) / "memory" / "interventions.jsonl")
+
+
+def test_default_streams_interventions_is_none_for_a_foreign_root(tmp_path):
+    """T3.1 — CONTAINMENT BY SIGNATURE (finding #3). The slug alone gives NO containment:
+    derived from $HOME/.claude unconditionally, it would hand this harness's interventions
+    log to a scan of a completely different root. The `root` comparison is what closes it.
+    This assertion is the one that would have failed against the round-1 design."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    (claude / "projects" / _slug(claude) / "memory").mkdir(parents=True)
+    foreign = tmp_path / "some-other-repo"
+    foreign.mkdir()
+    streams = _default_streams_under_home(home, root=foreign)
+    assert streams["interventions"] is None
+    assert streams["decisions"] is not None   # the other three are unaffected
+
+
+def test_no_stream_in_stream_order_defaults_to_none(tmp_path):
+    """T3.3 — the general guard. A key in STREAM_ORDER is a stream with a card, a footer
+    row, and a join branch. One that defaults to None is a DARK FEATURE: it renders
+    'absent' forever and no test notices, because every friction test injects its path
+    explicitly. That is exactly how `interventions: None` shipped.
+
+    NOTE (finding #4): this test builds its OWN $HOME with the memory directory present.
+    A `None` under a bare fake $HOME -- where projects/<slug>/memory/ does not exist -- is
+    CORRECT behaviour (§4.1's directory gate), not the dark-feature bug this test hunts.
+    Do NOT 'fix' a failure here by weakening the assertion; give the home its memory dir.
+    # Changing this requires a spec change (SPEC_6 preamble)."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    (claude / "projects" / _slug(claude) / "memory").mkdir(parents=True)
+    streams = _default_streams_under_home(home)
+    assert set(streams) == set(rh.STREAM_ORDER)
+    assert sorted(k for k, v in streams.items() if v is None) == []
+
+
+def test_interventions_stream_is_reachable_without_the_cli_flag(tmp_path):
+    """T3.5 — end-to-end reachability: drive the CLI with NO --interventions-file and prove
+    the stream loads from the default path. Every pre-S6a friction test passed the flag
+    explicitly, which is why the dead default survived.
+
+    The sidecar's `root` is set to this home's .claude dir on purpose: the post-load
+    containment (T3.6) correctly drops a DEFAULT interventions path when the sidecar was
+    scanned from a different root, so a `/fake/root` sidecar would render 'not provided'
+    for the right reason at the wrong time."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    mem = claude / "projects" / _slug(claude) / "memory"
+    mem.mkdir(parents=True)
+    (mem / "interventions.jsonl").write_text(
+        json.dumps({"timestamp": "2026-07-14T00:00:00",
+                    "memory_file": "feedback_note.md"}) + "\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = str(claude)
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                      env={**os.environ, "HOME": str(home)})
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text()
+    assert "1 records parsed, 1 dated" in text
+    assert "Interventions — stream not provided" not in text
+
+
+def test_default_interventions_is_contained_when_the_sidecar_root_is_foreign(tmp_path):
+    """T3.6 — the CLI path has NO --root argument (verified: render_html.main's parser
+    declares --out-dir/--date/the four --*-file flags/--no-friction), and it builds
+    `streams` BEFORE any sidecar is loaded, so the selected root is not knowable there.
+    Containment is therefore re-applied against doc["root"] once it IS known. Without this,
+    serve mode would be contained while the more common CLI path stayed leaky."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    mem = claude / "projects" / _slug(claude) / "memory"
+    mem.mkdir(parents=True)
+    (mem / "interventions.jsonl").write_text(
+        json.dumps({"timestamp": "2026-07-14T00:00:00",
+                    "memory_file": "feedback_note.md"}) + "\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = str(tmp_path / "some-other-repo")
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                      env={**os.environ, "HOME": str(home)})
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text()
+    assert "Interventions — stream not provided" in text
+
+
+def test_explicit_interventions_file_survives_a_foreign_sidecar_root(tmp_path):
+    """T3.7 — containment applies to the DEFAULT-derived path only. An explicit
+    --interventions-file naming a different file is never dropped: the operator asked for
+    it by name, and the flag is the documented override (§4.1 rejects a second env hatch
+    for the same reason)."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = str(tmp_path / "some-other-repo")
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    stream = tmp_path / "explicit.jsonl"
+    stream.write_text(json.dumps({"timestamp": "2026-07-14T00:00:00",
+                                  "memory_file": "feedback_note.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                      "--interventions-file", str(stream))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text()
+    assert "1 records parsed, 1 dated" in text
+
+
+def test_default_interventions_fails_closed_when_the_sidecar_root_is_absent(tmp_path):
+    """T3.11 — a sidecar with no `root` cannot establish "the selected root IS the harness
+    root", so the DEFAULT-derived stream must be dropped, not retained. Returning it
+    unchanged would let one missing field bypass the entire containment -- doubt removed
+    rather than added, which is the asymmetry §6.3's one-way override rule exists to
+    protect. An explicit --interventions-file is unaffected (see the test above)."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    mem = claude / "projects" / _slug(claude) / "memory"
+    mem.mkdir(parents=True)
+    (mem / "interventions.jsonl").write_text(
+        json.dumps({"timestamp": "2026-07-14T00:00:00",
+                    "memory_file": "feedback_note.md"}) + "\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc.pop("root")
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                      env={**os.environ, "HOME": str(home)})
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text()
+    assert "Interventions — stream not provided" in text

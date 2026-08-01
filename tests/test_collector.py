@@ -4886,3 +4886,17 @@ def test_outside_root_work_tree_still_reports_outside_root(tmp_path):
     assert refusal is not None
     assert refusal[0] == "outside_root"
     assert "resolves outside the harness root" in refusal[1]
+
+
+def test_iter_input_paths_excludes_jsonl_telemetry_streams(fake_harness):
+    """T3.10 — §4.5's containment answer, pinned. The interventions stream lives INSIDE the
+    scanned root, unlike the other three, so an append to it must not look like a collector
+    input change (which would force a full re-collect instead of the cheap friction-only
+    rebuild, and re-open the loop question). The collector reaches that directory only via
+    `paths.add(mem_dir)` plus `mem_dir.glob("*.md")` -- never `*.jsonl`.
+    # Changing this requires a spec change (S6 §4.5)."""
+    proj, slug = _active_slug(fake_harness)
+    root = fake_harness
+    (root / "projects" / slug / "memory" / "interventions.jsonl").write_text("{}\n")
+    paths = set(map(str, _collector.iter_input_paths(root, proj)))
+    assert not [p for p in paths if p.endswith(".jsonl")]

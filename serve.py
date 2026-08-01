@@ -454,7 +454,14 @@ def _stream_paths_list(streams):
     parallel per-sweep check the watcher runs alongside `_watched_snapshot`. `stream_path`
     (not the friction-stream name like "decisions") is `state.stream_offsets`'s key, per
     the B2 design. A `no_friction` run's all-None streams dict, or a bare `None`, yields
-    []."""
+    [].
+
+    Why they are excluded is no longer obvious: since S6a the interventions stream lives
+    INSIDE the scanned root (projects/<slug>/memory/), unlike the other three. The
+    collector reaches that directory only as `paths.add(mem_dir)` plus
+    `mem_dir.glob("*.md")` -- never `*.jsonl` -- so an append to the stream is not a
+    collector-input change and still takes the cheap friction-only rebuild. Pinned by
+    tests/test_collector.py::test_iter_input_paths_excludes_jsonl_telemetry_streams."""
     if not streams:
         return []
     seen = []
@@ -825,14 +832,18 @@ class _Server(ThreadingHTTPServer):
     _watcher_thread: threading.Thread | None
 
 
-def _build_streams(no_friction):
+def _build_streams(no_friction, root):
     """Mirrors render_html.main's --no-friction branching exactly: delegates to the
     shared render_html.default_streams() helper (real ~/.claude JSONL paths) unless
     friction is disabled, in which case None (render_from_out_dir treats a None streams
-    value as the all-None/disabled dict)."""
+    value as the all-None/disabled dict).
+
+    `root` is FORWARDED (§4.5, finding #3): default_streams offers the interventions log
+    only when the selected root IS the harness root. Dropping it here would leave serve
+    mode uncontained while the CLI path is fixed -- the worst of both."""
     if no_friction:
         return None
-    return render_html.default_streams()
+    return render_html.default_streams(root=root)
 
 
 def build_server(
@@ -886,7 +897,7 @@ def build_server(
     if not ok:
         raise ValueError(f"--out-dir must be outside the guarded root(s): {out_dir}")
     if streams is None:
-        streams = _build_streams(no_friction)
+        streams = _build_streams(no_friction, root)
     state = _State(streams=streams, no_friction=no_friction)
     # Capture the watch baseline BEFORE the initial `_rebuild` reads the inputs (Codex r2
     # residual-race fix), mirroring the stream-offset PRE-read seeding below: a watched harness

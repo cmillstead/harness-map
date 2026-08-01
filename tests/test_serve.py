@@ -1,9 +1,11 @@
+import contextlib
 import dataclasses
 import datetime
 import http.client
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import threading
@@ -1494,3 +1496,50 @@ def test_maximal_two_tier_fixture_serves_old_shape_dashboard_when_compose_unset(
             os.environ.pop("HOME", None)
         else:
             os.environ["HOME"] = old_home
+
+
+@contextlib.contextmanager
+def _home(path):
+    """Point $HOME at a real temp tree for the duration of the block, then restore it.
+    A REAL environment change, not a patched one -- the same save/restore shape the
+    compose-mode test above already uses, kept as a helper so the two S6a tests below
+    cannot leak $HOME into the rest of the module on an assertion failure."""
+    old = os.environ.get("HOME")
+    os.environ["HOME"] = str(path)
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old
+
+
+def test_build_streams_forwards_the_server_root(tmp_path):
+    """T3.8 — §4.5, finding #3: `_build_streams` must forward the server's --root, or
+    serve mode silently keeps the OLD uncontained default while the CLI path is fixed --
+    the worst of both. serve.py is otherwise a verification task: the watch / snapshot /
+    sweep machinery is genuinely unchanged."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    slug = re.sub(r"[/.]", "-", os.path.abspath(str(claude)))
+    (claude / "projects" / slug / "memory").mkdir(parents=True)
+    foreign = tmp_path / "some-other-repo"
+    foreign.mkdir()
+    with _home(home):
+        assert srv._build_streams(False, claude)["interventions"] is not None
+        assert srv._build_streams(False, foreign)["interventions"] is None
+
+
+def test_stream_paths_list_includes_the_interventions_path(tmp_path):
+    """T3.9 — the moment the default stops being None, watch coverage, size snapshotting
+    and sweep classification engage with NO further edits, because all three iterate
+    `_stream_paths_list(state.streams)`. This pins that the fourth path actually reaches
+    that list."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    slug = re.sub(r"[/.]", "-", os.path.abspath(str(claude)))
+    (claude / "projects" / slug / "memory").mkdir(parents=True)
+    with _home(home):
+        paths = srv._stream_paths_list(srv._build_streams(False, claude))
+    assert any(p.endswith("memory/interventions.jsonl") for p in paths)
