@@ -5918,6 +5918,98 @@ def test_truncated_run_lower_bounds_every_visible_count(tmp_path):
     assert panel is not None and "≥" in panel.group(1)
 
 
+def test_codex_sentence_not_lower_bounded_by_other_streams_truncation(tmp_path):
+    """Post-exec Codex finding #2 (S6a). `_codex_sentence`'s `truncated` arg at both call
+    sites was `_any_stream_truncated(footer)` -- a RUN-level flag any of the four streams
+    can trip. `_render_stream_card` uses the per-stream `_stream_truncated(f)` for the
+    codex CARD's count, so a truncated interventions stream made the codex card show an
+    exact number while the codex-aggregate SENTENCE beside it claimed a lower bound for a
+    read that finished completely -- two widgets disagreeing about the same run on the
+    same page. `_codex_stream_truncated` now scopes the sentence to the codex stream's own
+    cap.
+
+    Interventions trips the LINE cap (Task 5's real-fixture pattern); codex stays a small,
+    entirely untruncated file."""
+    out_dir = tmp_path / "codexscope"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    interventions = tmp_path / "codexscope-iv.jsonl"
+    record = json.dumps({"timestamp": "2026-07-14T00:00:00",
+                         "memory_file": "feedback_note.md"}) + "\n"
+    interventions.write_text(record * (rh.STREAM_MAX_LINES + 5))
+    codex_file = tmp_path / "codexscope-codex.jsonl"
+    codex_file.write_text(
+        json.dumps({"ts": "2026-07-01T00:00:00Z", "mode": "plan", "verdict": "APPROVED"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                       "--interventions-file", str(interventions),
+                       "--codex-file", str(codex_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    # the truncated stream's own card is still a lower bound (anti-vacuity: the fix must
+    # not have accidentally removed EVERY truncation marker)
+    assert re.search(r'<div class="stream-card"><div class="count">≥\d+</div>'
+                     r'<h3>Interventions</h3>', text) is not None
+    # the codex CARD is untouched by this fix (already per-stream) and stays exact
+    assert re.search(r'<div class="stream-card"><div class="count">1</div>'
+                     r'<h3>Codex reviews</h3>', text) is not None
+    # the codex-aggregate SENTENCE (the bug) must also be exact, not lower-bounded
+    codex_card = re.search(
+        r'<h2>Codex aggregate \(not node-joined\)</h2><p>(.*?)</p>', text, re.S)
+    assert codex_card is not None
+    assert "≥" not in codex_card.group(1)
+    assert "1 Codex review" in codex_card.group(1)
+
+
+def test_codex_sentence_lower_bounded_when_codex_itself_truncated(tmp_path):
+    """Post-exec Codex finding #2, the reverse case: when the codex stream's OWN read
+    stops at a cap, its aggregate sentence must still carry the lower bound -- the fix
+    narrows the scope to the codex stream, it does not remove the bound entirely."""
+    out_dir = tmp_path / "codextrunc"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    codex_file = tmp_path / "codextrunc-codex.jsonl"
+    record = json.dumps({"ts": "2026-07-01T00:00:00Z", "mode": "plan",
+                         "verdict": "APPROVED"}) + "\n"
+    codex_file.write_text(record * (rh.STREAM_MAX_LINES + 5))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--codex-file", str(codex_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    codex_card = re.search(
+        r'<h2>Codex aggregate \(not node-joined\)</h2><p>(.*?)</p>', text, re.S)
+    assert codex_card is not None
+    assert "≥" in codex_card.group(1)
+
+
+def test_codex_copy_payload_not_lower_bounded_by_other_streams_truncation(tmp_path):
+    """Post-exec Codex finding #2, clipboard-payload half: `build_copy_payloads` had the
+    identical `_any_stream_truncated(footer)` bug at its own `_codex_sentence` call site,
+    a second home for the same defect. Same fixture shape as the dashboard test above."""
+    out_dir = tmp_path / "codexscopepayload"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    interventions = tmp_path / "codexscopepayload-iv.jsonl"
+    record = json.dumps({"timestamp": "2026-07-14T00:00:00",
+                         "memory_file": "feedback_note.md"}) + "\n"
+    interventions.write_text(record * (rh.STREAM_MAX_LINES + 5))
+    codex_file = tmp_path / "codexscopepayload-codex.jsonl"
+    codex_file.write_text(
+        json.dumps({"ts": "2026-07-01T00:00:00Z", "mode": "plan", "verdict": "APPROVED"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                       "--interventions-file", str(interventions),
+                       "--codex-file", str(codex_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    island = re.search(r'<script type="application/json" id="copy-friction">(.*?)</script>',
+                       text, re.S)
+    assert island is not None, "friction copy island missing"
+    body = island.group(1)
+    # the truncated interventions bullet still carries the note (anti-vacuity)
+    assert "read truncated at the lines cap" in body
+    # the codex sentence appended after it must NOT be lower-bounded
+    assert "1 Codex review" in body
+    assert "≥1 Codex review" not in body
+
+
 def test_truncated_copy_payload_agrees_with_the_dashboard(tmp_path):
     """T5.10 — `build_copy_payloads` INDEPENDENTLY recomputes the friction total and re-bands
     it through `build_overview_model`, so without this fix the clipboard payload renders

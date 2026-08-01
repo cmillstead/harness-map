@@ -963,8 +963,10 @@ def build_copy_payloads(date, models, friction, doc):
     # --- friction: sentences ---
     friction_md = "\n".join(f"- {_friction_sentence(f, codex_aggregate)}" for f in footer) \
         or "_Friction overlay disabled._"
+    # Finding #2 (post-exec Codex): scoped to the codex stream's own cap, not the
+    # run-level bound — same reasoning as `_render_friction_panel`'s codex_html.
     friction_md += "\n\n" + _codex_sentence(codex_aggregate,
-                                            truncated=_any_stream_truncated(footer))
+                                            truncated=_codex_stream_truncated(footer))
     # --- weight: top files per always-loaded category ---
     weight_lines = [f"- `{c['path']}` — {c.get('size', 0)} tokens"
                     for c in sorted(models["context_weight"]["always"]["cells"],
@@ -1470,6 +1472,17 @@ def _any_stream_truncated(footer):
     `joined` per-stream would change its shape and break existing consumers (finding #2);
     a run-level bound is honest and costs nothing."""
     return any(_stream_truncated(f) for f in footer)
+
+
+def _codex_stream_truncated(footer):
+    """True when the CODEX stream itself stopped at a cap (finding #2, post-exec Codex
+    review). `_codex_sentence` is an aggregate-only surface with no node join — unlike
+    `friction_total`/the component table, it never merges other streams' records, so it
+    must not inherit `_any_stream_truncated`'s run-level bound. Without this, a truncated
+    interventions stream made the codex CARD (`_stream_truncated`, per-stream) show an
+    exact count while the codex SENTENCE beside it showed a lower bound for a read that
+    finished completely — two widgets disagreeing about the same number on the same page."""
+    return next((_stream_truncated(f) for f in footer if f["stream"] == "codex"), False)
 
 
 def _lb(value, truncated):
@@ -4021,9 +4034,12 @@ def _render_friction_panel(joined, footer, codex_aggregate, friction_total_value
     stream_cards = "".join(_render_stream_card(f, codex_aggregate) for f in footer)
     component_table = _render_component_friction_table(joined, truncated=run_truncated)
     rows = "".join(_render_friction_row(f, codex_aggregate) for f in footer)
+    # Finding #2 (post-exec Codex): the codex aggregate is scoped to the codex STREAM's own
+    # cap, not the run-level `run_truncated` above — see `_codex_stream_truncated`.
+    codex_sentence = _codex_sentence(codex_aggregate, truncated=_codex_stream_truncated(footer))
     codex_html = (
         f'<div class="card"><h2>Codex aggregate (not node-joined)</h2>'
-        f'<p>{esc_html(_codex_sentence(codex_aggregate, truncated=run_truncated))}</p></div>'
+        f'<p>{esc_html(codex_sentence)}</p></div>'
     )
     return (
         '<aside class="card" id="friction-panel">'
