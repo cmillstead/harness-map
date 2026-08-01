@@ -1479,12 +1479,31 @@ def _stream_truncated(f):
 
 
 def _any_stream_truncated(footer):
-    """True when ANY stream's read stopped at a cap. The per-component join table and the
-    friction total merge records from all four streams and carry no stream tag, so once one
-    stream is truncated every count derived from that merge is a lower bound. Tagging
-    `joined` per-stream would change its shape and break existing consumers (finding #2);
-    a run-level bound is honest and costs nothing."""
+    """True when ANY stream's read stopped at a cap. Correct for exactly one surface:
+    `friction_total`, which sums joined telemetry + metrics-aggregate-only + codex runs and
+    therefore genuinely spans all four streams. Every OTHER surface takes a narrower bound
+    -- see `_joined_streams_truncated` and `_stream_named_truncated`. The earlier claim here
+    that the per-component table also spans all four was wrong: `joined` never contains a
+    codex record (post-exec Codex round 2, finding 2)."""
     return any(_stream_truncated(f) for f in footer)
+
+
+def _stream_named_truncated(footer, name):
+    """True when the NAMED stream's own read stopped at a cap. The general form of
+    `_codex_stream_truncated`: a count derived from exactly one stream takes THAT stream's
+    bound, never the run-level one."""
+    return next((_stream_truncated(f) for f in footer if f["stream"] == name), False)
+
+
+def _joined_streams_truncated(footer):
+    """True when any stream that actually FEEDS `joined` stopped at a cap.
+
+    `codex` is aggregate-only -- it never joins a node and contributes no record to
+    `joined` -- so a codex-only truncation must not lower-bound the per-component table or
+    the joined-telemetry drill term. Rendering an exact count as `≥N` is the mirror of the
+    defect `_codex_stream_truncated` fixed (commit 6d1f5c9): two widgets disagreeing about
+    the same number, one of them asserting an incompleteness the read did not have."""
+    return any(_stream_truncated(f) for f in footer if f["stream"] != "codex")
 
 
 def _codex_stream_truncated(footer):
@@ -1494,8 +1513,23 @@ def _codex_stream_truncated(footer):
     must not inherit `_any_stream_truncated`'s run-level bound. Without this, a truncated
     interventions stream made the codex CARD (`_stream_truncated`, per-stream) show an
     exact count while the codex SENTENCE beside it showed a lower bound for a read that
-    finished completely — two widgets disagreeing about the same number on the same page."""
-    return next((_stream_truncated(f) for f in footer if f["stream"] == "codex"), False)
+    finished completely — two widgets disagreeing about the same number on the same page.
+    Now the named-stream helper's codex case; kept as a name because three call sites read
+    better for it."""
+    return _stream_named_truncated(footer, "codex")
+
+
+# Which streams each `_friction_contributions` term is derived from, and therefore whose
+# cap bounds it. Keyed by the term's LABEL rather than by position so that a label edit
+# fails loudly with a KeyError at the render site instead of silently mis-bounding a term.
+# `_friction_contributions` keeps returning 2-tuples -- its arity is pinned by an existing
+# assertion (test_render_html.py:406, commit 3018096, predates this branch; rule 7).
+_CONTRIBUTION_TRUNCATION = {
+    "Telemetry events joined to a component": _joined_streams_truncated,
+    "Metrics events not attributed to a component (aggregate-only)":
+        lambda footer: _stream_named_truncated(footer, "metrics"),
+    "Codex review runs (not node-joined)": _codex_stream_truncated,
+}
 
 
 def _lb(value, truncated):
@@ -1528,7 +1562,11 @@ def _friction_total_display(value, footer):
     parameter threaded through four render functions.
 
     `friction_total()` itself is UNCHANGED and still returns an int -- this is presentation,
-    and the reconciling arithmetic in `_friction_contributions` must keep summing exactly."""
+    and the reconciling arithmetic in `_friction_contributions` must keep summing exactly.
+
+    The run-level bound is the RIGHT one HERE specifically, and only here: friction_total is
+    the one displayed count that genuinely sums all four streams. Do not "make it
+    consistent" with the narrower bounds elsewhere."""
     return _lb(value, _any_stream_truncated(footer))
 
 
@@ -2715,9 +2753,11 @@ def _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate):
     if key == "friction_total":
         # `_friction_contributions` keeps returning INTS — its "provably reconciles" sum is
         # the contract an existing assertion pins. The lower bound belongs here, at the
-        # render site, never inside the arithmetic.
-        trunc = _any_stream_truncated(footer)
-        items = [f'{esc_html(label)}: {esc_html(_lb(n, trunc))}'
+        # render site, never inside the arithmetic. Each term is bounded by the streams
+        # that FEED it (post-exec Codex round 2, findings 2-3): a codex-only cap must not
+        # mark the joined-telemetry and metrics terms as lower bounds, and an
+        # interventions-only cap must not mark the codex term.
+        items = [f'{esc_html(label)}: {esc_html(_lb(n, _CONTRIBUTION_TRUNCATION[label](footer)))}'
                  for label, n in _friction_contributions(joined, footer, codex_aggregate)]
         # Finding #11 / §14: friction_total is arithmetic and it drives a gauge, so it is
         # NOT exempt from the basename-attribution prohibition. Where the aggregate would
@@ -2727,7 +2767,7 @@ def _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate):
         interventions_events = next(
             (f.get("segments_joined", 0) for f in footer if f["stream"] == "interventions"), 0)
         note = (f'<p class="gauge-drill-note">Includes '
-                f'{esc_html(_lb(interventions_events, trunc))} '
+                f'{esc_html(_lb(interventions_events, _stream_named_truncated(footer, "interventions")))} '
                 f'events attributed by basename — evidence INFERRED, not VERIFIED.</p>'
                 ) if interventions_events else ""
         return _drill_list(items) + note + tab
@@ -4066,12 +4106,12 @@ def _render_friction_panel(joined, footer, codex_aggregate, friction_total_value
         'These local telemetry streams (decisions, review metrics, Codex reviews, interventions) '
         'are matched by name onto the components on the map — a data join, not a judgment.</p>'
     )
-    run_truncated = _any_stream_truncated(footer)
+    joined_truncated = _joined_streams_truncated(footer)
     stream_cards = "".join(_render_stream_card(f, codex_aggregate) for f in footer)
-    component_table = _render_component_friction_table(joined, truncated=run_truncated)
+    component_table = _render_component_friction_table(joined, truncated=joined_truncated)
     rows = "".join(_render_friction_row(f, codex_aggregate) for f in footer)
     # Finding #2 (post-exec Codex): the codex aggregate is scoped to the codex STREAM's own
-    # cap, not the run-level `run_truncated` above — see `_codex_stream_truncated`.
+    # cap, not the joined-stream bound above — see `_codex_stream_truncated`.
     codex_sentence = _codex_sentence(codex_aggregate, truncated=_codex_stream_truncated(footer))
     codex_html = (
         f'<div class="card"><h2>Codex aggregate (not node-joined)</h2>'

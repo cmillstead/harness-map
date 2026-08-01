@@ -6050,6 +6050,127 @@ def test_codex_sentence_lower_bounded_when_codex_itself_truncated(tmp_path):
     assert "≥" in codex_card.group(1)
 
 
+def test_component_table_not_lower_bounded_by_codex_only_truncation(tmp_path):
+    """Post-exec Codex round 2, finding 2. `joined` never contains a codex record -- codex
+    is aggregate-only and never joins a node -- so a codex-only truncation must not mark the
+    per-component table's exact counts as lower bounds. Codex trips the LINE cap; the one
+    interventions record stays small and untruncated."""
+    out_dir = tmp_path / "componenttable"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    codex_file = tmp_path / "componenttable-codex.jsonl"
+    record = json.dumps({"ts": "2026-07-01T00:00:00Z", "mode": "plan",
+                         "verdict": "APPROVED"}) + "\n"
+    codex_file.write_text(record * (rh.STREAM_MAX_LINES + 5))
+    interventions = tmp_path / "componenttable-iv.jsonl"
+    interventions.write_text(json.dumps({"timestamp": "2026-07-14T00:00:00",
+                                         "memory_file": "feedback_note.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                       "--interventions-file", str(interventions),
+                       "--codex-file", str(codex_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    table = re.search(r'<table class="friction-components sortable">(.*?)</table>', text, re.S)
+    assert table is not None
+    assert "≥" not in table.group(1)
+    # anti-vacuity: the codex stream's own card must still show the lower bound, proving
+    # truncation is live in this fixture and the fix did not simply delete every marker
+    assert re.search(r'<div class="stream-card"><div class="count">≥\d+</div>'
+                     r'<h3>Codex reviews</h3>', text) is not None
+
+
+def test_drill_terms_bounded_per_contribution_not_run_wide(tmp_path):
+    """Post-exec Codex round 2, findings 2-3. Inside the friction_total drill, each
+    decomposition term takes the bound of the stream(s) that FEED it: a codex-only
+    truncation lower-bounds the codex term but must leave the joined-telemetry term exact."""
+    out_dir = tmp_path / "drillterms"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    codex_file = tmp_path / "drillterms-codex.jsonl"
+    record = json.dumps({"ts": "2026-07-01T00:00:00Z", "mode": "plan",
+                         "verdict": "APPROVED"}) + "\n"
+    codex_file.write_text(record * (rh.STREAM_MAX_LINES + 5))
+    interventions = tmp_path / "drillterms-iv.jsonl"
+    interventions.write_text(json.dumps({"timestamp": "2026-07-14T00:00:00",
+                                         "memory_file": "feedback_note.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                       "--interventions-file", str(interventions),
+                       "--codex-file", str(codex_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    panel = re.search(r'id="gdrawer-friction_total"[^>]*>(.*?)</div>', text, re.S)
+    assert panel is not None
+    body = panel.group(1)
+    codex_li = re.search(r'<li>Codex review runs \(not node-joined\): (.*?)</li>', body)
+    joined_li = re.search(r'<li>Telemetry events joined to a component: (.*?)</li>', body)
+    assert codex_li is not None and joined_li is not None
+    assert "≥" in codex_li.group(1)
+    assert "≥" not in joined_li.group(1)
+
+
+def test_interventions_note_not_bounded_by_codex_only_truncation(tmp_path):
+    """The friction_total drill's interventions-attribution note reads `segments_joined`
+    from the interventions footer entry alone -- a codex-only truncation must not lower-
+    bound it."""
+    out_dir = tmp_path / "notebound"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    codex_file = tmp_path / "notebound-codex.jsonl"
+    record = json.dumps({"ts": "2026-07-01T00:00:00Z", "mode": "plan",
+                         "verdict": "APPROVED"}) + "\n"
+    codex_file.write_text(record * (rh.STREAM_MAX_LINES + 5))
+    interventions = tmp_path / "notebound-iv.jsonl"
+    interventions.write_text(json.dumps({"timestamp": "2026-07-14T00:00:00",
+                                         "memory_file": "feedback_note.md"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                       "--interventions-file", str(interventions),
+                       "--codex-file", str(codex_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    note = re.search(r'<p class="gauge-drill-note">(.*?)</p>', text, re.S)
+    assert note is not None
+    assert "≥" not in note.group(1)
+
+
+def test_codex_term_exact_when_only_interventions_truncated(tmp_path):
+    """The reverse of the previous three: interventions trips the LINE cap and codex stays
+    a single small record. The joined-telemetry drill term takes the interventions bound;
+    the codex term must NOT -- the case commit 6d1f5c9 fixed for `_codex_sentence` but not
+    for this drill decomposition."""
+    out_dir = tmp_path / "reversecase"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    interventions = tmp_path / "reversecase-iv.jsonl"
+    record = json.dumps({"timestamp": "2026-07-14T00:00:00",
+                         "memory_file": "feedback_note.md"}) + "\n"
+    interventions.write_text(record * (rh.STREAM_MAX_LINES + 5))
+    codex_file = tmp_path / "reversecase-codex.jsonl"
+    codex_file.write_text(
+        json.dumps({"ts": "2026-07-01T00:00:00Z", "mode": "plan", "verdict": "APPROVED"}) + "\n")
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                       "--interventions-file", str(interventions),
+                       "--codex-file", str(codex_file))
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    panel = re.search(r'id="gdrawer-friction_total"[^>]*>(.*?)</div>', text, re.S)
+    assert panel is not None
+    body = panel.group(1)
+    codex_li = re.search(r'<li>Codex review runs \(not node-joined\): (.*?)</li>', body)
+    joined_li = re.search(r'<li>Telemetry events joined to a component: (.*?)</li>', body)
+    assert codex_li is not None and joined_li is not None
+    assert "≥" not in codex_li.group(1)
+    assert "≥" in joined_li.group(1)
+
+
+def test_contribution_truncation_table_covers_every_label():
+    """Pure-unit drift guard: `_CONTRIBUTION_TRUNCATION`'s keys must exactly match
+    `_friction_contributions`'s labels, so a future label edit fails loudly with a
+    KeyError at the render site instead of silently mis-bounding a term."""
+    assert set(rh._CONTRIBUTION_TRUNCATION) == {
+        label for label, _ in rh._friction_contributions({}, [], {"runs": 0})
+    }
+
+
 def test_codex_copy_payload_not_lower_bounded_by_other_streams_truncation(tmp_path):
     """Post-exec Codex finding #2, clipboard-payload half: `build_copy_payloads` had the
     identical `_any_stream_truncated(footer)` bug at its own `_codex_sentence` call site,
