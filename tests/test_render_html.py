@@ -5332,6 +5332,26 @@ def test_stream_card_numeral_and_sentence_agree(tmp_path):
     assert card is not None and card.group(1) == "3"
 
 
+def test_interventions_card_count_exceeds_its_friction_total_contribution(tmp_path):
+    """QA P2 — `_stream_event_count`'s documented asymmetry, pinned: for `interventions`
+    the card shows records PARSED, not records ATTRIBUTED. An unmatched record (its
+    memory file deleted, so it joins no map component) is parsed but contributes NOTHING
+    to `friction_total`. This is the CURRENT, deliberate behaviour — the sentence beneath
+    the card discloses the gap in words ("1 unmatched ...") — so a future change to
+    either number is a conscious decision, not silent drift. Not a bug: do not "fix" this
+    by switching the card to `segments_joined`, which would break
+    `test_stream_card_numeral_and_sentence_agree`."""
+    text = _one_stream_render(tmp_path, "diverge", "--interventions-file", [
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "no-such-memory-file.md"},
+    ])
+    card = re.search(r'<div class="stream-card"><div class="count">(\d+)</div>'
+                     r'<h3>Interventions</h3>', text)
+    assert card is not None and card.group(1) == "1"
+    gauge = re.search(r'data-gauge="friction_total"[^>]*>\s*<div class="v">(\d+)</div>', text)
+    assert gauge is not None and gauge.group(1) == "0"
+    assert "1 unmatched (the named memory file is no longer a node on this map)" in text
+
+
 # --------------------------------------------- S6a: the default interventions path (§4.1)
 def test_default_streams_derives_interventions_path_from_home(tmp_path):
     """T3.2/T3.4 — the slug is DERIVED from $HOME at call time, never a literal.

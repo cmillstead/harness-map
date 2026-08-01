@@ -306,6 +306,18 @@ And on every stream, joined or not:
 |---|---|
 | `truncated_at_cap` | **present only when the read stopped at a cap**: `"bytes"`, `"lines"`, or `"bytes+lines"`. The two caps (`max_bytes=5_000_000`, `max_lines=20_000`) are independent — a stream of many compact records trips the line cap without approaching the byte cap. Every count derived from a truncated stream renders as a lower bound (`≥N`) **on every surface that displays it** — stream card, per-component join table, friction-gauge decomposition and its INFERRED-attribution note, footer sentence, and the clipboard copy payload — and its severity band is SUPPRESSED entirely: a partial read must never paint green. The footer's collapsed **raw-counters `<details>`** is a `json.dumps` of the whole counter dict, so it keeps its integer values and instead carries a lead-in line stating that every count below it is a lower bound. |
 
+### Stream card counts
+
+Each stream's headline card (`_stream_event_count`) shows that stream's own lead figure, and
+the figure differs by stream: `decisions`/`metrics` show their ATTRIBUTED count (`segments_joined`
+/ eligible-minus-aggregate-only); `interventions` shows its PARSED count (`records_parsed`),
+because that is the figure the interventions sentence leads with and the one an operator
+checking "did my log get read" wants first; `codex` shows its aggregate run count. Consequently
+**the four card numerals do not sum to `friction_total`** — an interventions record can be
+parsed but unmatched, undated, or future-skipped, contributing zero to the total while still
+counted on the card. This is deliberate, disclosed in words by the sentence beneath each card,
+and is not a defect.
+
 ## Notes
 
 1. **Signals vs. judgments.** The collector emits SIGNALS (A) — it counts, reads, and classifies mechanically (file categories, evidence labels, line thresholds). The model produces JUDGMENTS (B) — CIVC classification, drag outcomes, "give it one home" decisions. The collector never classifies a verb coverage or condemns a duplicate pair as dead weight; it only reports that the pair exists above threshold.

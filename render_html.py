@@ -3904,7 +3904,20 @@ def _stream_event_count(f, codex_aggregate):
     """A6 headline count for one stream card — the SAME figure `_friction_sentence`
     already leads with, so the card count and the sentence never disagree. Pure
     function of the footer dict `f` (from `build_friction_overlay`) + `codex_aggregate`;
-    reuses counters the join functions already computed, never re-derives."""
+    reuses counters the join functions already computed, never re-derives.
+
+    Deliberate asymmetry, not an oversight: each stream's card shows that stream's
+    OWN headline figure, and the headline differs by stream. `decisions`/`metrics`
+    report their ATTRIBUTED count (`segments_joined` / eligible-minus-aggregate-only)
+    because that is what those streams lead with. `interventions` instead reports its
+    PARSED count (`records_parsed`) because that is what `_friction_sentence` leads
+    with there, and it is what an operator checking "did my log get read" wants first
+    — it includes unmatched/ambiguous/future-skipped records that contribute ZERO to
+    `friction_total`, and the sentence below the card discloses the full chain down
+    to the contributed count. Consequence: the four card numerals do NOT sum to
+    `friction_total`. This is by design, not a bug to fix by switching interventions
+    to `segments_joined` — see `test_stream_card_numeral_and_sentence_agree`, which
+    pins the card and the sentence to the SAME lead figure per stream."""
     if f["status"] != "loaded":
         return 0
     stream = f["stream"]
