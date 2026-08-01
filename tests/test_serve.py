@@ -1421,6 +1421,31 @@ def test_guard_rejection_survives_watcher_degrade_handler_not_bare_systemexit(tm
         server.server_close()
 
 
+def test_write_guard_roots_refuses_a_nonstring_sidecar_root(tmp_path):
+    """A26 (S6a guard-fix audit, HIGH). `_write_guard_roots` used to silently DROP a
+    non-string `ctx.doc["root"]` from the returned list instead of refusing -- exactly
+    the render_html.py `main()` fail-open (see test_render_html.py's A26 tests), just
+    reached from serve.py's write-time re-validation instead of the one-shot CLI. A
+    dropped root leaves `guard_roots` EMPTY, and `write_html_safely` skips containment
+    validation entirely on an empty `guard_roots`. `ctx` here is a REAL `RenderContext`
+    built by the actual production `render_from_out_dir` (no mock, no hand-rolled
+    dataclass) from an on-disk sidecar whose `root` field is `5` -- the same shape a
+    corrupted or crafted sidecar could produce; the real collector itself never emits a
+    non-string root, so this is the only no-mock way to reach the branch. Both callers
+    (`_rebuild`, `_rebuild_friction_only`) already treat a `RenderError` from this call
+    as a normal, catchable rebuild fault (see the P1-B tests above) -- it degrades to
+    keep-last-good / falls back to a full rebuild and never crashes the server."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = 5
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    ctx = srv.render_html.render_from_out_dir(
+        out_dir, date="2026-07-15", streams=None, no_friction=True)
+    with pytest.raises(srv.render_html.RenderError, match="root field is not a string"):
+        srv._write_guard_roots(ctx)
+
+
 # ================================================================= T9: integration test net
 # The SAME maximal two-tier fixture test_collector.py/test_render_html.py exercise, served
 # live via `build_server` (in-process, matching every other serve.py test -- serve.py never

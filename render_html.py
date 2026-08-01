@@ -4504,7 +4504,14 @@ def main(argv: list[str] | None = None) -> int:
     inspected_roots = doc.get("inspected_roots")
     project_containment_root = inspected_roots.get("project_containment") if inspected_roots else None
     sidecar_root = doc.get("root")
-    sidecar_root = sidecar_root if isinstance(sidecar_root, str) else None
+    # A non-string root can't be validated against, and write_html_safely's docstring is
+    # explicit that an EMPTY guard_roots skips containment validation entirely -- so
+    # silently dropping an unparseable root here would convert "cannot verify containment"
+    # into "do not check containment" (the fail-open this guard exists to prevent). Refuse
+    # the write instead of guessing or falling back to some other root.
+    if sidecar_root is not None and not isinstance(sidecar_root, str):
+        print(f"fatal: sidecar root field is not a string: {sidecar_root!r}", file=sys.stderr)
+        return 1
     guard_roots = [r for r in (sidecar_root, project_containment_root) if r]
     try:
         write_html_safely(out_path, html_text, guard_roots)

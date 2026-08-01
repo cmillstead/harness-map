@@ -216,9 +216,22 @@ def _write_guard_roots(ctx):
     containment root. `ctx.doc["inspected_roots"]["project_containment"]` is present
     only when the sidecar was collected with `--compose` (T8); a non-compose ctx has no
     `inspected_roots` key at all, so this degrades to `[operator_root]` — unchanged
-    single-root behavior for the non-compose case."""
+    single-root behavior for the non-compose case.
+
+    A non-string `ctx.doc["root"]` raises `render_html.RenderError` instead of silently
+    dropping it: `write_html_safely` skips containment validation entirely on an EMPTY
+    guard_roots, so dropping an unparseable root here would convert "cannot verify
+    containment" into "do not check containment" -- the fail-open this guard exists to
+    close. Every caller (`_rebuild`, `_rebuild_friction_only`) already treats a
+    `RenderError` from this write-time re-validation as a normal, catchable render
+    failure (see their docstrings) -- it degrades to keep-last-good / fall back to a
+    full rebuild, same as any other write-time guard rejection, and never crashes the
+    watcher thread or the server."""
+    root = ctx.doc.get("root")
+    if root is not None and not isinstance(root, str):
+        raise render_html.RenderError(f"refusing to write: sidecar root field is not a string: {root!r}")
     inspected_roots = ctx.doc.get("inspected_roots") or {}
-    return [r for r in (ctx.doc.get("root"), inspected_roots.get("project_containment")) if r]
+    return [r for r in (root, inspected_roots.get("project_containment")) if r]
 
 
 def _rebuild(state, out_dir, root, project_root, compose=False):

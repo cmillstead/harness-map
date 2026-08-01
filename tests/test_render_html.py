@@ -5481,14 +5481,19 @@ def test_default_interventions_fails_closed_when_the_sidecar_root_is_absent(tmp_
 
 
 def test_default_interventions_fails_closed_when_the_sidecar_root_is_not_a_string(tmp_path):
-    """T3.12 (S6a Task 3 audit, MEDIUM, harden). A non-string truthy `doc["root"]` (e.g. a
-    sidecar field that came back as an int, list, or dict instead of a path string) cannot
-    establish "the selected root IS the harness root" either -- same asymmetry as an absent
-    root above -- but before this fix `Path(doc_root)` raised TypeError for a non-string
-    truthy value, crashing the ENTIRE render instead of just dropping the default stream.
-    Falsy non-strings (0, "", [], {}, False) were already fine because `doc_root and ...`
-    short-circuits; only truthy non-strings reached `Path(doc_root)`. The `isinstance` guard
-    treats a non-string root exactly like an absent one: fails closed, does not raise."""
+    """T3.12 (S6a Task 3 audit, MEDIUM, harden) -- superseded by A26 (S6a guard-fix audit,
+    HIGH). A non-string truthy `doc["root"]` (e.g. a sidecar field that came back as an
+    int, list, or dict instead of a path string) cannot establish "the selected root IS
+    the harness root" either -- same asymmetry as an absent root above. This test used to
+    pin that the render degraded gracefully (default-interventions stream dropped, rc 0):
+    that was wrong, because dropping the unparseable root also emptied `guard_roots`
+    passed to `write_html_safely`, and an EMPTY `guard_roots` skips containment
+    validation ENTIRELY -- `main()` reproducibly wrote the HTML file inside a guarded
+    root when `--out-dir` pointed there. A26 fixes `main()` to refuse the render instead
+    of dropping the unparseable root, since an empty guard list means "cannot verify
+    containment," not "containment not needed." This test now pins the CORRECTED
+    contract: fail closed with a non-zero exit, no HTML written, and a stderr message
+    naming the bad root -- never a silent write with the containment guard disabled."""
     home = tmp_path / "home"
     claude = home / ".claude"
     mem = claude / "projects" / _slug(claude) / "memory"
@@ -5503,9 +5508,34 @@ def test_default_interventions_fails_closed_when_the_sidecar_root_is_not_a_strin
     _write_sidecar(out_dir, "2026-07-15", doc)
     proc = run_render(out_dir, "--date", "2026-07-15",
                       env={**os.environ, "HOME": str(home)})
-    assert proc.returncode == 0, proc.stderr
-    text = (out_dir / "harness-map-2026-07-15.html").read_text()
-    assert "Interventions — stream not provided" in text
+    assert proc.returncode == 1, proc.stdout
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+    assert "root field is not a string" in proc.stderr
+
+
+def test_nonstring_sidecar_root_does_not_write_inside_the_would_be_guarded_root(tmp_path):
+    """A26 (S6a guard-fix audit, HIGH) -- this is the exact probe that reproduced the
+    fail-open. Before the fix, `main()` dropped a non-string `doc["root"]` from
+    `guard_roots` instead of refusing, leaving `guard_roots` EMPTY; `write_html_safely`
+    skips containment validation entirely on an empty `guard_roots` (its own docstring:
+    "A falsy/empty guard_roots skips validation entirely"). So `--out-dir` pointed
+    straight INSIDE the harness root the sidecar's `root` field would otherwise have
+    named, and the HTML was written there uncaught, rc 0. Pins that the fix closes this:
+    no write happens at all, regardless of where `--out-dir` resolves, because `main()`
+    now refuses before `write_html_safely` is ever reached."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    claude.mkdir(parents=True)
+    out_dir = claude / "harness-map-out"       # INSIDE the would-be guarded root
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["root"] = 5
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15",
+                      env={**os.environ, "HOME": str(home)})
+    assert proc.returncode == 1, proc.stdout
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+    assert "root field is not a string" in proc.stderr
 
 
 def test_render_html_and_collector_derive_the_same_project_slug(tmp_path):
