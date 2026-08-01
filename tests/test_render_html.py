@@ -6197,3 +6197,54 @@ def test_truncated_backfilled_split_is_lower_bounded(tmp_path):
     assert m is not None, "the observed/backfilled split did not render for a truncated stream"
     assert all(g.startswith("≥") for g in m.groups()), (
         f"a truncated split rendered bare numbers: {m.group(0)}")
+
+
+def _metrics_byte_cap_render(tmp_path, name, date="2026-07-15", bad_line=None):
+    """A metrics stream sized to trip ONLY the byte cap: each record carries a large `pad`
+    field so the byte budget is crossed in far fewer than `STREAM_MAX_LINES` records --
+    isolates `read_jsonl`'s byte-cap sentinel from the line cap, the same isolation
+    `_truncated_render` gives the line-cap case in the opposite direction. `bad_line`, when
+    given, is a genuinely malformed line prepended so it survives inside the byte budget
+    (the byte cap discards only the file's END, never its start)."""
+    out_dir = tmp_path / name
+    out_dir.mkdir()
+    _write_sidecar(out_dir, date, _minimal_doc())
+    stream = tmp_path / f"{name}.jsonl"
+    record = json.dumps({"date": "2026-07-01", "rework_iterations": 1, "pad": "x" * 600}) + "\n"
+    lines = ([bad_line + "\n"] if bad_line else []) + [record] * 8000
+    stream.write_text("".join(lines))
+    assert stream.stat().st_size > rh.STREAM_MAX_BYTES, "fixture must trip the BYTE cap"
+    assert len(lines) < rh.STREAM_MAX_LINES, \
+        "fixture must stay far under the LINE cap -- isolates the byte-cap sentinel"
+    proc = run_render(out_dir, "--date", date, "--metrics-file", str(stream))
+    assert proc.returncode == 0, proc.stderr
+    return (out_dir / f"harness-map-{date}.html").read_text()
+
+
+def test_metrics_byte_cap_sentinel_not_shown_as_invalid_line(tmp_path):
+    """Post-exec Codex finding #3 (S6a). `read_jsonl` counts the rejected byte-cap overflow
+    tail as one synthetic malformed record (its own comment: "the rejected overflow tail
+    counts once as malformed") -- a parse-layer bookkeeping artifact marking WHERE the read
+    stopped, not a real invalid line. Before this fix, a metrics stream whose every line is
+    syntactically valid but which merely exceeds `max_bytes` rendered "≥1 invalid lines",
+    asserting a data-quality problem this stream never had -- in the one stage whose whole
+    thesis is evidence honesty. `≥0` (not bare `0`): the metrics stream's OWN read stopped
+    at a cap, so every count in its sentence still takes the run's ordinary lower bound
+    (finding #3 fixes the sentinel, it does not exempt this sentence from truncation)."""
+    text = _metrics_byte_cap_render(tmp_path, "mbytecap")
+    assert "read truncated at the bytes cap" in text
+    matches = set(re.findall(r"(≥?\d+) invalid lines", text))
+    assert matches == {"≥0"}, f"expected every 'invalid lines' surface to read ≥0, got {matches}"
+
+
+def test_metrics_byte_cap_sentinel_subtraction_keeps_a_real_malformed_line(tmp_path):
+    """Post-exec Codex finding #3, the anti-vacuity half: a stream with ONE genuinely
+    malformed line AND byte-cap truncation must still report that one real invalid line --
+    the fix subtracts exactly the parse-layer sentinel (`max(records_invalid - 1, 0)` when
+    the byte cap fired), it does not zero the counter outright. Without the `max(..., 0)`
+    floor this would under-report; without the subtraction at all it would over-report by
+    one (≥2 instead of ≥1)."""
+    text = _metrics_byte_cap_render(tmp_path, "mbytecapreal", bad_line="not valid json")
+    assert "read truncated at the bytes cap" in text
+    matches = set(re.findall(r"(≥?\d+) invalid lines", text))
+    assert matches == {"≥1"}, f"expected every 'invalid lines' surface to read ≥1, got {matches}"

@@ -1492,6 +1492,21 @@ def _lb(value, truncated):
     return f"≥{value}" if truncated else value
 
 
+def _displayed_invalid_count(f):
+    """`records_invalid` minus the `read_jsonl` byte-cap sentinel, never below zero
+    (post-exec Codex finding #3, S6a). `read_jsonl` counts the rejected byte-cap overflow
+    tail as one synthetic malformed record ("the rejected overflow tail counts once as
+    malformed") -- that is a parse-layer bookkeeping artifact marking WHERE the read
+    stopped, not a real invalid line, and a stream whose lines are ALL valid but which
+    merely exceeds `max_bytes` must not be displayed as having an invalid line it never
+    had. `max(..., 0)` keeps a genuinely malformed line visible when both it AND the byte
+    cap fired on the same read."""
+    invalid = f.get("records_invalid", 0)
+    if "bytes" in f.get("truncated_at_cap", ""):
+        invalid -= 1
+    return max(invalid, 0)
+
+
 def _friction_total_display(value, footer):
     """The friction total as DISPLAYED. `≥N` when ANY stream was truncated -- and that
     string is also what SUPPRESSES the severity band, because `nonneg_number` rejects it and
@@ -1549,7 +1564,7 @@ def _friction_sentence(f, codex_aggregate):
             f"{_lb(ambiguous, trunc)} ambiguous).", f)
     if f["stream"] == "metrics":
         eligible, agg_only = f.get("records_eligible", 0), f.get("records_aggregate_only", 0)
-        attributed, invalid = eligible - agg_only, f.get("records_invalid", 0)
+        attributed, invalid = eligible - agg_only, _displayed_invalid_count(f)
         return _sentence_with_note(
             f"{label} — {_lb(attributed, trunc)} of {_lb(eligible, trunc)} eligible pipeline "
             f"records attributed to phase/agent components ({_lb(agg_only, trunc)} "

@@ -277,6 +277,20 @@ Every stream's footer entry carries `stream`, `status`, `path_display`, and — 
 `status == "loaded"` — `lines_nonblank`, `records_parsed`, `records_invalid`, and
 `truncated_at_cap` (only if the read stopped at a cap).
 
+**`records_invalid` and the byte-cap sentinel.** `records_invalid` counts genuinely
+malformed lines (bad JSON, an oversized line, a non-dict value) as `read_jsonl` parses
+them — but when the byte cap trips, `read_jsonl` ALSO counts the rejected overflow tail as
+one additional synthetic malformed record: a parse-layer bookkeeping artifact marking
+WHERE the read stopped, not a real invalid line. Left uncorrected, a stream whose every
+line is syntactically valid but which merely exceeds `max_bytes` would render "≥1 invalid
+lines" for zero real problems. The **metrics stream's rendered sentence** (the one surface
+that narrates `records_invalid` as an English "N invalid lines" claim) subtracts that one
+sentinel back out — `max(records_invalid - 1, 0)` when `"bytes"` is present in
+`truncated_at_cap` — before display. This is a display-layer correction only: the raw
+`records_invalid` counter in the footer dict, and the per-stream raw-counters `<details>`
+dump on every stream (including metrics), still carries the uncorrected value, since that
+surface is explicit raw internal bookkeeping rather than a narrated claim.
+
 The date-provenance counters below are carried by the **three joined streams only**
 (`decisions`, `metrics`, `interventions`). `codex` is aggregate-only: it never joins to a
 node and reports `records_aggregate_only` instead. It applies the SAME date rules — a
