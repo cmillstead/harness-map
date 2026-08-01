@@ -5166,3 +5166,65 @@ def test_finite_number_still_accepts_negatives():
     assert rh.nonneg_number(-5) is None
     assert rh.nonneg_number(0) == 0.0
     assert rh.nonneg_number(5) == 5.0
+
+
+# ------------------------------------------------- S6a: date-key contract (§4.3, finding #12)
+def test_record_date_reads_timestamp_key():
+    """T1.1 — every interventions record dates via `timestamp`; before S6a all 48 were
+    invisibly UNDATED (AMENDMENTS A27).
+    # Changing this key set requires a spec change (S6 §4.3)."""
+    assert rh._record_date({"timestamp": "2026-07-31T01:18:24"}) == "2026-07-31"
+
+
+def test_record_date_prefers_date_over_timestamp_when_both_present():
+    """T1.2 — the TAIL position of `timestamp` is load-bearing and is CONTRACT, not
+    accident: `_record_date` returns on the first matching key, so any record that already
+    resolves via date/ts/verified_date returns before `timestamp` is consulted. That is what
+    makes the three wired streams byte-frozen by CONSTRUCTION rather than by today's data.
+    # Changing this ordering requires a spec change (S6 §4.3)."""
+    rec = {"date": "2026-01-01", "timestamp": "2026-07-31T01:18:24"}
+    assert rh._record_date(rec) == "2026-01-01"
+
+
+def test_record_date_rejects_calendar_invalid_date():
+    """T1.3 — DATE_RE is `\\d{4}-\\d{2}-\\d{2}` used with .match(): purely STRUCTURAL, so
+    `2026-13-45` parsed clean before S6a. A calendar-invalid date must be treated as
+    UNDATED and must never be trusted for the `d > current_date` future-filter comparison —
+    an invalid date must not be able to skip a record, nor to sneak past the guard."""
+    assert rh._record_date({"date": "2026-13-45"}) is None
+    assert rh._record_date_info({"date": "2026-13-45"}) == (None, "invalid", False)
+
+
+def test_record_date_ignores_unregistered_date_like_keys():
+    """T1.4 — negative guard: a date mentioned in free prose must not silently backdate a
+    record. Only the declared keys carry a record's date."""
+    assert rh._record_date({"rationale_snippet": "on 2026-07-31 the operator said"}) is None
+
+
+def test_record_date_conflict_is_date_vs_timestamp_only():
+    """T1.5 — `records_conflicting_date` compares `date` against `timestamp` ONLY.
+    Generalising it to 'any two recognised keys disagree' produces ~39 FALSE conflicts on
+    the live decisions stream, where `date` (39 records) and `verified_date` (43 records)
+    carry deliberately different semantics (AMENDMENTS A27 key census).
+    # Changing this comparison requires a spec change (S6 §4.3)."""
+    conflict = {"date": "2026-01-01", "timestamp": "2026-07-31T00:00:00"}
+    agree = {"date": "2026-07-31", "timestamp": "2026-07-31T01:18:24"}
+    other = {"date": "2026-01-01", "verified_date": "2026-07-31"}
+    assert rh._record_date_info(conflict) == ("2026-01-01", "dated", True)
+    assert rh._record_date_info(agree) == ("2026-07-31", "dated", False)
+    assert rh._record_date_info(other) == ("2026-01-01", "dated", False)
+
+
+def test_aggregate_codex_does_not_drop_a_calendar_invalid_record():
+    """T1.6 — `aggregate_codex` is the one stream that did NOT route through the shared
+    date helper: it kept a raw `or rec["ts"][:10]` fallback that reached the unvalidated
+    string. `2026-13-45` matches DATE_RE structurally and string-compares greater than any
+    real date, so the record was SILENTLY DROPPED -- an invalid date must never be able to
+    skip a record, nor to sneak past the guard (finding #12).
+
+    Also pins that a genuinely future-dated record IS still skipped, so the fix cannot be
+    'satisfied' by disabling the guard."""
+    invalid = [{"mode": "plan", "verdict": "SHIP", "ts": "2026-13-45T00:00:00Z"}]
+    assert rh.aggregate_codex(invalid, "2026-07-15")["runs"] == 1
+    future = [{"mode": "plan", "verdict": "SHIP", "ts": "2099-12-31T00:00:00Z"}]
+    assert rh.aggregate_codex(future, "2026-07-15")["runs"] == 0

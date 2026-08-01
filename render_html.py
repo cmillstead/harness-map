@@ -12,6 +12,7 @@ this module implements it (precedence: 9-C2 > 9-R > body).
 import argparse
 import base64
 import dataclasses
+import datetime
 import hashlib
 import html
 import importlib.util
@@ -1132,14 +1133,71 @@ def read_jsonl(
     return records, malformed, nonblank
 
 
-def _record_date(rec):
-    for key in ("date", "ts", "verified_date"):
+# The keys that carry a record's date, in FIRST-MATCH-WINS order. `timestamp` is LAST and
+# its tail position is LOAD-BEARING: _record_date_info returns on the first VALID match, so
+# any record that already resolves via date/ts/verified_date returns before `timestamp` is
+# consulted. That is what freezes the three pre-S6 streams by CONSTRUCTION, not merely
+# because no decisions/metrics/codex record happens to carry `timestamp` today (measured:
+# 0 of 182, AMENDMENTS A27). Prepending, or a per-stream date-key map, forfeits that
+# guarantee and creates a second home for one rule (cf. A3's two-band-homes wart).
+# Changing this tuple or its ORDER requires a spec change (S6 §4.3).
+_DATE_KEYS = ("date", "ts", "verified_date", "timestamp")
+
+
+def _date_prefix(value):
+    """The leading YYYY-MM-DD of `value` if it is a string carrying a REAL calendar date,
+    else None. DATE_RE alone is purely STRUCTURAL (`\\d{4}-\\d{2}-\\d{2}` via .match()), so
+    `2026-13-45` matched it and was trusted as a date — including for the `d > current_date`
+    future-filter, where a bogus date could skip a whole record. datetime.date.fromisoformat
+    is the calendar gate."""
+    if not isinstance(value, str):
+        return None
+    m = DATE_RE.match(value)
+    if not m:
+        return None
+    try:
+        datetime.date.fromisoformat(m.group(0))
+    except ValueError:
+        return None
+    return m.group(0)
+
+
+def _record_date_info(rec):
+    """(date_or_None, status, conflict) — the ONE date-provenance reading every stream join
+    uses, so the three joins can never disagree about what a date is.
+
+    status is one of:
+      "dated"   — a recognised key carried a valid calendar date (returned as `date`)
+      "invalid" — a recognised key matched DATE_RE but is not a real calendar date; the
+                  record is treated as UNDATED and is never compared against current_date
+      "undated" — no recognised key carried anything date-shaped at all
+
+    `conflict` is True iff BOTH `date` and `timestamp` are present with valid but DIFFERENT
+    dates. Scoped to that ONE pair deliberately: `date` vs `verified_date` legitimately
+    differ on the decisions stream (39 vs 43 records, AMENDMENTS A27), so a generalised
+    any-two-keys-disagree rule would manufacture ~39 false conflicts. First-match-wins still
+    picks `date` — that is correct (§4.3's ordering guarantee) — but the disagreement is now
+    COUNTED rather than silently swallowed."""
+    date = None
+    saw_structural = False
+    for key in _DATE_KEYS:
         val = rec.get(key)
-        if isinstance(val, str):
-            m = DATE_RE.match(val)
-            if m:
-                return m.group(0)
-    return None
+        if isinstance(val, str) and DATE_RE.match(val):
+            saw_structural = True
+            if date is None:
+                date = _date_prefix(val)
+    if date is None:
+        return (None, "invalid" if saw_structural else "undated", False)
+    d_date, d_ts = _date_prefix(rec.get("date")), _date_prefix(rec.get("timestamp"))
+    conflict = d_date is not None and d_ts is not None and d_date != d_ts
+    return (date, "dated", conflict)
+
+
+def _record_date(rec):
+    """The date half of `_record_date_info`, kept as the single-value accessor the join
+    functions and `aggregate_codex` already call. One home, two readers — never a second
+    extractor (§4.3 rejects a per-join normalizer for exactly this reason)."""
+    return _record_date_info(rec)[0]
 
 
 def join_decisions(
@@ -1283,8 +1341,16 @@ def aggregate_codex(records: list[dict[str, Any]], current_date: str) -> dict[st
     revise_rounds = []
     runs = 0
     for rec in records:
-        d = _record_date(rec) or (rec.get("ts", "")[:10] if isinstance(rec.get("ts"), str) else None)
-        if d and DATE_RE.match(d) and d > current_date:
+        # The raw `or rec["ts"][:10]` fallback that used to sit here is DELETED. It reached
+        # the unvalidated string, so a calendar-invalid `ts` (2026-13-45) matched DATE_RE,
+        # string-compared greater than any real date, and SILENTLY DROPPED the record --
+        # the exact defect the calendar gate exists to close, surviving in the one stream
+        # that did not route through the shared helper (finding #12). It was also already
+        # dead: DATE_RE is anchored by .match(), so matching the full `ts` and matching
+        # `ts[:10]` accept identical strings -- it could only ever fire on the invalid case,
+        # where firing is wrong. _record_date_info is now the ONLY date reader in this file.
+        d = _record_date(rec)
+        if d is not None and d > current_date:
             continue
         runs += 1
         mode = rec.get("mode")
