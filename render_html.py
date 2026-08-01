@@ -2174,7 +2174,11 @@ STATIC_SCRIPT = """
         var decorated = rows.map(function(r, i){
           var cell = r.children[col];
           var raw = cell ? cell.textContent.trim() : '';
-          var key = (type === 'num') ? parseFloat(raw) : raw;
+          // A lower-bounded cell reads "≥N" (server-side _lb: f"≥{value}", no space): strip
+          // the marker before parseFloat, or every truncated-run count collapses to NaN ->
+          // -Infinity and the column silently stops sorting on the one report where the
+          // reader needs it most.
+          var key = (type === 'num') ? parseFloat(raw.replace(/^≥/, '')) : raw;
           if (type === 'num' && isNaN(key)) { key = -Infinity; }
           return {r: r, key: key, i: i};
         });

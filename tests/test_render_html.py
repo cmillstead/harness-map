@@ -1629,6 +1629,27 @@ def test_component_friction_table_is_sortable_with_deterministic_initial_order(t
     assert 'class="sort-ind"' in text          # initial indicator markup present
 
 
+def test_sortable_numeric_column_strips_lower_bound_marker_before_parsing(tmp_path):
+    """Post-exec Codex finding #1 (S6a). Task 5's `_lb` renders a truncated numeric cell as
+    "≥N" (`_render_component_friction_table`'s "Friction records" column, e.g. "≥12").
+    The embedded sorter's numeric key was `parseFloat(raw)` -- `parseFloat("≥12")` is `NaN`,
+    and the existing `isNaN -> -Infinity` fallback (kept below for a genuinely non-numeric
+    cell, e.g. a not-measured placeholder) then sorted EVERY row of a truncated report's
+    column into the same bucket, silently breaking the sort on the one report where a
+    reader needs it most.
+
+    STDLIB-ONLY LIMITATION (binding rule 9: no JS engine in this suite). This test cannot
+    execute the sorter and observe row order -- it can only assert the emitted JS source
+    strips the "≥" marker before `parseFloat`. It does NOT prove a browser actually
+    reorders truncated rows correctly; a typo inside the regex, or a JS engine whose
+    `String.replace` behaves unexpectedly, would still pass this test. That gap is real and
+    is not covered anywhere else in this suite."""
+    assert "parseFloat(raw.replace(/^≥/, ''))" in rh.STATIC_SCRIPT
+    # the non-numeric fallback must still catch a genuinely non-numeric cell -- the strip
+    # must not broaden into "any cell sorts last"
+    assert "if (type === 'num' && isNaN(key)) { key = -Infinity; }" in rh.STATIC_SCRIPT
+
+
 def test_weight_view_has_treemap_and_ladder_both_prerendered(tmp_path):
     doc = _minimal_doc()
     out_dir = tmp_path / "weight"
