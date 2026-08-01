@@ -642,6 +642,40 @@ def test_join_decisions_temporal_cutoff_excludes_future_records():
     assert heat == {}
 
 
+def test_join_decisions_date_provenance_counters_on_own_return():
+    """QA P3 — the date-provenance counters (`_accumulate_date` / `_new_date_counters`,
+    shared by all three joined streams) are asserted only on `join_interventions`'s
+    return; `test_join_decisions_temporal_cutoff_excludes_future_records` above checks
+    only `heat == {}`, which a resolver bug could also produce with the wrong counter
+    values. Assert `join_decisions`'s OWN counters directly, so a future decisions-only
+    specialization that bypasses the shared helper cannot silently lose them."""
+    node_index = {"a.md": ["always_loaded:rules/a.md"]}
+    records = [
+        {"date": "2026-08-01", "component": "rules/a.md"},   # future — skipped
+        {"date": "2026-07-01", "component": "rules/a.md"},   # dated, in the past
+    ]
+    heat, joined, extra = rh.join_decisions(records, node_index, "2026-07-15")
+    assert extra["records_skipped_future"] == 1
+    assert extra["records_dated_as_of"] == 1
+
+
+def test_join_decisions_undated_invalid_and_conflicting_counters():
+    """QA P3 — mirrors `test_interventions_counts_undated_invalid_and_conflicting`
+    (T2.2/T2.3/T2.4) for the decisions join, whose date-provenance counters had no
+    direct coverage at all before this test."""
+    node_index = {"a.md": ["always_loaded:rules/a.md"]}
+    records = [
+        {"component": "rules/a.md"},                                       # undated
+        {"date": "2026-13-45", "component": "rules/a.md"},                 # invalid calendar
+        {"date": "2026-07-01", "timestamp": "2026-07-14T00:00:00",
+         "component": "rules/a.md"},                                       # conflicting
+    ]
+    heat, joined, extra = rh.join_decisions(records, node_index, "2026-07-15")
+    assert extra["records_undated"] == 1
+    assert extra["records_invalid_date"] == 1
+    assert extra["records_conflicting_date"] == 1
+
+
 def test_join_interventions_bare_name_ambiguous_heats_none():
     node_index = {"a.md": ["always_loaded:rules/a.md", "on_demand:skills/x/rules/a.md"]}
     records = [{"date": "2026-07-01", "memory_file": "a.md"}]
@@ -691,6 +725,20 @@ def test_join_metrics_unattributed_record_counts_aggregate_only_and_feeds_fricti
     heat, joined, extra = rh.join_metrics(records, {}, "2026-07-15")
     assert extra["records_aggregate_only"] == 1
     assert rh.friction_total({}, {"runs": 0}, extra["records_aggregate_only"]) == 1
+
+
+def test_join_metrics_date_provenance_counters_on_own_return():
+    """QA P3 — the date-provenance counters are asserted only on `join_interventions`'s
+    return; `join_metrics` had no direct coverage at all. `_accumulate_date` runs BEFORE
+    the eligibility check (line order in `join_metrics`), so an ineligible record still
+    contributes to date provenance -- covered here via the eligible/future-skip pair."""
+    records = [
+        {"date": "2026-08-01", "rework_iterations": 1},   # future — skipped
+        {"date": "2026-07-01", "rework_iterations": 1},   # dated, in the past
+    ]
+    heat, joined, extra = rh.join_metrics(records, {}, "2026-07-15")
+    assert extra["records_skipped_future"] == 1
+    assert extra["records_dated_as_of"] == 1
 
 
 def test_join_metrics_alias_resolves_exact_node_not_basename_sibling():
@@ -5303,6 +5351,24 @@ def test_interventions_counts_undated_invalid_and_conflicting(tmp_path):
     assert "records_undated" in text and "records_invalid_date" in text
     assert "records_conflicting_date" in text
     assert "1 undated" in text and "1 invalid" in text and "1 conflicting" in text
+
+
+def test_decisions_counts_undated_invalid_and_conflicting(tmp_path):
+    """QA P3 — analogous to `test_interventions_counts_undated_invalid_and_conflicting`,
+    proving the SAME date-provenance counters reach the decisions stream's raw-counters
+    `<details>`, not only the interventions stream's. Unlike interventions, `_friction_sentence`
+    has no decisions-branch words for these counters (T2.2-T2.4 only worded the
+    interventions branch), so this asserts the `json.dumps` raw-counters values directly
+    (HTML-escaped: `esc_html` turns `"` into `&quot;`) rather than a sentence phrase."""
+    text = _one_stream_render(tmp_path, "decisions-prov", "--decisions-file", [
+        {"component": "rules/a.md"},                                       # undated
+        {"date": "2026-13-45", "component": "rules/a.md"},                 # invalid calendar
+        {"date": "2026-07-01", "timestamp": "2026-07-14T00:00:00",
+         "component": "rules/a.md"},                                       # conflicting
+    ])
+    assert "&quot;records_undated&quot;: 1" in text
+    assert "&quot;records_invalid_date&quot;: 1" in text
+    assert "&quot;records_conflicting_date&quot;: 1" in text
 
 
 def test_interventions_future_dated_record_is_skipped_and_counted(tmp_path):
