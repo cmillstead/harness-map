@@ -5564,3 +5564,254 @@ def test_no_absolute_home_literal_in_runtime_modules():
         assert home_slug not in text, (
             f"{name} contains this machine's derived project slug ({home_slug}) -- it leaks "
             f"the username without matching a /Users/ grep; derive it at call time")
+
+
+# ---------------------------------------------------- S6a: truncation (finding #13, S-3)
+def _truncated_render(tmp_path, name, date="2026-07-15"):
+    """Render with an interventions stream that trips the LINE cap while staying FAR under
+    the byte cap — the case a single `truncated` boolean cannot express.
+
+    A REAL over-cap file, never a patched constant: rh.STREAM_MAX_LINES + 5 compact records
+    at ~69 bytes each is ~1.4 MB, i.e. 20,005 lines against a 5,000,000-byte cap. That is
+    what proves the two caps are genuinely independent parameters rather than one derived
+    from the other."""
+    out_dir = tmp_path / name
+    out_dir.mkdir()
+    _write_sidecar(out_dir, date, _minimal_doc())
+    stream = tmp_path / f"{name}.jsonl"
+    record = json.dumps({"timestamp": "2026-07-14T00:00:00",
+                         "memory_file": "feedback_note.md"}) + "\n"
+    stream.write_text(record * (rh.STREAM_MAX_LINES + 5))
+    assert stream.stat().st_size < rh.STREAM_MAX_BYTES, \
+        "fixture must trip the LINE cap WITHOUT approaching the byte cap"
+    proc = run_render(out_dir, "--date", date, "--interventions-file", str(stream))
+    assert proc.returncode == 0, proc.stderr
+    return (out_dir / f"harness-map-{date}.html").read_text()
+
+
+def test_read_jsonl_reports_line_cap_independently_of_byte_cap(tmp_path):
+    """T5.1 — VERIFIED against source: read_jsonl(path, max_bytes=STREAM_MAX_BYTES,
+    max_lines=STREAM_MAX_LINES) -- the line cap is a GENUINELY SEPARATE parameter. A stream
+    of many compact records trips max_lines while nowhere near 5 MB. A single boolean
+    `truncated` conflates them and cannot say which limit to raise."""
+    stream = tmp_path / "many.jsonl"
+    stream.write_text("".join(json.dumps({"i": i}) + "\n" for i in range(40)))
+    caps = {}
+    records, malformed, nonblank = rh.read_jsonl(stream, max_lines=10, caps_out=caps)
+    assert len(records) == 10
+    assert caps == {"lines": True}          # byte cap NOT tripped
+
+
+def test_read_jsonl_reports_byte_cap(tmp_path):
+    """T5.2 — the byte cap keeps the OLDEST records and silently drops the NEWEST: for an
+    append-only log the rejected tail IS the newest data, disclosed before S6a only as
+    `malformed += 1`, indistinguishable from one bad line."""
+    stream = tmp_path / "big.jsonl"
+    stream.write_text("".join(json.dumps({"pad": "x" * 100}) + "\n" for _ in range(50)))
+    caps = {}
+    rh.read_jsonl(stream, max_bytes=1000, caps_out=caps)
+    assert caps.get("bytes") is True
+
+
+def test_read_jsonl_reports_both_caps_when_both_trip(tmp_path):
+    """T5.3 — the two caps are detected independently and both are reported."""
+    stream = tmp_path / "both.jsonl"
+    stream.write_text("".join(json.dumps({"pad": "x" * 100}) + "\n" for _ in range(50)))
+    caps = {}
+    rh.read_jsonl(stream, max_bytes=1000, max_lines=3, caps_out=caps)
+    assert caps == {"bytes": True, "lines": True}
+
+
+@pytest.mark.parametrize("n_records,trailing_newline,expect_flag", [
+    (10, True, False),    # exactly at cap, file ends in "\n" -> split yields a trailing
+                          # empty segment; the loop breaks at the boundary but NOTHING was
+                          # dropped, so flagging here would be a false blind spot
+    (10, False, False),   # exactly at cap, no trailing newline -> no boundary artifact
+    (11, True, True),     # one over -> a real record was omitted
+])
+def test_read_jsonl_line_cap_flags_only_real_overflow(
+        tmp_path, n_records, trailing_newline, expect_flag):
+    """T5.8 — the off-by-one. `split("\\n")` on newline-terminated content produces a
+    terminal empty element, so an `i >= max_lines` branch alone reports truncation for a
+    file that fit exactly. That suppresses a severity band that was legitimately earned:
+    false doubt is still a false reading, and it would fire on every well-formed file whose
+    record count happens to equal the cap."""
+    stream = tmp_path / f"cap-{n_records}-{trailing_newline}.jsonl"
+    body = "\n".join(json.dumps({"i": i}) for i in range(n_records))
+    stream.write_text(body + ("\n" if trailing_newline else ""))
+    caps = {}
+    records, _malformed, _nonblank = rh.read_jsonl(stream, max_lines=10, caps_out=caps)
+    assert len(records) == 10
+    assert caps.get("lines", False) is expect_flag
+
+
+def test_read_jsonl_return_arity_is_three_and_overlay_arity_is_four(tmp_path):
+    """T5.7 — finding #2, pinned at RUNTIME (not against the annotation string, which
+    renders as `tuple[list[dict[str, typing.Any]], int, int]` and would make this test
+    brittle for no gain). Adding a positional element to either return breaks every existing
+    unpacking site and its tests — a binding-rule-7 violation — AND ships a dead API for
+    M8's drag composite, which does not exist and which §4.4's own fence forbids S6a from
+    building. Per-stream detail rides the EXISTING footer dict.
+    # Changing either arity requires a spec change (S6 §4.4 item 1)."""
+    stream = tmp_path / "arity.jsonl"
+    stream.write_text('{"a": 1}\n')
+    assert len(rh.read_jsonl(stream)) == 3
+    assert len(rh.read_jsonl(stream, caps_out={})) == 3
+    overlay = rh.build_friction_overlay(
+        _minimal_doc(), {k: None for k in rh.STREAM_ORDER}, {}, "2026-07-15", False)
+    assert len(overlay) == 4
+
+
+def test_truncated_stream_counts_render_as_lower_bounds(tmp_path):
+    """T5.4 — the read stopped early, so the true value is UNKNOWN and can only be larger.
+    A bare N asserts a completeness the read did not have."""
+    text = _truncated_render(tmp_path, "lb")
+    assert "≥" in text
+    assert re.search(r'<div class="stream-card"><div class="count">≥\d+</div>'
+                     r'<h3>Interventions</h3>', text) is not None
+    assert "read truncated at the lines cap" in text
+    assert "every count above is a lower bound" in text
+
+
+def test_truncated_stream_paints_no_severity_band(tmp_path):
+    """T5.5 — DISCLOSURE ALONE IS NOT THE CONTROL. Round 1 surfaced the blind spot while
+    totals and bands went on being computed from the surviving prefix, so a truncated file
+    could render CLEAN or LOW. `inaccessible != clean`, applied at the stream level: a
+    green band beside a footnote IS a green band."""
+    text = _truncated_render(tmp_path, "band")
+    gauge = re.search(r'data-gauge="friction_total"[^>]*>(.*?)</button>', text, re.S)
+    assert gauge is not None
+    assert '<div class="band">' not in gauge.group(1)
+    hero = re.search(r'<div class="hero-friction[^"]*">(.*?)<h3>', text, re.S)
+    assert hero is not None and '<span class="badge">' not in hero.group(1)
+
+
+def test_untruncated_stream_still_paints_its_band(tmp_path):
+    """T5.6 — the anti-vacuity half of T5.5. Without this, deleting the band entirely would
+    make T5.5 pass while destroying the feature."""
+    text = _one_stream_render(tmp_path, "untrunc", "--interventions-file", [
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "feedback_note.md"},
+    ])
+    gauge = re.search(r'data-gauge="friction_total"[^>]*>(.*?)</button>', text, re.S)
+    assert gauge is not None and '<div class="band">' in gauge.group(1)
+    assert "≥" not in gauge.group(1)
+    assert '<div class="stream-card"><div class="count">1</div><h3>Interventions</h3>' in text
+
+
+def test_truncated_run_lower_bounds_every_visible_count(tmp_path):
+    """T5.9 — `≥N` on one surface beside a bare `N` on four others is WORSE than neither:
+    the bare numbers read as precision, and the operator has no way to tell which surfaces
+    were affected. Every count derived from a truncated read is a lower bound, wherever it
+    is displayed.
+
+    Covers the surfaces the stream card does not: the per-component join table and the
+    friction-gauge drill decomposition.
+
+    The plan's third clause here asserted an `≥N events (≥N observed, ≥N backfilled)`
+    split. That surface DOES NOT EXIST yet -- `events_backfilled` is a footer counter only
+    (render_html.py::join_interventions) and nothing renders an observed/backfilled split.
+    Task 6 builds it and asserts its `_lb` wrapping; asserting it here would have been red
+    for a surface this task is fenced out of building."""
+    text = _truncated_render(tmp_path, "everywhere")
+    table = re.search(r'<table class="friction-components sortable">(.*?)</table>', text, re.S)
+    assert table is not None and "≥" in table.group(1)
+    panel = re.search(r'id="gdrawer-friction_total"[^>]*>(.*?)</div>', text, re.S)
+    assert panel is not None and "≥" in panel.group(1)
+
+
+def test_truncated_copy_payload_agrees_with_the_dashboard(tmp_path):
+    """T5.10 — `build_copy_payloads` INDEPENDENTLY recomputes the friction total and re-bands
+    it through `build_overview_model`, so without this fix the clipboard payload renders
+    `friction events: 20000 (HIGH)` for the very run whose dashboard shows `≥20000` and no
+    band at all. That is the two-homes divergence A3 already cost this codebase once,
+    reintroduced between the page and the thing the operator pastes into a ticket.
+
+    Island id VERIFIED against source, not guessed: `_render_copy_island("overview", ...)`
+    delegates to `_render_json_island(f"copy-{view_id}", ...)`, so the id is `copy-overview`
+    and the body is `esc_json_script(...)` -- json.dumps with ensure_ascii=False, so the
+    payload carries a LITERAL "≥", never a "\\u2265" escape."""
+    text = _truncated_render(tmp_path, "payload")
+    island = re.search(r'<script type="application/json" id="copy-overview">(.*?)</script>',
+                       text, re.S)
+    assert island is not None, "overview copy island missing"
+    body = island.group(1)
+    assert "friction events: ≥" in body
+    for band in ("CLEAN", "LOW", "HIGH"):
+        assert f"({band})" not in body, f"copy payload still bands a truncated total: {band}"
+
+
+def test_every_friction_count_surface_is_lower_bounded(tmp_path):
+    """T5.11 — the anti-rot guard for the per-site threading decision. `_lb` is applied at
+    each render site rather than carried by the value itself (see the bypass-proofing box),
+    which is only safe if a regression in one of the KNOWN surfaces fails loudly instead of
+    silently rendering bare.
+
+    WHAT THIS TEST DOES AND DOES NOT CLAIM. It pins the SIX ENUMERATED surfaces below: if
+    one of them regresses to a bare count, or is renamed so its pattern stops matching, this
+    test goes red. It CANNOT detect a surface that is not in the dict -- a seventh surface
+    added elsewhere is invisible to it, because the dict is the whole of what it inspects.
+    `_render_friction_row`'s raw-counters <details> is the live proof of that limit: it
+    displays every footer counter and is covered by T5.12, not by this list.
+
+    If you are adding a seventh surface: route it through `_lb`, then add it here -- do not
+    delete an entry.
+    # Changing this surface list requires a spec change (S6 §5 S-3 / finding #13)."""
+    text = _truncated_render(tmp_path, "surfaces")
+    surfaces = {
+        # ANCHORED to the interventions stream by name: `_render_friction_panel` builds
+        # `stream_cards` by iterating `footer` in STREAM_ORDER, so `decisions` is the FIRST
+        # card. An unanchored r'<div class="stream-card"><div class="count">(≥?\d+)</div>'
+        # matches THAT card -- untruncated, therefore bare, therefore this test would be
+        # GUARANTEED RED. Stream cards carry no data-stream attribute; the <h3> label is
+        # what identifies one, so the label is what the pattern anchors on.
+        "stream card": (r'<div class="stream-card"><div class="count">(≥?\d+)</div>'
+                        r'<h3>Interventions</h3>'),
+        "friction panel headline": r'<h2>Friction events:\s*(≥?\d+)</h2>',
+        "gauge tile value": r'data-gauge="friction_total"[^>]*><div class="v">(≥?\d+)</div>',
+        "overview hero count": r'<p class="count">(≥?\d+) events',
+        "component table cell": (r'<tr class="friction-component-row"[^>]*>'
+                                 r'<td>[^<]*</td><td>(≥?\d+)</td>'),
+        "gauge drill decomposition": r'Telemetry events joined to a component: (≥?\d+)',
+    }
+    bare = []
+    for name, pattern in surfaces.items():
+        m = re.search(pattern, text)
+        assert m is not None, f"surface disappeared or was renamed: {name}"
+        if not m.group(1).startswith("≥"):
+            bare.append(f"{name} -> {m.group(1)}")
+    assert not bare, (
+        "these surfaces render a bare count for a TRUNCATED stream; route each through "
+        f"_lb(value, truncated): {bare}")
+
+
+def test_truncated_stream_raw_counters_detail_states_the_lower_bound(tmp_path):
+    """T5.12 — finding 1c, round 2. `_render_friction_row` dumps EVERY footer counter as
+    bare ints into a visible (expandable) <details>:
+
+        raw = {k: v for k, v in f.items() if k not in ("stream","status","path_display")}
+
+    After Task 5 that dict gains `truncated_at_cap`, which helps -- but it does not make the
+    neighbouring `records_parsed` / `lines_nonblank` / `segments_joined` ints honest. They
+    are still exact-looking numbers from a read that stopped early.
+
+    Wrapping each value in `_lb` was REJECTED: json.dumps would render "\\u2265123" (the
+    default is ensure_ascii=True), turning a readable number into an escape sequence, and it
+    would silently change every count-valued key from int to str inside a machine-readable
+    dump. A LEAD-IN LINE inside the <details> is the honest form -- it costs zero bytes when
+    nothing truncated, changes no value's type, and mirrors the footer sentence's own
+    "every count above is a lower bound" wording.
+
+    Anchored to the INTERVENTIONS row, not the first <details>: the rows are emitted in
+    STREAM_ORDER, so an unanchored search finds the decisions row (untruncated, no lead-in)
+    -- the same first-match trap that made T5.11 guaranteed-red."""
+    text = _truncated_render(tmp_path, "rawrow")
+    row = re.search(r'<tr><td>interventions</td>.*?'
+                    r'<details class="friction-row-detail">(.*?)</details>', text, re.S)
+    assert row is not None, "interventions raw-counters detail disappeared or was renamed"
+    assert "every count below is a LOWER BOUND" in row.group(1)
+    assert "truncated_at_cap" in row.group(1)
+    # Anti-vacuity: an UNTRUNCATED row must carry no lead-in at all.
+    clean = _one_stream_render(tmp_path, "rawrow-clean", "--interventions-file", [
+        {"timestamp": "2026-07-14T00:00:00", "memory_file": "feedback_note.md"},
+    ])
+    assert "every count below is a LOWER BOUND" not in clean

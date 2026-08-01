@@ -94,6 +94,13 @@ STREAM_LABELS = {"decisions": "Decisions", "metrics": "Review metrics",
 CODEX_VERDICT_LABELS = {"APPROVED": "approved", "PASS": "pass", "REVISE": "needed revision",
                          "SHIP": "shipped"}
 
+# read_jsonl's two caps, named so build_friction_overlay passes the SAME values the
+# function defaults to and a test can trip either one with a real fixture instead of a mock.
+# They are INDEPENDENT: a stream of many compact records trips STREAM_MAX_LINES without ever
+# approaching STREAM_MAX_BYTES.
+STREAM_MAX_BYTES = 5_000_000
+STREAM_MAX_LINES = 20_000
+
 
 # --------------------------------------------------------------------------- escaping
 def esc_html(value: Any) -> str:
@@ -889,7 +896,7 @@ def build_overview_model(
     models: dict[str, Any],
     headline: dict[str, Any],
     phantom_ref_count: int,
-    friction_total_value: int,
+    friction_total_value: int | str,
     phantom_confirmed_count: int | None = None,
 ) -> dict[str, Any]:
     """A3/AM-2 digest — pure aggregation over already-built models. No new data derived:
@@ -901,7 +908,11 @@ def build_overview_model(
     ONLY because an existing assertion calls this function without it and pins the
     `hygiene` dict by exact equality (binding rule 7 forbids editing either); None means
     "not supplied" and preserves the pre-split behaviour of banding on the displayed
-    total. Every production call site passes it."""
+    total. Every production call site passes it.
+
+    `friction_total_value` is `int | str` because a truncated read displays `≥N`
+    (`_friction_total_display`). That is not a widening for its own sake: the string is what
+    SUPPRESSES the band, since `_gauge_band` gives any non-numeric value ("", "neutral")."""
     civc = models["civc"]
     roadmap_gaps = ([(c["verb"], c["surface"]) for c in civc["cells"] if c["verdict"] == "empty"]
                     if civc.get("available") else [])
@@ -952,7 +963,8 @@ def build_copy_payloads(date, models, friction, doc):
     # --- friction: sentences ---
     friction_md = "\n".join(f"- {_friction_sentence(f, codex_aggregate)}" for f in footer) \
         or "_Friction overlay disabled._"
-    friction_md += "\n\n" + _codex_sentence(codex_aggregate)
+    friction_md += "\n\n" + _codex_sentence(codex_aggregate,
+                                            truncated=_any_stream_truncated(footer))
     # --- weight: top files per always-loaded category ---
     weight_lines = [f"- `{c['path']}` — {c.get('size', 0)} tokens"
                     for c in sorted(models["context_weight"]["always"]["cells"],
@@ -966,13 +978,22 @@ def build_copy_payloads(date, models, friction, doc):
     hygiene_md = "\n".join(hyg_lines) or "_No hygiene flags._"
     # --- overview: digest summary ---
     payload_phantom_total, payload_phantom_confirmed = _phantom_counts(doc)
+    # The clipboard payload recomputes the friction total INDEPENDENTLY of render_html(),
+    # so it must apply the same lower-bound display — otherwise the thing the operator
+    # pastes into a ticket carries a bare count AND a severity band for the very run whose
+    # dashboard suppresses both (the two-homes divergence A3 already cost this codebase).
     over = build_overview_model(models, doc.get("headline", {}) or {},
                                 payload_phantom_total,
-                                friction_total(joined, codex_aggregate, _metrics_aggregate_only(footer)),
+                                _friction_total_display(
+                                    friction_total(joined, codex_aggregate,
+                                                   _metrics_aggregate_only(footer)), footer),
                                 phantom_confirmed_count=payload_phantom_confirmed)
+    # A suppressed band is NO parenthetical, never an empty "()" — the same shape
+    # `_render_friction_hero` uses, so page and payload stay in step.
+    band_md = f" ({over['friction']['band']})" if over["friction"]["band"] else ""
     overview_md = (f"# harness-map {date}\n\n"
                    f"- roadmap gaps: {len(over['roadmap_gaps'])}\n"
-                   f"- friction events: {over['friction']['count']} ({over['friction']['band']})\n"
+                   f"- friction events: {over['friction']['count']}{band_md}\n"
                    f"- over-cap files: {over['hygiene']['over_cap']}, "
                    f"dup pairs: {over['hygiene']['dup_pairs']}, "
                    f"phantom refs: {over['hygiene']['phantom_refs']}\n\n"
@@ -1063,7 +1084,11 @@ def _split_component(component: str) -> list[str]:
 
 
 def read_jsonl(
-    path: Path, max_bytes: int = 5_000_000, max_lines: int = 20_000
+    path: Path,
+    max_bytes: int = STREAM_MAX_BYTES,
+    max_lines: int = STREAM_MAX_LINES,
+    *,
+    caps_out: dict[str, bool] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """(records, malformed_count, lines_nonblank) — never raises. Disclosed caps guard
     against a FIFO/device/unbounded stream hanging or OOMing the renderer.
@@ -1080,7 +1105,14 @@ def read_jsonl(
     mid-token) and counted once as malformed; complete lines fully inside the budget still
     parse normally. For the common under-cap case the return is byte-for-byte the same records/
     counters as a full read, preserving serve.py's size-based stream-offset heuristic (which
-    stats the file itself and never depends on this function's byte accounting)."""
+    stats the file itself and never depends on this function's byte accounting).
+
+    Finding #13: `caps_out`, when supplied, receives {"bytes": True} and/or {"lines": True}
+    for each cap that actually TRUNCATED the read. It is an out-parameter, not a fourth
+    tuple element, deliberately: five existing tests unpack this function as a 3-tuple, and
+    a positional addition would break them (binding rule 7) as well as `build_friction_
+    overlay`'s own four-value contract (§4.4 item 1 / finding #2). Default None keeps every
+    existing call site byte-identical."""
     records: list[dict[str, Any]] = []
     malformed = 0
     nonblank = 0
@@ -1105,8 +1137,18 @@ def read_jsonl(
         cut = data.rfind(b"\n")
         data = data[:cut + 1] if cut != -1 else b""  # no whole line under the cap -> reject all
         malformed += 1  # the rejected overflow tail counts once as malformed
+        if caps_out is not None:
+            caps_out["bytes"] = True
     text = data.decode("utf-8", errors="replace")
-    for i, raw in enumerate(text.split("\n")):
+    segments = text.split("\n")
+    if caps_out is not None and any(s.strip() for s in segments[max_lines:]):
+        # Real overflow only. A file of exactly max_lines records ending in "\n" splits into
+        # max_lines + 1 segments, the last of them empty: the loop below still breaks at the
+        # boundary, but NOTHING was dropped. Flagging truncation there would report a blind
+        # spot that does not exist and suppress a band that was legitimately earned --
+        # false doubt is still a false reading.
+        caps_out["lines"] = True
+    for i, raw in enumerate(segments):
         if i >= max_lines:
             break
         line = raw.strip()
@@ -1404,6 +1446,60 @@ def aggregate_codex(records: list[dict[str, Any]], current_date: str) -> dict[st
             "max_revise_round": max(revise_rounds) if revise_rounds else 0}
 
 
+def _stream_truncated(f):
+    """True when this stream's read stopped at a cap, so every count derived from it is a
+    LOWER BOUND and its severity band must be suppressed entirely."""
+    return bool(f.get("truncated_at_cap"))
+
+
+def _any_stream_truncated(footer):
+    """True when ANY stream's read stopped at a cap. The per-component join table and the
+    friction total merge records from all four streams and carry no stream tag, so once one
+    stream is truncated every count derived from that merge is a lower bound. Tagging
+    `joined` per-stream would change its shape and break existing consumers (finding #2);
+    a run-level bound is honest and costs nothing."""
+    return any(_stream_truncated(f) for f in footer)
+
+
+def _lb(value, truncated):
+    """`≥N` for a count from a truncated stream, else the value unchanged. The read stopped
+    early; the true value is unknown and can only be larger, so a bare N asserts a
+    completeness the read did not have."""
+    return f"≥{value}" if truncated else value
+
+
+def _friction_total_display(value, footer):
+    """The friction total as DISPLAYED. `≥N` when ANY stream was truncated -- and that
+    string is also what SUPPRESSES the severity band, because `nonneg_number` rejects it and
+    `_gauge_band` then returns ("", "neutral"), which `_render_gauge` renders as no band
+    element at all. The same mechanism NOT_MEASURED_TEXT already uses; no new flag, no new
+    parameter threaded through four render functions.
+
+    `friction_total()` itself is UNCHANGED and still returns an int -- this is presentation,
+    and the reconciling arithmetic in `_friction_contributions` must keep summing exactly."""
+    return _lb(value, _any_stream_truncated(footer))
+
+
+def _truncation_note(f):
+    """The clause naming the cap that stopped this stream's read, or "" when none did."""
+    if not _stream_truncated(f):
+        return ""
+    return (f"read truncated at the {f['truncated_at_cap']} cap — every count above is a "
+            f"lower bound and no severity band is shown")
+
+
+def _sentence_with_note(sentence, f):
+    """Append the truncation clause to an already-terminated stream sentence, as a
+    semicolon clause rather than a second sentence — the note is lowercase, so a full stop
+    ahead of it renders as `dated. read truncated…`. Emits ZERO extra bytes when the stream
+    was not truncated, so untruncated output is unchanged."""
+    note = _truncation_note(f)
+    if not note:
+        return sentence
+    body = sentence[:-1] if sentence.endswith(".") else sentence
+    return f"{body}; {note}."
+
+
 def _friction_sentence(f, codex_aggregate):
     """One human-readable sentence per stream row, built ONLY from the same counters
     already computed by the join functions (never new numbers) — the raw dict stays
@@ -1417,47 +1513,61 @@ def _friction_sentence(f, codex_aggregate):
         return f"{label} — stream not provided."
     if status == "inaccessible":
         return f"{label} — telemetry file exists but is not a readable file."
+    # Every count below is a LOWER BOUND once this stream's read stopped at a cap: the
+    # records past the cap were never parsed, so each counter can only be larger.
+    trunc = _stream_truncated(f)
     if f["stream"] == "decisions":
         total, joined = f.get("segments_total", 0), f.get("segments_joined", 0)
         dated, ambiguous = f.get("records_dated_as_of", 0), f.get("segments_ambiguous", 0)
-        return (f"{label} — {joined} of {total} component references matched to map "
-                f"components ({dated} records dated; {ambiguous} ambiguous).")
+        return _sentence_with_note(
+            f"{label} — {_lb(joined, trunc)} of {_lb(total, trunc)} component references "
+            f"matched to map components ({_lb(dated, trunc)} records dated; "
+            f"{_lb(ambiguous, trunc)} ambiguous).", f)
     if f["stream"] == "metrics":
         eligible, agg_only = f.get("records_eligible", 0), f.get("records_aggregate_only", 0)
         attributed, invalid = eligible - agg_only, f.get("records_invalid", 0)
-        return (f"{label} — {attributed} of {eligible} eligible pipeline records attributed "
-                f"to phase/agent components ({agg_only} aggregate-only); {invalid} invalid lines.")
+        return _sentence_with_note(
+            f"{label} — {_lb(attributed, trunc)} of {_lb(eligible, trunc)} eligible pipeline "
+            f"records attributed to phase/agent components ({_lb(agg_only, trunc)} "
+            f"aggregate-only); {_lb(invalid, trunc)} invalid lines.", f)
     if f["stream"] == "interventions":
         parsed, dated = f.get("records_parsed", 0), f.get("records_dated_as_of", 0)
-        bits = [f"{label} — {parsed} records parsed, {dated} dated"]
+        bits = [f"{label} — {_lb(parsed, trunc)} records parsed, {_lb(dated, trunc)} dated"]
         for count_key, word in (("records_undated", "undated"),
                                 ("records_invalid_date", "invalid"),
                                 ("records_conflicting_date", "conflicting"),
                                 ("records_skipped_future", "skipped as future-dated")):
             n = f.get(count_key, 0)
             if n:
-                bits.append(f"{n} {word}")
-        return "; ".join(bits) + "."
+                bits.append(f"{_lb(n, trunc)} {word}")
+        return _sentence_with_note("; ".join(bits) + ".", f)
     # codex — aggregate-only, no node join (§2.2)
     runs = codex_aggregate["runs"]
-    return f"{label} — {runs} records, aggregate-only (target is a plan filename, not a map component)."
+    return _sentence_with_note(
+        f"{label} — {_lb(runs, trunc)} records, aggregate-only (target is a plan filename, "
+        f"not a map component).", f)
 
 
-def _codex_sentence(agg):
+def _codex_sentence(agg, *, truncated=False):
     """English summary of `codex_aggregate` — derived entirely from its own dict,
-    never hardcoded numbers."""
+    never hardcoded numbers.
+
+    `truncated` (keyword-only, default False so every direct caller is unchanged): when the
+    run's read stopped at a cap, every count here is a LOWER BOUND. The `runs == 0` early
+    return is left alone deliberately — `≥0 Codex reviews` reads worse than the plain
+    sentence and adds no information."""
     runs = agg["runs"]
     if runs == 0:
         return "No Codex reviews recorded in this window."
-    mode_bits = ", ".join(f"{v} on {k}s" for k, v in agg["by_mode"].items())
+    mode_bits = ", ".join(f"{_lb(v, truncated)} on {k}s" for k, v in agg["by_mode"].items())
     mode_clause = f" — {mode_bits}" if mode_bits else ""
-    verdict_bits = ", ".join(f"{v} {CODEX_VERDICT_LABELS.get(k, k.lower())}"
+    verdict_bits = ", ".join(f"{_lb(v, truncated)} {CODEX_VERDICT_LABELS.get(k, k.lower())}"
                               for k, v in agg["by_verdict"].items())
     max_round = agg["max_revise_round"]
     revise_clause = f" (up to {max_round} revise round{'s' if max_round != 1 else ''})" if max_round else ""
     verdict_clause = f" Verdicts: {verdict_bits}{revise_clause}." if verdict_bits else ""
     plural = "s" if runs != 1 else ""
-    return f"{runs} Codex review{plural}{mode_clause}.{verdict_clause}"
+    return f"{_lb(runs, truncated)} Codex review{plural}{mode_clause}.{verdict_clause}"
 
 
 def _stream_status(path, disabled):
@@ -1519,10 +1629,16 @@ def build_friction_overlay(
             # _stream_status only returns "loaded" when `path` passed its own is-not-None
             # check — cast (not assert) so this is a pure type narrowing with zero
             # runtime effect, matching the M1 typing-only scope.
-            records, malformed, nonblank = read_jsonl(cast(Path, path))
+            caps: dict[str, bool] = {}
+            records, malformed, nonblank = read_jsonl(
+                cast(Path, path), STREAM_MAX_BYTES, STREAM_MAX_LINES, caps_out=caps)
             counters["lines_nonblank"] = nonblank
             counters["records_parsed"] = len(records)
             counters["records_invalid"] = malformed
+            if caps:
+                # Fixed order, never sorted(set(...)) -- determinism §4.4.
+                counters["truncated_at_cap"] = "+".join(
+                    k for k in ("bytes", "lines") if caps.get(k))
             if stream == "decisions":
                 h, j, extra = join_decisions(records, node_index, current_date, root)
                 _merge(h, j)
@@ -2508,7 +2624,11 @@ def _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate):
                  for r in refs]
         return _drill_list(items) + tab
     if key == "friction_total":
-        items = [f'{esc_html(label)}: {esc_html(n)}'
+        # `_friction_contributions` keeps returning INTS — its "provably reconciles" sum is
+        # the contract an existing assertion pins. The lower bound belongs here, at the
+        # render site, never inside the arithmetic.
+        trunc = _any_stream_truncated(footer)
+        items = [f'{esc_html(label)}: {esc_html(_lb(n, trunc))}'
                  for label, n in _friction_contributions(joined, footer, codex_aggregate)]
         return _drill_list(items) + tab
     if key in ("always_loaded_words", "always_loaded_tokens_est"):
@@ -2963,11 +3083,15 @@ def _render_friction_hero(friction_model):
         f'<span class="badge">{esc_html(_drag_outcome_label(r.get("outcome","")))}</span></li>'
         for r in top_drag
     ) or '<li class="empty-state">none</li>'
+    # A suppressed band leaves NO element, not an empty one — an empty badge still reads as
+    # a verdict pill. When a band exists the emitted bytes are unchanged: the leading space
+    # already sat between `events` and the span.
+    band = friction_model["band"]
+    band_html = f' <span class="badge">{esc_html(band)}</span>' if band else ""
     return (
         f'<div class="hero-friction hero-friction-{esc_html(friction_model["semantic"])}">'
         '<h2>Friction</h2>'
-        f'<p class="count">{esc_html(friction_model["count"])} events '
-        f'<span class="badge">{esc_html(friction_model["band"])}</span></p>'
+        f'<p class="count">{esc_html(friction_model["count"])} events{band_html}</p>'
         f'<h3>Top drag candidates</h3><p class="digest">{esc_html(_DRAG_DEFINITION)}</p>'
         f'<ul>{top_drag_html}</ul>'
         '</div>'
@@ -3747,8 +3871,11 @@ def _stream_event_count(f, codex_aggregate):
 
 
 def _render_stream_card(f, codex_aggregate):
-    """A6 stream card: event count, title, plain-English description, source filename."""
-    count = _stream_event_count(f, codex_aggregate)
+    """A6 stream card: event count, title, plain-English description, source filename.
+
+    `_stream_event_count` keeps returning an int — its contract is unchanged; the lower
+    bound is applied HERE, at the display site."""
+    count = _lb(_stream_event_count(f, codex_aggregate), _stream_truncated(f))
     title = STREAM_LABELS[f["stream"]]
     sentence = _friction_sentence(f, codex_aggregate)
     return (
@@ -3761,7 +3888,7 @@ def _render_stream_card(f, codex_aggregate):
     )
 
 
-def _render_component_friction_table(joined):
+def _render_component_friction_table(joined, *, truncated=False):
     """A6 per-component join table (finding #1): which map nodes got heated, and how
     many friction records each. Reads the SAME `joined` dict `build_friction_overlay`
     already returns — does not re-derive. `sorted(joined.items())` (node_key ascending)
@@ -3771,14 +3898,19 @@ def _render_component_friction_table(joined):
     is the deterministic INITIAL DOM state (`aria-sort="none"` on load — never
     pre-toggled); the client sort reorders only the live DOM, never the emitted bytes.
     Each row carries `data-node-key` so the treemap click-to-jump (item 6) can
-    highlight it."""
+    highlight it.
+
+    `truncated` (keyword-only, default False so any direct caller is unchanged): `joined`
+    merges records from all four streams and carries no stream tag, so once ANY stream's
+    read stopped at a cap every per-component count here is a lower bound."""
     if not joined:
         rows = ('<tr class="friction-component-row"><td colspan="2" class="empty-state">'
                  'no components joined</td></tr>')
     else:
         rows = "".join(
             f'<tr class="friction-component-row" data-node-key="{esc_html(node_key)}">'
-            f'<td>{esc_html(node_key)}</td><td>{esc_html(len(records))}</td></tr>'
+            f'<td>{esc_html(node_key)}</td>'
+            f'<td>{esc_html(_lb(len(records), truncated))}</td></tr>'
             for node_key, records in sorted(joined.items())
         )
     return (
@@ -3794,10 +3926,22 @@ def _render_component_friction_table(joined):
 
 
 def _render_friction_row(f, codex_aggregate):
+    """The per-stream provenance row, whose <details> dumps EVERY footer counter as bare
+    ints into visible (expandable) UI. `truncated_at_cap` discloses THAT the read stopped,
+    but the neighbouring `records_parsed`/`lines_nonblank`/`segments_joined` ints still read
+    as exact — so a lead-in says in words what `_lb` says in a glyph.
+
+    A lead-in rather than `_lb` per value: this is a `json.dumps` of a whole dict, so `_lb`
+    per value would render "\\u2265123" (json.dumps defaults to ensure_ascii=True) and would
+    silently change every count-valued key from int to str inside a machine-readable dump.
+    The lead-in changes no value's type and emits ZERO bytes when nothing truncated."""
     sentence = esc_html(_friction_sentence(f, codex_aggregate))
     raw = {k: v for k, v in f.items() if k not in ("stream", "status", "path_display")}
+    lead = ('<p class="friction-row-lb">Read truncated at the '
+            f'{esc_html(f.get("truncated_at_cap", ""))} cap — every count below is a '
+            'LOWER BOUND.</p>') if _stream_truncated(f) else ""
     raw_html = (f'<details class="friction-row-detail"><summary>raw counters</summary>'
-                f'{esc_html(json.dumps(raw, sort_keys=True))}</details>') if raw else ""
+                f'{lead}{esc_html(json.dumps(raw, sort_keys=True))}</details>') if raw else ""
     return (f'<tr><td>{esc_html(f["stream"])}</td><td>{esc_html(f["status"])}</td>'
             f'<td>{esc_html(f["path_display"])}</td>'
             f'<td>{sentence}{raw_html}</td></tr>')
@@ -3809,12 +3953,13 @@ def _render_friction_panel(joined, footer, codex_aggregate, friction_total_value
         'These local telemetry streams (decisions, review metrics, Codex reviews, interventions) '
         'are matched by name onto the components on the map — a data join, not a judgment.</p>'
     )
+    run_truncated = _any_stream_truncated(footer)
     stream_cards = "".join(_render_stream_card(f, codex_aggregate) for f in footer)
-    component_table = _render_component_friction_table(joined)
+    component_table = _render_component_friction_table(joined, truncated=run_truncated)
     rows = "".join(_render_friction_row(f, codex_aggregate) for f in footer)
     codex_html = (
         f'<div class="card"><h2>Codex aggregate (not node-joined)</h2>'
-        f'<p>{esc_html(_codex_sentence(codex_aggregate))}</p></div>'
+        f'<p>{esc_html(_codex_sentence(codex_aggregate, truncated=run_truncated))}</p></div>'
     )
     return (
         '<aside class="card" id="friction-panel">'
@@ -3903,8 +4048,12 @@ def render_html(
     # by the renderer instead of the collector. Derived in `_phantom_counts` so the
     # Overview digest below bands off the SAME pair (QA exit gate, HIGH 1).
     phantom_ref_count, phantom_confirmed_count = _phantom_counts(doc)
+    # ONE display conversion, shared by every band consumer. `friction_total()` still
+    # returns an int and `_friction_contributions` still reconciles against it exactly; the
+    # `≥N` string exists only downstream of here, where it also suppresses the band.
     friction_total_value = friction_total(joined, codex_aggregate, _metrics_aggregate_only(footer))
-    overview_model = build_overview_model(models, headline, phantom_ref_count, friction_total_value,
+    friction_total_shown = _friction_total_display(friction_total_value, footer)
+    overview_model = build_overview_model(models, headline, phantom_ref_count, friction_total_shown,
                                           phantom_confirmed_count=phantom_confirmed_count)
 
     warn_count = len(doc.get("inaccessible", []) or []) + len(doc.get("errors", []) or [])
@@ -3962,7 +4111,7 @@ def render_html(
         f'<div class="subtitle">root: {esc_html(doc.get("root",""))} | date: {esc_html(date)} '
         f'| generated_at: {esc_html(doc.get("generated_at",""))} {warn_badge}</div></header>',
         _render_instrument_readout(headline, phantom_ref_count, phantom_confirmed_count,
-                                   friction_total_value, models["trend"], models, doc, joined,
+                                   friction_total_shown, models["trend"], models, doc, joined,
                                    footer, codex_aggregate),
         '<div class="controls">',
         '<nav class="view-switch" role="tablist">',
@@ -3976,7 +4125,7 @@ def render_html(
         "<main>",
         _render_overview_view(overview_model, models["civc"], date, copy_payloads["overview"], doc),
         _render_weight_view(models["context_weight"], heat, friction_enabled, doc, copy_payloads["weight"]),
-        _render_friction_view(joined, footer, codex_aggregate, models["drag"], friction_total_value, date,
+        _render_friction_view(joined, footer, codex_aggregate, models["drag"], friction_total_shown, date,
                               copy_payloads["friction"]),
         _render_hygiene_view(doc, models, copy_payloads["hygiene"]),
         "</main>",
