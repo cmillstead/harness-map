@@ -3684,6 +3684,123 @@ def test_phantom_guidance_totality_fix_is_a_no_op_for_every_known_kind():
                                                             # before kind is ever looked up
 
 
+# ============================================================= S6b QA P1: build_phantom_ref_brief
+# was not kind-aware for `template`. Before this fix, `template` (resolved=None) fell
+# into the generic out-of-root branch: the Finding claimed "the resolution space extends
+# outside the scanned root" (false -- a stencil has no resolution space), and the Action
+# manufactured `/coding-team` work on a non-issue while promising the row would
+# disappear (false -- a correct template still renders as a template row).
+def test_build_phantom_ref_brief_is_kind_aware_for_template():
+    ref = {"source": "CLAUDE.md", "ref": "<repo>/docs/handoff/YYYY-MM-DD-<slug>.md",
+           "kind": "template", "resolved": None}
+    brief = rh.build_phantom_ref_brief(ref)
+    assert "extends outside the scanned root" not in brief
+    assert "Route this through" not in brief
+    assert "gone" not in brief
+    assert "No action needed unless the placeholder" in brief  # correct template guidance
+    assert brief == rh.build_phantom_ref_brief(dict(ref))      # pure
+
+
+def test_build_phantom_ref_brief_template_regression_other_kinds_unchanged():
+    """The template branch must not change any pre-existing kind's Finding/Action --
+    same fixtures as test_build_phantom_ref_brief_is_pure_and_kind_aware."""
+    path_brief = rh.build_phantom_ref_brief(
+        {"source": "rules/a.md", "ref": "nope.md", "kind": "path", "resolved": False})
+    assert "does not resolve to a real target" in path_brief
+    assert "Route this through `/coding-team`" in path_brief
+    slash_brief = rh.build_phantom_ref_brief(
+        {"source": "rules/a.md", "ref": "/gone", "kind": "slash_command", "resolved": None})
+    assert "could not verify" in slash_brief
+    assert "Route this through `/coding-team`" in slash_brief
+
+
+# ============================================================= S6b QA P2: env_flag unverifiable
+# guidance. `_PHANTOM_GROUP_ORDER`'s "unverifiable" header text ("the target space extends
+# outside the scanned root") does not hold for env_flag: resolved=null there means a hook
+# file INSIDE --root could not be read (_hooks_body_corpus, collector.py:3327), not that
+# the target space extends outside the root. The header stays (pinned verbatim by
+# test_rendered_phantom_table_carries_three_group_headers; correcting it would LOOSEN a
+# same-execution assertion, which A27 does not permit) -- the row-level guidance cell
+# carries the real reason instead.
+def test_phantom_guidance_env_flag_unverifiable_names_the_real_cause():
+    text = rh._phantom_guidance("env_flag", None)
+    assert text == rh._PHANTOM_GUIDANCE_ENV_FLAG_UNVERIFIABLE
+    assert "hook file inside the scanned root" in text
+    assert "could not be read" in text
+    assert "Inaccessible card" in text
+    assert text != rh._PHANTOM_GUIDANCE["env_flag"]   # not the legacy confirmed-negative text
+    assert "extends outside the scanned root" not in text
+    assert "wire the flag" not in text   # no confident action for an unconfirmed state
+
+
+def test_phantom_guidance_env_flag_resolved_false_still_legacy():
+    """The confirmed-negative case (complete hooks corpus) is untouched."""
+    assert rh._phantom_guidance("env_flag", False) == rh._PHANTOM_GUIDANCE["env_flag"]
+
+
+# ============================================================= S6b QA: seam matrix
+# One row's meaning is rendered on FOUR surfaces (group header text, status word,
+# guidance cell, downloadable brief), and until now nothing compared them -- the class of
+# defect both P1 and P2 are instances of. `_D4_SEAM_SURFACES` is a dict, not four inline
+# calls, so a fifth surface added later is obviously meant to join `readings` below.
+_D4_SEAM_SURFACES = {
+    "group": lambda row: rh._phantom_group_key(row),
+    "status_word": lambda row: rh._phantom_status_word(row["kind"], row["resolved"]),
+    "guidance": lambda row: rh._phantom_guidance(row["kind"], row["resolved"]),
+    "brief": lambda row: rh.build_phantom_ref_brief(row),
+}
+
+# Every (kind, resolved) pair the collector can actually emit (check_phantom_refs,
+# collector.py:3420-3667), plus the legacy slash_command resolved=False shape old
+# sidecars still carry (S2 gate fix predates the resolved=null shape).
+_D4_SEAM_MATRIX = [
+    {"kind": "path", "resolved": False},          # collector.py:3642
+    {"kind": "template", "resolved": None},        # collector.py:3640
+    {"kind": "external", "resolved": None},        # collector.py:3520 / 3540 / 3610
+    {"kind": "slash_command", "resolved": None},   # collector.py:3515 (current shape)
+    {"kind": "slash_command", "resolved": False},  # legacy sidecar shape
+    {"kind": "env_flag", "resolved": False},       # collector.py:3665, complete hooks corpus
+    {"kind": "env_flag", "resolved": None},        # collector.py:3665, incomplete hooks corpus
+]
+# Excluded: kind="template", resolved=True. The collector never emits this combination
+# (template rows are always resolved=None -- collector.py:3640). `_phantom_guidance`
+# checks `resolved is True` BEFORE `kind` (deliberately -- a confirmed-provenance read
+# cannot be overridden by a shape kind), while `_phantom_group_key` checks `kind` BEFORE
+# `resolved` (deliberately -- a shape classification can never carry a confirmed negative;
+# mirror case at test_hostile_resolved_false_on_a_template_row_still_groups_as_not_a_path).
+# Those two deliberate, opposite precedence orders mean this one combination disagrees BY
+# DESIGN: group="not_a_path" but guidance="Resolved at collection time... no action
+# needed", not the template text -- verified directly by execution, not assumed. A row the
+# collector cannot produce is excluded from a matrix that checks agreement on rows it does.
+def test_template_resolved_true_precedence_is_the_documented_non_issue_not_a_defect():
+    """Pins the reason the (template, True) combination is excluded from
+    _D4_SEAM_MATRIX above -- a real assertion, not a comment asserting itself."""
+    assert rh._phantom_group_key({"kind": "template", "resolved": True}) == "not_a_path"
+    assert rh._phantom_guidance("template", True) == \
+        "Resolved at collection time — listed for provenance; no action needed."
+
+
+def test_seam_group_status_guidance_and_brief_agree_across_the_matrix():
+    """For every (kind, resolved) pair the collector can emit, the four operator-facing
+    surfaces must not contradict each other:
+      * no row whose guidance says there is nothing to do may carry brief text
+        instructing a /coding-team fix-and-remove routing;
+      * no row grouped "not_a_path" (never had a target) may receive brief text telling
+        the operator to fix or remove a target;
+      * the status word and the group must not disagree about which rows are "not a
+        path"."""
+    for pair in _D4_SEAM_MATRIX:
+        row = {"source": "s", "ref": "r", **pair}
+        readings = {name: fn(row) for name, fn in _D4_SEAM_SURFACES.items()}
+        if "no action needed" in readings["guidance"].lower():
+            assert "Route this through" not in readings["brief"], pair
+        if readings["group"] == "not_a_path":
+            assert "does not resolve to a real target" not in readings["brief"], pair
+            assert "Route this through" not in readings["brief"], pair
+        assert (readings["status_word"] == "not a path") == \
+            (readings["group"] == "not_a_path"), pair
+
+
 def test_phantom_table_renders_when_kind_is_unhashable(tmp_path):
     """End-to-end: a malformed sidecar row (`kind` is a list) must render the row with
     the catch-all guidance-derived brief path intact, not exit the whole render with

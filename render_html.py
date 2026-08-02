@@ -3288,6 +3288,27 @@ _PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE = (
     "cannot tell the two apart from syntax alone."
 )
 
+# S6b QA P2: `_PHANTOM_GROUP_ORDER`'s "unverifiable" header reads "the target space
+# extends outside the scanned root" — true for `external` and `slash_command`, but NOT
+# for `env_flag`. An env_flag row gets resolved=null only when `_hooks_body_corpus`
+# (collector.py) reports `complete=False`: a hook file INSIDE `--root` (hooks/*.py or
+# hooks/*.sh) could not be read, so the negative ("no hook reads this flag") is
+# unprovable. Nothing about that token's resolution space is outside the root — the
+# unreadable file is IN it. The header stays kind-neutral (it is pinned verbatim by
+# test_rendered_phantom_table_carries_three_group_headers and A27 permits tighten-only,
+# never loosening, correction of a same-execution assertion — this one predates this
+# execution), so the correction lives at the row level instead: this guidance sits
+# directly beside the row and states the REAL reason. No verdict words (binding rule 6)
+# — this states what happened, not a judgment about it.
+_PHANTOM_GUIDANCE_ENV_FLAG_UNVERIFIABLE = (
+    "A hook file inside the scanned root (hooks/*.py or hooks/*.sh) could not be read, "
+    "so the collector cannot prove no hook consumes this flag by literal-string search "
+    "of hook bodies. This is not the same case as a target outside the scanned root — "
+    "the unreadable file is IN this root, not beyond it. The unreadable path is listed "
+    "in the Inaccessible card. Confirm whether that file references this flag before "
+    "deciding whether to wire it to a gate or drop the mention."
+)
+
 
 def _resolved_state(resolved):
     """The ONE derivation of the tri-state `resolved` — True / False / None-meaning-
@@ -3410,6 +3431,14 @@ def _phantom_guidance(kind, resolved):
         return "Resolved at collection time — listed for provenance; no action needed."
     if state is None and kind == "slash_command":
         return _PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
+    # S6b QA P2: same shape as the slash_command override immediately above — the
+    # unverifiable env_flag row's real cause is a hook file the collector could not
+    # read, not a target outside the scanned root, so it needs its own text rather
+    # than falling through to the resolved=False dict entry ("wire the flag to a real
+    # gate, or drop the mention"), which asserts a confirmed negative this state does
+    # not have.
+    if state is None and kind == "env_flag":
+        return _PHANTOM_GUIDANCE_ENV_FLAG_UNVERIFIABLE
     # T3.1: same invariant as `_tokens_treemap` (render_html.py:488-494) -- `kind` arrives
     # straight from sidecar JSON, so an unhashable shape (`[]`, `{}`) is valid JSON a
     # stale/corrupt/hand-crafted sidecar can carry. `dict.get` HASHES its key, so an
@@ -3443,24 +3472,47 @@ def build_phantom_ref_brief(ref):
     source = ref.get("source", "")
     r = ref.get("ref", "")
     kind = ref.get("kind", "")
-    # Same shared policy as the table row beside it (`_resolved_state`), so the brief and
-    # the Resolved column can never describe one row differently.
-    if _resolved_state(ref.get("resolved")) is None:
-        finding = (f"`{source}` points at `{r}` (kind: {kind}), which the collector "
-                   f"could not verify — the resolution space extends outside the "
-                   f"scanned root.\n\n")
+    resolved = ref.get("resolved", False)
+    # S6b QA P1: mirrors `_phantom_group_key`/`_phantom_status_word`'s kind-first check
+    # (isinstance guard because `kind` arrives straight from sidecar JSON and `in
+    # _NEVER_RESOLVABLE_KINDS` hashes its operand — an unhashable kind must short-circuit
+    # before the hash, same reasoning as those two functions). A stencil is a SHAPE, not
+    # a target: there was never a resolution space for it to extend outside of, and a
+    # CORRECT template still renders as a template row afterward, so neither the Finding
+    # nor the Action may claim otherwise — this is the feature's flagship live example
+    # and the fourth consumer `_phantom_guidance`/`_phantom_group_key`/`_phantom_status_word`
+    # already special-case for `template`.
+    if isinstance(kind, str) and kind in _NEVER_RESOLVABLE_KINDS:
+        finding = (f"`{source}` points at `{r}` (kind: {kind}) — a stencil naming a "
+                   f"SHAPE (`<...>`, `{{...}}`, a glob, or a YYYY-MM-DD pattern), not a "
+                   f"file. There was never a target to resolve.\n\n")
+        action = (
+            "No action needed unless the placeholder text itself is wrong. This is not "
+            "a broken reference: a correct template still renders as a template row, so "
+            "re-running `/harness-map` will not make the row disappear.\n"
+        )
     else:
-        finding = (f"`{source}` points at `{r}` (kind: {kind}) which does not resolve "
-                   f"to a real target.\n\n")
+        # Same shared policy as the table row beside it (`_resolved_state`), so the
+        # brief and the Resolved column can never describe one row differently.
+        if _resolved_state(resolved) is None:
+            finding = (f"`{source}` points at `{r}` (kind: {kind}), which the collector "
+                       f"could not verify — the resolution space extends outside the "
+                       f"scanned root.\n\n")
+        else:
+            finding = (f"`{source}` points at `{r}` (kind: {kind}) which does not resolve "
+                       f"to a real target.\n\n")
+        action = (
+            "Route this through `/coding-team`: correct or remove the reference in "
+            f"`{source}`, then re-run `/harness-map` to confirm the phantom ref is gone.\n"
+        )
     return (
         "# Fix phantom reference\n\n"
         "## Finding\n"
         f"{finding}"
         "## What to do\n"
-        f"{_phantom_guidance(kind, ref.get('resolved', False))}\n\n"
+        f"{_phantom_guidance(kind, resolved)}\n\n"
         "## Action\n"
-        "Route this through `/coding-team`: correct or remove the reference in "
-        f"`{source}`, then re-run `/harness-map` to confirm the phantom ref is gone.\n"
+        f"{action}"
     )
 
 
