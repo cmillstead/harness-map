@@ -5582,10 +5582,18 @@ def test_parse_settings_unsearchable_root_records_error_not_crash(unsearchable_r
 def test_build_document_unsearchable_root_is_degraded_not_crashed(unsearchable_root):
     """S7.M2/M3 deferred this: build_document's chain used to RAISE on this fixture via
     parse_settings's settings_path.is_file() before S7.M3b guarded it. Now the whole
-    document degrades instead of crashing."""
+    document degrades instead of crashing. `_CRASH_ERROR_PREFIX` is only ever added by
+    main()'s wrapper, never by build_document itself, so that check alone can't
+    distinguish "degraded gracefully" from "crashed and got wrapped" at this call level
+    -- the load-bearing assertions pin the ACTUAL recorded content: the pre-existing
+    "skills" is_dir() guard (Task 1/2) still fires, and this task's own is_file() guard
+    names the probe it caught, so a future regression that silently drops either
+    recording fails this test instead of a truthy check passing on unrelated content."""
     doc = _collector.build_document(unsearchable_root, None)
     assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
-    assert doc["inaccessible"] or doc["errors"]
+    recorded = {e["path"]: e["reason"] for e in doc["inaccessible"]}
+    assert recorded.get("skills") == "unreadable"
+    assert any("settings.json is_file() check failed" in e for e in doc["errors"])
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
@@ -5593,10 +5601,13 @@ def test_build_document_compose_unsearchable_root_is_degraded_not_crashed(
     unsearchable_root, tmp_path
 ):
     """Compose-tier analog of the test above: same fixture, project_root supplied so
-    tier_composition is populated too."""
+    tier_composition is populated too. Same specific-content assertions as above --
+    see that test's docstring for why a truthy check is insufficient here."""
     project_root = tmp_path / "repo"
     project_root.mkdir()
     doc = _collector.build_document(unsearchable_root, project_root, compose=True)
     assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
     assert "tier_composition" in doc
-    assert doc["inaccessible"] or doc["errors"]
+    recorded = {e["path"]: e["reason"] for e in doc["inaccessible"]}
+    assert recorded.get("skills") == "unreadable"
+    assert any("settings.json is_file() check failed" in e for e in doc["errors"])
