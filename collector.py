@@ -1079,7 +1079,16 @@ def walk_always_loaded(
         # CLAUDE.md), AND compose is off — compose mode emits the project CLAUDE.md via
         # _walk_project_tier below instead, unconditionally on registration (H1: the two
         # paths must never BOTH fire for the same physical file, or it double-counts).
-        if not compose and (root / "projects" / active_slug / "memory").is_dir():
+        # Path.is_dir() re-raises EACCES from an unreadable ancestor (it swallows only the
+        # ENOENT family) — an escape here aborts walk_always_loaded and, via build_document,
+        # replaces the ENTIRE report with a crash envelope. Record and treat as absent.
+        legacy_memory_dir = root / "projects" / active_slug / "memory"
+        try:
+            legacy_memory_present = legacy_memory_dir.is_dir()
+        except OSError as e:
+            errors.append(f"projects memory is_dir failed for {legacy_memory_dir}: {e}")
+            legacy_memory_present = False
+        if not compose and legacy_memory_present:
             proj_claude = Path(project_root) / "CLAUDE.md"
             present, ok = _safe_exists(proj_claude)
             if not ok:
@@ -1098,7 +1107,12 @@ def walk_always_loaded(
     # under its harness-relative name by design. Recursive, symlink-loop-prone trees (hooks/)
     # are handled in Task 3 with explicit name+target recording instead of a body read.
     projects_dir = root / "projects"
-    if projects_dir.is_dir():
+    try:
+        projects_dir_is_dir = projects_dir.is_dir()
+    except OSError as e:
+        errors.append(f"projects is_dir failed for {projects_dir}: {e}")
+        projects_dir_is_dir = False
+    if projects_dir_is_dir:
         try:
             slug_dirs = sorted(p for p in projects_dir.iterdir() if p.is_dir())
         except OSError:
@@ -1226,7 +1240,12 @@ def collect_descriptions(
     # walk to follow symlinks through. A symlinked skill DIR is followed and reported under
     # its harness-relative name by design.
     skills_dir = root / "skills"
-    if skills_dir.is_dir():
+    try:
+        skills_dir_is_dir = skills_dir.is_dir()
+    except OSError:
+        _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+        skills_dir_is_dir = False
+    if skills_dir_is_dir:
         try:
             skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
         except OSError:
@@ -1250,7 +1269,12 @@ def collect_descriptions(
             })
 
     agents_dir = root / "agents"
-    if agents_dir.is_dir():
+    try:
+        agents_dir_is_dir = agents_dir.is_dir()
+    except OSError:
+        _append_inaccessible_once(inaccessible, _rel_safe(root, agents_dir))
+        agents_dir_is_dir = False
+    if agents_dir_is_dir:
         try:
             agent_files = sorted(agents_dir.glob("*.md"))
         except OSError:
@@ -1282,7 +1306,12 @@ def collect_on_demand(
     # walk to follow symlinks through. A symlinked skill DIR is followed and reported under
     # its harness-relative name by design.
     skills_dir = root / "skills"
-    if skills_dir.is_dir():
+    try:
+        skills_dir_is_dir = skills_dir.is_dir()
+    except OSError:
+        _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+        skills_dir_is_dir = False
+    if skills_dir_is_dir:
         try:
             skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
         except OSError:
@@ -1294,7 +1323,12 @@ def collect_on_demand(
             if not ok:
                 inaccessible.append({"path": _rel(root, skill_md), "reason": "unreadable"})
                 continue
-            has_test = (skill_dir / "tests").is_dir()
+            tests_dir = skill_dir / "tests"
+            try:
+                has_test = tests_dir.is_dir()
+            except OSError:
+                _append_inaccessible_once(inaccessible, _rel_safe(root, tests_dir))
+                has_test = False
             if present:
                 text = _read_checked(root, skill_md, inaccessible)
                 if text is not None:
@@ -1309,7 +1343,12 @@ def collect_on_demand(
 
             for subdir, kind in (("phases", "phase"), ("prompts", "prompt"), ("agents", "agent")):
                 target = skill_dir / subdir
-                if not target.is_dir():
+                try:
+                    target_is_dir = target.is_dir()
+                except OSError:
+                    _append_inaccessible_once(inaccessible, _rel_safe(root, target))
+                    continue
+                if not target_is_dir:
                     continue
                 try:
                     body_files = sorted(target.glob("*.md"))
@@ -1332,7 +1371,12 @@ def collect_on_demand(
     if project_root is not None:
         active_slug = _project_slug(project_root)
         mem_dir = root / "projects" / active_slug / "memory"
-        if mem_dir.is_dir():
+        try:
+            mem_dir_is_dir = mem_dir.is_dir()
+        except OSError:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, mem_dir))
+            mem_dir_is_dir = False
+        if mem_dir_is_dir:
             try:
                 mem_files = sorted(mem_dir.glob("*.md"))
             except OSError:

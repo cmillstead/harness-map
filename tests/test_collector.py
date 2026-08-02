@@ -5413,3 +5413,124 @@ def test_empty_document_carries_metric_definitions(fake_harness):
     computed."""
     env = _collector._empty_document(fake_harness)
     assert env["metric_definitions"] == {}
+
+
+# S7.M1 (F6): eight is_dir() call sites in walk_always_loaded / collect_descriptions /
+# collect_on_demand were unguarded against an ancestor directory that stats fine but
+# cannot be listed (search bit cleared). Path.is_dir() re-raises EACCES from that case
+# (it swallows only the ENOENT family) -- an escape there aborts the whole scan and, via
+# build_document, replaces the ENTIRE report with a crash envelope. Every one of the six
+# tests below builds a REAL unreadable directory (no mocks) and asserts the OSError is
+# recorded into inaccessible[]/errors[] instead of propagating.
+
+@pytest.fixture
+def unsearchable_root(tmp_path):
+    """A real harness root whose children cannot be stat'd (search bit cleared).
+    os.stat(root) itself still succeeds -- only descent fails, which is precisely the
+    ancestor-unreadable case Path.is_dir() re-raises instead of swallowing."""
+    root = tmp_path / "harness"
+    (root / "skills" / "demo").mkdir(parents=True)
+    (root / "skills" / "demo" / "SKILL.md").write_text("---\ndescription: d\n---\nbody\n")
+    (root / "agents").mkdir()
+    (root / "projects" / "slug" / "memory").mkdir(parents=True)
+    os.chmod(root, 0o600)
+    try:
+        yield root
+    finally:
+        os.chmod(root, 0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_descriptions_unsearchable_root_records_inaccessible(unsearchable_root):
+    inaccessible = []
+    skill_desc, agent_desc = _collector.collect_descriptions(unsearchable_root, inaccessible)
+    assert skill_desc == []
+    assert agent_desc == []
+    recorded = {e["path"] for e in inaccessible}
+    assert "skills" in recorded
+    assert "agents" in recorded
+    assert all(e["reason"] == "unreadable" for e in inaccessible)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_on_demand_unsearchable_root_records_inaccessible(unsearchable_root):
+    inaccessible = []
+    skills, internal, memory = _collector.collect_on_demand(unsearchable_root, None, inaccessible)
+    assert skills == []
+    assert internal == []
+    assert memory == []
+    assert "skills" in {e["path"] for e in inaccessible}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_on_demand_unreadable_skill_subdirs_record_inaccessible(tmp_path):
+    """1297 (tests/) and 1312 (phases|prompts|agents): the skill dir AND its SKILL.md are
+    both listable/readable (so the earlier _safe_exists(skill_md) guard does not
+    short-circuit the loop via `continue`), but "tests" and "phases" are each a symlink
+    into an unreadable-parent target -- same real-filesystem technique as
+    test_walk_always_loaded_skills_root_inaccessible_records_error_not_crash above --
+    so is_dir() on the symlink itself raises EACCES rather than returning False."""
+    root = tmp_path / "harness"
+    skill_dir = root / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("body\n")
+    hidden = tmp_path / "hidden-subdir-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skill_dir / "tests").symlink_to(hidden / "tests")
+    (skill_dir / "phases").symlink_to(hidden / "phases")
+    try:
+        inaccessible = []
+        skills, internal, _memory = _collector.collect_on_demand(root, None, inaccessible)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert internal == []
+    recorded = {e["path"] for e in inaccessible}
+    assert "skills/demo/tests" in recorded
+    assert "skills/demo/phases" in recorded
+    assert skills and skills[0]["has_test"] is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_on_demand_unreadable_memory_dir_records_inaccessible(tmp_path):
+    root = tmp_path / "harness"
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    slug = _collector._project_slug(project_root)
+    (root / "projects" / slug / "memory").mkdir(parents=True)
+    os.chmod(root / "projects" / slug, 0o600)
+    try:
+        inaccessible = []
+        _skills, _internal, memory = _collector.collect_on_demand(root, project_root, inaccessible)
+        assert memory == []
+        assert any("memory" in e["path"] for e in inaccessible)
+    finally:
+        os.chmod(root / "projects" / slug, 0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_always_loaded_unsearchable_root_records_error(unsearchable_root):
+    inaccessible, errors = [], []
+    files, variants = _collector.walk_always_loaded(
+        unsearchable_root, None, inaccessible, errors)
+    assert files == []
+    assert variants == []
+    assert any("projects" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+@pytest.mark.xfail(
+    strict=True,
+    reason="build_document's chain still has unguarded is_dir()/is_file() sites outside "
+           "S7 Task 2's scope: parse_settings:1432 (Task 3b) and "
+           "_detect_skill_test_coverage:3937 (Task 3), confirmed by direct probing. This "
+           "whole-pipeline invariant is milestone-level, not satisfiable by Task 2's 8 "
+           "sites alone -- remove this marker once whichever of Task 3/3b/3c lands last "
+           "closes the remaining gap.",
+)
+def test_build_document_unsearchable_root_is_degraded_not_crashed(unsearchable_root):
+    """The whole point of F6: an unreadable surface must be DISCLOSED, not converted
+    into an empty crash envelope that a reader could mistake for a clean harness."""
+    doc = _collector.build_document(unsearchable_root, None)
+    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+    assert doc["inaccessible"] or doc["errors"], "an unreadable root must never read as clean"
