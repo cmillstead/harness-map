@@ -3429,6 +3429,30 @@ def check_phantom_refs(
     refs: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     hooks_corpus, hooks_corpus_complete = _hooks_body_corpus(root, inaccessible)
+    # S6b.M2.1: computed ONCE per call, not per token -- reused by BOTH candidate loops
+    # below to filter out-of-root candidates before any stat. A `root` that cannot be
+    # stat'd makes containment undecidable for every candidate, so `_in_root` skips them
+    # all (same "cannot determine -> not proven inside" posture as the fp_inside table
+    # in reconcile_hooks, collector.py:1599-1607).
+    try:
+        root_stat = os.stat(root)
+    except OSError:
+        root_stat = None
+
+    def _in_root(candidate: Path) -> bool:
+        # `_resolves_inside_root`'s fast lexical `root in candidate.parents` check
+        # compares RAW path components without collapsing "..". A joined-but-unresolved
+        # candidate like `root / "../active-repo/x.md"` therefore walks back to a literal
+        # ancestor equal to `root` after popping one trailing component per ".." segment
+        # -- and returns True -- even though the path actually RESOLVES outside root
+        # (verified: `Path('/r/claude') in (Path('/r/claude') / '../x').parents` is
+        # True). Calling `_resolves_inside_root` on the raw join would silently defeat
+        # this fix. `validate_write_target` (collector.py:330) already carries the same
+        # lexical defense for its own containment check ("tested both LEXICALLY
+        # (normpath, catches a textual '..' that still exits a root)"); reused here
+        # rather than inventing a second predicate.
+        normalized = Path(os.path.normpath(str(candidate)))
+        return root_stat is not None and _resolves_inside_root(normalized, root, root_stat)
 
     for rel_path, text in corpus_files:
         for m in _GENERIC_BACKTICK_RE.finditer(text):
@@ -3500,8 +3524,24 @@ def check_phantom_refs(
                 candidates = [root / norm]
                 if str(src_dir) not in (".", ""):
                     candidates.append(root / src_dir / norm)
+                # S6b.M2.1: a relative token (no leading `/` or `~`, so it skipped the
+                # `external` branch above) can still escape --root through a `../`
+                # segment. Filter to in-root candidates BEFORE any `_safe_exists` stat --
+                # stat-ing an out-of-root candidate at all is what turned row-presence
+                # into a filesystem existence oracle (a `../etc/passwd`-shaped token could
+                # probe anything readable by the process). If NONE of a token's candidates
+                # resolve inside root, the docstring's own promise applies: classify as
+                # `external`, never assert absence about a path this scan cannot see.
+                in_root_candidates = [c for c in candidates if _in_root(c)]
+                if not in_root_candidates:
+                    key = (rel_path, norm, "external")
+                    if key not in seen:
+                        seen.add(key)
+                        refs.append({"source": rel_path, "ref": norm, "kind": "external",
+                                     "resolved": None, "evidence": "INFERRED"})
+                    continue
                 handled = False
-                for candidate in candidates:
+                for candidate in in_root_candidates:
                     present, ok = _safe_exists(candidate)
                     if not ok:
                         # Same shape, same fix as the slash-command probe above: `handled`
@@ -3556,8 +3596,22 @@ def check_phantom_refs(
                     stripped_candidates = [root / stripped]
                     if str(src_dir) not in (".", ""):
                         stripped_candidates.append(root / src_dir / stripped)
+                    # S6b.M2.1: `stripped` is a PATH NEVER PROBED by the candidate loop
+                    # above (that loop probed the unstripped citation) -- so it needs its
+                    # own containment filter, same reasoning as the loop above. Without
+                    # this, a `../x.md:1` token bypassed the unstripped loop's oracle
+                    # fix (the unstripped candidate never matches a real filename, so
+                    # `handled` stays False) and reached an unguarded stat here instead.
+                    in_root_stripped_candidates = [c for c in stripped_candidates if _in_root(c)]
+                    if not in_root_stripped_candidates:
+                        key = (rel_path, norm, "external")
+                        if key not in seen:
+                            seen.add(key)
+                            refs.append({"source": rel_path, "ref": norm, "kind": "external",
+                                         "resolved": None, "evidence": "INFERRED"})
+                        continue
                     stripped_handled = False
-                    for candidate in stripped_candidates:
+                    for candidate in in_root_stripped_candidates:
                         present, ok = _safe_exists(candidate)
                         if not ok:
                             # Unreadable: record it and DROP the token. Same policy as the

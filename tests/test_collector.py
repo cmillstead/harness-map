@@ -988,6 +988,89 @@ def test_freeze_multisegment_absolute_stays_external_none_inferred(fake_harness)
     assert hits[0]["evidence"] == "INFERRED"
 
 
+# ---------------------------------------------------------------------------
+# S6b.M2.1 — traversal existence-oracle fix. `check_phantom_refs` joins an
+# untrusted token onto `root` and stats the result; a `../`-token therefore
+# probed arbitrary filesystem paths OUTSIDE --root, and row-present-vs-absent
+# was a binary existence oracle over the whole filesystem. Fixed by routing
+# both candidate loops (the pre-existing one and D4's line-suffix-stripped
+# one) through `_resolves_inside_root` before any stat, same as every other
+# containment check in this file.
+# ---------------------------------------------------------------------------
+
+def test_anti_oracle_unsuffixed_traversal_token_exists_vs_absent_indistinguishable(fake_harness):
+    """Pre-existing oracle (not introduced by D4): a `../`-token with no `:line`
+    suffix must not leak whether its out-of-root target exists. Equality of the
+    emitted row across the EXISTS and ABSENT cases IS the security property --
+    a test that only checks 'a row appears' does not close the oracle.
+
+    The citing file is at ROOT LEVEL (`CLAUDE.md`, src_dir="."), not in a
+    subdirectory: a subdirectory citer would add a SECOND, src_dir-relative
+    candidate (`root / src_dir / norm`) whose ".." can cancel the descent and
+    land back INSIDE root -- a legitimate, unrelated resolution mode, not part
+    of what this test isolates."""
+    (fake_harness / "CLAUDE.md").write_text("See `../active-repo/CLAUDE.md` for detail.")
+    doc_exists = run_collector(fake_harness)
+    hits_exists = [r for r in doc_exists["phantom_refs"] if r["ref"] == "../active-repo/CLAUDE.md"]
+
+    (fake_harness.parent / "active-repo" / "CLAUDE.md").unlink()
+    doc_absent = run_collector(fake_harness)
+    hits_absent = [r for r in doc_absent["phantom_refs"] if r["ref"] == "../active-repo/CLAUDE.md"]
+
+    assert hits_exists == hits_absent, (hits_exists, hits_absent)
+    assert len(hits_exists) == 1, hits_exists
+    assert hits_exists[0]["kind"] == "external"
+    assert hits_exists[0]["resolved"] is None
+    assert hits_exists[0]["evidence"] == "INFERRED"
+
+
+def test_anti_oracle_suffixed_traversal_token_exists_vs_absent_indistinguishable(fake_harness):
+    """The D4 regression: the line-suffix strip builds a SECOND candidate
+    (`root / stripped`) that bypassed containment even after the fix above
+    closed the unsuffixed loop. Same equality property, `:line`-suffixed token.
+    Same root-level-citer reasoning as the unsuffixed test above applies."""
+    (fake_harness / "CLAUDE.md").write_text("See `../active-repo/CLAUDE.md:1` for detail.")
+    doc_exists = run_collector(fake_harness)
+    hits_exists = [r for r in doc_exists["phantom_refs"] if r["ref"] == "../active-repo/CLAUDE.md:1"]
+
+    (fake_harness.parent / "active-repo" / "CLAUDE.md").unlink()
+    doc_absent = run_collector(fake_harness)
+    hits_absent = [r for r in doc_absent["phantom_refs"] if r["ref"] == "../active-repo/CLAUDE.md:1"]
+
+    assert hits_exists == hits_absent, (hits_exists, hits_absent)
+    assert len(hits_exists) == 1, hits_exists
+    assert hits_exists[0]["kind"] == "external"
+    assert hits_exists[0]["resolved"] is None
+    assert hits_exists[0]["evidence"] == "INFERRED"
+
+
+def test_traversal_fix_is_noop_for_ordinary_inroot_relative_tokens(fake_harness):
+    """Regression: a token with at least one in-root candidate must behave EXACTLY as
+    before this fix -- both the resolving and the genuinely-missing case."""
+    (fake_harness / "rules" / "a.md").write_text(
+        "See `rules/b.md` and `rules/ghost.md` for detail.")
+    doc = run_collector(fake_harness)
+    assert not any(r["ref"] == "rules/b.md" for r in doc["phantom_refs"]), doc["phantom_refs"]
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "rules/ghost.md"]
+    assert len(hits) == 1, hits
+    assert hits[0]["kind"] == "path"
+    assert hits[0]["resolved"] is False
+    assert hits[0]["evidence"] == "VERIFIED"
+
+
+def test_traversal_segment_that_still_resolves_inside_root_is_unaffected(fake_harness):
+    """A `..` segment is not itself disqualifying -- only a candidate that RESOLVES
+    outside root is. `docs/../docs/real.md` normalizes back inside root at the OS level
+    and must resolve exactly like `docs/real.md`; a naive `'..' in token` rejection would
+    wrongly turn this into a false `external` row."""
+    (fake_harness / "docs").mkdir(parents=True, exist_ok=True)
+    (fake_harness / "docs" / "real.md").write_text("Body.\n")
+    (fake_harness / "rules" / "a.md").write_text("See `docs/../docs/real.md` for detail.")
+    doc = run_collector(fake_harness)
+    assert not any(r["ref"] == "docs/../docs/real.md" for r in doc["phantom_refs"]), \
+        doc["phantom_refs"]
+
+
 def test_phantom_definition_versions_bump_to_four_with_the_d4_detector(fake_harness):
     """§8.1/§8.5: the version bump lands in the SAME commit as the detector edit.
     v1 pre-S1.M0 · v2 S1.M0+S2.M4 · v3 S2-gate D2 · v4 S6 D4.
