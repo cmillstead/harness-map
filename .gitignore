@@ -5,8 +5,13 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 
-# Working docs (implementation plans, handoffs). These carry local absolute
-# paths and internal process detail, and this repo is public — the coding-team
-# lifecycle hooks read plan frontmatter from here, so the directory must exist
-# locally while never being published.
-docs/
+# Implementation plans ONLY. Plans carry local absolute paths and raw process
+# detail, and this repo is public — the coding-team lifecycle hooks read plan
+# frontmatter from here, so the directory must exist locally while never being
+# published.
+#
+# Everything else under docs/ IS tracked — retros, handoffs, design notes.
+# Scrub absolute paths (/Users/<name>) and operator-identifying literals before
+# committing one; test_no_absolute_home_literal_in_runtime_modules covers
+# runtime modules only, not docs.
+docs/plans/
