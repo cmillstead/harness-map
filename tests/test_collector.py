@@ -5536,11 +5536,67 @@ def test_detect_skill_test_coverage_unsearchable_root_records_error(unsearchable
     assert result == []
     assert any("skills" in e for e in errors)
 
-# Both build_document-level tests (this compose variant, and the non-compose variant Task
-# 2 deferred above) are intentionally NOT added here: build_document's chain still RAISES
-# on this fixture via parse_settings's settings_path.is_file() (collector.py:1432), which
-# reraises EACCES the same way the is_dir() sites above did, runs before any of this
-# task's guarded sites, and is not caught inside build_document itself (only main()'s
-# top-level except converts a crash to an envelope). The remaining unguarded SITE belongs
-# to Task 3b ("_read_text, parse_settings (P1 pair)"); these build_document-level TESTS
-# belong to Task 3c, the last task in the chain and the first point at which they can pass.
+# S7.M3b (F6): _read_text's is_file() probe and parse_settings's is_file()/is_symlink()
+# probes were the last unguarded ENOENT-only-swallow sites in this same class -- each one
+# also re-raises EACCES from an unsearchable ancestor. Guarded now; the two tests below
+# prove the guarded outcome instead of a propagated crash.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_read_text_unsearchable_ancestor_returns_inaccessible(unsearchable_root):
+    """_read_text's is_file() probe (collector.py:182) re-raises EACCES from an
+    unsearchable ancestor exactly like the is_dir() sites above; the probe now lives
+    inside the same try as the read so both fold into (None, "INACCESSIBLE") instead
+    of propagating. Reachability: unsearchable_root's SKILL.md sits two levels below
+    the chmod'd root, so descending to it needs the cleared search bit."""
+    text, status = _collector._read_text(unsearchable_root / "skills" / "demo" / "SKILL.md")
+    assert text is None
+    assert status == "INACCESSIBLE"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_parse_settings_unsearchable_root_records_error_not_crash(unsearchable_root):
+    """parse_settings's settings_path.is_file() probe (collector.py:1451) re-raises
+    EACCES from the same unsearchable-ancestor condition; guarded now so the run
+    degrades to ({}, False) plus an errors[] entry instead of propagating out of
+    build_document. Reachability: settings.json would live directly under
+    unsearchable_root, which itself has the cleared search bit, so even a
+    same-level stat needs the missing bit."""
+    errors, blind_spots = [], []
+    settings, parsed_ok = _collector.parse_settings(unsearchable_root, errors, blind_spots)
+    assert settings == {}
+    assert parsed_ok is False
+    assert any("settings.json" in e for e in errors)
+
+
+# The is_symlink() probe guarded alongside is_file() above (collector.py: ~1470) is not
+# independently exercised by a third test: reaching it requires is_file() (stat, follows
+# symlinks) AND the already-guarded exists() to both return cleanly without raising on
+# this exact path, and os.lstat()'s directory-traversal work (what is_symlink() uses) is
+# a strict subset of os.stat()'s -- so any EACCES/ELOOP that could reach lstat() would
+# already have surfaced in one of the two preceding stat()-based calls. No mock-free,
+# non-racy filesystem construction reaches this except-block in isolation; it is kept as
+# defensive symmetry with the function's established idiom, not as independently-tested
+# behavior.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_build_document_unsearchable_root_is_degraded_not_crashed(unsearchable_root):
+    """S7.M2/M3 deferred this: build_document's chain used to RAISE on this fixture via
+    parse_settings's settings_path.is_file() before S7.M3b guarded it. Now the whole
+    document degrades instead of crashing."""
+    doc = _collector.build_document(unsearchable_root, None)
+    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+    assert doc["inaccessible"] or doc["errors"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_build_document_compose_unsearchable_root_is_degraded_not_crashed(
+    unsearchable_root, tmp_path
+):
+    """Compose-tier analog of the test above: same fixture, project_root supplied so
+    tier_composition is populated too."""
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    doc = _collector.build_document(unsearchable_root, project_root, compose=True)
+    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+    assert "tier_composition" in doc
+    assert doc["inaccessible"] or doc["errors"]

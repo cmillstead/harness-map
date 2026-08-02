@@ -179,9 +179,12 @@ def _read_text(path):
     a FIFO/socket/dir must not block the collector. `is_file()` follows symlinks (True
     for a regular file or a symlink to one; False for FIFO/dir/socket/broken symlink),
     so regular-file behavior is unchanged — no false negatives."""
-    if not path.is_file():
-        return None, "INACCESSIBLE"
     try:
+        # is_file() itself can raise OSError (EACCES) when an ancestor directory
+        # is unsearchable, not just when the read fails — the probe is inside the
+        # same try as the read so both fold into the one INACCESSIBLE outcome.
+        if not path.is_file():
+            return None, "INACCESSIBLE"
         return path.read_text(encoding="utf-8", errors="replace"), "VERIFIED"
     except OSError:
         return None, "INACCESSIBLE"
@@ -1448,7 +1451,15 @@ def parse_settings(
       trigger via settings.json specifically — the intended, more robust outcome.)
       Returns (settings_dict, parsed_ok)."""
     settings_path = root / "settings.json"
-    if not settings_path.is_file():   # follows symlinks; False for FIFO/socket/dir/broken-symlink/absent
+    try:
+        is_regular_file = settings_path.is_file()   # follows symlinks; False for FIFO/socket/dir/broken-symlink/absent
+    except OSError as e:
+        # is_file() itself can raise EACCES from an unsearchable ancestor directory,
+        # not just report False — LOUD per this function's own "unreadable-as-a-regular
+        # file" branch, same shape as the read-failure case below.
+        errors.append(f"settings.json is_file() check failed: {e!r}")
+        return {}, False
+    if not is_regular_file:
         try:
             present = settings_path.exists()   # follows symlinks; True for a symlink to a FIFO/socket/dir
         except OSError:
@@ -1457,7 +1468,12 @@ def parse_settings(
             errors.append("settings.json exists but is not a regular file (FIFO/socket/directory); "
                            "refusing to open it to avoid blocking on a special file.")
             return {}, False
-        if settings_path.is_symlink():   # exists() False + is_symlink() True == a broken (dangling) symlink
+        try:
+            is_broken_symlink = settings_path.is_symlink()   # exists() False + is_symlink() True == a broken (dangling) symlink
+        except OSError as e:
+            errors.append(f"settings.json is_symlink() check failed: {e!r}")
+            return {}, False
+        if is_broken_symlink:
             errors.append("settings.json is a broken symlink (target does not exist)")
             return {}, False
         blind_spots.append("settings.json not found; permissions/config/hooks reflect defaults.")
