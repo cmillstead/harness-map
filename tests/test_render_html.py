@@ -3714,6 +3714,41 @@ def test_build_phantom_ref_brief_template_regression_other_kinds_unchanged():
     assert "Route this through `/coding-team`" in slash_brief
 
 
+# ============================================================= S6b QA P3: build_phantom_ref_brief
+# was not kind-aware for env_flag's unverifiable state (resolved=None). Before this fix, the
+# generic branch's Finding claimed "the resolution space extends outside the scanned root" --
+# false for env_flag, whose real cause (an unreadable hook file INSIDE `--root`) is already
+# named, correctly, by `_PHANTOM_GUIDANCE_ENV_FLAG_UNVERIFIABLE` in the very next section of
+# the same document. The Finding and the "What to do" section contradicted each other by name.
+def test_build_phantom_ref_brief_env_flag_unverifiable_names_the_real_cause():
+    ref = {"source": "rules/a.md", "ref": "MY_GUARD_FLAG", "kind": "env_flag",
+           "resolved": None}
+    brief = rh.build_phantom_ref_brief(ref)
+    # The Finding must not claim a resolution space outside the scanned root.
+    assert "extends outside the scanned root" not in brief
+    # The Action must not promise the row disappears on re-run...
+    assert "confirm the phantom ref is gone" not in brief
+    # ...and must not instruct removing the reference as the remedy.
+    assert "correct or remove the reference" not in brief
+    # It must state the real cause and point at the real blocker instead.
+    assert "hook file inside the scanned root could not be read" in brief
+    assert "Inaccessible card" in brief
+    assert brief == rh.build_phantom_ref_brief(dict(ref))   # pure
+
+
+def test_build_phantom_ref_brief_env_flag_resolved_false_unchanged():
+    """The confirmed-negative case (complete hooks corpus) must be byte-unchanged by the
+    P3 fix -- routing through `/coding-team` on a genuine confirmed-missing target is
+    correct there, unlike the unverifiable case above."""
+    ref = {"source": "rules/a.md", "ref": "MY_GUARD_FLAG", "kind": "env_flag",
+           "resolved": False}
+    brief = rh.build_phantom_ref_brief(ref)
+    assert "does not resolve to a real target" in brief
+    assert ("Route this through `/coding-team`: correct or remove the reference in "
+            "`rules/a.md`, then re-run `/harness-map` to confirm the phantom ref is "
+            "gone.") in brief
+
+
 # ============================================================= S6b QA P2: env_flag unverifiable
 # guidance. `_PHANTOM_GROUP_ORDER`'s "unverifiable" header text ("the target space extends
 # outside the scanned root") does not hold for env_flag: resolved=null there means a hook
@@ -3749,6 +3784,13 @@ _D4_SEAM_SURFACES = {
     "guidance": lambda row: rh._phantom_guidance(row["kind"], row["resolved"]),
     "brief": lambda row: rh.build_phantom_ref_brief(row),
 }
+
+# S6b QA P3: which kinds' resolution space GENUINELY extends outside the scanned root --
+# a CC built-in, a plugin command, or a file the walk cannot see (Codex P2-4, docstring at
+# `build_phantom_groups`). `template` has no target at all; `env_flag`'s unverifiable state
+# means an unreadable file INSIDE `--root`, not one beyond it. Neither may claim the
+# outside-root text truthfully -- this is the set the P3 seam check below tests against.
+_D4_KINDS_WITH_OUT_OF_ROOT_SPACE = frozenset({"external", "slash_command"})
 
 # Every (kind, resolved) pair the collector can actually emit (check_phantom_refs,
 # collector.py:3420-3667), plus the legacy slash_command resolved=False shape old
@@ -3799,6 +3841,28 @@ def test_seam_group_status_guidance_and_brief_agree_across_the_matrix():
             assert "Route this through" not in readings["brief"], pair
         assert (readings["status_word"] == "not a path") == \
             (readings["group"] == "not_a_path"), pair
+        # S6b QA P3, additive: none of the three checks above caught the P3 defect --
+        # they compare surfaces to EACH OTHER, never a surface's factual claim to the
+        # row's kind. The env_flag-unverifiable Finding said "extends outside the scanned
+        # root" while sitting beside guidance that named an in-root cause, and nothing
+        # above notices a claim that is simply untrue for this row.
+        claims_outside_root = "extends outside the scanned root" in readings["brief"]
+        if not (pair["kind"] in _D4_KINDS_WITH_OUT_OF_ROOT_SPACE
+                and pair.get("resolved") is None):
+            # Every other row in the matrix: the claim must be ABSENT, because for those
+            # rows it is either false (template, env_flag-unverifiable) or moot (resolved
+            # is not None, so the brief takes a different branch entirely).
+            assert not claims_outside_root, pair
+        # A structural self-contradiction check, generalisable to any future kind or
+        # surface without enumerating them: no brief may assert the resolution space
+        # extends outside the scanned root while its OWN guidance section, rendered into
+        # the same document, says the opposite. This is the shape the P3 defect actually
+        # had -- one section claiming outside-root, the very next section naming an
+        # in-root cause -- and it catches a fifth surface's version of the same mistake
+        # without anyone having to add it to a kind list.
+        if claims_outside_root:
+            assert "not beyond it" not in readings["brief"], pair
+            assert "is IN this root" not in readings["brief"], pair
 
 
 def test_phantom_table_renders_when_kind_is_unhashable(tmp_path):

@@ -3491,6 +3491,27 @@ def build_phantom_ref_brief(ref):
             "a broken reference: a correct template still renders as a template row, so "
             "re-running `/harness-map` will not make the row disappear.\n"
         )
+    # S6b QA P3: third surface of the same defect class as P1 (template) and P2
+    # (_phantom_guidance's env_flag text) — this function's own generic
+    # `_resolved_state(resolved) is None` branch below claims "the resolution space
+    # extends outside the scanned root", which is false for env_flag: resolved=null there
+    # means `_hooks_body_corpus` (collector.py) reported an unreadable hook file INSIDE
+    # `--root`, the same real cause `_PHANTOM_GUIDANCE_ENV_FLAG_UNVERIFIABLE` already names
+    # in the "What to do" section beside it. Leaving this branch generic put a claim in
+    # the Finding that contradicted the guidance immediately below it, in the same
+    # document. The Action must not promise the row disappears on re-run (nothing about
+    # the hooks corpus changes by editing `source`) and must not tell the operator to
+    # correct or remove the reference — the reference is not the problem, the unreadable
+    # hook file is.
+    elif kind == "env_flag" and _resolved_state(resolved) is None:
+        finding = (f"`{source}` points at `{r}` (kind: {kind}) — a hook file inside the "
+                   f"scanned root could not be read, so the collector cannot prove no "
+                   f"hook consumes this flag.\n\n")
+        action = (
+            "Read the unreadable hook file listed in the Inaccessible card first — it is "
+            f"the blocker, not the reference in `{source}`. If it references this flag, "
+            "route the fix through `/coding-team`; if not, no action is needed here.\n"
+        )
     else:
         # Same shared policy as the table row beside it (`_resolved_state`), so the
         # brief and the Resolved column can never describe one row differently.
