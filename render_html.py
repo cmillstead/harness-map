@@ -1096,9 +1096,22 @@ def _phantom_counts(doc: dict[str, Any]) -> tuple[int, int]:
 
     DISPLAY uses the total (every row is a row the operator should see counted); the
     CLEAN/BROKEN BAND uses `confirmed` (resolved=False rows only), because banding a
-    resolved=null row BROKEN is a verdict the renderer has no evidence for (rule 6)."""
+    resolved=null row BROKEN is a verdict the renderer has no evidence for (rule 6).
+
+    S6b.M7: `confirmed` additionally honours the kind-first precedence
+    `_phantom_group_key` established -- a row whose `kind` is in
+    `_NEVER_RESOLVABLE_KINDS` (a shape classification, e.g. `template`) may never
+    count as `confirmed`, even if a hostile/corrupt sidecar row also carries
+    `resolved: False`. The collector never emits that combination (template rows
+    are always `resolved: None`); this is defence-in-depth, same `isinstance`-guarded
+    membership test as `_phantom_group_key`/`_phantom_status_word` reuse."""
     rows = doc.get("phantom_refs", []) or []
-    return len(rows), sum(1 for r in rows if r.get("resolved") is False)
+    confirmed = sum(
+        1 for r in rows
+        if r.get("resolved") is False
+        and not (isinstance(r.get("kind"), str) and r.get("kind") in _NEVER_RESOLVABLE_KINDS)
+    )
+    return len(rows), confirmed
 
 
 def build_overview_model(

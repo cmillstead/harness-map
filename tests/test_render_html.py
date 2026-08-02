@@ -3899,6 +3899,32 @@ def test_never_resolvable_rows_do_not_paint_the_phantom_gauge_broken():
     assert (total, confirmed) == (2, 0)
 
 
+def test_phantom_counts_honours_kind_first_precedence_for_hostile_template_row():
+    """S6b.M7: `_phantom_group_key`'s own docstring asserts kind is checked BEFORE
+    `resolved` so a hostile/corrupt sidecar row `{"kind": "template", "resolved":
+    false}` can never carry a confirmed negative -- but `_phantom_counts` counted it
+    as `confirmed` anyway, contradicting the group it lands in (`not_a_path`) on the
+    same page. The collector never emits this combination (template rows are always
+    resolved=None); this is defence-in-depth against a corrupt/hand-crafted sidecar."""
+    doc = {"phantom_refs": [
+        {"source": "a.md", "ref": "docs/{x}.md", "kind": "template",
+         "resolved": False, "evidence": "VERIFIED"},
+    ]}
+    total, confirmed = rh._phantom_counts(doc)
+    assert (total, confirmed) == (1, 0)
+
+
+def test_phantom_counts_still_counts_a_real_path_row_as_confirmed():
+    """No-behaviour-change pin: an ordinary `kind="path", resolved=False` row -- the
+    collector's real confirmed-missing shape -- must still count."""
+    doc = {"phantom_refs": [
+        {"source": "a.md", "ref": "scripts/deploy.sh", "kind": "path",
+         "resolved": False, "evidence": "VERIFIED"},
+    ]}
+    total, confirmed = rh._phantom_counts(doc)
+    assert (total, confirmed) == (1, 1)
+
+
 def test_slash_command_guidance_discloses_the_absolute_path_ambiguity():
     """The replacement for the rejected §7.2 finding-#14 inversion (orchestrator ruling
     2026-08-01). `/tmp` gets a command-flavored label the collector cannot justify; the

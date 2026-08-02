@@ -3611,6 +3611,7 @@ def check_phantom_refs(
                                          "resolved": None, "evidence": "INFERRED"})
                         continue
                     stripped_handled = False
+                    stripped_escaped = False
                     for candidate in in_root_stripped_candidates:
                         present, ok = _safe_exists(candidate)
                         if not ok:
@@ -3620,10 +3621,60 @@ def check_phantom_refs(
                             _append_inaccessible_once(inaccessible, _rel_safe(root, candidate))
                             stripped_handled = True
                             break
-                        if present and candidate.is_file():
+                        if not present:
+                            continue
+                        # S6b.M7 SECURITY FIX: `candidate` is lexically inside root (that
+                        # is how it reached `in_root_stripped_candidates`), but if it is a
+                        # symlink -- or sits beneath one -- its TARGET can still resolve
+                        # OUTSIDE root; `_in_root`'s normpath-based check is lexical and
+                        # cannot see through a symlink. The old code went straight to a
+                        # bare `candidate.is_file()`, which FOLLOWS the link and turns the
+                        # outside target's existence into an oracle: present-but-dangling
+                        # and present-but-real are indistinguishable from `_safe_exists`
+                        # alone, but `is_file()` told them apart by touching a path this
+                        # scan has no standing to probe. Resolve ONCE here and reuse that
+                        # single result for both the containment re-check and the file-type
+                        # check below -- resolving again after this would reopen the same
+                        # TOCTOU window the tri-state helpers elsewhere in this module are
+                        # built to avoid.
+                        try:
+                            resolved_target = candidate.resolve()
+                        except OSError:
+                            _append_inaccessible_once(inaccessible, _rel_safe(root, candidate))
+                            stripped_handled = True
+                            break
+                        if not _resolves_inside_root(resolved_target, root, root_stat):
+                            # The symlink chain exits root. Whether the outside target
+                            # exists or not must produce the SAME row (that equality IS
+                            # the anti-oracle property), so this candidate is treated
+                            # exactly like a lexically out-of-root one: never probed for
+                            # file-ness, never asserted resolved OR missing. Another
+                            # candidate for this same token may still resolve normally, so
+                            # this falls through to the next candidate rather than
+                            # immediately reporting.
+                            stripped_escaped = True
+                            continue
+                        # Resolved and CONTAINED: safe to ask whether it names a file.
+                        # `is_file()` on the already-resolved path keeps S-9 closed (a
+                        # real DIRECTORY still does not make an extension-bearing token
+                        # "resolve") without re-touching the original symlink chain.
+                        if resolved_target.is_file():
                             stripped_handled = True
                             break
                     if stripped_handled:
+                        continue
+                    if stripped_escaped:
+                        # Every candidate that had a chance to resolve escaped root; none
+                        # resolved inside it. Same footing as any other out-of-root
+                        # candidate (collector.py:3536-3542): kind="external",
+                        # resolved=None, evidence="INFERRED" -- never resolved: False,
+                        # evidence: VERIFIED, which would assert a confirmed negative
+                        # about a target this scan cannot see.
+                        key = (rel_path, norm, "external")
+                        if key not in seen:
+                            seen.add(key)
+                            refs.append({"source": rel_path, "ref": norm, "kind": "external",
+                                         "resolved": None, "evidence": "INFERRED"})
                         continue
                 # (2) Shape classification, replacing the bare `path` emission. The
                 # `template` branch must not `continue` past its append — zero rows may

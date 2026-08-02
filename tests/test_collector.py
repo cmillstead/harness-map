@@ -1071,6 +1071,73 @@ def test_traversal_segment_that_still_resolves_inside_root_is_unaffected(fake_ha
         doc["phantom_refs"]
 
 
+# ---------------------------------------------------------------------------
+# S6b.M7 -- the symlink existence oracle. The `:line`-stripped branch's
+# `and candidate.is_file()` (collector.py:3623) FOLLOWS a symlink whose final
+# component lexically resolves inside root but whose TARGET lies outside it.
+# `_in_root`/`_resolves_inside_root` are LEXICAL (normpath-based) and cannot
+# see through the symlink, so an out-of-root symlink target's existence
+# leaked into whether the row was reported at all.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+@pytest.mark.parametrize("suffix", ["", ":12"])
+def test_anti_oracle_symlink_traversal_exists_vs_absent_indistinguishable(fake_harness, suffix):
+    """An in-root symlink whose target lies OUTSIDE root must not leak whether that
+    target exists, in EITHER the unsuffixed probe or the `:line`-stripped probe.
+    Equality of the emitted rows across the EXISTS and ABSENT cases IS the security
+    property -- a test that only checks 'a row appears' does not close the oracle."""
+    outside = fake_harness.parent / "outside_target.md"
+    link = fake_harness / "rules" / "link.md"
+    link.symlink_to(outside)
+    (fake_harness / "CLAUDE.md").write_text(f"See `rules/link.md{suffix}` for detail.\n")
+
+    outside.write_text("x")
+    doc_exists = run_collector(fake_harness)
+    hits_exists = [r for r in doc_exists["phantom_refs"] if r["ref"] == f"rules/link.md{suffix}"]
+
+    outside.unlink()
+    doc_absent = run_collector(fake_harness)
+    hits_absent = [r for r in doc_absent["phantom_refs"] if r["ref"] == f"rules/link.md{suffix}"]
+
+    assert hits_exists == hits_absent, (hits_exists, hits_absent)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_symlink_escaping_root_never_reports_verified_missing(fake_harness):
+    """The out-of-root symlink token must land on the SAME footing as any other
+    out-of-root candidate -- `kind="external"`, `resolved=None`, `evidence="INFERRED"`
+    -- never `resolved: False, evidence: "VERIFIED"` (a confirmed-missing claim this
+    scan has no standing to make about a target outside --root)."""
+    outside = fake_harness.parent / "outside_target.md"
+    link = fake_harness / "rules" / "link.md"
+    link.symlink_to(outside)
+    (fake_harness / "CLAUDE.md").write_text("See `rules/link.md:12` for detail.\n")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "rules/link.md:12"]
+    assert len(hits) == 1, doc["phantom_refs"]
+    assert hits[0]["kind"] == "external"
+    assert hits[0]["resolved"] is None
+    assert hits[0]["evidence"] == "INFERRED"
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+@pytest.mark.parametrize("suffix", ["", ":12"])
+def test_inroot_symlink_to_inroot_target_still_resolves_normally(fake_harness, suffix):
+    """Regression, both probe shapes: an in-root symlink whose target is ALSO in-root
+    must keep resolving -- the fix narrows containment, it must not narrow resolution
+    for a target this scan can genuinely see."""
+    real = fake_harness / "skills" / "demo" / "linked.md"
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text("Body.\n")
+    link = fake_harness / "rules" / "link.md"
+    link.symlink_to(os.path.relpath(real, link.parent))
+    (fake_harness / "CLAUDE.md").write_text(f"See `rules/link.md{suffix}` for detail.\n")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"] if r["ref"] == f"rules/link.md{suffix}"], \
+        doc["phantom_refs"]
+
+
 def test_phantom_definition_versions_bump_to_four_with_the_d4_detector(fake_harness):
     """§8.1/§8.5: the version bump lands in the SAME commit as the detector edit.
     v1 pre-S1.M0 · v2 S1.M0+S2.M4 · v3 S2-gate D2 · v4 S6 D4.
