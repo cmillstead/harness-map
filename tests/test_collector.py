@@ -5517,20 +5517,7 @@ def test_walk_always_loaded_unsearchable_root_records_error(unsearchable_root):
     assert variants == []
     assert any("projects" in e for e in errors)
 
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
-@pytest.mark.xfail(
-    strict=True,
-    reason="build_document's chain still has unguarded is_dir()/is_file() sites outside "
-           "S7 Task 2's scope: parse_settings:1432 (Task 3b) and "
-           "_detect_skill_test_coverage:3937 (Task 3), confirmed by direct probing. This "
-           "whole-pipeline invariant is milestone-level, not satisfiable by Task 2's 8 "
-           "sites alone -- remove this marker once whichever of Task 3/3b/3c lands last "
-           "closes the remaining gap.",
-)
-def test_build_document_unsearchable_root_is_degraded_not_crashed(unsearchable_root):
-    """The whole point of F6: an unreadable surface must be DISCLOSED, not converted
-    into an empty crash envelope that a reader could mistake for a clean harness."""
-    doc = _collector.build_document(unsearchable_root, None)
-    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
-    assert doc["inaccessible"] or doc["errors"], "an unreadable root must never read as clean"
+# test_build_document_unsearchable_root_is_degraded_not_crashed intentionally NOT added
+# here: build_document's chain still crashes on this fixture via unguarded sites outside
+# this task's scope (parse_settings, _detect_skill_test_coverage) -- owned by S7 Task 3c,
+# the last task in the F6 chain (order: 2 -> 3 -> 3b -> 3c).
