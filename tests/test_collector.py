@@ -5824,6 +5824,20 @@ def test_main_unsearchable_root_never_triggers_crash_backstop(unsearchable_root)
 # is a THIRD class reachable without that privilege line.
 #
 # Do not add a test that asserts classes 5/6 are prevented; they are not.
+#
+# A THIRD documented limitation, distinct from 5 and 6: class 4's PRE-OPEN input_paths
+# rung (`_reject_if_target_is_an_input_path`, checked against `out_path` before the
+# parent is even opened) is NOT independently pinned by any test. Mutation testing found
+# that stubbing the post-pin rung alone fails its own test, and stubbing BOTH rungs fails
+# the e2e test, but stubbing the pre-open rung ALONE leaves the whole suite green -- the
+# two rungs are mutually redundant on every static filesystem layout this suite can build,
+# the same reason the plan gives for the post-pin rung's own coverage gap. This is a
+# DECISION, not an oversight: binding condition 4 ("each closed class carries a pinned
+# regression test") IS satisfied for class 4 -- the class is pinned by the post-pin rung,
+# which is the authoritative one. What is unpinned is one of two redundant rungs, not the
+# class itself. A test that cannot fail would report coverage that does not exist, which
+# is the same dishonesty the F6 half of this stage spent five tasks removing, relocated
+# into the suite -- so no test is added for it here.
 # ---------------------------------------------------------------------------------
 
 
@@ -6314,3 +6328,26 @@ def test_no_module_overclaims_the_write_toctou_as_fixed():
                 f"{module_name} claims '{banned}'. Four classes are closed and TWO ARE "
                 f"ACCEPTED -- say 'four closed, two accepted with rationale' instead. "
                 f"See RISK_REGISTER R11.")
+
+
+def test_exactly_one_low_level_write_implementation_exists():
+    """S6b produced four findings from the two write sinks drifting apart. Pin the
+    consolidation structurally: mkstemp may be CALLED only in the collector's documented
+    fallback helper, and render_html must not carry a second write implementation.
+
+    Counting the bare string "tempfile.mkstemp" would over-match: the module's docstrings
+    and comments name it twice in prose (explaining why the dir_fd path does NOT use it),
+    which is documentation, not a second implementation. The actual call syntax carries
+    an open paren, so counting "tempfile.mkstemp(" isolates the one real invocation."""
+    collector_src = Path(_collector.__file__).read_text(encoding="utf-8")
+    render_src = (Path(_collector.__file__).parent / "render_html.py").read_text(encoding="utf-8")
+
+    assert "tempfile" not in render_src, (
+        "render_html must not own a second write implementation — it routes through "
+        "collector.write_text_contained")
+    assert collector_src.count("tempfile.mkstemp(") == 1, (
+        "mkstemp may be CALLED only in _write_text_contained_fallback")
+    fallback_start = collector_src.index("def _write_text_contained_fallback")
+    assert collector_src.index("tempfile.mkstemp(") > fallback_start
+    assert "write_text_contained" in render_src
+    assert "write_text_contained" in render_src
