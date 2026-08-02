@@ -3091,6 +3091,15 @@ def _phantom_guidance(kind, resolved):
         return "Resolved at collection time — listed for provenance; no action needed."
     if state is None and kind == "slash_command":
         return _PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
+    # T3.1: same invariant as `_tokens_treemap` (render_html.py:488-494) -- `kind` arrives
+    # straight from sidecar JSON, so an unhashable shape (`[]`, `{}`) is valid JSON a
+    # stale/corrupt/hand-crafted sidecar can carry. `dict.get` HASHES its key, so an
+    # unguarded lookup would raise TypeError and, via `_RENDER_FALLBACK_ERRORS`, turn one
+    # malformed row into a whole-page render failure -- the doctrine here is per-row
+    # degradation, never that. Only a `str` can be a real kind; anything else falls
+    # through to the catch-all, same as an unknown string kind already does.
+    if not isinstance(kind, str):
+        return _PHANTOM_GUIDANCE_DEFAULT
     return _PHANTOM_GUIDANCE.get(kind, _PHANTOM_GUIDANCE_DEFAULT)
 
 

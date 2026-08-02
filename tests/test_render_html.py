@@ -3428,6 +3428,66 @@ def test_phantom_guidance_legacy_entries_are_preserved_byte_for_byte():
     assert rh._phantom_guidance("mystery", None) == rh._PHANTOM_GUIDANCE_DEFAULT
 
 
+# T3.1: `_phantom_guidance` must be TOTAL, mirroring `_resolved_state` above it.
+# `_PHANTOM_GUIDANCE.get(kind, ...)` hashes `kind`, and `kind` arrives straight from
+# sidecar JSON (`r.get("kind", "")` / `build_phantom_ref_brief`) -- a stale, corrupted,
+# or hand-crafted sidecar can carry `"kind": []` or `"kind": {}`, both valid JSON, both
+# unhashable. Per `_tokens_treemap`'s documented invariant (render_html.py:488-494), one
+# malformed row must degrade to the catch-all guidance, not kill the whole render.
+def test_phantom_guidance_unhashable_kind_returns_default_without_raising():
+    assert rh._phantom_guidance([], False) == rh._PHANTOM_GUIDANCE_DEFAULT
+    assert rh._phantom_guidance({}, False) == rh._PHANTOM_GUIDANCE_DEFAULT
+    assert rh._phantom_guidance([], None) == rh._PHANTOM_GUIDANCE_DEFAULT
+    assert rh._phantom_guidance({}, True) == \
+        "Resolved at collection time — listed for provenance; no action needed."
+
+
+def test_phantom_guidance_other_hostile_kind_types_still_hit_default():
+    """Non-string, HASHABLE kinds already fell through to the catch-all before this fix
+    (they never raised) -- pin that they still do, unchanged."""
+    assert rh._phantom_guidance(b"path", False) == rh._PHANTOM_GUIDANCE_DEFAULT
+    assert rh._phantom_guidance(3, False) == rh._PHANTOM_GUIDANCE_DEFAULT
+    assert rh._phantom_guidance(None, False) == rh._PHANTOM_GUIDANCE_DEFAULT
+
+
+def test_phantom_guidance_totality_fix_is_a_no_op_for_every_known_kind():
+    """The fix must be a pure no-op for every input that previously worked: every real
+    kind still routes to its own entry, the slash_command/resolved=None override still
+    wins, the resolved=True provenance branch is untouched, and an unknown STRING kind
+    still lands on the catch-all."""
+    provenance = "Resolved at collection time — listed for provenance; no action needed."
+    assert rh._phantom_guidance("template", False) == rh._PHANTOM_GUIDANCE["template"]
+    assert rh._phantom_guidance("path", False) == rh._PHANTOM_GUIDANCE["path"]
+    assert rh._phantom_guidance("external", False) == rh._PHANTOM_GUIDANCE["external"]
+    assert rh._phantom_guidance("env_flag", False) == rh._PHANTOM_GUIDANCE["env_flag"]
+    assert rh._phantom_guidance("slash_command", None) == \
+        rh._PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
+    assert rh._phantom_guidance("slash_command", False) == \
+        rh._PHANTOM_GUIDANCE["slash_command"]
+    assert rh._phantom_guidance("mystery", False) == rh._PHANTOM_GUIDANCE_DEFAULT
+    assert rh._phantom_guidance("path", True) == provenance
+    assert rh._phantom_guidance([], True) == provenance   # resolved=True short-circuits
+                                                            # before kind is ever looked up
+
+
+def test_phantom_table_renders_when_kind_is_unhashable(tmp_path):
+    """End-to-end: a malformed sidecar row (`kind` is a list) must render the row with
+    the catch-all guidance-derived brief path intact, not exit the whole render with
+    'fatal: could not render ...'."""
+    doc = _minimal_doc()
+    doc["phantom_refs"] = [{"source": "rules/a.md", "ref": "ghost.md", "kind": [],
+                            "resolved": False, "evidence": "VERIFIED"}]
+    out_dir = tmp_path / "unhashable_kind"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "fatal: could not render" not in text
+    m = re.search(r'<tr><td>rules/a\.md</td><td>ghost\.md</td>(.*?)</tr>', text, re.S)
+    assert m is not None
+
+
 def test_never_resolvable_rows_do_not_paint_the_phantom_gauge_broken():
     """Requirement 17, re-verified AFTER reclassification: `_phantom_counts` returns
     (total, confirmed) and the CLEAN/BROKEN band keys off `confirmed` (resolved is False
