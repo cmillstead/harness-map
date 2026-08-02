@@ -780,6 +780,313 @@ def test_retired_ref_ordering_is_deterministic(fake_harness):
     assert slash_refs == [("rules/a.md", "/first-gone"), ("rules/a.md", "/second-gone"),
                            ("rules/b.md", "/second-gone")]
 
+# ---------------------------------------------------------------------------
+# S6b / D4 — post-probe SHAPE classification (S6 §7.2). `template` is a SIGNAL
+# about a token's shape, never a verdict: it carries resolved=None /
+# evidence=INFERRED, because syntax alone cannot determine what a token names.
+# ---------------------------------------------------------------------------
+
+def test_template_angle_and_date_stencil_is_inferred(fake_harness):
+    """The live-corpus shape: `<repo>/docs/handoff/YYYY-MM-DD-<slug>.md`. Asserting
+    resolved=False/VERIFIED about a file literally named `<slug>` is a wrong claim."""
+    (fake_harness / "rules" / "a.md").write_text(
+        "Write to `<repo>/docs/handoff/YYYY-MM-DD-<slug>.md` first.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"]
+            if r["ref"] == "<repo>/docs/handoff/YYYY-MM-DD-<slug>.md"]
+    assert len(hits) == 1, doc["phantom_refs"]
+    assert hits[0]["kind"] == "template"
+    assert hits[0]["resolved"] is None
+    assert hits[0]["evidence"] == "INFERRED"
+
+
+def test_template_star_glob_is_inferred(fake_harness):
+    """Fork ⑤ resolution: globs count as templates. `.git/hooks/*` is a PATTERN."""
+    (fake_harness / "rules" / "a.md").write_text("Check `.git/hooks/*` for local hooks.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == ".git/hooks/*"]
+    assert len(hits) == 1 and hits[0]["kind"] == "template"
+    assert hits[0]["resolved"] is None and hits[0]["evidence"] == "INFERRED"
+
+
+def test_template_question_glob_is_inferred(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("See `docs/note-?.md` for the set.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "docs/note-?.md"]
+    assert len(hits) == 1 and hits[0]["kind"] == "template"
+
+
+def test_template_brace_placeholder_is_inferred(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("Handoff to `docs/{session}.md` on exit.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "docs/{session}.md"]
+    assert len(hits) == 1 and hits[0]["kind"] == "template"
+
+
+def test_template_bare_yyyy_mm_dd_stencil_is_inferred(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("Name it `docs/YYYY-MM-DD-notes.md`.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "docs/YYYY-MM-DD-notes.md"]
+    assert len(hits) == 1 and hits[0]["kind"] == "template"
+
+
+def test_line_suffix_strip_resolves_an_existing_file(fake_harness):
+    """The live-corpus shape: `agents/ct-implementer.md:28-32` strips to a path that
+    EXISTS, so the row disappears. Disappearance by genuine resolution is the only
+    sanctioned way a row may vanish."""
+    (fake_harness / "rules" / "target.md").write_text("Body.\n")
+    (fake_harness / "CLAUDE.md").write_text("See `rules/target.md:28-32` for detail.\n")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"] if r["ref"].startswith("rules/target.md")], \
+        doc["phantom_refs"]
+
+
+def test_line_suffix_strip_resolves_through_a_symlink(fake_harness):
+    """Path.is_file() FOLLOWS symlinks. The live row that disappears does so through a
+    deploy symlink (~/.claude/agents/ct-implementer.md -> ../skills/.../ct-implementer.md),
+    so the symlink mode is covered explicitly, not assumed."""
+    real = fake_harness / "skills" / "demo" / "linked.md"
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text("Body.\n")
+    link = fake_harness / "rules" / "linked.md"
+    link.symlink_to(os.path.relpath(real, link.parent))
+    (fake_harness / "CLAUDE.md").write_text("See `rules/linked.md:10-12` for detail.\n")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"] if r["ref"].startswith("rules/linked.md")], \
+        doc["phantom_refs"]
+
+
+def test_line_suffix_single_line_form_also_strips(fake_harness):
+    (fake_harness / "rules" / "target.md").write_text("Body.\n")
+    (fake_harness / "CLAUDE.md").write_text("See `rules/target.md:7` for detail.\n")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"] if r["ref"].startswith("rules/target.md")]
+
+
+def test_surviving_row_keeps_the_operators_original_citation(fake_harness):
+    """The strip applies ONLY to the probe target. The reported `ref` keeps the citation
+    so the operator can find the text they wrote."""
+    (fake_harness / "CLAUDE.md").write_text("See `rules/absent.md:28-32` for detail.\n")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["source"] == "CLAUDE.md"
+            and r["ref"] == "rules/absent.md:28-32"]
+    assert len(hits) == 1, doc["phantom_refs"]
+    assert hits[0]["kind"] == "path"
+    assert hits[0]["resolved"] is False and hits[0]["evidence"] == "VERIFIED"
+
+
+def test_line_strip_is_digits_and_end_anchored_not_a_colon_split(fake_harness):
+    """A general split(":") would maul `https:` and `C:` forms. Anchoring on digits at
+    END of token is what makes that impossible."""
+    (fake_harness / "rules" / "a.md").write_text(
+        "See `https://example.com/spec.md` and `docs/notes:draft.md` for context.")
+    doc = run_collector(fake_harness)
+    refs = {r["ref"] for r in doc["phantom_refs"]}
+    assert "https://example.com/spec.md" in refs, doc["phantom_refs"]
+    assert "docs/notes:draft.md" in refs, doc["phantom_refs"]
+
+
+def test_trap1_line_strip_does_not_break_namespaced_slash_commands(fake_harness):
+    """Trap 1 (§9.6): `/paul:apply` and `rules/b.md:12-19` in ONE fixture; BOTH must
+    behave.
+
+    PREMISE CORRECTED at the Codex gate (P3-3). The design framed this as
+    "`commands/paul:apply.md` must be unaffected", but that is not a path this harness
+    ever produces: `/paul:apply` maps to `commands/paul/apply.md` -- the colon becomes a
+    directory separator (`collector.py:3395`, pinned by
+    `test_collector.py:674::test_namespaced_slash_command_resolves_to_nested_command_home`).
+    So the real trap is that a general `split(":")` on the PROBE TARGET would corrupt the
+    `/ns:name` TOKEN before the slash-command branch ever segments it, silently retiring
+    S2.M4's namespaced-command feature. That is what this asserts.
+
+    The separate colon-IN-FILENAME case does exist and is reachable (a token like
+    `docs/notes:draft.md` arrives through the `/` clause of `_looks_like_path_token`); it
+    is covered by `test_line_strip_is_digits_and_end_anchored_not_a_colon_split` above,
+    not here."""
+    (fake_harness / "commands" / "paul").mkdir(parents=True, exist_ok=True)
+    (fake_harness / "commands" / "paul" / "apply.md").write_text("---\nname: apply\n---\nB.\n")
+    (fake_harness / "rules" / "b.md").write_text("Body.\n")
+    (fake_harness / "rules" / "a.md").write_text(
+        "Run `/paul:apply` then read `rules/b.md:12-19`.")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"] if r["ref"] == "/paul:apply"], doc["phantom_refs"]
+    assert not [r for r in doc["phantom_refs"] if r["ref"].startswith("rules/b.md")], \
+        doc["phantom_refs"]
+
+
+def test_directory_reference_still_resolves_and_emits_no_row(fake_harness):
+    """SCOPE, binding (finding #14): the is_file() narrowing applies ONLY to the
+    post-strip probe. Applying it to every slash-bearing ref would turn legitimate
+    DIRECTORY references into false phantom rows -- INVERTING the defect D4 exists to
+    fix. The pre-existing candidate loop keeps _safe_exists, untouched."""
+    (fake_harness / "rules" / "a.md").write_text("Hooks live in `hooks/` and rules in `rules/`.")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"] if r["ref"] in ("hooks/", "rules/")], \
+        doc["phantom_refs"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_unreadable_stripped_target_is_recorded_not_reported_missing(fake_harness):
+    """Codex gate P2-3, THE FAILURE DIRECTION. The stripped target is a path the
+    candidate loop never probed -- upstream probed `rules/locked/x.md:12`, and
+    `rules/locked/x.md` is a different path. A bare `is_file()` returns False for an
+    unreadable target, which would emit `resolved: False, evidence: VERIFIED` about
+    something never verified. That is the binding invariant of this skill: INACCESSIBLE
+    IS NOT CLEAN. `_safe_exists` gives the tri-state; the token is recorded in
+    `inaccessible` and DROPPED, never reported as a confirmed-missing path.
+
+    The healthy-symlink test above does NOT exercise this branch -- it takes the
+    resolving path. Changing this requires a spec change (S6 §7.2)."""
+    locked = fake_harness / "rules" / "locked"
+    locked.mkdir(parents=True, exist_ok=True)
+    (locked / "x.md").write_text("Body.\n")
+    (fake_harness / "CLAUDE.md").write_text("See `rules/locked/x.md:12-19` for detail.\n")
+    locked.chmod(0o000)
+    try:
+        doc = run_collector(fake_harness)
+    finally:
+        locked.chmod(0o755)
+    assert not [r for r in doc["phantom_refs"] if r["ref"].startswith("rules/locked/x.md")], \
+        doc["phantom_refs"]
+    assert any(e["path"].startswith("rules/locked/x.md") for e in doc["inaccessible"]), \
+        doc["inaccessible"]
+
+
+def test_line_suffixed_probe_landing_on_a_directory_does_not_resolve(fake_harness):
+    """S-9: the post-strip probe requires is_file(), so landing on a real DIRECTORY can
+    never make an extension-bearing token 'resolve'."""
+    d = fake_harness / "rules" / "adir.md"
+    d.mkdir(parents=True, exist_ok=True)
+    (fake_harness / "CLAUDE.md").write_text("See `rules/adir.md:3` for detail.\n")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "rules/adir.md:3"]
+    assert len(hits) == 1, doc["phantom_refs"]
+    assert hits[0]["kind"] == "path" and hits[0]["resolved"] is False
+
+
+def test_freeze_genuinely_missing_relative_path_stays_path_false_verified(fake_harness):
+    """NON-WIDENING FREEZE 1: the true positive must survive D4 untouched. This is the
+    `deploy.sh` shape -- the ONLY true positive in the live corpus."""
+    (fake_harness / "rules" / "a.md").write_text("Run `scripts/deploy.sh` to publish.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "scripts/deploy.sh"]
+    assert len(hits) == 1, doc["phantom_refs"]
+    assert hits[0]["kind"] == "path"
+    assert hits[0]["resolved"] is False
+    assert hits[0]["evidence"] == "VERIFIED"
+
+
+def test_freeze_multisegment_absolute_stays_external_none_inferred(fake_harness):
+    """NON-WIDENING FREEZE 2: the post-probe classifier must not reach the absolute
+    branch, which returns BEFORE any probe."""
+    (fake_harness / "rules" / "a.md").write_text("Use `/usr/local/bin/tool.sh` for this.")
+    doc = run_collector(fake_harness)
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "/usr/local/bin/tool.sh"]
+    assert len(hits) == 1, doc["phantom_refs"]
+    assert hits[0]["kind"] == "external"
+    assert hits[0]["resolved"] is None
+    assert hits[0]["evidence"] == "INFERRED"
+
+
+def test_phantom_definition_versions_bump_to_four_with_the_d4_detector(fake_harness):
+    """§8.1/§8.5: the version bump lands in the SAME commit as the detector edit.
+    v1 pre-S1.M0 · v2 S1.M0+S2.M4 · v3 S2-gate D2 · v4 S6 D4.
+    Changing these values requires a spec change (S6 §8.1)."""
+    doc = run_collector(fake_harness)
+    assert doc["metric_definitions"]["phantom_ref_count"] == 4
+    assert doc["metric_definitions"]["phantom_confirmed_count"] == 4
+
+
+def test_absolute_token_case_divergence_is_pinned_and_neither_claims_absence(fake_harness):
+    """REGRESSION PIN for a documented divergence, not a normalization assertion.
+
+    `_SLASH_COMMAND_RE` (collector.py:36) has lowercase-only character classes and no
+    re.IGNORECASE, so the two spellings take DIFFERENT branches by construction:
+      `/tmp` matches  -> slash_command (homes probed under --root, none found)
+      `/TMP` does not -> external      (the absolute fall-through)
+    S6 §7.2's "compare segment.lower()" fix describes an UNREACHABLE code path: no
+    uppercase token can ever reach a command comparison. Recorded as a spec false
+    positive (plan requirement 3).
+
+    THE LOAD-BEARING PART is the second loop: whatever kind each spelling receives,
+    NEITHER may carry a CONFIRMED negative. That is the failure-direction asymmetry --
+    an unrecognized absolute token falls to a label that claims nothing, never to
+    resolved=False/VERIFIED. Changing this requires a spec change (S6 §7.2)."""
+    (fake_harness / "rules" / "a.md").write_text("Scratch goes in `/tmp` or `/TMP`.")
+    doc = run_collector(fake_harness)
+    by_ref = {r["ref"]: r for r in doc["phantom_refs"] if r["ref"] in ("/tmp", "/TMP")}
+    assert set(by_ref) == {"/tmp", "/TMP"}, doc["phantom_refs"]
+    assert by_ref["/tmp"]["kind"] == "slash_command", by_ref["/tmp"]
+    assert by_ref["/TMP"]["kind"] == "external", by_ref["/TMP"]
+    for r in by_ref.values():
+        assert r["resolved"] is None, r
+        assert r["evidence"] == "INFERRED", r
+
+
+def test_absolute_token_is_never_probed_outside_the_scanned_root(fake_harness):
+    """Requirement 4: probing an absolute path is a read outside --root and would make
+    the result machine-dependent. The only probes the absolute branch performs are
+    root/commands/... and root/skills/..., both INSIDE --root. An unreadable absolute
+    token therefore never reaches `inaccessible`."""
+    (fake_harness / "rules" / "a.md").write_text("See `/nonexistent-abs-xyz/file.md`.")
+    doc = run_collector(fake_harness)
+    assert not [e for e in doc["inaccessible"] if e["path"].startswith("/")], doc["inaccessible"]
+    hits = [r for r in doc["phantom_refs"] if r["ref"] == "/nonexistent-abs-xyz/file.md"]
+    assert len(hits) == 1 and hits[0]["kind"] == "external"
+
+
+def test_classification_never_drops_a_row(fake_harness):
+    """Requirement 7: the `template` branch must never `continue` past the append.
+    Zero rows may disappear except by genuine filesystem resolution."""
+    (fake_harness / "rules" / "a.md").write_text(
+        "See `docs/{x}.md`, `origin/main`, and `docs/absent.md` for context.")
+    doc = run_collector(fake_harness)
+    kinds = sorted(r["kind"] for r in doc["phantom_refs"] if r["source"] == "rules/a.md")
+    # `origin/main` stays `path` -- the refspec arm is deferred to S6c (DEVIATION 5), so
+    # it is reported as what was actually probed rather than dismissed as a git object.
+    assert kinds == ["path", "path", "template"], doc["phantom_refs"]
+
+
+def test_trap2_bare_git_refs_produce_no_rows_at_all(fake_harness):
+    """Trap 2 (§9.6), NON-WIDENING FREEZE. Bare `HEAD` and `main..HEAD` are rejected
+    upstream by `_looks_like_path_token` (no `/`, no .md/.py/.sh/.json extension), so
+    they are not detected as references at all. Any change that starts reporting them
+    ADDS rows that never existed -- a widening this stage does not authorize.
+
+    This test outlives the deferred `refspec` arm and matters MORE without it: S6c will
+    design refspec classification against real instances, and this pins the detection
+    boundary it must not silently cross while doing so. Changing this requires a spec
+    change (S6 §7.2)."""
+    (fake_harness / "rules" / "a.md").write_text("Reset to `HEAD` or diff `main..HEAD`.")
+    doc = run_collector(fake_harness)
+    assert not [r for r in doc["phantom_refs"] if r["ref"] in ("HEAD", "main..HEAD")], \
+        doc["phantom_refs"]
+
+
+def test_line_range_limitation_is_disclosed_in_blind_spots(fake_harness):
+    """Requirement 12 has TWO homes and both are mandatory: the tile drawer (renderer)
+    and blind_spots (collector). Stripping `:999999` and probing only the FILE makes a
+    stale LINE reference disappear from the phantom table; the operator must never read
+    that disappearance as "the citation was checked"."""
+    doc = run_collector(fake_harness)
+    hits = [b for b in doc["blind_spots"] if "line range itself is never validated" in b]
+    assert len(hits) == 1, doc["blind_spots"]
+    assert "checked for the FILE only" in hits[0]
+
+
+def test_new_blind_spots_are_the_last_two_so_no_existing_index_shifts(fake_harness):
+    """Pins the PLACEMENT, not just the presence. If a later edit moves either entry into
+    the static list, the golden's structural diff starts reporting CHANGED paths and the
+    Step 16 gate's evidence stops being clean -- fail here, with the reason, instead.
+
+    Asserts the last TWO entries because Step 13 appends two, in this order: the
+    line-range disclosure, then the path-shaped/vocabulary limitation."""
+    doc = run_collector(fake_harness)
+    tail = doc["blind_spots"][-2:]
+    assert "line range itself is never validated" in tail[0], doc["blind_spots"]
+    assert "PATH-SHAPED" in tail[1], doc["blind_spots"]
+
+
 def test_prose_never_clause_is_promotion_candidate(fake_harness):
     (fake_harness / "rules" / "a.md").write_text("NEVER commit secrets. Files must be under 200 lines.")
     doc = run_collector(fake_harness)
@@ -1865,7 +2172,14 @@ def test_description_extraction_is_read_only(fake_harness):
 # Verified mechanically by the structural diff in this task's Step 6: the REMOVED path set
 # is empty and every ADDED path starts with `.metric_definitions` -- no existing value
 # changed.
-_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan."], "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "metric_definitions": {"always_loaded_file_count": 1, "always_loaded_tokens_est": 1, "always_loaded_words": 1, "duplicate_pair_count": 1, "hooks_with_test_ratio": 1, "instruction_files_over_200": 1, "memory_body_count": 1, "orphan_registration_count": 1, "orphan_script_count": 1, "phantom_confirmed_count": 3, "phantom_ref_count": 3, "promotion_candidate_count": 1, "skills_with_test_ratio": 1, "unchecked_binary_count": 1}, "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "staleness_null_reasons": {"agents/demo-agent.md": "no_repo", "commands/demo-cmd.md": "no_repo", "rules/a.md": "no_repo", "rules/b.md": "no_repo", "skills/coding-team/rules/c.md": "no_repo", "skills/demo/SKILL.md": "no_repo", "skills/demo/phases/p1.md": "no_repo"}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
+# S6b Task 2: regenerated again, same rule and same reason, for D4 -- two additive
+# `blind_spots` entries (the line-range and path-shaped-token disclosures) and the two
+# `metric_definitions` phantom versions moving 3 -> 4 in the same change as the detector
+# edit. Verified mechanically by this task's Step 16 structural diff: REMOVED is empty,
+# ADDED is exactly `.blind_spots[6]` and `.blind_spots[7]`, and the ONLY CHANGED paths are
+# `.metric_definitions.phantom_confirmed_count` and `.metric_definitions.phantom_ref_count`
+# -- no existing blind_spot index moved. `blob == _GOLDEN_...` is unchanged.
+_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan.", "Line-range citations (`path.md:12-19`) are checked for the FILE only \\u2014 the line range itself is never validated, so a stale range in an otherwise-valid citation is invisible to this scan.", "Placeholder and glob tokens are recognized only when they are PATH-SHAPED \\u2014 a backticked `<slug>.md`, `{session}.md` or `*.md` with no directory separator is not detected as a reference at all, so it is neither resolved nor reported."], "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "metric_definitions": {"always_loaded_file_count": 1, "always_loaded_tokens_est": 1, "always_loaded_words": 1, "duplicate_pair_count": 1, "hooks_with_test_ratio": 1, "instruction_files_over_200": 1, "memory_body_count": 1, "orphan_registration_count": 1, "orphan_script_count": 1, "phantom_confirmed_count": 4, "phantom_ref_count": 4, "promotion_candidate_count": 1, "skills_with_test_ratio": 1, "unchecked_binary_count": 1}, "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "staleness_null_reasons": {"agents/demo-agent.md": "no_repo", "commands/demo-cmd.md": "no_repo", "rules/a.md": "no_repo", "rules/b.md": "no_repo", "skills/coding-team/rules/c.md": "no_repo", "skills/demo/SKILL.md": "no_repo", "skills/demo/phases/p1.md": "no_repo"}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
 
 
 def test_non_compose_output_byte_identical_to_pre_change(fake_harness):

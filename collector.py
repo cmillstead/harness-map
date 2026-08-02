@@ -35,6 +35,32 @@ _ENV_FLAG_SHAPE_RE = re.compile(r"_ALLOW_|_SKIP_|GUARD|WRITE_")
 # ^/name  or  ^/ns:name  or  ^/ns:sub:...:name  (/base:orientation:tasks:deep-why is live)
 _SLASH_COMMAND_RE = re.compile(r"^/[a-z0-9][a-z0-9-]*(?::[a-z0-9][a-z0-9-]*)*$")
 
+# S6b / D4 (S6 §7.2) — POST-PROBE shape classification. Applied only where the `path`
+# row would otherwise be emitted, so a token that RESOLVES is dropped exactly as today
+# regardless of shape: there is no new way to lose a legitimate resolution.
+#
+# `template` names a SHAPE, not a file: angle/brace placeholders, shell globs, or a
+# YYYY-MM-DD stencil. Asserting `resolved: false / VERIFIED` about a file literally named
+# `<slug>` or `*` is a wrong claim, which is the defect D4 removes.
+#
+# `template` is the ONLY shape kind D4 ships. §7.2 also specifies a `refspec` kind; it is
+# DEFERRED to S6c (see the plan's DEVIATION 5) because separating git refs from file
+# paths lexically is undecidable — three review rounds each closed its cases and exposed
+# new ones on both edges — and the live corpus contains zero such rows. Do not add it
+# back here.
+_TEMPLATE_REF_RE = re.compile(r"[<>{}*?]|YYYY-MM-DD")
+
+# A trailing `:12` / `:12-19` line citation. DIGITS-AND-END-ANCHORED, never a general
+# `split(":")` — that is what keeps `commands/paul:apply.md` (S2.M4's namespaced
+# slash-command feature) and `https:` / `C:` forms intact.
+#
+# NOT the same thing as `render_html.py::_normalize_ref_token`, and the two must STAY
+# separate: that one normalizes TELEMETRY refs in the renderer for join-key purposes and
+# operates on a different input space with different failure consequences. Merging them
+# would couple the collector's phantom detector to the friction join. If a future simplify
+# pass proposes unifying them, this comment is the answer.
+_LINE_SUFFIX_RE = re.compile(r":\d+(?:-\d+)?$")
+
 # S6b §8.1 — DEFINITION VERSIONS, not values. A metric's integer changes when the code
 # that COMPUTES it changes meaning, so a consumer comparing two sidecars can tell "the
 # world changed" from "we changed how we measure". Bump a metric's integer IN THE SAME
@@ -56,10 +82,9 @@ METRIC_DEFINITIONS: dict[str, int] = {
     "memory_body_count": 1,
     "hooks_with_test_ratio": 1,
     "skills_with_test_ratio": 1,
-    # v1 pre-S1.M0 · v2 S1.M0+S2.M4 · v3 S2-gate D2. S6b Task 2 bumps both to 4 in the
-    # same commit as the D4 detector edit.
-    "phantom_ref_count": 3,
-    "phantom_confirmed_count": 3,   # same detector; two views, one version (§6.5 C18)
+    # v1 pre-S1.M0 · v2 S1.M0+S2.M4 · v3 S2-gate D2 · v4 S6 D4
+    "phantom_ref_count": 4,
+    "phantom_confirmed_count": 4,   # same detector; two views, one version (§6.5 C18)
 }
 
 _NEVER_RE = re.compile(r"\bNEVER\b")
@@ -3490,11 +3515,82 @@ def check_phantom_refs(
                         break
                 if handled:
                     continue
-                key = (rel_path, norm, "path")
+                # D4 (S6 §7.2), POST-probe. Everything below runs ONLY on tokens the
+                # probe above already failed to resolve, so no resolution can be lost.
+                #
+                # (1) The `:<line>` strip, applied to the PROBE TARGET ONLY — the
+                # reported `ref` keeps the operator's original citation so they can find
+                # the text they wrote.
+                #
+                # THE STRIPPED TARGET IS A PATH THAT WAS NEVER PROBED (Codex gate P2-3).
+                # The candidate loop above probed the UNSTRIPPED citation
+                # `rules/x.md:12`; `rules/x.md` is a DIFFERENT path, so nothing upstream
+                # established its accessibility. It therefore gets the same tri-state
+                # treatment every other probe in this function gets: `_safe_exists`, NOT a
+                # bare `is_file()`. A bare `is_file()` returns False for an unreadable
+                # target -- a symlink whose target cannot be read is the demonstrated case
+                # -- and we would emit `resolved: False, evidence: VERIFIED` about
+                # something we never verified. That is the binding invariant of this whole
+                # skill: INACCESSIBLE IS NOT CLEAN; never report a surface clean because
+                # we could not see it.
+                #
+                # `is_file()` is still required, but only AFTER `_safe_exists` returns
+                # ok=True -- at that point the stat has already succeeded, so is_file()
+                # is only distinguishing file from directory and cannot swallow an error.
+                # That keeps S-9 closed (a real DIRECTORY can never make an
+                # extension-bearing token "resolve") without collapsing the tri-state.
+                # The narrowing stays scoped INSIDE this branch: applying it to every
+                # slash-bearing ref would turn legitimate directory references
+                # (`skills/harness-map/`, `.claude/hooks`) into false phantom rows,
+                # INVERTING the defect D4 exists to fix (finding #14).
+                #
+                # LIMITATION, disclosed not hidden: stripping `:999999` and probing only
+                # the FILE makes a stale LINE reference disappear from the table. The row
+                # dropping is correct — the file does exist, and existence is what
+                # phantom_refs measures — but line-range validity is UNKNOWN and is never
+                # implied as checked. See the blind spot emitted in build_document and the
+                # tile-drawer note in render_html. A line-range validator is separate
+                # scope and is not built here.
+                if _LINE_SUFFIX_RE.search(norm):
+                    stripped = _LINE_SUFFIX_RE.sub("", norm)
+                    stripped_candidates = [root / stripped]
+                    if str(src_dir) not in (".", ""):
+                        stripped_candidates.append(root / src_dir / stripped)
+                    stripped_handled = False
+                    for candidate in stripped_candidates:
+                        present, ok = _safe_exists(candidate)
+                        if not ok:
+                            # Unreadable: record it and DROP the token. Same policy as the
+                            # candidate loop above -- inaccessible is not retired, and it
+                            # is certainly not "confirmed missing".
+                            _append_inaccessible_once(inaccessible, _rel_safe(root, candidate))
+                            stripped_handled = True
+                            break
+                        if present and candidate.is_file():
+                            stripped_handled = True
+                            break
+                    if stripped_handled:
+                        continue
+                # (2) Shape classification, replacing the bare `path` emission. The
+                # `template` branch must not `continue` past its append — zero rows may
+                # disappear except by the genuine resolution above.
+                #
+                # `path` is the default and the honest one: it reports what was actually
+                # probed. A shape kind may only pre-empt it when the token PROVABLY names
+                # no target — which is true of a stencil and was NOT true of the deferred
+                # `refspec` arm (S6c, DEVIATION 5).
+                kind: str
+                resolved: bool | None
+                evidence: str
+                if _TEMPLATE_REF_RE.search(norm):
+                    kind, resolved, evidence = "template", None, "INFERRED"
+                else:
+                    kind, resolved, evidence = "path", False, "VERIFIED"
+                key = (rel_path, norm, kind)
                 if key not in seen:
                     seen.add(key)
-                    refs.append({"source": rel_path, "ref": norm, "kind": "path",
-                                 "resolved": False, "evidence": "VERIFIED"})
+                    refs.append({"source": rel_path, "ref": norm, "kind": kind,
+                                 "resolved": resolved, "evidence": evidence})
                 continue
             env_match = _ENV_FLAG_NAME_RE.match(token)
             if env_match:
@@ -4140,6 +4236,33 @@ def build_document(
             f"{exhausted_count} instruction file(s) were probed — their last_commit_ts is "
             f"null with reason budget_exhausted, which is NOT a measurement. Re-run, or "
             f"raise the budget.")
+
+    # S6b / D4 requirement 12, binding disclosure.
+    #
+    # POSITION IS DELIBERATE and both directions are constrained. UNCONDITIONAL, and
+    # placed after the last conditional append a NON-compose run can reach (the
+    # `if exhausted_count:` block above) but BEFORE the first `if compose:` below.
+    #   - Earlier (inside the static list) shifts every conditional entry's index, which
+    #     shows up as an unexplained CHANGED path in the golden's structural diff.
+    #   - Inside or after `if compose:` it would never run on the DEFAULT path, so the
+    #     disclosure would silently not exist in an ordinary run.
+    # In a non-compose run it therefore lands LAST and adds an index rather than moving
+    # one. Compose-mode appends land after it, which is fine — nothing keys off its
+    # index, only off the fact that it exists and shifts nothing.
+    blind_spots.append(
+        "Line-range citations (`path.md:12-19`) are checked for the FILE only — the line "
+        "range itself is never validated, so a stale range in an otherwise-valid citation "
+        "is invisible to this scan.")
+    # Codex gate P2-1: "we classify templates" over-promises without this. Backtick
+    # tokens are only detected as refs when they carry a `/` or a [\w./~-] extension, so
+    # a BARE placeholder or glob never becomes a row and never reaches the template
+    # classifier. No row means no claim, so this is a scope limit rather than a defect —
+    # but an operator reading a `template` kind would otherwise assume the detector sees
+    # every placeholder in their instruction files. It does not.
+    blind_spots.append(
+        "Placeholder and glob tokens are recognized only when they are PATH-SHAPED — a "
+        "backticked `<slug>.md`, `{session}.md` or `*.md` with no directory separator is "
+        "not detected as a reference at all, so it is neither resolved nor reported.")
 
     totals = {
         "words": sum(f["words"] for f in files),

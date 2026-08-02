@@ -1029,6 +1029,11 @@ def build_node_index(models: dict[str, Any]) -> dict[str, list[str]]:
 
 
 # ------------------------------------------------------------------------------ friction
+# NOT the same thing as `collector.py::_LINE_SUFFIX_RE`, and the two must STAY separate:
+# this one normalizes TELEMETRY refs for the friction join; that one strips a `:line`
+# citation off a phantom-ref PROBE TARGET in a different module on a different input space
+# with different failure consequences. Merging them would couple the friction join to the
+# phantom detector. If a future simplify pass proposes unifying them, this is the answer.
 def _normalize_ref_token(ref):
     """Strips the `:symbol` suffix and ` --flag` tail off a loose telemetry text ref,
     WITHOUT collapsing it to a basename — kept on the full string so a path-bearing ref
