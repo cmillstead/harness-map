@@ -3026,6 +3026,10 @@ _PHANTOM_GUIDANCE = {
     "external": "External ref — verify the target still exists and is correct, or remove the pointer.",
     "env_flag": "Env-flag ref — wire the flag to a real gate, or drop the mention.",
     "slash_command": "Retired slash command — both homes (commands/<name>.md, skills/<name>/SKILL.md) are absent; the rule points at a command that no longer exists. Update or drop the reference.",
+    "template": "Template/placeholder reference — the token names a SHAPE (`<...>`, `{...}`, a glob, or a YYYY-MM-DD stencil), not a file, so there is nothing to resolve. No action needed unless the placeholder itself is wrong.",
+    # NO `refspec` entry. Requirement 18 specifies one, but the `refspec` KIND is deferred
+    # to S6c (DEVIATION 5), and a guidance string for a kind the collector never emits is
+    # a dark feature. S6c adds the kind and its guidance in the same change.
 }
 _PHANTOM_GUIDANCE_DEFAULT = "Verify the target exists or remove the pointer."
 
@@ -3039,6 +3043,23 @@ _PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE = (
     "commands/<ns>/<name>.md, skills/<name>/SKILL.md). Claude Code BUILT-INS and plugin "
     "commands live OUTSIDE this root and cannot be checked from here — confirm the "
     "command is gone before updating or removing the reference."
+    # S6b: the residual half of the §7.2 finding-#14 inversion, which was REJECTED by
+    # orchestrator ruling 2026-08-01 as incoherent with this very feature — `/token` rows
+    # flag RETIRED commands, and "a token is a command only if it is a KNOWN command"
+    # cannot flag one by definition. Closed here by DISCLOSURE instead, the same remedy
+    # §7.2 proposed for `refspec`, for the same reason: a bare single-segment `/token` is
+    # lexically indistinguishable from an absolute filesystem path and the classifier
+    # cannot separate them, so the label stays and the ambiguity is stated.
+    # APPEND-ONLY. The four sentences above are pinned by assertions in several tests --
+    # constant-equality, required substrings, negative phrase checks, and PAGE-LEVEL
+    # negatives that never name this constant at all (they render it into a page and
+    # assert on the page). Never edit them, and treat any word added below as subject to
+    # every page-wide `not in text` assertion in the suite. The authoritative set is the
+    # S6b plan's Task 3 Step 6 table; enumerate by ROUTE TO OUTPUT, never by grepping
+    # this symbol's name.
+    " This row may not describe a command at all: a bare single-segment `/token` is "
+    "lexically indistinguishable from an absolute filesystem path, and the collector "
+    "cannot tell the two apart from syntax alone."
 )
 
 

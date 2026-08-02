@@ -3390,6 +3390,95 @@ def test_gauge_does_not_paint_unverifiable_rows_broken(tmp_path):
     assert "Phantom refs: 1" in phantom_row  # ...while the DISPLAYED number stays the total
 
 
+# S6b / D4 renderer half. `_phantom_guidance` falls through to
+# _PHANTOM_GUIDANCE_DEFAULT ("Verify the target exists or remove the pointer"), which
+# instructs the operator to DELETE a correct stencil. The new kind needs its own entry.
+def test_phantom_guidance_template_entry_is_present_and_verbatim():
+    assert rh._PHANTOM_GUIDANCE["template"] == (
+        "Template/placeholder reference — the token names a SHAPE (`<...>`, `{...}`, a "
+        "glob, or a YYYY-MM-DD stencil), not a file, so there is nothing to resolve. No "
+        "action needed unless the placeholder itself is wrong.")
+    assert rh._phantom_guidance("template", None) == rh._PHANTOM_GUIDANCE["template"]
+
+
+def test_phantom_guidance_has_no_refspec_entry(fake_harness):
+    """DEVIATION 5: the `refspec` kind is deferred to S6c and this stage must not ship a
+    guidance string for a kind the collector never emits. A dead entry would be a dark
+    feature -- and worse, a reviewer or an S6c implementer could read its presence as
+    evidence the arm shipped.
+
+    S6c adds BOTH the kind and its guidance, together. Changing this requires a spec
+    change (S6 §7.2)."""
+    assert "refspec" not in rh._PHANTOM_GUIDANCE
+    # and an unknown kind still lands on the catch-all rather than anything bespoke
+    assert rh._phantom_guidance("refspec", None) == rh._PHANTOM_GUIDANCE_DEFAULT
+
+
+def test_phantom_guidance_legacy_entries_are_preserved_byte_for_byte():
+    """Additive only: the four pre-existing kinds and the catch-all default must be
+    unchanged, and the slash-command unverifiable override must still win."""
+    for kind in ("path", "external", "env_flag", "slash_command"):
+        assert kind in rh._PHANTOM_GUIDANCE
+    assert rh._PHANTOM_GUIDANCE["path"].startswith("Broken path —")
+    assert rh._PHANTOM_GUIDANCE["external"].startswith("External ref —")
+    assert rh._PHANTOM_GUIDANCE["env_flag"].startswith("Env-flag ref —")
+    assert rh._PHANTOM_GUIDANCE_DEFAULT == "Verify the target exists or remove the pointer."
+    assert rh._phantom_guidance("slash_command", None) == \
+        rh._PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
+    assert rh._phantom_guidance("mystery", None) == rh._PHANTOM_GUIDANCE_DEFAULT
+
+
+def test_never_resolvable_rows_do_not_paint_the_phantom_gauge_broken():
+    """Requirement 17, re-verified AFTER reclassification: `_phantom_counts` returns
+    (total, confirmed) and the CLEAN/BROKEN band keys off `confirmed` (resolved is False
+    rows only). Template rows carry resolved=None, so they must count toward DISPLAY and
+    not toward the band. The `external` row is included so the assertion is not carried
+    by a single kind."""
+    doc = {"phantom_refs": [
+        {"source": "a.md", "ref": "docs/{x}.md", "kind": "template",
+         "resolved": None, "evidence": "INFERRED"},
+        {"source": "a.md", "ref": "/usr/bin/tool.sh", "kind": "external",
+         "resolved": None, "evidence": "INFERRED"},
+    ]}
+    total, confirmed = rh._phantom_counts(doc)
+    assert (total, confirmed) == (2, 0)
+
+
+def test_slash_command_guidance_discloses_the_absolute_path_ambiguity():
+    """The replacement for the rejected §7.2 finding-#14 inversion (orchestrator ruling
+    2026-08-01). `/tmp` gets a command-flavored label the collector cannot justify; the
+    honest fix is to SAY SO, the remedy §7.2 proposed for `origin/main` (requirements
+    13 and 18)."""
+    text = rh._PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
+    assert "lexically indistinguishable from an absolute filesystem path" in text
+    assert "cannot tell the two apart" in text
+
+
+def test_slash_command_guidance_append_preserved_every_existing_pin():
+    """Rule 7 is satisfied by APPENDING. Covers every pin in the plan's Task 3 Step 6
+    table -- the single source of truth for that set -- at the two layers they live on:
+
+      * rows 1-8, the constant-level pins, checked through `build_phantom_ref_brief` --
+        two required substrings still present, three forbidden phrases still absent;
+      * rows 9-10, the PAGE-level negatives, checked directly against the constant. The
+        pre-existing tests at :3350 and :3374 already assert them end-to-end through a
+        rendered page and must pass unmodified; these two lines assert the same property
+        AT THE SOURCE so a violation fails naming the guidance string, instead of
+        surfacing two tests away as a complaint about a table cell or a gauge."""
+    brief = rh.build_phantom_ref_brief(
+        {"source": "rules/a.md", "ref": "/tmp", "kind": "slash_command", "resolved": None})
+    assert "No home for this command under the scanned root" in brief
+    assert "BUILT-INS" in brief
+    assert "no longer exists" not in brief
+    assert "Verify the target exists" not in brief
+    assert "does not resolve to a real target" not in brief
+    assert "lexically indistinguishable from an absolute filesystem path" in brief
+    # The two page-level forbidden strings, checked at the source so a failure names the
+    # cause rather than surfacing as an unrelated-looking page assertion two tests away.
+    assert "<td>None</td>" not in rh._PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
+    assert "BROKEN" not in rh._PHANTOM_GUIDANCE_SLASH_UNVERIFIABLE
+
+
 def test_phantom_table_has_guidance_column_and_brief(tmp_path):
     doc = _minimal_doc()   # one phantom ref
     out_dir = tmp_path / "phantom"
