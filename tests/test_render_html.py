@@ -6984,3 +6984,82 @@ def test_legacy_table_entries_carry_all_fourteen_metric_definition_keys():
     assert len(expected_keys) == 14, expected_keys
     for digest, values in rh.LEGACY_METRIC_DEFINITIONS.items():
         assert set(values) == expected_keys, (digest, set(values) ^ expected_keys)
+
+
+# ------------------------------------------------------------ T5.1 standing totality guard
+# Every field below has, at some point in S6b, arrived from untrusted sidecar/definition
+# JSON and been fed — unguarded — into an operation that HASHES or ORDER-COMPARES it
+# (`dict.get`, `x in <frozenset>`, `set(...)`, `sorted(..., key=...)`), turning one
+# hostile-but-valid-JSON value into a whole-page render failure instead of a degraded
+# row. Four confirmed instances, all in this module, none caught by reading the code:
+#   1. `_phantom_guidance`                          -- `dict.get(kind)` on an unhashable
+#      kind (T3.1; caught by review before ship).
+#   2. `_phantom_group_key` / `_phantom_status_word` -- bare `kind in <frozenset>` on an
+#      unhashable kind (T4; caught when T3.1's OWN end-to-end test failed under T4).
+#   3. `series_confounded`                          -- `set(resolved)` on an unhashable
+#      element (T5.1; found only by executing the predicate, not by reading it).
+#   4. `build_confounded_reason`                    -- `sorted(..., key=lambda p: p[0])`
+#      comparing an incomparable date (T5.1; same discovery path as #3).
+# Reactive per-instance fixes were not closing this pattern, so this test drives EVERY
+# S6b function that reads untrusted content with a hostile-value matrix and asserts NONE
+# may raise — a fifth instance fails HERE, at the source, instead of surviving to audit.
+#
+# Add a new S6b function's `(callable, argument-builder)` pair to `_TOTALITY_TARGETS` the
+# day it is written if it reads a value straight out of sidecar/definition JSON — that is
+# the whole reason the table is a tuple of pairs and not nine separate assertions.
+#
+# `sidecar_bytes` (on `resolve_metric_definition_version`) and the outer `doc`/`legacy`
+# CONTAINER shapes are held at a fixed, valid shape rather than hostile-varied: unlike
+# `kind`/`resolved`/a version NUMBER (all of which are attacker/corruption-controlled leaf
+# content read straight out of parsed JSON), `sidecar_bytes` is guaranteed bytes by its
+# only production source (`Path.read_bytes()`, and `hashlib.sha256` legitimately rejects
+# non-bytes), `doc`/`legacy` are guaranteed dict-or-None by the collector's own JSON-object
+# parse layer, and `metric` is always one of the 14 internal `METRIC_DEFINITIONS` literals
+# — never externally supplied. The hostile matrix instead targets the one position in
+# `resolve_metric_definition_version` that genuinely IS untrusted leaf content:
+# `doc["metric_definitions"][metric]`, exactly what
+# `test_definition_version_rejects_bool_true_which_equals_one_in_python` already probes
+# and what `_valid_definition_version` exists to guard. This narrowing is deliberate, not
+# an omission — see the `sidecar_bytes` note in the T5.1 dispatch for the same principle
+# applied to the file-bytes parameter.
+_TOTALITY_HOSTILE_VALUES = (
+    [], {}, b"x", 0, -1, 1.0, "1", True, False, None, "",
+    float("nan"), "x" * 10000, {"a": [1, {"b": 2}]},
+)
+
+_TOTALITY_TARGETS = (
+    # T3.1
+    (rh._phantom_guidance, lambda v: (v, v)),
+    # T4
+    (rh._phantom_group_key, lambda v: ({"kind": v, "resolved": v},)),
+    (rh.build_phantom_groups, lambda v: ([{"kind": v, "resolved": v}],)),
+    (rh._phantom_never_resolvable_count, lambda v: ([{"kind": v, "resolved": v}],)),
+    (rh._phantom_status_word, lambda v: (v, v)),
+    # T5 / T5.1
+    (rh._valid_definition_version, lambda v: (v,)),
+    (rh.resolve_metric_definition_version,
+     lambda v: ({"metric_definitions": {"phantom_ref_count": v}}, b"x",
+                "phantom_ref_count", {})),
+    (rh.series_confounded, lambda v: ([v],)),
+    # A second, DIFFERENTLY-TYPED tuple in the window forces the sort key to actually
+    # COMPARE against `v` rather than merely compute it — a single-element list never
+    # exercises the comparison that broke #4 above.
+    (rh.build_confounded_reason, lambda v: ("m", [(v, 1), ("2026-01-02", 2)])),
+)
+
+
+def test_every_s6b_function_reading_untrusted_json_is_total():
+    """Standing guard against the defect class named in the block comment above: no
+    function in `_TOTALITY_TARGETS`, called with any value in `_TOTALITY_HOSTILE_VALUES`
+    in the position that value's argument-builder places it, may raise. A raise here means
+    a new S6b function (or an edit to an existing one) reintroduced "hash/compare an
+    untrusted value without a shape guard" — fix the function, do not narrow this test."""
+    failures = []
+    for fn, build_args in _TOTALITY_TARGETS:
+        for value in _TOTALITY_HOSTILE_VALUES:
+            args = build_args(value)
+            try:
+                fn(*args)
+            except Exception as exc:  # noqa: BLE001 -- totality proof: ANY raise is a bug
+                failures.append((fn.__name__, value, type(exc).__name__, str(exc)))
+    assert failures == [], failures

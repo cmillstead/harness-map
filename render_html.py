@@ -495,9 +495,22 @@ def series_confounded(versions: list[int | None]) -> bool:
     there would fire a confound on EVERY metric on the run the marker ships — 100% noise
     exactly when the mechanism is introduced. Callers pass only RESOLVED versions; a
     sidecar with no marker resolves through the legacy table, and only a genuine digest
-    miss yields None."""
+    miss yields None.
+
+    TOTALITY (T5.1): `resolved is None` was the only guarded case, so `set(resolved)`
+    hashed every OTHER element unconditionally — a hand-crafted or corrupt element
+    (`[1,2]`, `{}`) raised `TypeError: unhashable type` instead of degrading, the same
+    defect class `_phantom_guidance`/`_phantom_group_key`/`_phantom_status_word` were
+    already fixed for. An element that is neither an int (excluding `bool`, since
+    `True == 1` in Python — same reasoning as `_valid_definition_version`) nor `None` is
+    not a version this function was built to reason about. It is treated the SAME as
+    UNKNOWN (returns True): a value we cannot interpret gives no more evidence of a
+    stable definition than a value we never saw, and folding it into the honest
+    "cannot claim uniform" outcome is the conservative choice already made for `None` —
+    never a silently invented default."""
     resolved = list(versions)
-    if any(v is None for v in resolved):
+    if any(v is None or not (isinstance(v, int) and not isinstance(v, bool))
+           for v in resolved):
         return True
     return len(set(resolved)) > 1
 
@@ -514,10 +527,22 @@ def build_confounded_reason(
     """Factual reason string for a confounded series: dates and version numbers only, no
     verdict word. `dated_versions` is an ordered list of (date_str, version|None).
 
-    Sorted by date then version-as-string for cross-PYTHONHASHSEED byte determinism."""
+    Sorted by date-as-string then version-as-string for cross-PYTHONHASHSEED byte
+    determinism.
+
+    TOTALITY (T5.1): the sort key used to compare `p[0]` directly, so a malformed date
+    (e.g. `None`, from a hand-crafted or corrupt tuple) raised `TypeError: '<' not
+    supported between instances of 'str' and 'NoneType'` the moment the window held a
+    second, differently-typed date to compare it against — the same "raise instead of
+    degrade" defect class fixed elsewhere in this module. Coercing with `str(...)`, same
+    as the version half already does, makes the key comparable across any input shape.
+    For every REAL date (already a `str`) `str(date) == date`, so this is a no-op on
+    valid input — the sort ORDER and the emitted text (`date` is still used un-coerced in
+    the f-string below) are byte-identical to before."""
     parts = [f"{date}: definition v{version}" if version is not None
              else f"{date}: definition unknown"
-             for date, version in sorted(dated_versions, key=lambda p: (p[0], str(p[1])))]
+             for date, version in sorted(dated_versions,
+                                          key=lambda p: (str(p[0]), str(p[1])))]
     return f"{metric} — " + "; ".join(parts)
 
 
