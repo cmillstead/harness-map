@@ -337,6 +337,190 @@ def _no_valid_sidecar_message(skipped: list[dict[str, Any]]) -> str:
     return f"no valid sidecar found ({detail})"
 
 
+# ------------------------------------------------------------ metric definition versions
+# S6b §8.1 — CLOSED and FROZEN. This table covers ONLY sidecars that predate the
+# collector's `metric_definitions` marker. It is NEVER appended to: after the first marked
+# sidecar the collector's own map is authoritative and this table is history. Freezing it
+# is what stops it rotting — a table that needs a human to remember to append a row on
+# every detector change silently falls behind and then reports a genuinely confounded
+# series as comparable, a false negative in the reassuring direction.
+#
+# KEYED BY SHA256 CONTENT DIGEST OF THE SIDECAR BYTES, NEVER BY DATE (finding #7).
+# Date-based provenance assumes filenames are truthful, files are immutable once written,
+# an old collector is never rerun under a backfilled date, and no same-day overwrite
+# occurs. This repo violates two of those: report files ARE mutated, and a same-date
+# overwrite is on record (two 2026-07-31 runs, 18:37 and 20:04, one filename). An artifact
+# whose digest is not in this table resolves to UNKNOWN, never to an inferred version.
+# There is deliberately no LEGACY_WINDOW_END and no date fallback of any kind.
+LEGACY_METRIC_DEFINITIONS: dict[str, dict[str, int]] = {
+    # 2026-07-17 — pre-S1.M0
+    "d66dfa906ab488a5876b2dae6195903148de88907b639d1b2bfd8c98de63e539": {
+        "always_loaded_tokens_est": 1,
+        "always_loaded_words": 1,
+        "always_loaded_file_count": 1,
+        "duplicate_pair_count": 1,
+        "instruction_files_over_200": 1,
+        "orphan_registration_count": 1,
+        "orphan_script_count": 1,
+        "unchecked_binary_count": 1,
+        "promotion_candidate_count": 1,
+        "memory_body_count": 1,
+        "hooks_with_test_ratio": 1,
+        "skills_with_test_ratio": 1,
+        "phantom_ref_count": 1,
+        "phantom_confirmed_count": 1,
+    },
+    # 2026-07-23 — pre-S1.M0
+    "300b3d48776cfedc58b586548b24134e4ef3db6a85c2b83b8d611cd0431f7b77": {
+        "always_loaded_tokens_est": 1,
+        "always_loaded_words": 1,
+        "always_loaded_file_count": 1,
+        "duplicate_pair_count": 1,
+        "instruction_files_over_200": 1,
+        "orphan_registration_count": 1,
+        "orphan_script_count": 1,
+        "unchecked_binary_count": 1,
+        "promotion_candidate_count": 1,
+        "memory_body_count": 1,
+        "hooks_with_test_ratio": 1,
+        "skills_with_test_ratio": 1,
+        "phantom_ref_count": 1,
+        "phantom_confirmed_count": 1,
+    },
+    # 2026-07-24 — S1.M0 sibling probe + S2.M4 slash_command carve-out
+    "77f1c3539bbf09db6ba832711cbaa7eec5d29f0d1ff2b94584a9fb30d7fe87c6": {
+        "always_loaded_tokens_est": 1,
+        "always_loaded_words": 1,
+        "always_loaded_file_count": 1,
+        "duplicate_pair_count": 1,
+        "instruction_files_over_200": 1,
+        "orphan_registration_count": 1,
+        "orphan_script_count": 1,
+        "unchecked_binary_count": 1,
+        "promotion_candidate_count": 1,
+        "memory_body_count": 1,
+        "hooks_with_test_ratio": 1,
+        "skills_with_test_ratio": 1,
+        "phantom_ref_count": 2,
+        "phantom_confirmed_count": 2,
+    },
+    # 2026-07-31 — S2-gate D2
+    "74fd26ee34a7a32f9589af1962e4a8e6830d1211feae1c72ad25bb3802e08fec": {
+        "always_loaded_tokens_est": 1,
+        "always_loaded_words": 1,
+        "always_loaded_file_count": 1,
+        "duplicate_pair_count": 1,
+        "instruction_files_over_200": 1,
+        "orphan_registration_count": 1,
+        "orphan_script_count": 1,
+        "unchecked_binary_count": 1,
+        "promotion_candidate_count": 1,
+        "memory_body_count": 1,
+        "hooks_with_test_ratio": 1,
+        "skills_with_test_ratio": 1,
+        "phantom_ref_count": 3,
+        "phantom_confirmed_count": 3,
+    },
+    # 2026-08-01 — catch-all: any later markerless sidecar predating this branch, nothing
+    # changed the detector between 07-31 and S6b.
+    "e9b416d6771a89b5e01af76d539aa54825373d88c26a1ac00838ee76f3273e16": {
+        "always_loaded_tokens_est": 1,
+        "always_loaded_words": 1,
+        "always_loaded_file_count": 1,
+        "duplicate_pair_count": 1,
+        "instruction_files_over_200": 1,
+        "orphan_registration_count": 1,
+        "orphan_script_count": 1,
+        "unchecked_binary_count": 1,
+        "promotion_candidate_count": 1,
+        "memory_body_count": 1,
+        "hooks_with_test_ratio": 1,
+        "skills_with_test_ratio": 1,
+        "phantom_ref_count": 3,
+        "phantom_confirmed_count": 3,
+    },
+}
+
+
+def _valid_definition_version(value: Any) -> bool:
+    """A version is a positive int and NOT a bool. `True == 1` in Python, so a stray
+    boolean would silently resolve as version 1 and report a series comparable when it is
+    not. Anything failing this is UNKNOWN, never a default."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def resolve_metric_definition_version(
+    doc: dict[str, Any] | None,
+    sidecar_bytes: bytes,
+    metric: str,
+    legacy: dict[str, dict[str, int]] | None = None,
+) -> int | None:
+    """Definition version for one (sidecar, metric), or None meaning UNKNOWN.
+
+    Resolution order, exactly (§8.1):
+      1. `doc["metric_definitions"][metric]` if present AND it passes strict validation;
+      2. the sidecar's sha256 CONTENT DIGEST looked up in the frozen legacy table;
+      3. None (UNKNOWN).
+    There is NO date fallback and NO silent default of 1 — an unrecognized artifact is
+    unknown, and saying so is the whole point of the mechanism.
+
+    Derived metrics (phantom_confirmed_count, the ratios) inherit the COLLECTOR definition
+    version of their underlying data. A separate renderer-derivation version was
+    considered and dropped: it is identical across every sidecar in a window (it is the
+    running code), so it can never differ and therefore has zero detection power. Do not
+    reintroduce it.
+
+    `legacy` is a parameter so tests can supply their own frozen table without patching a
+    module constant — the table's real contents are one operator's historical artifacts
+    and cannot be reproduced hermetically."""
+    table = LEGACY_METRIC_DEFINITIONS if legacy is None else legacy
+    declared = (doc or {}).get("metric_definitions")
+    if isinstance(declared, dict) and metric in declared:
+        value = declared[metric]
+        return value if _valid_definition_version(value) else None
+    digest = hashlib.sha256(sidecar_bytes).hexdigest()
+    value = table.get(digest, {}).get(metric)
+    return value if _valid_definition_version(value) else None
+
+
+def series_confounded(versions: list[int | None]) -> bool:
+    """A series is confounded iff its resolved versions across the window hold more than
+    one distinct value, OR any resolved version is None (UNKNOWN).
+
+    Takes VERSIONS ONLY, by signature — it can see no metric values at all. That is
+    deliberate and load-bearing: see §8.4 and `test_no_value_shape_heuristic_is_possible`.
+
+    THE MARKER'S FIRST APPEARANCE IS NOT A TRANSITION. An `absent -> N` step is the
+    marker's introduction, not an observed change in how the metric was computed. Flagging
+    there would fire a confound on EVERY metric on the run the marker ships — 100% noise
+    exactly when the mechanism is introduced. Callers pass only RESOLVED versions; a
+    sidecar with no marker resolves through the legacy table, and only a genuine digest
+    miss yields None."""
+    resolved = list(versions)
+    if any(v is None for v in resolved):
+        return True
+    return len(set(resolved)) > 1
+
+
+# Verdict words the reason string must never contain — the renderer states FACTS
+# (dates, version numbers); the judgment stays the model's (binding rule 6).
+_CONFOUND_REASON_FORBIDDEN = ("worse", "better", "improving", "worsening", "broken",
+                              "good", "bad", "healthy", "degraded", "regressed")
+
+
+def build_confounded_reason(
+    metric: str, dated_versions: list[tuple[str, int | None]]
+) -> str:
+    """Factual reason string for a confounded series: dates and version numbers only, no
+    verdict word. `dated_versions` is an ordered list of (date_str, version|None).
+
+    Sorted by date then version-as-string for cross-PYTHONHASHSEED byte determinism."""
+    parts = [f"{date}: definition v{version}" if version is not None
+             else f"{date}: definition unknown"
+             for date, version in sorted(dated_versions, key=lambda p: (p[0], str(p[1])))]
+    return f"{metric} — " + "; ".join(parts)
+
+
 # --------------------------------------------------------------------------- node keys
 def _al_node_key(path, tier="operator"):
     """T12 (P2 fix): operator and project roots each surface files at the SAME

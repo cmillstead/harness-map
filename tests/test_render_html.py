@@ -1,6 +1,7 @@
 """Tests for render_html.py per docs/plans/2026-07-15-harness-map-html-viz-design.md §5.
 Real fixtures only (no mocks — the renderer is pure stdlib). Reuses `run_collector`
 (test_collector.py:21) and `fake_harness` (conftest.py:13)."""
+import hashlib
 import importlib.util
 import json
 import os
@@ -6846,3 +6847,140 @@ def test_metrics_byte_cap_sentinel_subtraction_keeps_a_real_malformed_line(tmp_p
     assert "read truncated at the bytes cap" in text
     matches = set(re.findall(r"(≥?\d+) invalid lines", text))
     assert matches == {"≥1"}, f"expected every 'invalid lines' surface to read ≥1, got {matches}"
+
+
+# --------------------------------------------------- S6b §8.1 metric definition versions
+def test_definition_version_read_from_the_collector_map():
+    doc = {"metric_definitions": {"phantom_ref_count": 4}}
+    assert rh.resolve_metric_definition_version(doc, b"x", "phantom_ref_count", {}) == 4
+
+
+def test_definition_version_rejects_bool_true_which_equals_one_in_python():
+    """Requirement 29: `isinstance(True, int)` is True. A stray boolean silently
+    resolving as version 1 would report a series comparable when it is not."""
+    for bad in (True, False, 0, -1, 1.0, "1", None, [], {}):
+        doc = {"metric_definitions": {"phantom_ref_count": bad}}
+        assert rh.resolve_metric_definition_version(doc, b"x", "phantom_ref_count", {}) is None, bad
+
+
+def test_definition_version_rejects_a_non_dict_metric_definitions():
+    for bad in ([], "x", 3, None):
+        assert rh.resolve_metric_definition_version(
+            {"metric_definitions": bad}, b"x", "phantom_ref_count", {}) is None, bad
+
+
+def test_definition_version_falls_back_to_the_content_digest_table():
+    raw = b'{"phantom_refs": []}'
+    digest = hashlib.sha256(raw).hexdigest()
+    legacy = {digest: {"phantom_ref_count": 2}}
+    assert rh.resolve_metric_definition_version({}, raw, "phantom_ref_count", legacy) == 2
+
+
+def test_collector_map_wins_over_the_legacy_table():
+    raw = b'{"x": 1}'
+    legacy = {hashlib.sha256(raw).hexdigest(): {"phantom_ref_count": 2}}
+    doc = {"metric_definitions": {"phantom_ref_count": 4}}
+    assert rh.resolve_metric_definition_version(doc, raw, "phantom_ref_count", legacy) == 4
+
+
+def test_unknown_digest_resolves_to_unknown_never_an_inferred_version():
+    """Requirement 28: an artifact whose digest matches nothing resolves to UNKNOWN."""
+    legacy = {hashlib.sha256(b"other").hexdigest(): {"phantom_ref_count": 2}}
+    assert rh.resolve_metric_definition_version({}, b"mutated", "phantom_ref_count", legacy) is None
+
+
+def test_no_date_fallback_exists_anywhere_in_resolution():
+    """Requirement 28/30: date-based provenance is UNSOUND here — this repo mutates
+    report files and has a same-date overwrite on record. A doc carrying a date and
+    nothing else must still resolve to UNKNOWN."""
+    doc = {"generated_at": "2026-07-17T10:00:00+00:00", "date": "2026-07-17"}
+    assert rh.resolve_metric_definition_version(doc, b"x", "phantom_ref_count", {}) is None
+    assert not hasattr(rh, "LEGACY_WINDOW_END")
+
+
+def test_series_confounded_true_on_more_than_one_distinct_version():
+    assert rh.series_confounded([1, 1, 2, 3]) is True
+
+
+def test_series_confounded_true_when_any_version_is_unknown():
+    assert rh.series_confounded([1, 1, None]) is True
+
+
+def test_series_confounded_false_on_a_uniform_window():
+    assert rh.series_confounded([1, 1, 1]) is False
+    assert rh.series_confounded([4]) is False
+    assert rh.series_confounded([]) is False
+
+
+def test_marker_first_appearance_is_not_a_transition(tmp_path):
+    """Requirement 32, REQUIRED negative test. The run that ships the marker has four
+    markerless predecessors that resolve through the legacy table and one marked sidecar.
+    Where the predecessors' versions AGREE with the new one, the series must NOT be
+    flagged — an `absent -> N` step is the marker's introduction, not an observed change.
+    Flagging here would fire a confound on every metric on the run the marker ships."""
+    legacy_raws = [b'{"n": 1}', b'{"n": 2}', b'{"n": 3}', b'{"n": 4}']
+    legacy = {hashlib.sha256(r).hexdigest(): {"memory_body_count": 1} for r in legacy_raws}
+    window = [({}, r) for r in legacy_raws]
+    window.append(({"metric_definitions": {"memory_body_count": 1}}, b'{"n": 5}'))
+    versions = [rh.resolve_metric_definition_version(d, r, "memory_body_count", legacy)
+                for d, r in window]
+    assert versions == [1, 1, 1, 1, 1]
+    assert rh.series_confounded(versions) is False
+
+
+def test_no_value_shape_heuristic_is_possible_by_signature():
+    """Requirement 35, REQUIRED negative test (§8.4). ANY value-shape heuristic (a large
+    jump, a sign flip) fires on `memory_body_count` 98 -> 117 — the one real drift finding
+    in the operator's dataset — converting the single true positive into a false negative.
+    `series_confounded` takes VERSIONS ONLY and cannot see values, so the heuristic is
+    unwritable without changing this signature. This test exists to stop anyone shipping
+    one later.
+
+    Changing this contract requires a spec change (S6 §8.4)."""
+    import inspect
+    params = list(inspect.signature(rh.series_confounded).parameters)
+    assert params == ["versions"], params
+    # Identical versions, wildly different implied values -> still not confounded.
+    assert rh.series_confounded([1, 1, 1, 1]) is False
+    # And a version change with no value movement at all IS confounded.
+    assert rh.series_confounded([1, 1, 2, 2]) is True
+
+
+def test_confounded_reason_is_factual_only_and_carries_no_verdict_word():
+    """Requirement 33: renderer-generated, dates and version numbers, no verdict word."""
+    reason = rh.build_confounded_reason(
+        "phantom_ref_count",
+        [("2026-07-17", 1), ("2026-07-24", 2), ("2026-07-31", 3), ("2026-08-02", None)])
+    assert reason == ("phantom_ref_count — 2026-07-17: definition v1; "
+                      "2026-07-24: definition v2; 2026-07-31: definition v3; "
+                      "2026-08-02: definition unknown")
+    low = reason.lower()
+    for word in rh._CONFOUND_REASON_FORBIDDEN:
+        assert word not in low, word
+
+
+def test_confounded_reason_is_deterministic_regardless_of_input_order():
+    a = rh.build_confounded_reason("m", [("2026-07-24", 2), ("2026-07-17", 1)])
+    b = rh.build_confounded_reason("m", [("2026-07-17", 1), ("2026-07-24", 2)])
+    assert a == b
+
+
+def test_legacy_table_keys_are_sha256_digests_and_the_table_is_frozen():
+    """Requirement 27/28: CLOSED, FROZEN, digest-keyed. Every key is 64 lowercase hex."""
+    for key in rh.LEGACY_METRIC_DEFINITIONS:
+        assert re.fullmatch(r"[0-9a-f]{64}", key), key
+    for values in rh.LEGACY_METRIC_DEFINITIONS.values():
+        for metric, version in values.items():
+            assert rh._valid_definition_version(version), (metric, version)
+
+
+def test_legacy_table_entries_carry_all_fourteen_metric_definition_keys():
+    """The plan requires every legacy entry to carry all fourteen METRIC_DEFINITIONS keys
+    explicitly — a metric absent from an entry resolves to None -> UNKNOWN -> confounded,
+    which would flag all fourteen series as 100% noise exactly when the mechanism is
+    introduced. There is no default; each key must be present."""
+    from collector import METRIC_DEFINITIONS
+    expected_keys = set(METRIC_DEFINITIONS)
+    assert len(expected_keys) == 14, expected_keys
+    for digest, values in rh.LEGACY_METRIC_DEFINITIONS.items():
+        assert set(values) == expected_keys, (digest, set(values) ^ expected_keys)
