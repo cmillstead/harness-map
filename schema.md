@@ -237,6 +237,7 @@ foreign-root run can never ingest this harness's interventions log.
 {
   "timestamp": "2026-06-07T19:31:04.917406+00:00",  // ISO-8601; the ONLY date key this stream uses
   "session_id": "<uuid>",                            // never rendered
+  "model": "<model id>",                             // optional, string — model id of the session that appended the row; "unknown" on backfilled rows and when not derivable (TRK-014, 2026-08-01)
   "memory_file": "feedback_proactive-solutions.md",  // BARE BASENAME, not a path
   "name": "<slug>", "description": "<prose>", "type": "feedback",
   "rule_summary": "<prose>", "rationale_snippet": "<prose>",
