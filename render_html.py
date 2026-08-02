@@ -2007,6 +2007,8 @@ details > summary{cursor:pointer;color:var(--accent)}
 .matrix .cell.verdict-covered{background:var(--good-bg);border-color:var(--good-line)}
 .matrix .cell.verdict-thin{background:var(--warn-bg);border-color:var(--warn-line)}
 .matrix .cell.verdict-empty{border:1px dashed var(--crit-line);background-color:var(--surface);background-image:repeating-linear-gradient(135deg,var(--crit-bg) 0,var(--crit-bg) 4px,transparent 4px,transparent 8px)}
+.phantom-group-not_a_path td,.phantom-group-not_a_path th{background-image:repeating-linear-gradient(135deg,var(--surface-2) 0,var(--surface-2) 4px,transparent 4px,transparent 8px)}
+.gauge-drill-faint{font-size:0.8rem;color:var(--faint)}
 .matrix .cell.sel{outline:2px solid var(--accent);outline-offset:-2px}
 .matrix .cell:focus-visible{outline:2px solid var(--accent)}
 .matrix .cell .cv{font-family:var(--mono);font-size:0.66rem;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}
@@ -2761,7 +2763,22 @@ def _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate):
         items = [f'<code>{esc_html(r.get("source",""))}</code> → {esc_html(r.get("ref",""))}'
                  + (' <em>(unverifiable)</em>' if r.get("resolved") is None else '')
                  for r in refs]
-        return _drill_list(items) + tab
+        n_rows = len(refs)
+        n_never = _phantom_never_resolvable_count(refs)
+        # §7.4: the sentence that stops the operator ignoring the whole table. BOTH
+        # figures derived at render time from the classified row set — no literal.
+        # This sentence ASSERTS CERTAINTY, so it may only ever count kinds that are
+        # never-resolvable by construction — see `_phantom_never_resolvable_count` for
+        # the bar, and honour it if a kind is ever added to the group.
+        never = (f'<p class="gauge-drill-note gauge-drill-faint">{n_never} of {n_rows} '
+                 f'rows were never resolvable paths.</p>') if n_rows else ""
+        # Requirement 12, binding disclosure: stripping `:999999` and probing only the
+        # FILE makes a stale LINE reference disappear from this table. The operator must
+        # not read that disappearance as "the citation was checked".
+        lines = ('<p class="gauge-drill-note gauge-drill-faint">Line ranges in citations '
+                 '(<code>path.md:12-19</code>) are not validated — only the file is '
+                 'checked.</p>') if n_rows else ""
+        return _drill_list(items) + never + lines + tab
     if key == "friction_total":
         # `_friction_contributions` keeps returning INTS — its "provably reconciles" sum is
         # the contract an existing assertion pins. The lower bound belongs here, at the
@@ -3083,6 +3100,99 @@ def _resolved_state(resolved):
     if resolved is False:
         return False
     return None
+
+
+# S6b / D4 §7.4. The three groups encode the ONE distinction the operator must read
+# instantly: "we checked and it's missing" vs "there was never anything to check" vs "we
+# could not see far enough to check". Group membership is derived from SEMANTICS, not from
+# a kind allowlist, so a kind added later cannot silently vanish from the table.
+_NEVER_RESOLVABLE_KINDS = frozenset({"template"})
+
+_PHANTOM_GROUP_ORDER: tuple[tuple[str, str], ...] = (
+    ("verified_missing", "Verified missing — the target was looked for and is not there"),
+    ("not_a_path", "Not a path — a template or glob; nothing was ever resolvable, so "
+                   "nothing was checked"),
+    ("unverifiable", "Unverifiable — the target space extends outside the scanned root"),
+)
+
+
+def _phantom_group_key(row: dict[str, Any]) -> str:
+    """Which of the three §7.4 groups a row belongs to. TOTAL by construction: the last
+    return is an unconditional catch-all, so an unrecognized `kind` lands in Unverifiable
+    rather than disappearing from the table (every mapping table needs an else branch).
+
+    Reads `resolved` through `_resolved_state`, the shared identity-based policy — never
+    truthiness and never a dict lookup, because `resolved` arrives straight from sidecar
+    JSON and can be any JSON value. The kind check comes FIRST so that a hostile sidecar
+    claiming `{"kind": "template", "resolved": false}` still lands in `not_a_path`: a
+    shape classification can never carry a confirmed negative.
+
+    Same T3.1 invariant as `_phantom_guidance`: `kind` arrives straight from sidecar JSON,
+    so an unhashable shape (`[]`, `{}`) is valid JSON a stale/corrupt/hand-crafted sidecar
+    can carry, and `in _NEVER_RESOLVABLE_KINDS` (a frozenset membership test) HASHES its
+    operand. Only a `str` can match a `_NEVER_RESOLVABLE_KINDS` entry, so the `isinstance`
+    guard is a pure short-circuit before the hash — it changes no row's group, and
+    catching this here (rather than upstream) keeps the existing per-row degradation
+    doctrine intact instead of trading a whole-page failure for a whole-page render."""
+    kind = row.get("kind", "")
+    if isinstance(kind, str) and kind in _NEVER_RESOLVABLE_KINDS:
+        return "not_a_path"
+    if _resolved_state(row.get("resolved")) is False:
+        return "verified_missing"
+    return "unverifiable"
+
+
+def build_phantom_groups(rows):
+    """Rows -> [(group_key, header_text, [rows])] in _PHANTOM_GROUP_ORDER, input order
+    preserved within each group. Pure. EMPTY groups are returned too, so this is the ONE
+    derivation both the table and the tile drawer read — a second count is how §7.4's
+    hardcoded `2/6/1` drifted out of agreement with its own after-table."""
+    bucketed: dict[str, list[dict[str, Any]]] = {k: [] for k, _ in _PHANTOM_GROUP_ORDER}
+    for row in rows:
+        bucketed[_phantom_group_key(row)].append(row)
+    return [(key, header, bucketed[key]) for key, header in _PHANTOM_GROUP_ORDER]
+
+
+def _phantom_never_resolvable_count(rows):
+    """Rows that were NEVER resolvable paths — the `not_a_path` group.
+
+    THE NAME OF THIS COUNT IS A CLAIM OF CERTAINTY, AND EVERY KIND IN THE GROUP MUST
+    EARN IT. Today the group holds `template` alone: a stencil names a SHAPE, so there
+    is no target, and no filesystem state and no future evidence could make one appear.
+    That is never-resolvable BY CONSTRUCTION, which is exactly what this sentence
+    asserts.
+
+    THE BAR FOR ADDING A KIND TO `not_a_path`, and it is the guardrail S6c will need:
+    a kind belongs in this group only if NO POSSIBLE EVIDENCE could resolve it. An
+    INFERENTIAL kind does not qualify -- it must either stay out of the group, or this
+    count and the drawer sentence must change with it to stop asserting certainty they
+    no longer have. The deferred `refspec` kind is precisely that case: its own guidance
+    would tell the operator the token may be a real path, and one layer hedging while
+    three assert is how a confident false claim survives the fix aimed at it. When S6c
+    brings `refspec` back, this docstring is the check it has to pass.
+
+    Codex P2-4 already narrowed this once, dropping `unverifiable` (`external` and
+    `slash_command` MAY resolve outside the scanned root -- a CC built-in, a plugin
+    command, a file the walk cannot see).
+
+    DERIVED from the single grouping, never counted a second way, so the drawer and the
+    table can never disagree."""
+    return len(build_phantom_groups(rows)[1][2])
+
+
+def _phantom_status_word(kind, resolved):
+    """§7.4: the Status word for the never-resolvable kinds is `not a path`, NEVER `no`.
+    `no` answers "does it exist", and these tokens were never asked that question. Every
+    other kind keeps `_resolved_label`'s three words unchanged.
+
+    Same T3.1 invariant as `_phantom_guidance`/`_phantom_group_key`: `kind` arrives
+    straight from sidecar JSON, so an unhashable shape is valid JSON a corrupt sidecar
+    can carry, and `in _NEVER_RESOLVABLE_KINDS` hashes its operand. The `isinstance`
+    guard is a pure short-circuit — only a `str` can match a `_NEVER_RESOLVABLE_KINDS`
+    entry — so it changes no row's status word, only which branch reaches it safely."""
+    if isinstance(kind, str) and kind in _NEVER_RESOLVABLE_KINDS:
+        return "not a path"
+    return _resolved_label(resolved)
 
 
 def _phantom_guidance(kind, resolved):
@@ -3717,12 +3827,30 @@ def _render_dupweb_body(model, raw_pairs):
     else:
         dup_body = '<p class="empty-state">no duplicate pairs above threshold</p>'
     if model["phantom_refs"]:
-        prows = "".join(
-            f'<tr><td>{esc_html(r.get("source",""))}</td><td>{esc_html(r.get("ref",""))}</td>'
-            f'<td>{esc_html(r.get("kind",""))}</td><td>{esc_html(_resolved_label(r.get("resolved")))}</td>'
-            f'<td>{esc_html(_phantom_guidance(r.get("kind",""), r.get("resolved", False)))}</td>'
-            f'<td>{_render_brief_control("phantom", i, build_phantom_ref_brief(r))}</td></tr>'
-            for i, r in enumerate(model["phantom_refs"]))
+        all_rows = model["phantom_refs"]
+        index_of = {id(r): i for i, r in enumerate(all_rows)}
+        prows = ""
+        for key, header, group_rows in build_phantom_groups(all_rows):
+            if not group_rows:
+                continue
+            # The GROUP carrier is the <tbody>, never the <tr>. An existing test regex
+            # (test_render_html.py:3173) matches a BARE `<tr><td>` on a row that groups
+            # as `unverifiable`; adding a class to the data-row <tr> breaks it, and
+            # binding rule 7 forbids editing that assertion. <tbody> reaches the same
+            # cells for styling and leaves every <tr> byte untouched.
+            prows += f'<tbody class="phantom-group phantom-group-{key}">'
+            prows += (f'<tr class="phantom-group-header">'
+                      f'<th colspan="6">{esc_html(header)} ({len(group_rows)})</th></tr>')
+            for r in group_rows:
+                i = index_of[id(r)]
+                prows += (
+                    f'<tr>'
+                    f'<td>{esc_html(r.get("source",""))}</td><td>{esc_html(r.get("ref",""))}</td>'
+                    f'<td>{esc_html(r.get("kind",""))}</td>'
+                    f'<td>{esc_html(_phantom_status_word(r.get("kind",""), r.get("resolved")))}</td>'
+                    f'<td>{esc_html(_phantom_guidance(r.get("kind",""), r.get("resolved", False)))}</td>'
+                    f'<td>{_render_brief_control("phantom", i, build_phantom_ref_brief(r))}</td></tr>')
+            prows += '</tbody>'
         phantom_body = (
             '<p class="digest">A phantom ref is a pointer in an instruction file to a '
             'target that doesn’t resolve — a dangling link. Rows marked "unverifiable" '

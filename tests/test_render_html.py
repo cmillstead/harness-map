@@ -3177,6 +3177,219 @@ def test_render_row_never_pairs_unverifiable_with_no_action_needed(tmp_path):
     assert "no action needed" not in row
 
 
+# ============================================================= S6b / D4 §7.4: phantom-table grouping
+# The distinction the operator must read instantly is "we checked and it's missing" vs
+# "there was never anything to check". A group boundary is read before any text is, which
+# is why this is a row GROUP and not a fifth column.
+_D4_MIXED_ROWS = [
+    {"source": "a.md", "ref": "scripts/deploy.sh", "kind": "path",
+     "resolved": False, "evidence": "VERIFIED"},
+    {"source": "a.md", "ref": "<repo>/docs/x-<slug>.md", "kind": "template",
+     "resolved": None, "evidence": "INFERRED"},
+    {"source": "a.md", "ref": "/usr/bin/tool.sh", "kind": "external",
+     "resolved": None, "evidence": "INFERRED"},
+    {"source": "a.md", "ref": "/gone", "kind": "slash_command",
+     "resolved": None, "evidence": "INFERRED"},
+]
+# FOUR rows: one per group-relevant kind. No `refspec` row -- that kind is deferred to
+# S6c (DEVIATION 5) and the collector never emits it, so a fixture carrying one would
+# assert grouping behavior for a kind that does not exist.
+
+
+def test_build_phantom_groups_returns_three_groups_in_fixed_order():
+    groups = rh.build_phantom_groups(_D4_MIXED_ROWS)
+    assert [g[0] for g in groups] == ["verified_missing", "not_a_path", "unverifiable"]
+
+
+def test_build_phantom_groups_partitions_by_semantics_not_kind_name():
+    groups = dict((g[0], g[2]) for g in rh.build_phantom_groups(_D4_MIXED_ROWS))
+    assert [r["ref"] for r in groups["verified_missing"]] == ["scripts/deploy.sh"]
+    assert [r["ref"] for r in groups["not_a_path"]] == ["<repo>/docs/x-<slug>.md"]
+    assert [r["ref"] for r in groups["unverifiable"]] == ["/usr/bin/tool.sh", "/gone"]
+
+
+def test_build_phantom_groups_is_pure_and_preserves_input_order():
+    a = rh.build_phantom_groups(_D4_MIXED_ROWS)
+    b = rh.build_phantom_groups([dict(r) for r in _D4_MIXED_ROWS])
+    assert [(g[0], g[1], [r["ref"] for r in g[2]]) for g in a] == \
+           [(g[0], g[1], [r["ref"] for r in g[2]]) for g in b]
+
+
+def test_phantom_group_counts_are_derived_not_literal():
+    """Requirement 20: the round-1 design text hardcoded `2/6/1` and "8 of 10", both
+    arithmetically wrong against its own after-table. Two different row sets must produce
+    two different rendered counts."""
+    small = rh.build_phantom_groups(_D4_MIXED_ROWS[:2])
+    full = rh.build_phantom_groups(_D4_MIXED_ROWS)
+    assert [len(g[2]) for g in small] == [1, 1, 0]
+    assert [len(g[2]) for g in full] == [1, 1, 2]
+
+
+def test_phantom_group_counts_reconcile_to_the_row_total():
+    """MANDATORY (§7.4, requirement 21) and a NAMED S6b exit gate. A design that states
+    group counts as prose drifts the next time a kind is added — that is precisely how
+    this defect arose.
+
+    TWO invariants:
+      * N1 + N2 + N3 == len(rows) -- ships exactly as requirement 21 specifies.
+      * the drawer numerator == N2. Requirement 21 as written said `N2 + N3`; Codex P2-4
+        dropped N3, because `unverifiable` (external + slash_command) MAY resolve outside
+        the scanned root and so does not earn a count whose name asserts certainty.
+
+    The expected value is derived here by a DIFFERENT route than the function uses -- a
+    direct kind filter over `rows`, versus the function's walk of the grouping -- so this
+    is not a tautology, and it will FAIL rather than silently agree if a kind is ever
+    added to `not_a_path` without meeting that group's never-resolvable-by-construction
+    bar (see `_phantom_never_resolvable_count`). That failure is the point: it is the
+    guardrail S6c trips if it returns `refspec` to the group without revisiting the
+    count."""
+    for rows in ([], _D4_MIXED_ROWS[:1], _D4_MIXED_ROWS[:3], _D4_MIXED_ROWS,
+                 _D4_MIXED_ROWS + [{"source": "a.md", "ref": "x", "kind": "mystery",
+                                    "resolved": "weird", "evidence": "INFERRED"}]):
+        groups = rh.build_phantom_groups(rows)
+        counts = [len(g[2]) for g in groups]
+        assert sum(counts) == len(rows), (rows, counts)
+        assert rh._phantom_never_resolvable_count(rows) == counts[1], (rows, counts)
+        expected_never = sum(1 for r in rows if r.get("kind") == "template")
+        assert rh._phantom_never_resolvable_count(rows) == expected_never, (rows, counts)
+
+
+def test_phantom_status_word_for_new_kinds_is_not_a_path():
+    """Requirement 23: `no` answers "does it exist", and these were never asked."""
+    assert rh._phantom_status_word("template", None) == "not a path"
+    assert rh._phantom_status_word("external", None) != "not a path"
+    assert rh._phantom_status_word("path", False) == "no"
+    assert rh._phantom_status_word("external", None) == "unverifiable"
+    assert rh._phantom_status_word("path", True) == "yes"
+
+
+def test_unknown_phantom_kind_lands_in_unverifiable_never_dropped():
+    rows = [{"source": "a.md", "ref": "x", "kind": "mystery",
+             "resolved": None, "evidence": "INFERRED"}]
+    groups = dict((g[0], g[2]) for g in rh.build_phantom_groups(rows))
+    assert groups["unverifiable"] == rows
+
+
+def test_hostile_resolved_false_on_a_template_row_still_groups_as_not_a_path():
+    """A shape classification can never carry a confirmed negative, even from a hostile
+    sidecar. The kind check precedes the resolved check for exactly this reason."""
+    rows = [{"source": "a.md", "ref": "docs/{x}.md", "kind": "template",
+             "resolved": False, "evidence": "VERIFIED"}]
+    groups = dict((g[0], g[2]) for g in rh.build_phantom_groups(rows))
+    assert groups["not_a_path"] == rows and groups["verified_missing"] == []
+
+
+def test_phantom_drawer_line_is_derived_from_the_row_set():
+    """Requirement 24: both figures derived. Two different docs, two different sentences.
+
+    Both the 2-row slice and the full 4-row set contain exactly ONE template, so the
+    numerator is 1 in both and only the DENOMINATOR moves. That is the stronger fixture:
+    a numerator that tracked total rows, or the `unverifiable` group, would read 1-of-2
+    and 3-of-4 and pass a laxer assertion."""
+    two = {"phantom_refs": _D4_MIXED_ROWS[:2]}
+    four = {"phantom_refs": _D4_MIXED_ROWS}
+    html_two = rh._gauge_drill_html("phantom_ref_count", {}, two, [], [], {})
+    html_four = rh._gauge_drill_html("phantom_ref_count", {}, four, [], [], {})
+    assert "1 of 2 rows were never resolvable paths." in html_two
+    assert "1 of 4 rows were never resolvable paths." in html_four
+
+
+def test_phantom_drawer_discloses_that_line_ranges_are_not_validated():
+    """Requirement 12: line-range validity is UNKNOWN and must never be implied as
+    checked. Stated in the drawer AND (collector side) in blind_spots."""
+    html = rh._gauge_drill_html("phantom_ref_count", {}, {"phantom_refs": _D4_MIXED_ROWS},
+                                [], [], {})
+    assert "Line ranges in citations" in html and "are not validated" in html
+
+
+def test_rendered_phantom_table_carries_three_group_headers(tmp_path):
+    """End-to-end through run_render, not a unit assertion on the model — a membership
+    test would pass even if the renderer stopped emitting groups."""
+    doc = _minimal_doc()
+    doc["phantom_refs"] = [dict(r) for r in _D4_MIXED_ROWS]
+    out_dir = tmp_path / "phgroups"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    html = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "Verified missing — the target was looked for and is not there (1)" in html
+    assert ("Not a path — a template or glob; nothing was ever resolvable, so nothing "
+            "was checked (1)") in html
+    assert "Unverifiable — the target space extends outside the scanned root (2)" in html
+
+
+def test_not_a_path_group_hatch_shares_the_pattern_but_not_the_severity_fill(tmp_path):
+    """Requirement 22, BOTH halves, and neither half is tautological.
+
+    (a) The PATTERN is shared with `.matrix .cell.verdict-empty` -- 135deg, 4px/8px
+        stops -- because that is what carries §7.4's meaning: "the instrument did not
+        produce a reading here". Asserted on the NEW selector, not on a bare
+        `"repeating-linear-gradient(135deg" in html`, which would pass on the
+        pre-existing rule alone and prove nothing about this change.
+
+    (b) The FILL is deliberately NOT `var(--crit-bg)`. Fill carries severity and these
+        rows have none -- their own guidance column reads "No action needed", and §7.3
+        states D4's purpose as the dashboard "stop[ping] painting red over rows the
+        collector never verified". Matching the critical fill would reintroduce at the
+        table layer the alarm D4 removes at the gauge layer.
+
+    What each assertion actually catches -- stated per-assertion, because "they all fail
+    on revert" is not true of all three and an overstated guarantee is worse than none:
+      * the selector+gradient assertion fails if the new CSS rule is DELETED or its
+        pattern/fill is changed in any way;
+      * the `not in` assertion fails if the fill is changed specifically to
+        `var(--crit-bg)` -- the one regression it exists to block. It passes vacuously if
+        the rule is deleted, which is fine: the first assertion covers deletion;
+      * the reference-rule assertion fails if `.matrix .cell.verdict-empty` loses the
+        135deg/4px/8px pattern. It is change-invariant with respect to THIS rule by
+        design -- its job is to catch the shared pattern drifting out from under us, so
+        that "shared" stops being an unchecked claim.
+
+    Changing this requires a spec change (S6 §7.4)."""
+    doc = _minimal_doc()
+    doc["phantom_refs"] = [dict(r) for r in _D4_MIXED_ROWS]
+    out_dir = tmp_path / "phhatch"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    html = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert '<tbody class="phantom-group phantom-group-not_a_path">' in html
+    rule = ".phantom-group-not_a_path td,.phantom-group-not_a_path th{background-image:"
+    gradient = ("repeating-linear-gradient(135deg,var(--surface-2) 0,var(--surface-2) 4px,"
+                "transparent 4px,transparent 8px)")
+    # (a) shared pattern, on the new selector
+    assert f"{rule}{gradient}}}" in html
+    # (a) the reference rule still carries the same 135deg/4px/8px pattern, so "shared"
+    # is asserted against the thing it is shared WITH, not merely restated
+    assert ("repeating-linear-gradient(135deg,var(--crit-bg) 0,var(--crit-bg) 4px,"
+            "transparent 4px,transparent 8px)") in html
+    # (b) the new rule must NOT adopt the severity fill
+    assert f"{rule}repeating-linear-gradient(135deg,var(--crit-bg)" not in html
+
+
+def test_grouped_phantom_data_rows_keep_a_bare_tr_opening_tag(tmp_path):
+    """RULE-7 GUARD, and the reason the group carrier is a <tbody>. An existing test at
+    tests/test_render_html.py:3173 regex-matches a BARE `<tr><td>` on a row that groups
+    as `unverifiable`. This asserts the property that test depends on, at the layer this
+    change controls, so a future refactor that moves the class onto the <tr> fails HERE
+    with a clear reason instead of failing an unrelated-looking hostile-value test."""
+    doc = _minimal_doc()
+    doc["phantom_refs"] = [dict(r) for r in _D4_MIXED_ROWS]
+    out_dir = tmp_path / "phtr"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    html = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert re.search(r'<tr><td>a\.md</td><td>scripts/deploy\.sh</td>', html), \
+        "data-row <tr> gained an attribute — binding rule 7: this breaks the bare-<tr> regex " \
+        "in test_render_row_never_pairs_unverifiable_with_no_action_needed"
+    assert 'class="phantom-row' not in html, \
+        "the group class belongs on the <tbody>, never on a data-row <tr>"
+
+
 def test_data_goto_cross_view_nav_removed_after_tab_merge():
     """Task B-t2 tab merge: `data-goto` only ever existed to drive the Overview
     mini-grid's "jump to Coverage tab" click — dropping the mini-grid (folded into
