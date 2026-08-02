@@ -4739,7 +4739,7 @@ def _fs_is_case_insensitive(probe_dir):
 
 def test_case_variant_root_still_reports_real_timestamps(tmp_path):
     """FINDING 3 (LOW). `os.path.realpath` does NOT canonicalize case on APFS
-    (`/Users/cevin/.CLAUDE` comes back unchanged) but git's `--show-toplevel` DOES, so
+    (`/Users/<user>/.CLAUDE` comes back unchanged) but git's `--show-toplevel` DOES, so
     `real.relative_to(top)` raised ValueError for EVERY file -- nulling the entire
     git-age signal behind reason `git_error` while `git_age_available` still said True.
     Direction was fail-safe, but the reason claimed git failed when git worked fine, which

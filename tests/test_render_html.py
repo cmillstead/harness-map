@@ -17,7 +17,12 @@ import pytest
 from test_collector import _build_two_tier_maximal_fixture, _SECRET_SENTINELS, run_collector
 
 RENDER = Path(__file__).resolve().parents[1] / "render_html.py"
-REAL_SAMPLE = Path("/Users/cevin/Documents/obsidian-vault/AI/output/harness-map-2026-07-15.json")
+# Optional real-data smoke fixture. Set HARNESS_MAP_REAL_SAMPLE to a collector sidecar
+# JSON to enable the two real-data smoke tests; they skip when it is unset or missing.
+# No absolute literal here on purpose -- this repo is public (see
+# test_no_absolute_home_literal_in_runtime_modules).
+_real_sample_env = os.environ.get("HARNESS_MAP_REAL_SAMPLE", "")
+REAL_SAMPLE = Path(_real_sample_env) if _real_sample_env else Path("/nonexistent/harness-map-real-sample.json")
 
 _spec = importlib.util.spec_from_file_location("harness_map_render_html", RENDER)
 rh = importlib.util.module_from_spec(_spec)

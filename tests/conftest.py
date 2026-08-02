@@ -6,7 +6,7 @@ import pytest
 
 def project_slug(path):
     # CC per-project memory dir name: absolute path with every "/" and "." replaced by "-".
-    # e.g. /Users/cevin/.claude -> -Users-cevin--claude   (matches the live projects/<slug>/ layout)
+    # e.g. /Users/<user>/.claude -> -Users-<user>--claude   (matches the live projects/<slug>/ layout)
     return re.sub(r"[/.]", "-", os.path.abspath(str(path)))
 
 @pytest.fixture
