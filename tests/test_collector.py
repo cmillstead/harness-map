@@ -5611,3 +5611,142 @@ def test_build_document_compose_unsearchable_root_is_degraded_not_crashed(
     recorded = {e["path"]: e["reason"] for e in doc["inaccessible"]}
     assert recorded.get("skills") == "unreadable"
     assert any("settings.json is_file() check failed" in e for e in doc["errors"])
+
+
+# S7.M3c (F6): three more unguarded-EACCES sites closing this chain -- check_phantom_refs'
+# resolved_target.is_file() probe, _project_tier_duplication_corpus's two silent `except
+# OSError: continue|pass` swallows, and _iter_descendant_dirs's os.walk (default
+# onerror=None discards a per-directory listing failure). Each test below builds a REAL
+# unreadable construction (no mocks) and confirms the OSError is recorded rather than
+# either propagating or vanishing silently.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_check_phantom_refs_stripped_target_permission_denied_recorded_inaccessible(tmp_path):
+    """check_phantom_refs' `resolved_target.is_file()` probe (collector.py ~3740) is
+    reachable WITHOUT a race: `_safe_exists(candidate)` validates the CANDIDATE's own
+    ancestor chain, but `candidate.resolve()` can legitimately succeed (pathlib's
+    non-strict resolve() lexically pops a `..` segment without ever stat-ing the
+    component it cancels) while landing on a resolved_target that sits beneath a
+    DIFFERENT, genuinely unreadable in-root ancestor that the original candidate's own
+    stat-based exists() check never had to touch. Reachability, confirmed empirically:
+    `root/rules/x.md` -> `../nonexistent_dir/../mid/deep/target.md` (relative symlink).
+    `_safe_exists` on the symlink itself returns present=True via the is_symlink()
+    shortcut (exists() cleanly hits ENOENT on the never-created `nonexistent_dir` and
+    stops there, never reaching the real `mid`), but pathlib's resolve() pops the
+    `nonexistent_dir/..` pair PURELY LEXICALLY (no filesystem check for `..`) and lands
+    on the real, chmod(0) `mid/deep/target.md` -- so a subsequent is_file() on that
+    resolved path raises EACCES where the original probe raised nothing.
+
+    Load-bearing anti-oracle assertion: the token must be DROPPED (recorded inaccessible,
+    never asserted resolved OR missing) -- reporting it either way would reopen the
+    existence oracle S6b.M7 closes."""
+    root = tmp_path / "harness"
+    (root / "rules").mkdir(parents=True)
+    (root / "mid" / "deep").mkdir(parents=True)
+    (root / "mid" / "deep" / "target.md").write_text("body\n")
+    (root / "rules" / "x.md").symlink_to("../nonexistent_dir/../mid/deep/target.md")
+    os.chmod(root / "mid", 0)
+    try:
+        inaccessible: list = []
+        corpus_files = [("CLAUDE.md", "See `rules/x.md:12` for details.")]
+        refs = _collector.check_phantom_refs(root, corpus_files, inaccessible)
+    finally:
+        os.chmod(root / "mid", 0o755)
+    assert refs == []
+    assert inaccessible == [{"path": "rules/x.md", "reason": "unreadable"}]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_tier_duplication_corpus_unreadable_claude_records_blind_spots(tmp_path):
+    """_project_tier_duplication_corpus's two `except OSError: continue|pass` swallows
+    (collector.py ~3270, ~3286) each let an unreadable project-tier surface yield zero
+    candidates with NO signal -- indistinguishable from a genuinely empty/absent surface.
+    A single chmod(0) on `.claude` reaches BOTH swallows in one pass: every
+    `_PROJECT_DUP_SURFACE_DIRS` entry (rules/agents/commands) is-dir() re-raises EACCES
+    from the unsearchable ancestor, and so does the separate `skills_dir.is_dir()` check
+    below it. blind_spots (already a parameter of this function) is the recording
+    channel -- pinning all four specific entries so a regression that dropped even one
+    silently would fail this test instead of a generic non-empty check passing."""
+    project_root = tmp_path / "repo"
+    claude = project_root / ".claude"
+    (claude / "rules").mkdir(parents=True)
+    (claude / "skills").mkdir(parents=True)
+    os.chmod(claude, 0o600)
+    try:
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        corpus = _collector._project_tier_duplication_corpus(
+            project_root, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(claude, 0o755)
+    assert corpus == []
+    assert any(".claude/rules" in b for b in blind_spots)
+    assert any(".claude/agents" in b for b in blind_spots)
+    assert any(".claude/commands" in b for b in blind_spots)
+    assert any("skills" in b for b in blind_spots)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_skill_has_test_asset_unreadable_nested_dir_records_error(tmp_path):
+    """_iter_descendant_dirs's os.walk (collector.py ~4122) previously ran with the
+    default onerror=None, which SILENTLY DISCARDS a per-directory listing failure
+    partway through the walk -- making an unreadable nested subtree return a DETERMINED
+    has_test: False instead of surfacing the gap. `errors` is optional (defaults to
+    None) so the pre-existing single-argument callers (see
+    test_skill_has_test_asset_ignores_pruned_dirs above) keep working unmodified.
+    Reachability: the skill dir's own tests/evals check (the DO-NOT-TOUCH guard, already
+    reported elsewhere) must pass cleanly first -- `locked` is neither name, so os.walk
+    reaches it and its own os.scandir(locked) raises EACCES when os.walk tries to
+    recurse into it, invoking the new onerror callback."""
+    skill_dir = tmp_path / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    locked = skill_dir / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0)
+    try:
+        errors: list = []
+        has_test = _collector._skill_has_test_asset(skill_dir, errors)
+    finally:
+        os.chmod(locked, 0o755)
+    assert has_test is False
+    assert any("locked" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_build_document_unreadable_nested_skill_dir_is_degraded_not_crashed(tmp_path):
+    """build_document-level integration of the _skill_has_test_asset walk-error guard
+    above: proves the new onerror recording reaches all the way to the top-level errors[]
+    without build_document crashing, and that test_coverage still reports a (conservative)
+    has_test: False for the affected skill rather than raising. Specific-content
+    assertion (not a truthy check) so a regression that silently dropped the recording,
+    while the run still completed, would fail this test."""
+    root = tmp_path / "harness"
+    skill_dir = root / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\ndescription: d\n---\nbody\n")
+    locked = skill_dir / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0)
+    try:
+        doc = _collector.build_document(root, None)
+    finally:
+        os.chmod(locked, 0o755)
+    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+    assert any("skill descendant walk failed" in e and "locked" in e for e in doc["errors"])
+    skills_result = {s["name"]: s["has_test"] for s in doc["test_coverage"]["skills"]}
+    assert skills_result.get("demo") is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_main_unsearchable_root_never_triggers_crash_backstop(unsearchable_root):
+    """`_CRASH_ERROR_PREFIX` is appended in exactly ONE place: main()'s top-level `except
+    Exception` around the build_document(...) call. parse_settings's own docstring
+    claims that backstop "no longer has an organic trigger via settings.json
+    specifically" now that every is_dir()/is_file()/is_symlink()/os.walk site in this F6
+    chain (Tasks 1-3c) is guarded. This test proves that claim via the real CLI
+    subprocess entry point (run_collector) against the same unsearchable_root fixture
+    every guard test above uses -- nothing here asserts the backstop is unreachable in
+    general, only that THIS fixture, which used to crash before S7.M2/M3b, no longer
+    reaches it."""
+    doc = run_collector(unsearchable_root)
+    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])

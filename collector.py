@@ -3272,7 +3272,11 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
         try:
             if d.is_dir():
                 candidates.extend(sorted(d.glob(pattern)))
-        except OSError:
+        except OSError as e:
+            # Inaccessible is NOT clean: an unreadable project-tier surface dir yields
+            # zero candidates for it, which reads identically to "nothing there" unless
+            # recorded. blind_spots is the existing recording channel for this function.
+            blind_spots.append(f"project {rel_dir} not probed for duplication scan: {e}")
             continue
     skills_dir = harness_root / "skills"
     try:
@@ -3282,8 +3286,10 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
                 present, ok = _safe_exists(skill_md)
                 if ok and present:
                     candidates.append(skill_md)
-    except OSError:
-        pass
+    except OSError as e:
+        # Same "inaccessible is NOT clean" invariant: an unreadable .claude/skills yields
+        # zero skill SKILL.md candidates with no signal unless recorded here.
+        blind_spots.append(f"project skills not probed for duplication scan: {e}")
 
     for fp in candidates:
         key = _physical_key(fp)
@@ -3737,7 +3743,21 @@ def check_phantom_refs(
                         # `is_file()` on the already-resolved path keeps S-9 closed (a
                         # real DIRECTORY still does not make an extension-bearing token
                         # "resolve") without re-touching the original symlink chain.
-                        if resolved_target.is_file():
+                        # `resolved_target` sits under a validated in-root ancestor chain
+                        # for `candidate`, but is a DIFFERENT path post-`resolve()` and can
+                        # itself sit beneath an unreadable in-root ancestor -- reachable
+                        # WITHOUT a race. An OSError here must not become a distinguishable
+                        # outcome (that would reopen the existence oracle the block above
+                        # closes), so this candidate is recorded inaccessible and handled
+                        # exactly like the resolve() failure above: never asserted resolved
+                        # OR missing.
+                        try:
+                            is_file = resolved_target.is_file()
+                        except OSError:
+                            _append_inaccessible_once(inaccessible, _rel_safe(root, candidate))
+                            stripped_handled = True
+                            break
+                        if is_file:
                             stripped_handled = True
                             break
                     if stripped_handled:
@@ -3933,7 +3953,7 @@ def _detect_hook_test_coverage(root, errors):
     return result
 
 
-def _skill_has_test_asset(skill_dir):
+def _skill_has_test_asset(skill_dir, errors=None):
     """PRESENCE-only signal (see _detect_hook_test_coverage docstring): a tests/ dir, an
     evals/ dir, or any test_*.py / *_eval.* file anywhere under the skill dir. Unlike
     _safe_exists, Path.is_dir() does NOT swallow PermissionError (only ENOENT-family
@@ -3947,13 +3967,27 @@ def _skill_has_test_asset(skill_dir):
     the watcher does not observe. This keeps the two walks equal BY CONSTRUCTION: a
     test/eval file this function can see is always inside a directory the watcher also
     yields, and a test/eval file planted under a pruned dir (e.g. node_modules) is
-    intentionally excluded from BOTH signals."""
+    intentionally excluded from BOTH signals.
+
+    `errors` (S7.M3c, optional): os.walk's default onerror silently discards a
+    per-directory listing failure partway through the descendant walk, which would
+    otherwise make an unreadable nested subtree return a DETERMINED has_test: False
+    rather than surfacing the gap — this is NOT the same swallow the tests/evals check
+    above documents (that one is a top-level check already reported elsewhere; this one
+    is unreported and partway through an unbounded recursive walk), so it is recorded
+    here instead when a caller supplies a list. Defaults to None (discarded) so this
+    function's pre-existing single-argument call shape keeps working."""
     try:
         if (skill_dir / "tests").is_dir() or (skill_dir / "evals").is_dir():
             return True
     except OSError:
         pass
-    for d in _iter_descendant_dirs(skill_dir):
+
+    def _record_walk_error(exc):
+        if errors is not None:
+            errors.append(f"skill descendant walk failed under {skill_dir}: {exc}")
+
+    for d in _iter_descendant_dirs(skill_dir, onerror=_record_walk_error):
         try:
             if next(d.glob("test_*.py"), None) is not None:
                 return True
@@ -3982,7 +4016,7 @@ def _detect_skill_test_coverage(root, errors):
         skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
     except OSError:
         skill_dirs = []
-    return [{"name": d.name, "has_test": _skill_has_test_asset(d)} for d in skill_dirs]
+    return [{"name": d.name, "has_test": _skill_has_test_asset(d, errors)} for d in skill_dirs]
 
 
 def detect_test_coverage(
@@ -4049,13 +4083,20 @@ _PRUNED_WALK_DIRS = frozenset({
 })
 
 
-def _iter_descendant_dirs(base):
+def _iter_descendant_dirs(base, onerror=None):
     """Yield `base` and every non-pruned directory beneath it (each membership-watchable).
     _skill_has_test_asset (Codex r4 fix) now SHARES this exact walk for its recursive
     test_*.py / *_eval.* glob search instead of Path.rglob() — the two are equal BY
     CONSTRUCTION, not by a duplicated constant that could drift: a test/eval file added at
     ANY non-pruned depth flips a skill's has_test AND is watched, while one planted under a
     pruned dir (node_modules, .venv, caches, ...) is intentionally invisible to BOTH.
+
+    `onerror` (optional): os.walk's default `onerror=None` SILENTLY DISCARDS a
+    per-directory listing failure partway through the walk, making an unreadable
+    subtree indistinguishable from a genuinely empty one to every caller. Pass a
+    callback here to record that failure (S7.M3c) instead of losing it; the
+    watcher call site (iter_input_paths, consumed by serve.py) omits it and keeps
+    its prior silent-on-walk-error behavior unchanged.
 
     followlinks=False (Codex r3 FIX 3): os.walk still ENTERS `base` even when `base` itself is a
     deploy-symlinked skill dir (the first hop stays -- os.walk always descends into the walk
@@ -4078,7 +4119,7 @@ def _iter_descendant_dirs(base):
             return
     except OSError:
         return
-    for dirpath, dirnames, _ in os.walk(base, followlinks=False):
+    for dirpath, dirnames, _ in os.walk(base, followlinks=False, onerror=onerror):
         # Prune generated/non-input subtrees IN PLACE so os.walk never descends into them.
         dirnames[:] = [d for d in dirnames if d not in _PRUNED_WALK_DIRS]
         yield Path(dirpath)
