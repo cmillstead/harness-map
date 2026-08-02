@@ -22,7 +22,6 @@ import os
 import re
 import stat
 import sys
-import tempfile
 import traceback
 from pathlib import Path
 from typing import Any, cast
@@ -2033,14 +2032,14 @@ def write_html_safely(
     it, closing the "check once, write many times later" gap that made a --out-dir
     symlink swapped after startup slip past a stale one-shot validation.
 
-    Then writes via the collector's mkstemp/fsync/os.replace-in-the-resolved-directory
-    pattern (reused verbatim) — never `write_text()`, which would truncate a
-    hard-linked inode also linked under a guarded root — through the VALIDATED
-    resolved path, re-checked ONE MORE TIME immediately before the `mkstemp` call
-    below (mirrors collector.main's own recheck-then-write shape exactly, closing the
-    validate-then-mkstemp parent-dir-swap window the same way), so a directory-
-    component symlink hop is settled at the check closest to the write, not re-followed
-    at write time.
+    The physical write then delegates to the SHARED `collector.write_text_contained`
+    helper — the same one collector.main's `--out` path uses (S7 consolidation).
+    Neither sink keeps its own copy of the temp-file/fsync/os.replace mechanics; a
+    directory-component symlink swapped in after the validation above is caught by the
+    helper's fd-pinned containment walk, not by a second pathname re-check here. See
+    `write_text_contained`'s docstring for the write-side threat model (six classes
+    considered, four closed, two accepted) and RISK_REGISTER R11 for the settled
+    rationale.
 
     A rejection at EITHER check raises `RenderError` (a catchable `Exception`, not
     `SystemExit`) — serve.py's watcher-loop degrade handlers (`except Exception`,
@@ -2066,44 +2065,65 @@ def write_html_safely(
         if not ok:
             raise RenderError(f"fatal: refusing to write inside a guarded root: {out_path}")
         out_path = resolved
-    tmp_name = None
+    # The physical write is the SHARED collector.write_text_contained helper — the SAME
+    # one collector.main's --out path uses. Neither sink keeps its own copy of the
+    # temp-file/fsync/os.replace mechanics: a divergence between the two write paths is
+    # the defect class this consolidation exists to prevent.
+    #
+    # TOCTOU (P30 successor): the pre-write re-check this function used to carry is
+    # superseded on the helper's dir_fd path. The helper opens the target's parent
+    # directory once with O_NOFOLLOW, pins its inode with the returned fd, decides
+    # containment against that PINNED inode by walking `..` through the kernel (never a
+    # second pathname predicate), and creates the temp file relative to the fd — so a
+    # directory-COMPONENT symlink swapped in after the validate_write_target check above
+    # cannot redirect the write. The honest scope is six classes considered, four closed,
+    # two accepted: a concurrent rename of the pinned directory and a bind-mount alias
+    # remain reachable, both only to a principal who could already edit this module. See
+    # write_text_contained's docstring table and RISK_REGISTER R11. On a platform without
+    # dir_fd support the helper takes its documented fallback branch, whose exposure is
+    # wider; that limitation is stated there, and only there.
+    #
+    # Hard-link safety is unchanged: the helper still creates a fresh inode in the
+    # target's directory and os.replace()s it onto the name, never write_text(), which
+    # would truncate a hard-linked inode also linked under a guarded root.
+    #
+    # errors="backslashreplace" (Codex P1) is passed through as `encoding_errors`: a lone
+    # UTF-16 surrogate anywhere in `text` must never raise UnicodeEncodeError and abort
+    # the write with no report produced — it deterministically becomes a literal escape
+    # instead, so the output file is always complete, always valid UTF-8. That is an
+    # ENCODING error mode only; it changes nothing about path security.
+    # DEFENCE IN DEPTH, and a FROZEN CONTRACT: this second validate_write_target call is
+    # RETAINED. It is not the closure mechanism -- the helper's fd-pinned check below is --
+    # but it is a caller-side re-check that (a) carries the `input_paths` dimension at the
+    # latest possible moment and (b) is pinned by the pre-existing regression test in
+    # tests/test_render_html.py for the parent-dir-swap-before-the-write TOCTOU window,
+    # which asserts `calls["n"] == 2`. Binding rule 7 is
+    # additions-only: that assertion may NOT be edited, so the two-call shape is a contract,
+    # not an implementation detail. collector.main keeps its own equivalent pre-check for
+    # the same reason -- both sinks stay symmetric.
+    #
+    # BOUND UNCONDITIONALLY, and the `if roots:` guard is PRESERVED. Both matter:
+    # `collector_mod` is bound at the top of this function only INSIDE its own `if roots:`
+    # block, so the write below would raise NameError on a falsy-`roots` call; and the
+    # pre-change code performed this second validate only when `roots` was truthy, so
+    # dropping the guard would newly call validate_write_target with an empty root list.
+    collector_mod = _get_sibling_collector()
+    if roots:
+        ok, out_path = collector_mod.validate_write_target(out_path, roots, input_paths)
+        if not ok:
+            raise RenderError("fatal: refusing to write inside a guarded root")
     try:
-        if roots:
-            # P30/TOCTOU narrowing (parity with collector.main's own pre-mkstemp re-check,
-            # collector.py's `--out` write path): re-resolve the ALREADY-validated target
-            # FRESH from disk and re-check it against every guard root IMMEDIATELY before
-            # mkstemp — a parent-directory symlink swapped in during the window between the
-            # check above and this line would otherwise slip through on the now-stale
-            # `out_path`. Reuses the same `validate_write_target` guard (not a hand-rolled
-            # duplicate), so this stays in lockstep with the check above; on rejection it
-            # raises the SAME catchable RenderError. The residual window between THIS
-            # re-check and the mkstemp call itself is the same accepted, documented
-            # low-risk limitation collector.main carries (single-user local tool; not fully
-            # closed).
-            ok, out_path = _get_sibling_collector().validate_write_target(out_path, roots, input_paths)
-            if not ok:
-                raise RenderError(f"fatal: refusing to write inside a guarded root: {out_path}")
-        fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), suffix=".tmp")
-        # errors="backslashreplace" (Codex P1): a lone UTF-16 surrogate anywhere in `text`
-        # (a non-UTF-8 filename the collector preserved via surrogateescape, reaching
-        # esc_json_script's ensure_ascii=False copy islands, or esc_html's own
-        # pre-html.escape substitution) must never raise UnicodeEncodeError here and
-        # abort the write with no report produced — it deterministically becomes a
-        # literal `\udNNN` escape instead, so the output file is always complete,
-        # always valid UTF-8. This changes ONLY the encoding error mode, never the
-        # write-safety/path-security logic above.
-        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, out_path)
-        tmp_name = None
-    finally:
-        if tmp_name is not None:
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
+        collector_mod.write_text_contained(
+            out_path, text, roots, input_paths=input_paths,
+            encoding_errors="backslashreplace")
+    except collector_mod.WriteContainmentError as exc:
+        raise RenderError(f"fatal: refusing to write inside a guarded root: {exc}") from exc
+    except OSError as exc:
+        # The helper's fd path raises a BARE OSError for a refused open -- ELOOP from
+        # O_NOFOLLOW on a symlinked parent, ENOENT/EACCES on an unreadable one. Those must
+        # surface to this function's callers as RenderError, the type write_html_safely has
+        # always raised for a write it refused, NOT as a raw OSError escaping uncaught.
+        raise RenderError(f"fatal: could not write {out_path}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------------- CSS/JS

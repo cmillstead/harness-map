@@ -2322,6 +2322,70 @@ def test_write_html_safely_recheck_immediately_before_mkstemp_closes_toctou_wind
         "a parent-dir symlink swapped in between validate and mkstemp must never be written through"
 
 
+def test_write_html_safely_preserves_hardlinked_inode(tmp_path):
+    guard = tmp_path / "guarded"
+    guard.mkdir()
+    protected = guard / "protected.md"
+    protected.write_text("ORIGINAL", encoding="utf-8")
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.html"
+    os.link(protected, target)
+
+    rh.write_html_safely(target, "<html></html>", [guard])
+
+    assert protected.read_text(encoding="utf-8") == "ORIGINAL"
+    assert target.read_text(encoding="utf-8") == "<html></html>"
+
+
+def test_write_html_safely_routes_through_the_shared_helper():
+    """Structural: the renderer must not carry its own write mechanics. Pairs with
+    Task 7's parity guard — this one names the specific call."""
+    import inspect
+    source = inspect.getsource(rh.write_html_safely)
+    assert "write_text_contained" in source
+    assert "mkstemp" not in source
+
+
+def test_write_html_safely_still_backslashreplaces_lone_surrogates(tmp_path):
+    """The encoding error mode is NOT security logic and must survive the refactor: a
+    lone UTF-16 surrogate must still produce a COMPLETE file, never abort the write."""
+    guard = tmp_path / "guarded"
+    guard.mkdir()
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.html"
+
+    rh.write_html_safely(target, "before \ud800 after", [guard])
+
+    written = target.read_text(encoding="utf-8")
+    assert "before" in written and "after" in written
+    assert "\\ud800" in written
+
+
+def test_write_html_safely_still_raises_render_error_inside_guard_root(tmp_path):
+    guard = tmp_path / "guarded"
+    (guard / "nested").mkdir(parents=True)
+    with pytest.raises(rh.RenderError):
+        rh.write_html_safely(guard / "nested" / "r.html", "<html></html>", [guard])
+    assert not (guard / "nested" / "r.html").exists()
+
+
+def test_write_html_safely_falls_back_when_dir_fd_unsupported(
+        tmp_path, monkeypatch):  # mock-ok: interposes on real fs capability detection, not a faked dependency
+    monkeypatch.setattr(os, "supports_dir_fd", frozenset())
+    guard = tmp_path / "guarded"
+    guard.mkdir()
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.html"
+
+    rh.write_html_safely(target, "<html></html>", [guard])
+
+    assert target.read_text(encoding="utf-8") == "<html></html>"
+    assert list(out_dir.glob("*.tmp")) == []
+
+
 def test_render_out_path_symlinked_into_project_root_rejected_at_write_time(tmp_path):
     """P1-B sink 3 (render_html.main): the html OUTPUT PATH itself resolving into the
     composed project root via a pre-existing symlink must be rejected -- write_html_safely
