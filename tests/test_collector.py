@@ -5536,12 +5536,11 @@ def test_detect_skill_test_coverage_unsearchable_root_records_error(unsearchable
     assert result == []
     assert any("skills" in e for e in errors)
 
-# test_build_document_unsearchable_root_is_degraded_not_crashed intentionally NOT added
-# here: confirmed directly (not just asserted) that build_document's chain still crashes
-# on this fixture -- parse_settings's settings_path.is_file() (collector.py:1432) reraises
-# EACCES the same way the is_dir() sites above did, is called BEFORE either of this task's
-# two guarded sites, and is not caught anywhere inside build_document (only main()'s
-# top-level except converts a crash to an envelope) -- so build_document(unsearchable_root,
-# ...) raises PermissionError rather than returning a doc with a _CRASH_ERROR_PREFIX entry.
-# parse_settings is out of this task's scope (S7 Task 3b: "_read_text, parse_settings (P1
-# pair)"); this test lands once that guard is in place.
+# Both build_document-level tests (this compose variant, and the non-compose variant Task
+# 2 deferred above) are intentionally NOT added here: build_document's chain still RAISES
+# on this fixture via parse_settings's settings_path.is_file() (collector.py:1432), which
+# reraises EACCES the same way the is_dir() sites above did, runs before any of this
+# task's guarded sites, and is not caught inside build_document itself (only main()'s
+# top-level except converts a crash to an envelope). The remaining unguarded SITE belongs
+# to Task 3b ("_read_text, parse_settings (P1 pair)"); these build_document-level TESTS
+# belong to Task 3c, the last task in the chain and the first point at which they can pass.
