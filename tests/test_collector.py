@@ -5419,7 +5419,7 @@ def test_empty_document_carries_metric_definitions(fake_harness):
 # collect_on_demand were unguarded against an ancestor directory that stats fine but
 # cannot be listed (search bit cleared). Path.is_dir() re-raises EACCES from that case
 # (it swallows only the ENOENT family) -- an escape there aborts the whole scan and, via
-# build_document, replaces the ENTIRE report with a crash envelope. Every one of the six
+# build_document, replaces the ENTIRE report with a crash envelope. Every one of the five
 # tests below builds a REAL unreadable directory (no mocks) and asserts the OSError is
 # recorded into inaccessible[]/errors[] instead of propagating.
 
@@ -5517,7 +5517,31 @@ def test_walk_always_loaded_unsearchable_root_records_error(unsearchable_root):
     assert variants == []
     assert any("projects" in e for e in errors)
 
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_walk_operator_tier_nodes_unsearchable_root_records_inaccessible(unsearchable_root):
+    inaccessible = []
+    nodes = _collector._walk_operator_tier_nodes(unsearchable_root, inaccessible)
+    assert nodes == []
+    recorded = {e["path"] for e in inaccessible}
+    assert "skills" in recorded
+    assert "agents" in recorded
+    assert "commands" in recorded
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_detect_skill_test_coverage_unsearchable_root_records_error(unsearchable_root):
+    errors = []
+    result = _collector._detect_skill_test_coverage(unsearchable_root, errors)
+    assert result == []
+    assert any("skills" in e for e in errors)
+
 # test_build_document_unsearchable_root_is_degraded_not_crashed intentionally NOT added
-# here: build_document's chain still crashes on this fixture via unguarded sites outside
-# this task's scope (parse_settings, _detect_skill_test_coverage) -- owned by S7 Task 3c,
-# the last task in the F6 chain (order: 2 -> 3 -> 3b -> 3c).
+# here: confirmed directly (not just asserted) that build_document's chain still crashes
+# on this fixture -- parse_settings's settings_path.is_file() (collector.py:1432) reraises
+# EACCES the same way the is_dir() sites above did, is called BEFORE either of this task's
+# two guarded sites, and is not caught anywhere inside build_document (only main()'s
+# top-level except converts a crash to an envelope) -- so build_document(unsearchable_root,
+# ...) raises PermissionError rather than returning a doc with a _CRASH_ERROR_PREFIX entry.
+# parse_settings is out of this task's scope (S7 Task 3b: "_read_text, parse_settings (P1
+# pair)"); this test lands once that guard is in place.

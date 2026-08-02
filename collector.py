@@ -778,16 +778,30 @@ def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
 # skill/agent/command discovery here is a NEW read/traverse surface (T4) — every path is
 # routed through T3's `_project_tier_gate` (H2 containment), same as `_walk_project_tier`.
 
-def _walk_operator_tier_nodes(root):
+def _walk_operator_tier_nodes(root, inaccessible=None):
     """Operator-tier skill/agent/command nodes (T4). A lean single-level existence walk
     (no body read — the node model needs only the collision key + path for the shadow
     resolver; word/line metrics stay owned by collect_descriptions/collect_on_demand).
     Commands get their FIRST node collection here — no prior section inventoried
     commands/*.md as nodes at all. Operator tier keeps its existing trusted
-    symlink-following (unchanged, matches every other operator-tier walk)."""
+    symlink-following (unchanged, matches every other operator-tier walk).
+
+    `inaccessible` (S7): the shared build_document inaccessible[] list. Path.is_dir()
+    re-raises EACCES from an unreadable ancestor, so a locked skills/ or agents/ dir used
+    to abort this walk and — via build_document, which has no per-section handler — replace
+    the whole document with a crash envelope. Each surface dir that cannot be probed is now
+    recorded here and skipped, so an unreadable surface is DISCLOSED rather than silently
+    absent from a report that would otherwise read as clean."""
     nodes: list[dict[str, Any]] = []
+    if inaccessible is None:
+        inaccessible = []
     skills_dir = root / "skills"
-    if skills_dir.is_dir():
+    try:
+        skills_dir_is_dir = skills_dir.is_dir()
+    except OSError:
+        _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+        skills_dir_is_dir = False
+    if skills_dir_is_dir:
         try:
             skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
         except OSError:
@@ -800,7 +814,12 @@ def _walk_operator_tier_nodes(root):
                               "tier": "operator", "path": _rel(root, skill_md)})
     for surface, dirname in (("agent", "agents"), ("command", "commands")):
         d = root / dirname
-        if not d.is_dir():
+        try:
+            d_is_dir = d.is_dir()
+        except OSError:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, d))
+            continue
+        if not d_is_dir:
             continue
         try:
             files = sorted(d.glob("*.md"))
@@ -3932,9 +3951,16 @@ def _skill_has_test_asset(skill_dir):
     return False
 
 
-def _detect_skill_test_coverage(root):
+def _detect_skill_test_coverage(root, errors):
     skills_dir = root / "skills"
-    if not skills_dir.is_dir():
+    try:
+        skills_dir_is_dir = skills_dir.is_dir()
+    except OSError as e:
+        # is_dir() re-raises EACCES from an unreadable ancestor; an escape here aborts
+        # detect_test_coverage and, via build_document, the entire report.
+        errors.append(f"skills is_dir failed for {skills_dir}: {e}")
+        return []
+    if not skills_dir_is_dir:
         return []
     try:
         skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
@@ -3953,7 +3979,7 @@ def detect_test_coverage(
     skill name, so both sections agree instead of on_demand carrying its own narrower
     (tests/-dir-only) check."""
     hooks_result = _detect_hook_test_coverage(root, errors)
-    skills_result = _detect_skill_test_coverage(root)
+    skills_result = _detect_skill_test_coverage(root, errors)
 
     skills_has_test = {s["name"]: s["has_test"] for s in skills_result}
     for entry in on_demand.get("skills", []):
@@ -4561,7 +4587,7 @@ def build_document(
         # same compose-only pattern as inspected_roots/out_of_root_refs above. 'claude_md'
         # and 'hook' (P2-A) reuse `files[]`/`composed_hooks` (both already
         # built/tier-tagged above) rather than re-walking or re-reading disk.
-        raw_nodes = _walk_operator_tier_nodes(root)
+        raw_nodes = _walk_operator_tier_nodes(root, inaccessible)
         if project_root is not None:
             raw_nodes += _walk_project_tier_nodes(project_root, out_of_root_refs)
         raw_nodes += _rule_nodes_from_files(files)
