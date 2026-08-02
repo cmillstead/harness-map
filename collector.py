@@ -531,13 +531,22 @@ def _reject_if_target_is_an_input_path(out_path, input_paths):
     looser one: literal (lexical/resolved equality), then resolved-realpath equality, then
     an os.path.samestat inode compare where both sides exist — that last rung is what
     catches an alias a string compare cannot see (an input that is itself a symlink onto
-    the target). A path that cannot be stat'd is skipped, same posture as elsewhere."""
+    the target). A path that cannot be stat'd is skipped, same posture as elsewhere.
+
+    RuntimeError IS CAUGHT ALONGSIDE OSError, and it is not defensive padding: on CPython
+    `Path.resolve()` converts an ELOOP into `RuntimeError("Symlink loop from ...")`, which
+    is NOT an OSError. REPRODUCED on 3.11.14 by the Codex challenge (finding F7) -- a
+    declared input that is a symlink loop escaped every caller's `except OSError` as an
+    unhandled RuntimeError. Pinned by
+    `test_write_text_contained_reports_a_symlink_loop_as_an_oserror`. Falling back to the
+    unresolved path is the same posture the OSError arm already takes: an unresolvable
+    path is compared literally rather than silently dropped."""
     if not input_paths:
         return
     lexical = Path(os.path.normpath(str(out_path)))
     try:
         resolved = out_path.resolve()
-    except OSError:
+    except (OSError, RuntimeError):
         resolved = out_path
     for candidate_input in input_paths:
         input_path = Path(candidate_input)
@@ -546,7 +555,7 @@ def _reject_if_target_is_an_input_path(out_path, input_paths):
                 f"refusing to write: {out_path} is one of this tool's own read inputs")
         try:
             input_resolved = input_path.resolve()
-        except OSError:
+        except (OSError, RuntimeError):
             input_resolved = input_path
         if input_resolved == resolved:
             raise WriteContainmentError(
@@ -601,9 +610,17 @@ def _reject_if_pinned_target_is_an_input_path(dir_fd, out_name, input_paths):
 
     KNOWN SEAM, stated rather than papered over: a target NAME that is itself a declared
     input symlink is caught by the pre-open rung's literal/resolved comparison, not by the
-    samestat here (lstat sees the link's own inode). Both rungs run, so the case is
-    covered; do not "fix" this by adding a third stat mode — the accumulating-checks
-    failure mode is the same one that got the st_dev tripwire declined."""
+    samestat here (lstat sees the link's own inode, while the INPUT side is resolved).
+    Both rungs run, so the case is covered ON A STABLE FILESYSTEM. It is NOT covered when
+    a redirect lands between the two rungs: the pre-open rung then cleared a different
+    pathname, and this rung's lstat/stat asymmetry misses the match, so `os.replace` can
+    retarget a declared input symlink. Raised by the Codex challenge (finding F1) and
+    stated here rather than closed, for two reasons: reaching it requires write access to
+    the output parent chain, which is the same privilege that makes accepted residual
+    class 5 unclosable (see the six-class table in `write_text_contained`), and the fix
+    would be a third stat mode — the accumulating-checks failure mode that got the st_dev
+    tripwire declined. Do NOT add that third stat mode. Do not upgrade this paragraph into
+    a claim that the seam is closed."""
     if not input_paths:
         return
     try:
@@ -711,6 +728,14 @@ def write_text_contained(out_path, text, guard_roots, *, input_paths=(),
     if not out_name:
         raise WriteContainmentError(f"refusing to write: no file name in target {out_path}")
     guard_roots = [r for r in guard_roots if r]
+    # MATERIALISE ONCE (Codex challenge, finding F2). `input_paths` is checked by TWO
+    # rungs -- pre-open and post-pin -- so a one-shot iterable (a generator expression at
+    # a call site) would be drained by the first and leave the AUTHORITATIVE second rung
+    # iterating zero inputs. That fails OPEN and does so silently: a generator is truthy,
+    # so the `if not input_paths` early-return does not catch it either. Today's callers
+    # pass `iter_input_paths()`, which returns a list, so nothing currently trips this --
+    # which is exactly why it needs pinning here rather than at a call site.
+    input_paths = tuple(input_paths)
 
     _reject_if_target_is_an_input_path(out_path, input_paths)
 
@@ -814,8 +839,19 @@ def _write_text_contained_fallback(out_path, parent, text, guard_roots, input_pa
     goes through that pathname, so classes 1 and 2 (symlinked parent, swapped grandparent)
     are narrowed but not fully closed here — the residual window sits between the re-check below
     and the mkstemp call, and a parent-directory symlink swapped into it can still redirect
-    the write. Classes 3 and 4 still hold on this branch: mkstemp creates a fresh inode and
-    os.replace only retargets the name, and `_reject_if_target_is_an_input_path` still runs.
+    the write. Class 3 still holds on this branch unconditionally: mkstemp creates a fresh
+    inode and os.replace only retargets the name. Class 4 holds only as far as
+    `_reject_if_target_is_an_input_path` reaches, which is a pathname comparison with no
+    pinned re-check behind it.
+
+    TWO FAIL-OPEN POINTS specific to this branch, named rather than left implicit (Codex
+    challenge, finding F4). `_reject_if_parent_inside_guard_roots` SKIPS a guard root that
+    exists but cannot be stat'd, and `_reject_if_target_is_an_input_path` treats an
+    unstattable input as "not the same file". The dir_fd branch denies on that same
+    ambiguity. The divergence is deliberate — it matches `validate_write_target`'s
+    long-standing posture, and this branch has no authoritative pinned rung to fall back on
+    — but it is a weaker posture, not an equivalent one, and it should be revisited if this
+    branch ever becomes reachable on a supported platform.
 
     This branch is reached only where the platform cannot do dir_fd writes at all, so the
     alternative is not writing. Do not describe it as equivalent to the dir_fd path, and do
@@ -830,7 +866,15 @@ def _write_text_contained_fallback(out_path, parent, text, guard_roots, input_pa
         raise WriteContainmentError(
             f"refusing to write: could not stat the resolved parent {resolved_parent}") from exc
     _reject_if_parent_inside_guard_roots(resolved_parent, parent_stat, guard_roots)
-    _reject_if_target_is_an_input_path(out_path, input_paths)
+    # CHECK THE PATH THIS BRANCH ACTUALLY WRITES THROUGH, not the caller's spelling
+    # (Codex challenge, finding F3). The write below lands at
+    # `resolved_parent / out_path.name`; clearing `out_path` instead compared a DIFFERENT
+    # pathname snapshot, so on a concurrent redirect the branch could clear one file and
+    # replace another. The two derivations are identical on a stable filesystem, which is
+    # why no static test distinguishes them -- that is a reason to make them the same
+    # expression, not a reason to leave them different.
+    written_path = resolved_parent / out_path.name
+    _reject_if_target_is_an_input_path(written_path, input_paths)
     tmp_name = None
     try:
         file_fd, tmp_name = tempfile.mkstemp(dir=str(resolved_parent), suffix=".tmp")
@@ -845,7 +889,7 @@ def _write_text_contained_fallback(out_path, parent, text, guard_roots, input_pa
                 os.fsync(handle.fileno())
         finally:
             os.close(file_fd)
-        os.replace(tmp_name, resolved_parent / out_path.name)
+        os.replace(tmp_name, written_path)
         tmp_name = None
     finally:
         if tmp_name is not None:

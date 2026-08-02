@@ -6149,3 +6149,39 @@ def test_reject_if_pinned_target_is_an_input_path_binds_identity_to_the_descript
         _collector._reject_if_pinned_target_is_an_input_path(dir_fd, "r.json", [])
     finally:
         os.close(dir_fd)
+
+
+def test_write_text_contained_reports_a_symlink_loop_as_an_oserror(tmp_path):
+    """Codex challenge finding F7, REPRODUCED before fixing: `Path.resolve()` raises
+    RuntimeError -- NOT OSError -- on a symlink loop (measured on CPython 3.11:
+    "Symlink loop from ..."). Both `.resolve()` sites in
+    `_reject_if_target_is_an_input_path` sat inside `except OSError`, so a looping path
+    escaped as an unhandled RuntimeError past every caller's `except OSError`.
+
+    Both directions are pinned because both were reproduced: a looping INPUT path and a
+    looping TARGET path. The contract this asserts is only that the failure arrives as an
+    OSError (WriteContainmentError is one) -- it deliberately does NOT assert that a loop
+    is *permitted* or *refused*, because that is not the point: the point is that the
+    documented exception policy holds instead of a foreign exception type escaping."""
+    guard = _guard_root(tmp_path)
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    assert loop_a.is_symlink(), "fixture must really be a loop, not a broken link"
+
+    # (a) looping INPUT path: resolution of the declared input is what loops.
+    try:
+        _collector.write_text_contained(
+            out_dir / "r.json", "x", [guard], input_paths=[loop_a])
+    except OSError:
+        pass
+    except RuntimeError as exc:      # pragma: no cover - this is the defect being fixed
+        pytest.fail(f"symlink-loop input escaped as RuntimeError, not OSError: {exc}")
+
+    # (b) looping TARGET path: resolution of out_path itself is what loops.
+    with pytest.raises(OSError):
+        _collector.write_text_contained(
+            loop_a / "r.json", "x", [guard], input_paths=[tmp_path / "unrelated.json"])
