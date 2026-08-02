@@ -4,3 +4,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+
+# Working docs (implementation plans, handoffs). These carry local absolute
+# paths and internal process detail, and this repo is public — the coding-team
+# lifecycle hooks read plan frontmatter from here, so the directory must exist
+# locally while never being published.
+docs/
