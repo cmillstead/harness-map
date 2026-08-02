@@ -34,6 +34,34 @@ _ENV_FLAG_NAME_RE = re.compile(r"^([A-Z][A-Z0-9_]{4,})(?:=.*)?$")
 _ENV_FLAG_SHAPE_RE = re.compile(r"_ALLOW_|_SKIP_|GUARD|WRITE_")
 # ^/name  or  ^/ns:name  or  ^/ns:sub:...:name  (/base:orientation:tasks:deep-why is live)
 _SLASH_COMMAND_RE = re.compile(r"^/[a-z0-9][a-z0-9-]*(?::[a-z0-9][a-z0-9-]*)*$")
+
+# S6b §8.1 — DEFINITION VERSIONS, not values. A metric's integer changes when the code
+# that COMPUTES it changes meaning, so a consumer comparing two sidecars can tell "the
+# world changed" from "we changed how we measure". Bump a metric's integer IN THE SAME
+# CHANGE as the detector edit, exactly as schema.md is updated in the same change as a
+# field addition. Derived metrics inherit the collector version of their underlying data;
+# a separate "renderer derivation version" was considered and DROPPED (it is identical
+# across every sidecar in a window, so it has zero detection power -- do not reintroduce
+# it). Changing any value here requires a spec change (S6 §8.1).
+METRIC_DEFINITIONS: dict[str, int] = {
+    "always_loaded_tokens_est": 1,
+    "always_loaded_words": 1,
+    "always_loaded_file_count": 1,
+    "duplicate_pair_count": 1,
+    "instruction_files_over_200": 1,
+    "orphan_registration_count": 1,
+    "orphan_script_count": 1,
+    "unchecked_binary_count": 1,
+    "promotion_candidate_count": 1,
+    "memory_body_count": 1,
+    "hooks_with_test_ratio": 1,
+    "skills_with_test_ratio": 1,
+    # v1 pre-S1.M0 · v2 S1.M0+S2.M4 · v3 S2-gate D2. S6b Task 2 bumps both to 4 in the
+    # same commit as the D4 detector edit.
+    "phantom_ref_count": 3,
+    "phantom_confirmed_count": 3,   # same detector; two views, one version (§6.5 C18)
+}
+
 _NEVER_RE = re.compile(r"\bNEVER\b")
 _ALWAYS_RE = re.compile(r"\bALWAYS\b")
 _MUST_RE = re.compile(r"\bmust\b")
@@ -4169,6 +4197,10 @@ def build_document(
         # null -- never for a key with a timestamp, never for a key absent from
         # last_commit_ts.
         "staleness_null_reasons": git_age_null_reasons,
+        # S6b §8.1 (ADDITIVE, no schema_version bump per binding rule 10). A copy, not the
+        # module constant, so a consumer mutating the emitted doc cannot corrupt the next
+        # run in the same process.
+        "metric_definitions": dict(METRIC_DEFINITIONS),
         "inaccessible": inaccessible,
         "blind_spots": blind_spots,
         "errors": errors,
@@ -4328,6 +4360,10 @@ def _empty_document(root: Path) -> dict[str, Any]:
             "hooks_total": 0, "skills_with_test": 0, "skills_total": 0}},
         "staleness": {"git_age_available": False, "last_commit_ts": {}},
         "staleness_null_reasons": {},
+        # Envelope rule: present-and-empty on the crash path. A crashed run measured
+        # nothing, so it defines nothing -- inheriting METRIC_DEFINITIONS here would let a
+        # crash envelope claim a definition it never computed.
+        "metric_definitions": {},
         "inaccessible": [], "blind_spots": [], "errors": [],
     }
 
