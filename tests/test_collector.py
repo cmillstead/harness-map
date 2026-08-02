@@ -2517,6 +2517,48 @@ def test_validate_write_target_rejects_out_matching_symlinked_input_target(tmp_p
     assert ok is False and resolved is None
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_validate_write_target_reports_a_symlink_loop_as_an_oserror(tmp_path):
+    """F7 (Codex challenge), reproduced before fixing: Path.resolve() raises RuntimeError
+    -- NOT OSError -- on a symlink loop (measured on CPython 3.11: "Symlink loop from
+    ..."). validate_write_target's two `.resolve()` sites (the candidate itself, and each
+    declared input path) sat inside `except OSError:` only, so a looping path escaped this
+    SINGLE shared caller-entry guard as an unhandled RuntimeError past every caller, which
+    only ever catches OSError. Same defect, same fix, as the write-time sibling
+    `_reject_if_target_is_an_input_path`
+    (test_write_text_contained_reports_a_symlink_loop_as_an_oserror) -- this is the
+    caller-entry twin of that helper's ladder.
+
+    Both directions are pinned because both `.resolve()` sites in this function can loop:
+    the candidate target itself, and a declared input path. The contract asserted is only
+    that no RuntimeError escapes -- not that a loop is permitted or refused, which is not
+    the point here."""
+    root = tmp_path / "root"
+    root.mkdir()
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    assert loop_a.is_symlink(), "fixture must really be a loop, not a broken link"
+
+    # (a) looping TARGET path: resolution of the candidate itself is what loops.
+    try:
+        ok, _ = _collector.validate_write_target(str(loop_a), [root])
+    except RuntimeError as exc:      # pragma: no cover - this is the defect being fixed
+        pytest.fail(f"symlink-loop target escaped as RuntimeError, not handled: {exc}")
+    else:
+        assert isinstance(ok, bool)
+
+    # (b) looping INPUT path: resolution of a declared input is what loops.
+    target = tmp_path / "outside.json"
+    try:
+        ok, resolved = _collector.validate_write_target(str(target), [root], [loop_a])
+    except RuntimeError as exc:      # pragma: no cover - this is the defect being fixed
+        pytest.fail(f"symlink-loop input escaped as RuntimeError, not handled: {exc}")
+    else:
+        assert ok is True and resolved == target.resolve()
+
+
 def test_compose_document_deterministic_across_hashseed(fake_harness, tmp_path):
     proj = tmp_path / "compose-proj"
     (proj / ".claude" / "rules").mkdir(parents=True, exist_ok=True)
@@ -6185,3 +6227,90 @@ def test_write_text_contained_reports_a_symlink_loop_as_an_oserror(tmp_path):
     with pytest.raises(OSError):
         _collector.write_text_contained(
             loop_a / "r.json", "x", [guard], input_paths=[tmp_path / "unrelated.json"])
+
+
+def test_collector_main_out_write_preserves_hardlinked_inode(tmp_path):
+    """End-to-end F5 through the real CLI path, not just the helper unit."""
+    root = tmp_path / "harness"
+    (root / "skills").mkdir(parents=True)
+    protected = root / "protected.md"
+    protected.write_text("ORIGINAL", encoding="utf-8")
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    out_path = out_dir / "r.json"
+    os.link(protected, out_path)
+
+    rc = _collector.main(["--root", str(root), "--project-root", str(tmp_path),
+                         "--out", str(out_path)])
+    assert rc == 0
+    assert protected.read_text(encoding="utf-8") == "ORIGINAL"
+    assert json.loads(out_path.read_text(encoding="utf-8"))["root"]
+
+
+def test_collector_main_out_write_through_symlinked_out_dir_still_works(tmp_path):
+    """REGRESSION GUARD for O_NOFOLLOW: validate_write_target resolve()s the target
+    before the helper ever sees it, so a legitimately symlinked --out dir must still
+    write. O_NOFOLLOW must only reject a parent that became a symlink AFTER resolution."""
+    root = tmp_path / "harness"
+    (root / "skills").mkdir(parents=True)
+    real_out = tmp_path / "real-reports"
+    real_out.mkdir()
+    link_out = tmp_path / "link-reports"
+    os.symlink(real_out, link_out)
+
+    rc = _collector.main(["--root", str(root), "--project-root", str(tmp_path),
+                         "--out", str(link_out / "r.json")])
+    assert rc == 0
+    assert (real_out / "r.json").exists()
+
+
+def test_collector_main_still_prints_json_and_leaves_no_temp_residue(tmp_path, capsys):
+    """The stdout contract is primary: the document is always emitted, write-or-not."""
+    root = tmp_path / "harness"
+    (root / "skills").mkdir(parents=True)
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+
+    rc = _collector.main(["--root", str(root), "--project-root", str(tmp_path),
+                         "--out", str(out_dir / "r.json")])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["schema_version"] == _collector.SCHEMA_VERSION
+    assert list(out_dir.glob("*.tmp")) == []
+
+
+def test_no_module_claims_the_write_toctou_window_is_open_on_the_fd_path():
+    """F3: a comment asserting a window is open where it is narrowed is itself a defect.
+    The 'not fully closed' claim may survive ONLY inside the documented fallback helper,
+    where it is still true — never in collector.main or write_html_safely."""
+    collector_src = Path(_collector.__file__).read_text(encoding="utf-8")
+    render_src = (Path(_collector.__file__).parent / "render_html.py").read_text(encoding="utf-8")
+    assert "not fully closed" not in render_src
+    assert collector_src.count("not fully closed") == 1, (
+        "the accepted-limitation claim must appear exactly once, in "
+        "_write_text_contained_fallback, where it is still true")
+    fallback_start = collector_src.index("def _write_text_contained_fallback")
+    assert collector_src.index("not fully closed") > fallback_start
+
+
+def test_no_module_overclaims_the_write_toctou_as_fixed():
+    """BINDING CONDITION 2, enforced rather than merely asserted in a document.
+
+    The write-side threat model is six classes considered, four closed, two ACCEPTED. A
+    comment or docstring that says the TOCTOU is 'fixed', or that the window is closed
+    without qualification, is false and will send the next reader looking for a guarantee
+    that does not exist -- which is exactly how classes 5 and 6 got re-litigated once
+    already. Settled record: RISK_REGISTER R11 / AMENDMENTS A36.
+
+    Note for anyone extending this test: the ban is on the CLAIM, so the assertion can be
+    literal here. Do not port this check to a document that also DEFINES the prohibition --
+    there the banned phrase legitimately appears and a naive grep matches its own rule."""
+    parent_dir = Path(_collector.__file__).parent
+    for module_name in ("collector.py", "render_html.py", "serve.py"):
+        src = (parent_dir / module_name).read_text(encoding="utf-8").lower()
+        for banned in ("toctou fixed", "toctou is fixed", "window is closed",
+                       "window is now closed", "toctou is closed"):
+            assert banned not in src, (
+                f"{module_name} claims '{banned}'. Four classes are closed and TWO ARE "
+                f"ACCEPTED -- say 'four closed, two accepted with rationale' instead. "
+                f"See RISK_REGISTER R11.")

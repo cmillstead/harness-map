@@ -334,7 +334,13 @@ def validate_write_target(raw_path, roots, input_paths=()):
     lexical = Path(os.path.normpath(str(expanded)))
     try:
         resolved = expanded.resolve()
-    except OSError:
+    except (OSError, RuntimeError):
+        # RuntimeError, not just OSError: on CPython Path.resolve() converts an ELOOP
+        # into RuntimeError("Symlink loop from ...") rather than an OSError subclass, so
+        # a --out path (or, below, a declared input path) that is a symlink loop would
+        # otherwise escape this handler and abort the caller. Same defect and same fix as
+        # the sibling write-time check in _reject_if_target_is_an_input_path (Codex
+        # challenge finding F7); this is the caller-entry twin of that helper's ladder.
         resolved = expanded
     for root in roots:
         root = Path(root)
@@ -351,7 +357,7 @@ def validate_write_target(raw_path, roots, input_paths=()):
             return False, None
         try:
             p_resolved = p_path.resolve()
-        except OSError:
+        except (OSError, RuntimeError):  # see the identical rationale above
             p_resolved = p_path
         if p_resolved == resolved:
             return False, None
@@ -5284,6 +5290,9 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     out_path = None
+    input_paths: list[Path] = []       # bound unconditionally: the write block below passes
+                                        # it to write_text_contained, and must never depend
+                                        # on which --out branch happened to run
     out_roots = [root]                 # guarded roots for BOTH the upfront check and the
                                         # write-time TOCTOU recheck below (P1-6a)
     if args.out is not None:
@@ -5295,7 +5304,6 @@ def main(argv: list[str] | None = None) -> int:
             # build_document/print so the always-valid-JSON-envelope invariant holds.
             print(f"warning: --root not accessible, skipping --out write: {e}", file=sys.stderr)
         else:
-            input_paths = []
             if args.compose:
                 try:
                     project_containment_root = Path(args.project_root).expanduser().resolve()
@@ -5324,17 +5332,29 @@ def main(argv: list[str] | None = None) -> int:
     except (UnicodeEncodeError, TypeError):
         text = json.dumps(doc, indent=args.indent, ensure_ascii=True)
     if out_path is not None:
-        # Re-validate IMMEDIATELY before writing (narrows the TOCTOU window between the
-        # earlier check and this write — the residual window between THIS check and the
-        # mkstemp call below is an accepted, documented low-risk limitation for a
-        # single-user local tool; not fully closed). Write hard-link-safely: an
-        # outside-root HARD LINK whose inode is also linked under --root passes
-        # resolve()-based path checks (hard links are invisible to path resolution), so a
-        # naive write_text() would truncate that shared inode — a read-only bypass.
-        # Writing to a temp file in the SAME directory, then os.replace()-ing it onto
-        # out_path, only ever retargets the out-path NAME at a fresh inode; any
-        # under-root hard-linked inode keeps its original, untouched content.
-        tmp_name = None
+        # Re-validate IMMEDIATELY before writing (the earlier --out guard ran before
+        # build_document; this catches a target retargeted since). The physical write then
+        # goes through the SHARED write_text_contained helper — the same helper
+        # render_html.write_html_safely uses, so the two sinks cannot drift.
+        #
+        # TOCTOU: the helper's write-side threat model is SIX CLASSES CONSIDERED, FOUR
+        # CLOSED, TWO ACCEPTED — see write_text_contained's docstring for the table and
+        # RISK_REGISTER R11 for the settled rationale. On the dir_fd path the helper opens
+        # this file's parent directory once with O_NOFOLLOW, pins that inode with the
+        # returned fd, decides containment against the PINNED inode, and creates the temp
+        # file relative to that fd — so a parent path COMPONENT swapped in afterward cannot
+        # redirect the write. It does NOT defeat a concurrent rename of the pinned
+        # directory itself, or a bind-mount alias; those are the two accepted residuals,
+        # and any principal who can reach them can already edit this file. On a platform
+        # without dir_fd support the helper takes its documented fallback branch, whose
+        # exposure is wider; that limitation is stated there.
+        #
+        # Hard-link safety is unchanged and still load-bearing: an outside-root HARD LINK
+        # whose inode is also linked under --root passes resolve()-based path checks
+        # (hard links are invisible to path resolution), so a naive write_text() would
+        # truncate that shared inode — a read-only bypass. The helper still creates a
+        # fresh inode in the target's directory and os.replace()s it onto the name, so
+        # any under-root hard-linked inode keeps its original, untouched content.
         try:
             resolved_recheck = out_path.resolve()
             for guard_root in out_roots:
@@ -5344,21 +5364,10 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if _resolves_inside_root(resolved_recheck, Path(guard_root), guard_root_stat):
                     raise OSError("--out resolved inside a guarded root at write time (TOCTOU)")
-            fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(text)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_name, out_path)
-            tmp_name = None
+            write_text_contained(resolved_recheck, text, out_roots,
+                                 input_paths=input_paths)
         except OSError as exc:
             print(f"warning: could not write --out: {exc}", file=sys.stderr)
-        finally:
-            if tmp_name is not None:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
     print(text)  # stdout is the primary contract — always emit the built document, write-or-not
     return 0
 
