@@ -6132,7 +6132,7 @@ def test_interventions_card_count_exceeds_its_friction_total_contribution(tmp_pa
 # --------------------------------------------- S6a: the default interventions path (§4.1)
 def test_default_streams_derives_interventions_path_from_home(tmp_path):
     """T3.2/T3.4 — the slug is DERIVED from $HOME at call time, never a literal.
-    `-Users-cevin--claude` is machine-specific; a literal would also ship the operator's
+    `-Users-<user>--claude` is machine-specific; a literal would also ship the operator's
     username into a PUBLIC repo (§4.1 publication requirement). The expected value is
     re-derived here by an INDEPENDENT implementation (`_slug`), so the assertion is not
     circular."""
