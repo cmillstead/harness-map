@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -5750,3 +5751,401 @@ def test_main_unsearchable_root_never_triggers_crash_backstop(unsearchable_root)
     reaches it."""
     doc = run_collector(unsearchable_root)
     assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+
+
+# ---------------------------------------------------------------------------------
+# WRITE-SIDE CONTAINMENT — what these tests do and do NOT pin.
+#
+# Six attack classes were enumerated against write_text_contained. FOUR ARE CLOSED and
+# each has a pinned regression test below; TWO ARE ACCEPTED RESIDUALS and deliberately
+# have NO test, because there is nothing to assert:
+#
+#   1 symlinked PARENT ................. CLOSED  ..._rejects_symlinked_parent
+#   2 swapped GRANDPARENT / intermediate  CLOSED  ..._rejects_parent_reached_through_a_
+#                                                   symlinked_grandparent, and the walk
+#                                                   itself in test_reject_if_pinned_dir_*
+#   3 hard-link truncation ............. CLOSED  ..._preserves_hardlinked_inode
+#   4 overwriting a read input ......... CLOSED  ..._refuses_to_overwrite_one_of_its_own_
+#                                                   read_inputs (pre-open) and
+#                                                   ..._reject_if_pinned_target_is_an_
+#                                                   input_path_* (post-pin)
+#   5 concurrent RENAME of the pinned directory into a guard root ......... ACCEPTED
+#   6 bind-mount alias of a guard-root descendant ......................... ACCEPTED
+#
+# Classes 5 and 6 were reproduced on a real filesystem and are not closable in portable
+# POSIX -- an fd pins an inode, not where that inode lives. They are accepted because any
+# attacker positioned to exploit them can already modify this tool's own source, so no
+# in-process check can be load-bearing against them. Settled 2026-08-02; authoritative
+# record RISK_REGISTER R11 + AMENDMENTS A36. If you are here because a review re-found
+# class 5 or 6: that is expected and pre-answered -- read R11 rather than re-deriving it.
+# A further VARIANT of 5 or 6 is the same accepted class. What would void the acceptance
+# is a THIRD class reachable without that privilege line.
+#
+# Do not add a test that asserts classes 5/6 are prevented; they are not.
+# ---------------------------------------------------------------------------------
+
+
+def _guard_root(tmp_path):
+    root = tmp_path / "guarded"
+    root.mkdir()
+    return root
+
+
+def test_write_text_contained_writes_content(tmp_path):
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    _collector.write_text_contained(target, '{"a":1}', [_guard_root(tmp_path)])
+    assert target.read_text(encoding="utf-8") == '{"a":1}'
+    assert list(out_dir.glob("*.tmp")) == []
+
+
+def test_write_text_contained_rejects_symlinked_parent(tmp_path):
+    """O_NOFOLLOW: a parent whose FINAL component is a symlink is refused outright.
+    Both real callers pass a path validate_write_target already resolve()d, so this
+    only fires when the parent became a symlink AFTER resolution — the attack."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link"
+    os.symlink(real_dir, link_dir)
+    with pytest.raises(OSError):
+        _collector.write_text_contained(link_dir / "r.json", "x", [_guard_root(tmp_path)])
+    assert not (real_dir / "r.json").exists()
+
+
+def test_write_text_contained_rejects_parent_that_is_a_guard_root(tmp_path):
+    guard = _guard_root(tmp_path)
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(guard / "r.json", "x", [guard])
+    assert not (guard / "r.json").exists()
+
+
+def test_write_text_contained_rejects_parent_inside_a_guard_root(tmp_path):
+    guard = _guard_root(tmp_path)
+    inner = guard / "nested" / "deeper"
+    inner.mkdir(parents=True)
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(inner / "r.json", "x", [guard])
+    assert not (inner / "r.json").exists()
+
+
+def test_write_text_contained_preserves_hardlinked_inode(tmp_path):
+    """F5: an outside-root path hard-linked to an inode ALSO linked under --root passes
+    every resolve()-based check (hard links are invisible to path resolution). The write
+    must retarget the NAME at a fresh inode, never truncate the shared one."""
+    guard = _guard_root(tmp_path)
+    protected = guard / "protected.md"
+    protected.write_text("ORIGINAL", encoding="utf-8")
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    os.link(protected, target)
+    original_ino = os.stat(protected).st_ino
+    assert os.stat(target).st_ino == original_ino
+
+    _collector.write_text_contained(target, "REPLACED", [guard])
+
+    assert protected.read_text(encoding="utf-8") == "ORIGINAL"
+    assert os.stat(protected).st_ino == original_ino
+    assert target.read_text(encoding="utf-8") == "REPLACED"
+    assert os.stat(target).st_ino != original_ino
+
+
+def test_write_text_contained_removes_temp_file_on_encode_failure(tmp_path):
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    with pytest.raises(UnicodeEncodeError):
+        _collector.write_text_contained(
+            target, "lone \ud800 surrogate", [_guard_root(tmp_path)])
+    assert list(out_dir.iterdir()) == [], "no temp residue may survive a failed write"
+    assert not target.exists()
+
+
+def test_write_text_contained_reports_dir_fd_support_on_this_platform():
+    """F4: the fast path must actually be taken here, or every other test in this file
+    is silently exercising only the fallback."""
+    assert _collector._dir_fd_write_supported() is True
+
+
+def test_write_text_contained_falls_back_when_dir_fd_unsupported(
+        tmp_path, monkeypatch):  # mock-ok: swaps a real capability set, filesystem stays real
+    """F4: the fallback is an EXPLICIT branch, not a dark path. Only the capability
+    check is monkeypatched — the filesystem stays real."""
+    monkeypatch.setattr(os, "supports_dir_fd", frozenset())  # mock-ok: real capability set, real fs
+    assert _collector._dir_fd_write_supported() is False
+
+    guard = _guard_root(tmp_path)
+    protected = guard / "protected.md"
+    protected.write_text("ORIGINAL", encoding="utf-8")
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    os.link(protected, target)
+
+    _collector.write_text_contained(target, "REPLACED", [guard])
+
+    assert target.read_text(encoding="utf-8") == "REPLACED"
+    assert protected.read_text(encoding="utf-8") == "ORIGINAL"  # F5 holds on the fallback too
+    assert list(out_dir.glob("*.tmp")) == []
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(guard / "r.json", "x", [guard])
+
+
+def test_write_text_contained_refuses_to_overwrite_one_of_its_own_read_inputs(tmp_path):
+    """F-P2 (added at plan review): the `input_paths` dimension must be re-checked at
+    WRITE time, not only at caller entry. The motivating case is a read input that sits
+    OUTSIDE every guarded root -- guard-root containment alone would wrongly allow it, so
+    this is the only check standing between `--out <a read input>` and overwriting it.
+
+    Three rungs, matching validate_write_target's ladder: literal equality, resolved
+    equality, and inode identity through a symlinked input. The third is the one a string
+    compare cannot catch."""
+    guard = _guard_root(tmp_path)
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+
+    literal_input = out_dir / "config.json"
+    literal_input.write_text("KEEP ME", encoding="utf-8")
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(
+            literal_input, "CLOBBERED", [guard], input_paths=[literal_input])
+    assert literal_input.read_text(encoding="utf-8") == "KEEP ME"
+
+    # Inode identity: the declared input is a SYMLINK onto the write target, so neither
+    # the literal nor the resolved-string compare sees a match -- only samestat does.
+    real_target = out_dir / "result.json"
+    real_target.write_text("KEEP ME TOO", encoding="utf-8")
+    aliased_input = tmp_path / "alias.json"
+    aliased_input.symlink_to(real_target)
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(
+            real_target, "CLOBBERED", [guard], input_paths=[aliased_input])
+    assert real_target.read_text(encoding="utf-8") == "KEEP ME TOO"
+
+    # Control: an unrelated declared input must NOT block a legitimate write.
+    unrelated = tmp_path / "unrelated.json"
+    unrelated.write_text("x", encoding="utf-8")
+    _collector.write_text_contained(
+        out_dir / "fresh.json", "WRITTEN", [guard], input_paths=[unrelated])
+    assert (out_dir / "fresh.json").read_text(encoding="utf-8") == "WRITTEN"
+
+
+def test_write_text_contained_refuses_when_pinned_parent_stops_matching_its_realpath(
+        tmp_path, monkeypatch):  # mock-ok: interposes on real fs timing, delegates to the real os.stat
+    """The ABA `samestat` branch is the ONE guard in this helper that no other test
+    forces. `rejects_symlinked_parent` exercises O_NOFOLLOW at open() and
+    `rejects_parent_inside_a_guard_root` exercises the ancestry check -- BOTH take the
+    no-mismatch path through the samestat comparison, so without this test the branch
+    that actually closes the ABA race is never executed. Plan review flagged it.
+
+    This does NOT fake a return value: it performs a REAL directory swap on a REAL
+    filesystem at the moment the helper resolves the parent, then delegates to the real
+    os.stat. Every value the helper sees is a genuine kernel result -- the interposition
+    only controls WHEN the swap happens, deterministically forcing the interleaving a
+    true race would hit only intermittently. Same technique, and same `mock-ok`
+    justification, as the pre-existing
+    test_write_html_safely_recheck_immediately_before_mkstemp_closes_toctou_window."""
+    guard = _guard_root(tmp_path)
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    target = out_dir / "r.json"
+
+    real_stat = os.stat
+    swapped = {"done": False}
+
+    def _swap_parent_then_stat(path, *args, **kwargs):
+        # ORDER IS LOAD-BEARING (Codex plan gate, P2-6): the swap must happen BEFORE
+        # delegating to the real os.stat. An earlier draft called real_stat FIRST and
+        # returned the pre-swap result -- which still samestat'd the pinned fstat, so the
+        # mismatch branch never fired and the test proved nothing. Swap, THEN stat, so the
+        # value the helper receives describes the NEW directory while its fd still pins the
+        # old one. That divergence is precisely the ABA condition under test.
+        if not swapped["done"] and Path(path) == out_dir:
+            swapped["done"] = True
+            out_dir.rename(tmp_path / "reports-moved")
+            decoy.rename(out_dir)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", _swap_parent_then_stat)  # mock-ok: real fs swap, real os.stat delegate
+    # THE CAPABILITY SET MUST BE REPAIRED, or this test silently proves nothing.
+    # `os.supports_dir_fd` holds FUNCTION OBJECTS, not names, so replacing `os.stat`
+    # removes it from that set -- `_dir_fd_write_supported()` then returns False and the
+    # whole call routes to the FALLBACK branch, whose documented TOCTOU limitation means
+    # the write COMPLETES into the swapped-in decoy and no WriteContainmentError is ever
+    # raised. Measured, not theorised: without these two lines this test fails DID NOT
+    # RAISE and the bytes land in the decoy directory. Re-registering the wrapper keeps
+    # the dir_fd branch selected while changing nothing about the filesystem.
+    monkeypatch.setattr(  # mock-ok: re-registers the real-delegating wrapper in the real capability set
+        os, "supports_dir_fd",
+        frozenset({os.open, os.rename, os.unlink, _swap_parent_then_stat}))
+    assert _collector._dir_fd_write_supported() is True, \
+        "this test must exercise the dir_fd branch, not the fallback"
+
+    with pytest.raises(_collector.WriteContainmentError) as excinfo:
+        _collector.write_text_contained(target, "x", [guard])
+    monkeypatch.undo()  # mock-ok: restores the real os.stat before the assertions below
+
+    assert "TOCTOU" in str(excinfo.value) or "no longer the opened directory" in str(excinfo.value)
+    assert swapped["done"], "the swap never fired — the test proved nothing; fix the trigger"
+    assert not (tmp_path / "reports" / "r.json").exists()
+    assert not (tmp_path / "reports-moved" / "r.json").exists()
+
+
+def test_reject_if_pinned_dir_inside_guard_roots_decides_from_the_descriptor(tmp_path):
+    """Class 2's MECHANISM, unit-tested directly rather than through the helper.
+
+    The end-to-end test below proves a symlinked grandparent is refused, but it cannot
+    prove WHICH rung refused it -- the ABA samestat check and the pathname predicate would
+    both also fire on that shape. This test calls the walk on its own, so a regression that
+    quietly reverted the dir_fd branch to `_reject_if_parent_inside_guard_roots` would fail
+    here even while the end-to-end test kept passing.
+
+    Also pins Y3 (descriptor ownership) and Y4 (absence permits / ambiguity denies), which
+    until now were verified only by a throwaway probe. Making them permanent is the point:
+    the Y3 leak was one fd per SUCCESSFUL traversal, so it is invisible to any test that
+    only checks the raise."""
+    guard = _guard_root(tmp_path)
+    nested = guard / "nested" / "deeper"
+    nested.mkdir(parents=True)
+    outside = tmp_path / "reports"
+    outside.mkdir()
+
+    def _open_fd_count():
+        # Bounded at 4096 deliberately: RLIMIT_NOFILE can be very large (or unlimited),
+        # and this runs inside a loop. A fixed ceiling is fine because the assertion is a
+        # DELTA -- a leak shifts the count regardless of where the window ends.
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        limit = 4096 if soft == resource.RLIM_INFINITY else min(soft, 4096)
+        n = 0
+        for candidate in range(limit):
+            try:
+                os.fstat(candidate)
+            except OSError:
+                continue
+            n += 1
+        return n
+
+    # (a) a descriptor OUTSIDE every guard root is permitted, and leaks nothing.
+    outside_fd = os.open(outside, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        before = _open_fd_count()
+        for _ in range(20):
+            _collector._reject_if_pinned_dir_inside_guard_roots(outside_fd, [guard])
+        assert _open_fd_count() == before, \
+            "the ancestry walk leaked a descriptor per traversal (Y3)"
+
+        # (b) an ABSENT guard root permits -- ~/.claude legitimately may not exist, and
+        #     both render paths add it as a permanent floor root (Y4).
+        _collector._reject_if_pinned_dir_inside_guard_roots(
+            outside_fd, [tmp_path / "does-not-exist"])
+    finally:
+        os.close(outside_fd)
+
+    # (c) a descriptor INSIDE a guard root is refused, established purely by walking `..`.
+    nested_fd = os.open(nested, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        before = _open_fd_count()
+        with pytest.raises(_collector.WriteContainmentError):
+            _collector._reject_if_pinned_dir_inside_guard_roots(nested_fd, [guard])
+        assert _open_fd_count() == before, "the raising path leaked a descriptor (Y3)"
+    finally:
+        os.close(nested_fd)
+
+    # (d) the descriptor IS the guard root.
+    guard_fd = os.open(guard, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(_collector.WriteContainmentError):
+            _collector._reject_if_pinned_dir_inside_guard_roots(guard_fd, [guard])
+    finally:
+        os.close(guard_fd)
+
+
+def test_write_text_contained_rejects_parent_reached_through_a_symlinked_grandparent(
+        tmp_path):
+    """Class 2, end to end. O_NOFOLLOW constrains only the FINAL component, so an
+    INTERMEDIATE symlink is still followed by os.open and the fd ends up pinned inside the
+    guard root while the caller's spelling of the path looks safe. The write must be
+    refused. `deeper` is a real directory -- only `grand` is a symlink -- so O_NOFOLLOW
+    alone is satisfied and cannot be what saves us.
+
+    WHAT THIS PINS, precisely: that the fd-anchored walk is WIRED and load-bearing on the
+    dir_fd path. Verified by mutation while writing this plan -- stub the walk out and the
+    write COMPLETES, landing under the guard root.
+
+    WHAT IT DOES NOT PIN: that the walk is strictly stronger than the old pathname
+    predicate on THIS layout. Also measured: `_reject_if_parent_inside_guard_roots` refuses
+    this same static shape too, because `_physical_key` is `os.path.realpath` and so
+    resolves the intermediate symlink before the ancestry compare. The walk's advantage is
+    structural rather than visible here -- it decides about the object actually written
+    through instead of relying on a separate resolution agreeing with the kernel's -- and
+    the shapes where the two genuinely diverge need a concurrent swap, which is a timing
+    condition no static test can stage. Do not "strengthen" this docstring into a claim the
+    test does not support."""
+    guard = _guard_root(tmp_path)
+    (guard / "nested" / "deeper").mkdir(parents=True)
+    grand = tmp_path / "grand"
+    grand.symlink_to(guard / "nested")
+
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(grand / "deeper" / "r.json", "x", [guard])
+    assert not (guard / "nested" / "deeper" / "r.json").exists()
+    assert list((guard / "nested" / "deeper").iterdir()) == [], "no temp residue either"
+
+
+def test_reject_if_pinned_target_is_an_input_path_binds_identity_to_the_descriptor(
+        tmp_path):
+    """Class 4's POST-PIN rung (Y5), unit-tested directly — and here is why it is NOT
+    tested end-to-end through write_text_contained.
+
+    On a STATIC filesystem the pre-open rung already catches every case this one does: its
+    third comparison is an os.path.samestat, so it sees hard links and symlink aliases too.
+    Any end-to-end scenario I can set up deterministically is therefore caught BEFORE the
+    pin, and an end-to-end test would pass without this rung existing at all — the X6
+    failure mode (a test that proves nothing because a different guard fired). What this
+    rung adds is coverage of a REDIRECT APPLIED AFTER the pre-open check, which is a timing
+    condition, not a filesystem layout. So it is pinned at the unit level, where the
+    identity comparison and the exception policy can both be asserted honestly.
+
+    The exception policy is asserted in BOTH directions deliberately: 'absence permits' and
+    'ambiguity denies' are one edit away from collapsing into a single branch, and either
+    collapse is silent — permit-on-ambiguity fails open, deny-on-absence rejects every
+    first write."""
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    target.write_text("ON DISK", encoding="utf-8")
+
+    dir_fd = os.open(out_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        # (a) identity match through a path the name compare cannot see: the declared
+        #     input is a hard link to the same inode, under a different name.
+        aliased = tmp_path / "input-alias.json"
+        os.link(target, aliased)
+        with pytest.raises(_collector.WriteContainmentError):
+            _collector._reject_if_pinned_target_is_an_input_path(
+                dir_fd, "r.json", [aliased])
+
+        # (b) unrelated input: permitted.
+        unrelated = tmp_path / "unrelated.json"
+        unrelated.write_text("x", encoding="utf-8")
+        _collector._reject_if_pinned_target_is_an_input_path(dir_fd, "r.json", [unrelated])
+
+        # (c) ABSENCE PERMITS, target side: a name with nothing under it yet cannot alias
+        #     anything. This is every first write.
+        _collector._reject_if_pinned_target_is_an_input_path(
+            dir_fd, "not-created-yet.json", [aliased])
+
+        # (d) ABSENCE PERMITS, input side: a declared input that is gone is skipped, and
+        #     the remaining inputs are still checked -- not short-circuited past.
+        os.unlink(unrelated)
+        with pytest.raises(_collector.WriteContainmentError):
+            _collector._reject_if_pinned_target_is_an_input_path(
+                dir_fd, "r.json", [unrelated, aliased])
+
+        # (e) empty input list is a no-op.
+        _collector._reject_if_pinned_target_is_an_input_path(dir_fd, "r.json", [])
+    finally:
+        os.close(dir_fd)

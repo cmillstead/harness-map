@@ -11,6 +11,7 @@ import ast
 import json
 import os
 import re
+import secrets
 import shlex
 import stat
 import subprocess
@@ -360,6 +361,499 @@ def validate_write_target(raw_path, roots, input_paths=()):
         except OSError:
             pass
     return True, resolved
+
+
+class WriteContainmentError(OSError):
+    """The write target's PINNED parent directory is inside (or IS) a guarded root, or
+    the directory that containment was decided against is not the directory actually
+    held open. Subclasses OSError deliberately: collector.main's existing
+    `except OSError` around its --out write keeps working unchanged, while
+    render_html.write_html_safely can catch THIS type specifically and re-raise its own
+    catchable RenderError.
+
+    Callers DO still need a broader `except OSError` alongside it: the fd path raises a
+    BARE OSError for a refused open (ELOOP from O_NOFOLLOW, ENOENT/EACCES on an
+    unreadable parent), which is not a containment verdict and is not this type. See
+    render_html.write_html_safely, which catches both. (An earlier draft of this docstring
+    claimed no caller needed a broader clause; that was wrong and is corrected here — flagged
+    by the Codex plan gate as P3-7.)"""
+
+
+_TMP_NAME_ATTEMPTS = 8       # O_EXCL collision retries; token_hex(16) makes >1 collision
+                             # astronomically unlikely, so a bounded loop is honest rather
+                             # than optimistic — exhaustion raises instead of looping.
+
+
+def _dir_fd_write_supported():
+    """True when this platform can do the whole fd-pinned write: open/rename/unlink/stat
+    all accepting dir_fd. Read from os.supports_dir_fd AT CALL TIME, never cached at
+    import, so the fallback branch is reachable in a test by monkeypatching the capability
+    set (F4) — a fallback nobody can execute is a dark path, not a fallback.
+
+    PROBES os.rename, NOT os.replace. CPython does not register os.replace in
+    os.supports_dir_fd even though it accepts src_dir_fd/dst_dir_fd — it is the same
+    renameat syscall as os.rename, which IS registered. Verified 2026-08-02 on this
+    platform: `os.replace in os.supports_dir_fd` is False while a real dir-fd os.replace
+    succeeds. Gating on os.replace would return False forever, silently routing EVERY
+    production write through the vulnerable fallback and shipping this entire hardening
+    dark. Do not "correct" this back to os.replace."""
+    return all(fn in os.supports_dir_fd
+               for fn in (os.open, os.rename, os.unlink, os.stat))
+
+
+def _reject_if_parent_inside_guard_roots(parent_real, parent_fstat, guard_roots):
+    """PATHNAME-based containment for a write's parent directory.
+
+    FALLBACK BRANCH ONLY. The dir_fd branch must NOT call this — it calls
+    `_reject_if_pinned_dir_inside_guard_roots` below, which decides about the opened
+    descriptor instead. Deciding containment about a pathname and then writing through a
+    descriptor is what made the class-2 grandparent attack land; this function is kept
+    solely because `_write_text_contained_fallback` has no descriptor to anchor to, and
+    that branch's documented limitation covers the resulting exposure.
+
+    Reuses the SAME two mechanisms the read paths use — `_resolves_inside_root`
+    (Path.parents + os.path.samestat, never str.startswith) and a direct inode compare —
+    rather than introducing a second containment predicate. A second predicate is a
+    drift source and was itself a finding in the previous stage.
+
+    Two checks per guard root, both required:
+      (a) inode identity: the pinned directory IS the guard root;
+      (b) ancestry: the pinned directory's realpath lies inside the guard root.
+    Neither subsumes the other — (a) catches a case-insensitive or hard-linked alias of
+    the root itself, (b) catches a descendant.
+
+    A guard root that cannot be stat'd is SKIPPED (nothing safe to compare against),
+    matching validate_write_target's existing posture for the same situation. The dir_fd
+    path deliberately DIVERGES from that posture — see the Y4 note in
+    `_reject_if_pinned_dir_inside_guard_roots`."""
+    for guard_root in guard_roots:
+        guard_root_path = Path(guard_root)
+        try:
+            guard_root_stat = os.stat(guard_root_path)
+        except OSError:
+            continue
+        if os.path.samestat(parent_fstat, guard_root_stat):
+            raise WriteContainmentError(
+                f"refusing to write: the target directory IS the guarded root {guard_root_path}")
+        if _resolves_inside_root(parent_real, guard_root_path, guard_root_stat):
+            raise WriteContainmentError(
+                f"refusing to write: {parent_real} resolves inside the guarded root "
+                f"{guard_root_path}")
+
+
+def _reject_if_pinned_dir_inside_guard_roots(dir_fd, guard_roots):
+    """Containment decided about the OPENED DESCRIPTOR, not about any pathname.
+
+    Walks upward from the pinned directory using `..` resolved BY THE KERNEL relative to
+    each successive descriptor, comparing every ancestor's (st_dev, st_ino) against each
+    guard root. Because no pathname is ever re-resolved, a symlink or rename applied to
+    any component — parent, grandparent, or higher — after the pin cannot change the
+    result. This is what closes class 2 (the grandparent attack), which O_NOFOLLOW alone
+    does not: O_NOFOLLOW constrains only the FINAL component.
+
+    Scope of this check — see the six-class table in `write_text_contained`'s docstring.
+    It closes classes 1–4 together with the rest of the helper; classes 5 and 6 are
+    ACCEPTED residuals, not oversights, and are recorded at RISK_REGISTER R11 / AMENDMENTS
+    A36. Do not describe this walk as making ancestry immutable — it does not.
+
+    DENY ON UNCERTAINTY, BUT NOT ON ABSENCE (Y4). A guard root that EXISTS but cannot be
+    stat'd (EACCES, ELOOP, or any other OSError) is unverifiable, and for a tool whose core
+    invariant is "zero writes under the mapped root" that is exactly when writing is unsafe
+    — so it RAISES rather than being skipped. This deliberately diverges from
+    validate_write_target's older skip-on-unstattable posture.
+
+    A guard root that simply DOES NOT EXIST (ENOENT / FileNotFoundError) is a different
+    case and is PERMITTED. Both render paths add `Path.home() / ".claude"` as a permanent
+    floor root (render_html.py:5163, serve.py:246), and in a public standalone install that
+    directory legitimately may not exist — denying on absence would reject EVERY write for
+    a user whose only sin is not having a ~/.claude. A nonexistent directory also cannot
+    contain the target, so permitting it is sound rather than merely convenient: there is
+    nothing to be inside of. Absent roots are still covered LEXICALLY by
+    validate_write_target at caller entry, which compares configured pathnames and does not
+    require the root to exist."""
+    guard_stats = []
+    for guard_root in guard_roots:
+        try:
+            guard_stats.append((guard_root, os.stat(guard_root)))
+        except FileNotFoundError:
+            continue          # absent != unverifiable; see docstring. Nothing to be inside of.
+        except OSError as exc:
+            raise WriteContainmentError(
+                f"refusing to write: guarded root {guard_root} exists but cannot be stat'd "
+                f"({exc.strerror}), so containment cannot be established") from exc
+
+    # DESCRIPTOR OWNERSHIP (Y3). An earlier draft leaked one fd per SUCCESSFUL traversal:
+    # at the filesystem root it returned while `parent_fd` was still open, and the outer
+    # finally closed only `current_fd`. Codex executed that loop 20 times and the process
+    # gained 20 descriptors. The shape below keeps EXACTLY ONE owned descriptor in
+    # `current_fd` at all times, and `parent_fd` is owned by its own try/finally until
+    # ownership is explicitly transferred -- so every exit path, including the root return
+    # and a raising os.close, closes exactly what it owns and nothing twice.
+    current_fd = os.dup(dir_fd)          # dup: never consume the caller's descriptor
+    try:
+        while True:
+            current_stat = os.fstat(current_fd)
+            for guard_root, guard_stat in guard_stats:
+                if os.path.samestat(current_stat, guard_stat):
+                    raise WriteContainmentError(
+                        f"refusing to write: the target directory is {guard_root} or lies "
+                        f"inside it (established from the opened descriptor)")
+            parent_fd = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=current_fd)
+            try:
+                at_root = os.path.samestat(os.fstat(parent_fd), current_stat)
+            except OSError:
+                os.close(parent_fd)
+                raise
+            if at_root:
+                os.close(parent_fd)   # `..` is itself: namespace root, containment clean
+                return                # current_fd closed by the outer finally
+            # TRANSFER OWNERSHIP BEFORE CLOSING THE OLD FD. Rebinding first means the outer
+            # finally always owns exactly one live descriptor, so even if this os.close
+            # raises (POSIX leaves the fd state unspecified after a failed close) there is
+            # no path on which the outer finally closes an fd a second time.
+            stale_fd, current_fd = current_fd, parent_fd
+            os.close(stale_fd)
+    finally:
+        os.close(current_fd)
+
+
+def _reject_if_target_is_an_input_path(out_path, input_paths):
+    """Write-time re-check of the `input_paths` dimension (F-P2, added at plan review).
+
+    `validate_write_target` rejects a target that IS one of the collector's own read
+    inputs; that is what stops `--out ~/.claude.json`, a file sitting OUTSIDE every
+    directory root where guard-root containment alone would wrongly allow the overwrite.
+    The pre-change code re-checked this immediately before mkstemp. Dropping it when the
+    write moved into this helper would have silently narrowed the guarantee, so it is
+    re-checked here at the latest possible moment.
+
+    Mirrors validate_write_target's own comparison ladder EXACTLY rather than inventing a
+    looser one: literal (lexical/resolved equality), then resolved-realpath equality, then
+    an os.path.samestat inode compare where both sides exist — that last rung is what
+    catches an alias a string compare cannot see (an input that is itself a symlink onto
+    the target). A path that cannot be stat'd is skipped, same posture as elsewhere."""
+    if not input_paths:
+        return
+    lexical = Path(os.path.normpath(str(out_path)))
+    try:
+        resolved = out_path.resolve()
+    except OSError:
+        resolved = out_path
+    for candidate_input in input_paths:
+        input_path = Path(candidate_input)
+        if input_path in (lexical, resolved):
+            raise WriteContainmentError(
+                f"refusing to write: {out_path} is one of this tool's own read inputs")
+        try:
+            input_resolved = input_path.resolve()
+        except OSError:
+            input_resolved = input_path
+        if input_resolved == resolved:
+            raise WriteContainmentError(
+                f"refusing to write: {out_path} resolves onto the read input {input_path}")
+        # NOTE: WriteContainmentError SUBCLASSES OSError, so the raise must sit OUTSIDE
+        # the try -- raising it inside would be swallowed by this same `except OSError`.
+        # (validate_write_target has the identical shape and is safe only because its
+        # raise-equivalent is a `return`. Do not "simplify" this back into the try.)
+        try:
+            same_file = os.path.samestat(os.stat(input_resolved), os.stat(resolved))
+        except OSError:
+            same_file = False
+        if same_file:
+            raise WriteContainmentError(
+                f"refusing to write: {out_path} is the same file as the read input "
+                f"{input_path}")
+
+
+def _reject_if_pinned_target_is_an_input_path(dir_fd, out_name, input_paths):
+    """Class-4 check RE-BOUND to the pinned directory (Y5). The pre-open rung above is
+    kept for its better error messages on the common case; THIS is the one that is not
+    defeatable by an intermediate-component swap.
+
+    `_reject_if_target_is_an_input_path` decides about a PATHNAME before the parent is
+    opened, so a redirect applied after it runs re-points what it cleared. Once `dir_fd`
+    pins the parent inode, `os.stat(out_name, dir_fd=dir_fd)` names the file the write will
+    actually land on — and that is what must be compared against the declared read inputs.
+    Without this rung, a redirect can route the write onto one of the tool's own inputs
+    sitting OUTSIDE every guard root, where guard-root containment alone would wrongly
+    permit it. That is exactly why class 4 is listed as closed rather than subsumed by
+    class 2: guard-root containment does not cover an input outside every root.
+
+    EXCEPTION POLICY — ABSENCE PERMITS, AMBIGUITY DENIES. This is the same split Y4
+    established for guard roots in `_reject_if_pinned_dir_inside_guard_roots`; the two must
+    not be allowed to drift apart:
+      * target FileNotFoundError -> return. A target that does not exist yet aliases
+        nothing, and this is the COMMON case (every first write), so denying here would
+        reject ordinary runs.
+      * target OSError (EACCES, ELOOP, ...) -> RAISE. The name exists but its identity is
+        unverifiable, and "cannot tell" is not "safe" for a tool whose core invariant is
+        that it never writes over its own read surface.
+      * input FileNotFoundError -> skip THAT input, continue with the rest. A declared
+        input that is gone cannot be the file being written.
+      * input OSError -> RAISE, same reasoning as the target.
+
+    `follow_symlinks=False` on the TARGET is deliberate and load-bearing: `os.replace`
+    retargets the NAME, unlinking whatever it currently denotes and linking the fresh temp
+    inode in its place. It does NOT write through a symlink, so a symlinked target name
+    leaves the pointed-at input's bytes untouched — the identity that matters here is the
+    name's own. The INPUT side resolves normally, because an input declared as a symlink
+    ONTO the target is precisely the alias this rung exists to catch.
+
+    KNOWN SEAM, stated rather than papered over: a target NAME that is itself a declared
+    input symlink is caught by the pre-open rung's literal/resolved comparison, not by the
+    samestat here (lstat sees the link's own inode). Both rungs run, so the case is
+    covered; do not "fix" this by adding a third stat mode — the accumulating-checks
+    failure mode is the same one that got the st_dev tripwire declined."""
+    if not input_paths:
+        return
+    try:
+        target_stat = os.stat(out_name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return          # nothing on disk under that name yet -> it cannot alias an input
+    except OSError as exc:
+        raise WriteContainmentError(
+            f"refusing to write: {out_name} exists in the pinned directory but cannot be "
+            f"stat'd ({exc.strerror}), so it cannot be cleared against this tool's own "
+            f"read inputs") from exc
+    for candidate_input in input_paths:
+        input_path = Path(candidate_input)
+        try:
+            input_stat = os.stat(input_path)
+        except FileNotFoundError:
+            continue    # a declared input that no longer exists cannot be the write target
+        except OSError as exc:
+            raise WriteContainmentError(
+                f"refusing to write: read input {input_path} cannot be stat'd "
+                f"({exc.strerror}), so the pinned target cannot be cleared against it"
+            ) from exc
+        if os.path.samestat(target_stat, input_stat):
+            raise WriteContainmentError(
+                f"refusing to write: the pinned target {out_name} is the same file as the "
+                f"read input {input_path}")
+
+
+def write_text_contained(out_path, text, guard_roots, *, input_paths=(),
+                         encoding_errors="strict"):
+    """THE single physical write for every sink in this tool — collector.main's `--out`
+    and render_html.write_html_safely both call exactly this. Neither grows its own copy
+    of the mechanics (that seam produced four findings in the previous stage).
+
+    WRITE-SIDE THREAT MODEL — SIX CLASSES CONSIDERED, FOUR CLOSED, TWO ACCEPTED.
+    Settled 2026-08-02; authoritative record RISK_REGISTER R11 + AMENDMENTS A36. A later
+    reviewer re-finding classes 5 or 6 is EXPECTED and pre-answered — point it there rather
+    than re-deriving. This is the honest claim about this helper; there is no stronger one.
+
+        1 Symlinked PARENT of the target ................. CLOSED  O_NOFOLLOW on the open
+        2 Swapped GRANDPARENT / intermediate component ... CLOSED  fd-anchored `..` walk
+        3 Hard-link truncation of a shared inode ......... CLOSED  O_CREAT|O_EXCL+replace
+        4 Overwriting one of this tool's own read inputs . CLOSED  pinned-identity check
+        5 Concurrent RENAME of the pinned directory ...... ACCEPTED
+        6 Bind-mount alias of a guard-root descendant .... ACCEPTED
+
+    An fd pins an INODE, not where that inode lives. Classes 5 and 6 were reproduced on a
+    real filesystem and are not closable in portable POSIX. They are accepted because ANY
+    attacker positioned to exploit them can already modify this tool's own source, so no
+    in-process check can be load-bearing against them: class 5 needs write access to the
+    output parent chain (`$HOME` for the default report directory) and class 6 needs mount
+    privileges. Either principal can edit this file, swap a hook, or rewrite settings.json
+    without racing anything. A guard cannot be a security boundary against a principal who
+    owns the code implementing the guard. Classes 1–4 are exactly those reachable WITHOUT
+    that privilege, which is where the real risk lives. (The weaker framing — "it's a
+    single-user local tool" — is explicitly rejected: single-user machines run untrusted
+    code all day.) What would VOID this acceptance is a THIRD class reachable without that
+    privilege line; a further variant of 5 or 6 is the same accepted class.
+
+    On the dir_fd path: the parent directory is opened ONCE with O_NOFOLLOW (a symlinked
+    parent is refused outright, not followed) and the returned fd PINS that directory's
+    inode for the rest of the call. Containment is then decided against the PINNED INODE
+    via `_reject_if_pinned_dir_inside_guard_roots`, never against a pathname, and the temp
+    file is created RELATIVE TO THAT FD. The old shape re-validated a PATHNAME and then
+    handed that same pathname to tempfile.mkstemp; deciding about a pathname and writing
+    through a descriptor is what made class 2 exploitable. This is the write-side mirror of
+    the read-side closure `_read_project_file` and `_walk_contained_dirs` already implement.
+
+    ABA binding: the realpath used for the ancestry check must `samestat` a FRESH stat
+    taken now, against the OPENED fd. If they differ, the directory containment was
+    decided about is not the directory being written into, and the write is refused —
+    the same both-directions check the read paths carry. It is defence in depth, NOT the
+    closure mechanism; the fd-anchored walk is.
+
+    HARD-LINK DEFENSE (F5), preserved exactly: an outside-root hard link whose inode is
+    also linked under a guarded root passes every resolve()-based path check, because
+    hard links are invisible to path resolution. Writing in place would truncate that
+    shared inode — a read-only-invariant bypass. So a FRESH inode is created in the same
+    directory (O_CREAT|O_EXCL) and os.replace only ever retargets the out-path NAME at
+    it; the under-root hard-linked inode keeps its original bytes.
+
+    `input_paths` (class 4): the collector's own read surface. The caller-entry
+    `validate_write_target` already rejects a target that IS one of these, which is what
+    stops `--out ~/.claude.json` — a read input that sits OUTSIDE every directory root, so
+    guard-root containment alone would wrongly allow overwriting it. That dimension is
+    re-checked TWICE here: once pre-open against the pathname (better error messages), and
+    again AFTER the pin against the target's identity in the pinned directory, which is the
+    rung an intermediate-component swap cannot defeat. Threading it through matters even
+    though no current caller passes a non-empty value: the previous shape re-checked
+    `input_paths` immediately before mkstemp, and dropping it silently would have been a
+    real (if currently inert) regression in a guarantee this tool advertises.
+
+    `encoding_errors` is the text-encoding error mode ONLY (render_html needs
+    "backslashreplace" so a lone UTF-16 surrogate degrades to a literal escape instead of
+    aborting the write with no report produced). It changes nothing about path security.
+
+    Raises WriteContainmentError (an OSError) on a containment rejection, OSError on any
+    filesystem failure, UnicodeEncodeError on an unencodable payload under
+    encoding_errors="strict". On every failure path the temp file is unlinked
+    BEST-EFFORT: cleanup errors are swallowed so the original write failure is what
+    propagates, so residue is possible if the unlink itself fails."""
+    out_path = Path(out_path)
+    parent = out_path.parent
+    out_name = out_path.name
+    if not out_name:
+        raise WriteContainmentError(f"refusing to write: no file name in target {out_path}")
+    guard_roots = [r for r in guard_roots if r]
+
+    _reject_if_target_is_an_input_path(out_path, input_paths)
+
+    if not _dir_fd_write_supported():
+        return _write_text_contained_fallback(
+            out_path, parent, text, guard_roots, input_paths, encoding_errors)
+
+    dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    tmp_name = None
+    try:
+        parent_fstat = os.fstat(dir_fd)
+        parent_real = Path(_physical_key(parent))
+        try:
+            parent_real_stat = os.stat(parent_real)
+        except OSError as exc:
+            raise WriteContainmentError(
+                f"refusing to write: could not stat the resolved parent {parent_real}") from exc
+        # TOCTOU: the path containment is decided about must BE the directory held open.
+        # Defence in depth only -- the fd-anchored walk below is the actual mechanism.
+        if not os.path.samestat(parent_real_stat, parent_fstat):
+            raise WriteContainmentError(
+                f"refusing to write: {parent_real} is no longer the opened directory (TOCTOU)")
+        # CONTAINMENT IS DECIDED ABOUT THE DESCRIPTOR, NOT THE PATHNAME. Do NOT call
+        # _reject_if_parent_inside_guard_roots here -- that is the FALLBACK branch's
+        # pathname predicate, and deciding about a pathname while writing through a
+        # descriptor is exactly what made class 2 (the grandparent swap) exploitable.
+        _reject_if_pinned_dir_inside_guard_roots(dir_fd, guard_roots)
+        # Class 4, re-bound to the pin. Must run BEFORE the temp file is created: once the
+        # temp exists, a failure here would leave residue for the finally to clean up for
+        # no reason, and the decision does not depend on the temp.
+        _reject_if_pinned_target_is_an_input_path(dir_fd, out_name, input_paths)
+
+        # tempfile.mkstemp does NOT accept dir_fd, so the name is generated here and
+        # created with O_EXCL relative to the pinned fd. Bounded retry: exhaustion raises
+        # rather than spinning.
+        file_fd = None
+        for _attempt in range(_TMP_NAME_ATTEMPTS):
+            candidate = f".harness-map-{secrets.token_hex(16)}.tmp"
+            try:
+                file_fd = os.open(
+                    candidate,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+            except FileExistsError:
+                continue
+            tmp_name = candidate
+            break
+        # BOTH are tested, not just file_fd: they are set together on the successful
+        # iteration, so either being None means the loop never succeeded. Testing only
+        # file_fd leaves tmp_name typed `str | None` at the os.replace below, which is
+        # a genuine type error rather than a mypy quibble -- the plan's block tested
+        # file_fd alone and did not type-check.
+        if file_fd is None or tmp_name is None:
+            raise OSError(
+                f"could not create a unique temporary file in {parent} after "
+                f"{_TMP_NAME_ATTEMPTS} attempts")
+
+        # closefd=False + one explicit close (X5). os.fdopen can raise BEFORE the wrapper
+        # takes ownership of the raw descriptor, which leaks it. With closefd=False the
+        # wrapper NEVER closes file_fd, so this finally is the single owner on every path
+        # -- including a raise from inside os.fdopen itself, which is why the try opens
+        # before the call rather than around the with-body. There is no double-close
+        # precisely because nothing else is permitted to close it.
+        try:
+            with os.fdopen(file_fd, "w", encoding="utf-8", errors=encoding_errors,
+                           closefd=False) as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            os.close(file_fd)
+        os.replace(tmp_name, out_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass          # best-effort cleanup; the write failure is what propagates
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+    return None
+
+
+def _write_text_contained_fallback(out_path, parent, text, guard_roots, input_paths,
+                                   encoding_errors):
+    """EXPLICIT platform fallback (F4) for a system whose os.open/os.replace/os.unlink do
+    not accept dir_fd. Behaviorally identical to the pre-S7 write: re-resolve and re-check
+    the target immediately before mkstemp, then mkstemp/fsync/os.replace in the target's
+    own directory.
+
+    The hard-link defense (F5) is UNCHANGED here — mkstemp still creates a fresh inode in
+    the same directory and os.replace still only retargets the name.
+
+    LIMITATION, true on THIS branch only, and WIDER than the dir_fd path's. With no
+    descriptor to anchor to, containment is decided about a pathname and the write then
+    goes through that pathname, so classes 1 and 2 (symlinked parent, swapped grandparent)
+    are narrowed but not fully closed here — the residual window sits between the re-check below
+    and the mkstemp call, and a parent-directory symlink swapped into it can still redirect
+    the write. Classes 3 and 4 still hold on this branch: mkstemp creates a fresh inode and
+    os.replace only retargets the name, and `_reject_if_target_is_an_input_path` still runs.
+
+    This branch is reached only where the platform cannot do dir_fd writes at all, so the
+    alternative is not writing. Do not describe it as equivalent to the dir_fd path, and do
+    not justify it as "fine for a single-user local tool" — that framing is explicitly
+    rejected (RISK_REGISTER R11). See `write_text_contained`'s six-class table for the
+    posture that does apply, and note that classes 1 and 2 are listed CLOSED there on the
+    strength of the dir_fd path, which is the one production actually takes."""
+    resolved_parent = Path(_physical_key(parent))
+    try:
+        parent_stat = os.stat(resolved_parent)
+    except OSError as exc:
+        raise WriteContainmentError(
+            f"refusing to write: could not stat the resolved parent {resolved_parent}") from exc
+    _reject_if_parent_inside_guard_roots(resolved_parent, parent_stat, guard_roots)
+    _reject_if_target_is_an_input_path(out_path, input_paths)
+    tmp_name = None
+    try:
+        file_fd, tmp_name = tempfile.mkstemp(dir=str(resolved_parent), suffix=".tmp")
+        # closefd=False + one explicit close, same ownership rule as the dir_fd branch:
+        # os.fdopen can raise before taking ownership of the raw fd. Both branches must
+        # carry this or the leak simply moves to whichever one was left alone.
+        try:
+            with os.fdopen(file_fd, "w", encoding="utf-8", errors=encoding_errors,
+                           closefd=False) as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            os.close(file_fd)
+        os.replace(tmp_name, resolved_parent / out_path.name)
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    return None
 
 
 # --- T3: project-tier read gate (H2 containment) + TOCTOU-closed read ---
