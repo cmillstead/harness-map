@@ -381,6 +381,33 @@ def _resolves_inside_root(candidate, root, root_stat):
     return False
 
 
+def _contained_or_disclosed(fp: Path, key: str, root: Path, root_stat, label: str,
+                            blind_spots: list[str]) -> bool:
+    """Shared containment gate for a profile-glob (or profile container-dir) consumer
+    that is about to read `fp`'s CONTENT (M11 exit gate, Finding 2): True iff `key` (fp's
+    resolved physical identity, from `_physical_key`) resolves inside `root`. On a False
+    verdict, records a blind_spots entry naming `fp` and `label`, deduped -- so a profile
+    glob that escapes containment (a symlinked directory matching an innocuous-looking
+    glob/role name, which `load_profile`'s string-only validation cannot see -- Finding
+    1's fix closes only the literal-'..'/absolute-string vector, not this one) is
+    disclosed, never silently read NOR silently dropped ("inaccessible is NOT clean").
+    Message format matches `_deduped_instruction_files`'s existing
+    "<label> <path> resolves outside the harness root — not read" wording, so every
+    containment-escape disclosure in this collector reads the same way.
+
+    `root_stat is None` (an unstat'able root) makes containment undecidable, so it is
+    treated as False -- "cannot determine" is never reported as "confirmed inside"."""
+    try:
+        inside = root_stat is not None and _resolves_inside_root(Path(key), root, root_stat)
+    except (OSError, RuntimeError):
+        inside = False
+    if not inside:
+        msg = f"{label} {_rel_safe(root, fp)} resolves outside the harness root — not read"
+        if msg not in blind_spots:
+            blind_spots.append(msg)
+    return inside
+
+
 def validate_write_target(raw_path, roots, input_paths=()):
     """SINGLE shared write-guard called at each write sink's CALLER entry point:
     collector.main's `--out` guard, serve.py `build_server`'s `--out-dir` startup guard,
@@ -3018,6 +3045,58 @@ class ProfileError(ValueError):
     any profile value is applied, so a bad profile can never HALF-apply (SPEC_7 §2)."""
 
 
+def _check_profile_path_safe(value: str, key: str, profile_path: Path) -> None:
+    """Reject an ABSOLUTE profile-path value or one with a literal '..' component,
+    naming `key` (M11 exit gate, Finding 1 P1). Every such value is later joined onto
+    `root` (directly, e.g. `root / value`, or via `root.glob(value)`) somewhere in the
+    collector -- a bare `isinstance(value, str)` check alone lets an absolute string
+    straight through `load_profile`, and pathlib's `/` SILENTLY REPLACES the left operand
+    when the right is absolute (`root / "/etc/hosts" == Path("/etc/hosts")`), defeating
+    containment before any read-time gate (`_resolves_inside_root`) ever runs -- the
+    escaping join happens first, not a symlink or a "resolves outside" case that gate
+    could catch. Reproduced live: a profile setting `top_level_files.root_instructions`
+    to "/etc/hosts" crashes `walk_always_loaded` with a bare `ValueError` from `_rel`'s
+    unguarded `relative_to`, which `main`'s outer handler turns into a full
+    `_empty_document` reported at exit 0 -- total inventory loss read as a clean empty
+    harness. This check closes that at the validation boundary, consistent with
+    load_profile's existing "never half-apply" contract.
+
+    Uses `pathlib.Path`, not `PurePosixPath`: this process only ever runs on POSIX
+    (CLAUDE.md's stdlib-only, deterministic-per-platform posture), and every join this
+    validates against (`root / value`, `root.glob(value)`) uses that SAME platform `Path`
+    class at read time -- validating with a different path flavor (e.g. PurePosixPath)
+    could disagree with what the actual join does. A Windows-style "C:\\x" or "\\\\host\\x"
+    is not absolute under a POSIX `Path` and is therefore not rejected here, but it is
+    also harmless there: POSIX `Path` treats a backslash as an ordinary filename
+    character, so `root / "C:\\x"` stays a single relative component INSIDE root -- not a
+    containment escape, just a filename that is unlikely to exist."""
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ProfileError(
+            f"profile {profile_path.name}: {key} must be a relative path with no "
+            "'..' component")
+
+
+def _check_profile_bare_name_safe(value: str, key: str, profile_path: Path) -> None:
+    """Reject a profile bare-name value (`memory_index_name`, `skill_manifest_name`) that
+    is not exactly ONE path component (M11 exit gate, Finding 1 P1). These are joined as
+    a single filename segment onto an already-resolved directory (`skill_dir /
+    skill_manifest_name`, `slug_dir / memory_dir_name / memory_index_name`) or compared
+    directly against one (`f.name == profile["memory_index_name"]`) -- `_check_profile_
+    path_safe`'s absolute/'..' check alone is not enough here: "a/b" is neither absolute
+    nor contains '..', but `Path(x) / "a/b"` still joins TWO components where the schema
+    promises one, and `Path.name` would silently take just "b" rather than reject the
+    mismatch. `value != Path(value).name` catches any embedded separator (including a
+    leading '/', which is also absolute and would be caught by the equality check itself
+    since `Path("/x").name == "x" != "/x"`); the explicit `("", ".", "..")` exclusion
+    catches the three literal single-token values whose `.name` degenerately survives (or
+    -- for ".." -- equals) that comparison without being a real filename."""
+    if value != Path(value).name or value in ("", ".", ".."):
+        raise ProfileError(
+            f"profile {profile_path.name}: {key} must be a single path component "
+            "(no separators, and not '.' or '..')")
+
+
 def _instruction_globs(profile: dict[str, Any]) -> tuple[str, ...]:
     """The instruction-file corpus, in DEDUP-SIGNIFICANT order (never sorted)."""
     return (tuple(profile["rules_globs"]) + tuple(profile["skills_globs"])
@@ -3104,6 +3183,39 @@ def load_profile(path: Path) -> dict[str, Any]:
                     or not all(isinstance(s, str) for s in pair)):
                 raise ProfileError(
                     f"profile {path.name}: {key} entries must be [prefix, dir] string pairs")
+
+    # M11 exit gate, Finding 1 (P1): every value that is later joined onto `root` as a
+    # filesystem path must be relative and '..'-free (_check_profile_path_safe), or --
+    # for the two bare-filename roles -- exactly one path component
+    # (_check_profile_bare_name_safe). Runs AFTER every type check above, still BEFORE
+    # the result dict is built, so a profile with an unsafe path never half-applies.
+    #
+    # `name`, `settings_format`, and `dispatcher_suffix` are deliberately NOT checked
+    # here: `name` and `settings_format` are labels/enum values, never joined onto a
+    # path, and `dispatcher_suffix` is only ever compared with `str.endswith` (collector.py
+    # reconcile_hooks) -- never joined -- so a '/' or '..' inside it is inert, not a
+    # containment vector.
+    for key in ("projects_glob", "commands_glob", "agents_glob"):
+        value = data[key]
+        if value is not None:
+            _check_profile_path_safe(value, key, path)
+    for key in ("memory_index_name", "skill_manifest_name"):
+        value = data[key]
+        if value is not None:
+            _check_profile_bare_name_safe(value, key, path)
+    for key in _PROFILE_LIST_KEYS:
+        for entry in data[key]:
+            _check_profile_path_safe(entry, key, path)
+    for key in _PROFILE_MAP_KEYS:
+        for role, entry in data[key].items():
+            if entry is not None:
+                _check_profile_path_safe(entry, f"{key}.{role}", path)
+    for pair in data["hook_command_remaps"]:
+        # Only the SECOND element (rel_dir) is a root-relative path this collector joins
+        # onto `root` -- the first is a literal '~'-prefixed prefix matched textually
+        # against a registered command string (e.g. "~/.claude/hooks"); it is SUPPOSED
+        # to look absolute-ish and is never joined onto `root`, so it is not checked.
+        _check_profile_path_safe(pair[1], "hook_command_remaps[1]", path)
 
     # Built only after EVERY check passed. Lists -> tuples: order preserved, never sorted.
     result: dict[str, Any] = {}
@@ -4362,12 +4474,24 @@ def scan_duplication(
     `compose=False` behavior (corpus, pairs shape, output) is byte-for-byte unchanged.
 
     M11 (SPEC_7 §2): the operator-tier corpus globs come from `profile["duplication_globs"]`
-    (defaulting to PROFILE_CLAUDE_CODE, which reproduces _DUP_GLOBS)."""
+    (defaulting to PROFILE_CLAUDE_CODE, which reproduces _DUP_GLOBS).
+
+    M11 exit gate, Finding 2 (P2): each glob candidate's containment is checked via
+    `_contained_or_disclosed` BEFORE its bytes are read (Codex R2-F7's "containment
+    refusal precedes the read", generalized here from `_deduped_instruction_files` to
+    this profile-glob consumer) -- a `duplication_globs` entry like "rules/*.md" where
+    `rules` is a symlink pointing outside `--root` used to be read (and its content
+    SAMPLED into a duplication pair's `shared_sample`) with no containment check at all;
+    it is now refused and disclosed instead."""
     profile = PROFILE_CLAUDE_CODE if profile is None else profile
     # Generalized skills/coding-team/rules -> skills/*/rules for release portability; the
     # seen_physical dedup below still collapses a rule reachable via multiple glob paths.
     seen_physical = set()
     corpus = []  # [(rel_path, tier, shingle_set), ...]
+    try:
+        root_stat = os.stat(root)
+    except OSError:
+        root_stat = None
     for pattern in profile["duplication_globs"]:
         try:
             candidates = sorted(root.glob(pattern))
@@ -4381,6 +4505,9 @@ def scan_duplication(
             if key in seen_physical:
                 continue
             seen_physical.add(key)
+            if not _contained_or_disclosed(fp, key, root, root_stat,
+                                           "duplication corpus file", blind_spots):
+                continue
             try:
                 size = fp.stat().st_size
             except OSError:
@@ -4465,7 +4592,21 @@ def _hooks_body_corpus(root, inaccessible=None, *, profile: dict[str, Any] | Non
     raises, so an unlistable dir is recorded and disclosed like an unreadable file.
 
     An ABSENT hooks dir is `complete=True`: a harness with no hooks has a known-empty
-    corpus, which is a fact, not a blind spot."""
+    corpus, which is a fact, not a blind spot.
+
+    M11 exit gate, Finding 2 (P2, assessed): unlike `scan_duplication`/`_staleness_
+    corpus`, `container_dirs["hooks"]` is a single dir role, not a glob list -- but it
+    reads file CONTENT the same way, so the same escape applies: `hooks/` matching a
+    symlink pointing outside `--root` (Finding 1's fix rejects only a literal absolute/
+    '..' role STRING, not a symlink on disk). Each candidate file's containment is now
+    checked via `_resolves_inside_root` before its body is read -- same `fp_inside`
+    pattern `reconcile_hooks` already uses for the identical hooks/ walk, reused here
+    rather than invented twice. Disclosed through `inaccessible[]` (this function's own
+    established sink for every other disclosure below), not a new `blind_spots` param --
+    adding one would mean threading it through `check_phantom_refs` and
+    `collect_promotion_candidates` too, for a case `inaccessible[]` already covers under
+    this project's "reaches inaccessible[], errors[], or blind_spots[]" disclosure
+    contract."""
     profile = PROFILE_CLAUDE_CODE if profile is None else profile
     hooks_name = profile["container_dirs"]["hooks"]
     if hooks_name is None:
@@ -4486,12 +4627,28 @@ def _hooks_body_corpus(root, inaccessible=None, *, profile: dict[str, Any] | Non
         if inaccessible is not None:
             _append_inaccessible_once(inaccessible, _rel_safe(root, hooks_dir))
         return "", False
+    try:
+        root_stat = os.stat(root)
+    except OSError:
+        root_stat = None
     complete = True
     body_suffixes = _hook_body_suffixes(profile)
     for name in names:
         if not name.endswith(body_suffixes):
             continue
         fp = hooks_dir / name
+        key = _physical_key(fp)
+        try:
+            fp_inside = root_stat is not None and _resolves_inside_root(Path(key), root, root_stat)
+        except (OSError, RuntimeError):
+            fp_inside = False
+        if not fp_inside:
+            # Same posture as an unreadable body below: unseen is unseen, whether the
+            # cause is a permission error or a resolved path outside --root.
+            complete = False
+            if inaccessible is not None:
+                _append_inaccessible_once(inaccessible, _rel_safe(root, fp))
+            continue
         text, _status = _read_text(fp)
         if text is None:
             # Covers both a genuinely unreadable regular file and a non-file the glob
@@ -4506,7 +4663,7 @@ def _hooks_body_corpus(root, inaccessible=None, *, profile: dict[str, Any] | Non
     return "\n".join(parts), complete
 
 
-def _staleness_corpus(root, inaccessible, *, profile: dict[str, Any] | None = None):
+def _staleness_corpus(root, inaccessible, blind_spots, *, profile: dict[str, Any] | None = None):
     """Corpus for phantom-ref + promotion-candidate scanning: rules/*.md,
     skills/coding-team/rules/*.md, and the harness CLAUDE.md — deduped by physical
     identity so a symlinked rule (deploy path + submodule source) is scanned once.
@@ -4514,18 +4671,34 @@ def _staleness_corpus(root, inaccessible, *, profile: dict[str, Any] | None = No
     M11 (SPEC_7 §2): the rule globs come from `profile["rules_globs"]` (defaulting to
     PROFILE_CLAUDE_CODE, which reproduces _STALENESS_RULE_GLOBS) and the root
     instructions file from `profile["top_level_files"]["root_instructions"]` — skipped
-    entirely when that role is None (a harness with no root instructions file)."""
+    entirely when that role is None (a harness with no root instructions file).
+
+    M11 exit gate, Finding 2 (P2): every `rules_globs` candidate's containment is
+    checked via `_contained_or_disclosed` before its bytes are read -- same fix and same
+    rationale as `scan_duplication`'s. (The single `root_instructions` file below is
+    NOT globbed and is out of this finding's scope -- see Finding 2's writeup: it names
+    only the profile GLOB consumers.)"""
     profile = PROFILE_CLAUDE_CODE if profile is None else profile
     seen = set()
     corpus = []
     paths = []
+    try:
+        root_stat = os.stat(root)
+    except OSError:
+        root_stat = None
     # Generalized skills/coding-team/rules -> skills/*/rules for release portability; deduped by
     # physical identity so a symlinked rule (deploy path + sub-skill source) is scanned once.
     for pattern in profile["rules_globs"]:
         try:
-            paths.extend(sorted(root.glob(pattern)))
+            candidates = sorted(root.glob(pattern))
         except OSError:
-            pass
+            candidates = []
+        for fp in candidates:
+            key = _physical_key(fp)
+            if not _contained_or_disclosed(fp, key, root, root_stat,
+                                           "staleness corpus file", blind_spots):
+                continue
+            paths.append(fp)
     root_instructions_name = profile["top_level_files"]["root_instructions"]
     if root_instructions_name is not None:
         claude = root / root_instructions_name
@@ -4954,7 +5127,19 @@ def _hook_test_stems(root, errors, *, profile: dict[str, Any] | None = None):
 
     M11 (SPEC_7 §2): the root-level test dir and the skills container come from
     `profile["container_dirs"]` (defaulting to PROFILE_CLAUDE_CODE); either role may be
-    None (no such surface), in which case that source is skipped entirely."""
+    None (no such surface), in which case that source is skipped entirely.
+
+    M11 exit gate, Finding 2 (P2, assessed -- NOT gated): this function never reads a
+    file's CONTENT (no `_read_text`/`_read_checked` call anywhere below) -- only
+    `Path.stem`, `.is_dir()`, and `.iterdir()`/`.glob("*.py")` names. Its return value
+    (`stems`, a set of normalized basenames) never reaches the report as a path or as
+    text either: the sole consumer, `_detect_hook_test_coverage`, folds it into a
+    per-IN-ROOT-hook-script boolean (`has_test`) and discards the stems themselves. A
+    `hooks/tests/` symlinked outside `--root` could at most flip an in-root hook's
+    `has_test` flag via a same-named outside test file -- no outside path or outside
+    content is ever disclosed or read -- so this does not meet the "a read or a name
+    reaching output can escape" bar the sibling functions above were gated for, and is
+    intentionally left ungated."""
     profile = PROFILE_CLAUDE_CODE if profile is None else profile
     stems = set()
     # Generalized skills/coding-team/hooks/tests -> skills/*/hooks/tests for release portability.
@@ -5548,7 +5733,7 @@ def build_document(
     duplication_section = scan_duplication(root, blind_spots, project_root=project_root,
                                             compose=compose, out_of_root_refs=out_of_root_refs,
                                             profile=profile)
-    corpus_files = _staleness_corpus(root, inaccessible, profile=profile)
+    corpus_files = _staleness_corpus(root, inaccessible, blind_spots, profile=profile)
     phantom_refs = check_phantom_refs(root, corpus_files, inaccessible, profile=profile)
     promotion_candidates = collect_promotion_candidates(root, corpus_files, settings,
                                                          profile=profile)

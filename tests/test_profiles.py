@@ -329,3 +329,206 @@ def test_foreign_profile_skips_plugin_reads_even_when_files_exist(bare_agents_re
     assert doc["config"]["installed_plugin_count"] == 0
     assert not any("known_marketplaces.json" in b or "installed_plugins.json" in b
                    for b in doc["blind_spots"])
+
+
+# --- M11 exit gate, Finding 1 (P1): load_profile must reject an absolute or '..'-bearing
+# profile path VALUE before it is ever half-applied. ---
+
+def test_load_profile_rejects_absolute_top_level_files_role(tmp_path):
+    """Direct load_profile reproduction of the team-lead's Finding 1: an absolute
+    top_level_files role used to validate as a bare string, then silently REPLACE the
+    root when joined (`root / "/etc/hosts" == Path("/etc/hosts")`)."""
+    p = _write_profile(tmp_path, lambda d: d["top_level_files"].__setitem__(
+        "root_instructions", "/etc/hosts"))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "top_level_files.root_instructions" in str(exc.value)
+
+
+def test_absolute_profile_path_rejected_at_exit_two_before_any_read(fake_harness, tmp_path):
+    """Full-CLI reproduction of the team-lead's Finding 1 exactly: BASELINE (no profile)
+    reads several always-loaded files with 0 errors; a profile identical to
+    claude-code.json except for an absolute root_instructions used to crash
+    walk_always_loaded (an unguarded `_rel`'s `relative_to` raising ValueError) with the
+    whole document replaced by `_empty_document` and reported at EXIT 0 -- total
+    inventory loss read as a clean empty harness. It must now be rejected by
+    load_profile ITSELF, at exit 2, naming the offending key, stdout still a full-key
+    envelope (Invariant 2), and no crash (`errors` carries only the profile-rejection
+    message, never a traceback fragment).
+    # Changing this value requires a spec change (SPEC_7 §2)."""
+    baseline = json.loads(run_collector_raw(fake_harness).stdout)
+    assert baseline["headline"]["always_loaded_file_count"] > 0
+    assert baseline["errors"] == []
+
+    p = _write_profile(tmp_path, lambda d: d["top_level_files"].__setitem__(
+        "root_instructions", "/etc/hosts"))
+    proc = run_collector_raw(fake_harness, "--profile", str(p))
+    assert proc.returncode == 2, proc.stderr
+    assert "top_level_files.root_instructions" in proc.stderr
+    doc = json.loads(proc.stdout)
+    for key in ("schema_version", "generated_at", "root", "headline", "always_loaded",
+                "on_demand", "enforcement", "config", "instruction_length_flags",
+                "duplication", "phantom_refs", "promotion_candidates", "test_coverage",
+                "inaccessible", "blind_spots", "errors"):
+        assert key in doc, f"crash envelope missing top-level key: {key}"
+    assert doc["headline"]["always_loaded_file_count"] == 0
+    assert len(doc["errors"]) == 1
+    assert "top_level_files.root_instructions" in doc["errors"][0]
+    assert "ValueError" not in doc["errors"][0]  # never the old crash-message shape
+
+
+def test_load_profile_rejects_absolute_container_dirs_role(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d["container_dirs"].__setitem__("hooks", "/tmp"))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "container_dirs.hooks" in str(exc.value)
+
+
+def test_load_profile_rejects_dotdot_in_a_list_glob(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "rules_globs", d["rules_globs"] + ["../outside.md"]))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "rules_globs" in str(exc.value)
+
+
+def test_load_profile_rejects_absolute_entry_in_hook_script_globs(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "hook_script_globs", d["hook_script_globs"] + ["/etc/*.py"]))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "hook_script_globs" in str(exc.value)
+
+
+def test_load_profile_rejects_dotdot_projects_glob(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("projects_glob", "../projects/*"))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "projects_glob" in str(exc.value)
+
+
+def test_load_profile_rejects_bare_name_with_embedded_separator(tmp_path):
+    """memory_index_name/skill_manifest_name are joined as a SINGLE filename component
+    (`skill_dir / skill_manifest_name`) -- neither absolute nor '..'-bearing, "sub/x.md"
+    still names two components where the schema promises one."""
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("skill_manifest_name", "sub/SKILL.md"))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "skill_manifest_name" in str(exc.value)
+
+
+def test_load_profile_rejects_bare_name_equal_to_dotdot(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("memory_index_name", ".."))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "memory_index_name" in str(exc.value)
+
+
+def test_load_profile_rejects_absolute_second_element_of_hook_command_remap(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "hook_command_remaps", [["~/.claude/hooks", "/etc/hooks"]]))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "hook_command_remaps" in str(exc.value)
+
+
+def test_load_profile_does_not_check_the_first_hook_command_remap_element(tmp_path):
+    """The FIRST element is a literal '~'-prefixed prefix matched textually against a
+    registered command string -- it is SUPPOSED to look absolute-ish and is never joined
+    onto `root`, so it must load even with a '..' inside it."""
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "hook_command_remaps", [["~/../weird/prefix", "hooks"]]))
+    loaded = _collector.load_profile(p)  # must not raise
+    assert loaded["hook_command_remaps"] == (("~/../weird/prefix", "hooks"),)
+
+
+def test_load_profile_does_not_check_dispatcher_suffix_name_or_settings_format():
+    """dispatcher_suffix is only ever compared with str.endswith (reconcile_hooks) --
+    never joined onto a path -- and `name`/`settings_format` are labels/enum values, not
+    paths. A '..'/'/' inside dispatcher_suffix or name is inert here, so load_profile
+    must not reject it (documents the deliberate exclusion from Finding 1's fix)."""
+    def mutate(d):
+        d["dispatcher_suffix"] = "../weird-suffix.py"
+        d["name"] = "weird/name"
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = _write_profile(Path(td), mutate)
+        loaded = _collector.load_profile(p)  # must not raise
+        assert loaded["dispatcher_suffix"] == "../weird-suffix.py"
+        assert loaded["name"] == "weird/name"
+
+
+# --- M11 exit gate, Finding 2 (P2): a profile glob with NO '..' and NO absolute path in
+# its TEXT can still escape containment if the directory it names is a symlink pointing
+# outside --root -- Finding 1's validation only rejects the STRING, not what it resolves
+# to on disk. scan_duplication and _staleness_corpus must gate the read the same way
+# _deduped_instruction_files already does. ---
+
+def test_duplication_glob_symlink_escape_is_gated_not_read(fake_harness, tmp_path):
+    """Reproduces the team-lead's Finding 2 exactly: an in-root file and an out-of-root
+    file share an 8-word shingle. Before this fix, the out-of-root file was read and its
+    content sampled straight into a duplication pair's shared_sample with no containment
+    check at all."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    shared_text = "alpha bravo charlie delta echo foxtrot golf hotel " * 4
+    (outside / "outside_secret.md").write_text(shared_text)
+    (fake_harness / "escaped").symlink_to(outside)
+    (fake_harness / "inroot_dup.md").write_text(shared_text)
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "duplication_globs", d["duplication_globs"] + ["*.md", "escaped/*.md"]))
+    doc = json.loads(run_collector_raw(fake_harness, "--profile", str(p)).stdout)
+    assert doc["errors"] == []
+    assert not any("escaped/outside_secret.md" in (pair["a"], pair["b"])
+                   for pair in doc["duplication"]["pairs"])
+    assert any(
+        "duplication corpus file escaped/outside_secret.md resolves outside the "
+        "harness root — not read" in b
+        for b in doc["blind_spots"])
+
+
+def test_staleness_glob_symlink_escape_is_gated_not_read(fake_harness, tmp_path):
+    """Same containment escape as the duplication test above, for _staleness_corpus's
+    rules_globs consumer."""
+    outside = tmp_path / "outside2"
+    outside.mkdir()
+    (outside / "outside_secret.md").write_text("Secret rule body " * 30)
+    (fake_harness / "escaped2").symlink_to(outside)
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "rules_globs", d["rules_globs"] + ["escaped2/*.md"]))
+    doc = json.loads(run_collector_raw(fake_harness, "--profile", str(p)).stdout)
+    assert doc["errors"] == []
+    assert any(
+        "staleness corpus file escaped2/outside_secret.md resolves outside the "
+        "harness root — not read" in b
+        for b in doc["blind_spots"])
+
+
+def test_hooks_body_corpus_leaf_symlink_escape_is_gated_not_read(fake_harness, tmp_path):
+    """M11 exit gate, Finding 2 (P2, assessed item 3): a hook SCRIPT that is itself a
+    symlink pointing outside --root must not have its body read into the hooks corpus --
+    same fp_inside pattern reconcile_hooks already applies to the identical hooks/ walk,
+    now also applied to _hooks_body_corpus's separate, parallel enumeration of it.
+
+    Proven via the env-flag phantom-ref cross-reference (check_phantom_refs,
+    collector.py ~5029): `SUPER_GUARD_FLAG` is referenced ONLY by the escaped hook's
+    body. BEFORE this fix, `_hooks_body_corpus` read that body anyway, so the flag
+    looked referenced and NO phantom row was ever emitted for it -- a false negative
+    (the corpus's one and only piece of evidence for the flag was itself read from
+    outside --root). AFTER the fix, the flag is correctly flagged AND downgraded to
+    resolved=None (not the confirmed-broken False) because the corpus is now known-
+    incomplete -- exactly the D2 treatment `_hooks_body_corpus`'s own docstring
+    describes for an unseen hook body."""
+    outside = tmp_path / "outside3"
+    outside.mkdir()
+    (outside / "real_hook.py").write_text("import os\nos.environ.get('SUPER_GUARD_FLAG')\n")
+    (fake_harness / "hooks" / "escaped_hook.py").symlink_to(outside / "real_hook.py")
+    (fake_harness / "rules" / "envflag.md").write_text(
+        "Reads the `SUPER_GUARD_FLAG` env var to bypass writes. " + "pad word " * 10)
+    doc = json.loads(run_collector_raw(fake_harness).stdout)
+    assert doc["errors"] == []
+    env_rows = [r for r in doc["phantom_refs"]
+                if r.get("kind") == "env_flag" and r.get("ref") == "SUPER_GUARD_FLAG"]
+    assert len(env_rows) == 1, doc["phantom_refs"]
+    assert env_rows[0]["resolved"] is None
+    assert any("escaped_hook.py" in e.get("path", "") for e in doc["inaccessible"])
