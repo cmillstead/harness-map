@@ -799,3 +799,84 @@ def test_empty_glob_string_full_cli_reproduction_exits_two_not_zero(fake_harness
     assert len(doc["errors"]) == 1
     assert "rules_globs" in doc["errors"][0]
     assert "collector crashed" not in doc["errors"][0]
+
+
+# --- M11 exit gate, Codex round, Finding 4 (P2): walk_always_loaded's nested-rule-dir
+# match compared `segs[0]` against the LITERAL "skills" -- a second hardcoded literal the
+# comment claiming "derived from rules_globs (never a second literal)" did not account
+# for. A profile renaming container_dirs["skills"] silently lost every nested
+# <skills>/*/<rules-subdir>/*.md file from the always-loaded corpus, with NO disclosure
+# at all (verified directly against the specific message, not a substring match). ---
+
+def test_renamed_skills_container_still_finds_its_own_nested_rules(fake_harness, tmp_path):
+    (fake_harness / "abilities" / "demo" / "guidance").mkdir(parents=True)
+    (fake_harness / "abilities" / "demo" / "guidance" / "g.md").write_text(
+        "Ability guidance body " * 20)
+
+    def mutate(d):
+        d["container_dirs"]["skills"] = "abilities"
+        d["rules_globs"] = ["rules/*.md", "abilities/*/guidance/*.md"]
+
+    p = _write_profile(tmp_path, mutate)
+    doc = json.loads(run_collector_raw(fake_harness, "--profile", str(p)).stdout)
+    assert doc["errors"] == []
+    paths = {f["path"] for f in doc["always_loaded"]["files"]}
+    assert "abilities/demo/guidance/g.md" in paths, paths
+    assert doc["headline"]["always_loaded_file_count"] == 5   # CLAUDE.md, rules/{a,b}.md,
+                                                                # memory/MEMORY.md, the nested file
+    rule_row = next(f for f in doc["always_loaded"]["files"]
+                    if f["path"] == "abilities/demo/guidance/g.md")
+    assert rule_row["category"] == "skill_rule"
+
+
+# --- M11 exit gate, Codex round, Finding 3 (P2): `projects_glob` was schema'd, validated,
+# documented, and exported, but read by NOTHING -- `container_dirs["projects"]` alone drove
+# project discovery, so `projects_glob` could not narrow (or, set to `null`, disable) which
+# projects/<slug> dirs walk_always_loaded treats as registered. ---
+
+def test_projects_glob_null_disables_project_discovery(fake_harness, tmp_path):
+    """DECISION 3: `projects_glob: null` means no project discovery in this layout --
+    every OTHER project's memory index must disappear from conditional_variants even
+    though container_dirs["projects"]/["memory"] are still populated and the dirs exist
+    on disk (proving projects_glob, not container_dirs, is what gates this)."""
+    proj = fake_harness.parent / "active-repo"
+    baseline = json.loads(run_collector_raw(fake_harness, project_root=proj).stdout)
+    assert len(baseline["always_loaded"]["conditional_variants"]) == 1   # other-proj-slug
+
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("projects_glob", None))
+    doc = json.loads(run_collector_raw(fake_harness, "--profile", str(p),
+                                       project_root=proj).stdout)
+    assert doc["errors"] == []
+    assert doc["always_loaded"]["conditional_variants"] == []
+
+
+def test_projects_glob_narrows_which_project_dirs_are_discovered(fake_harness, tmp_path):
+    """A narrower `projects_glob` (e.g. "projects/team-*") must EXCLUDE a real,
+    accessible projects/<slug> dir that does not match it -- proving the glob actually
+    filters membership rather than merely gating on/off."""
+    (fake_harness / "projects" / "team-alpha" / "memory").mkdir(parents=True)
+    (fake_harness / "projects" / "team-alpha" / "memory" / "MEMORY.md").write_text(
+        "# Team alpha\n- item\n")
+    proj = fake_harness.parent / "active-repo"
+    baseline = json.loads(run_collector_raw(fake_harness, project_root=proj).stdout)
+    baseline_slugs = {v["project_slug"] for v in baseline["always_loaded"]["conditional_variants"]}
+    assert baseline_slugs == {"other-proj-slug", "team-alpha"}
+
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("projects_glob", "projects/team-*"))
+    doc = json.loads(run_collector_raw(fake_harness, "--profile", str(p),
+                                       project_root=proj).stdout)
+    assert doc["errors"] == []
+    slugs = {v["project_slug"] for v in doc["always_loaded"]["conditional_variants"]}
+    assert slugs == {"team-alpha"}
+
+
+def test_projects_glob_ignores_non_directory_matches(fake_harness):
+    """The team-lead's explicit warning: `glob("projects/*")` returns FILES too -- a
+    stray file directly under projects/ that matches the glob must be silently skipped,
+    not treated as a project slug dir (which would otherwise attempt `slug_dir / "memory"`
+    against a file)."""
+    (fake_harness / "projects" / "not-a-project.txt").write_text("stray file\n")
+    doc = json.loads(run_collector_raw(fake_harness).stdout)
+    assert doc["errors"] == []
+    slugs = {v["project_slug"] for v in doc["always_loaded"]["conditional_variants"]}
+    assert "not-a-project.txt" not in slugs

@@ -1898,6 +1898,19 @@ def walk_always_loaded(
     # walk to follow symlinks through. A symlinked skill/rule DIR is followed and reported
     # under its harness-relative name by design. Recursive, symlink-loop-prone trees (hooks/)
     # are handled in Task 3 with explicit name+target recording instead of a body read.
+    #
+    # M11 exit gate, Codex round, Finding 3 (P2): `projects_glob` (defaulting to
+    # "projects/*") is what actually GATES and NARROWS which projects/<slug> dirs count as
+    # registered here -- `container_dirs["projects"]` alone (used above only to locate the
+    # container dir and, unchanged, still recorded as an errors[]-worthy is_dir() probe)
+    # used to be the only thing driving this walk, leaving `projects_glob` entirely inert.
+    # `None` means "no project discovery in this layout" ([DECISION] SPEC_7 §2): slug_dirs
+    # stays empty. A non-null glob NARROWS the existing dir-filtered candidate set to those
+    # ALSO matching the pattern (`root.glob(pattern)`, intersected — never substituted for
+    # the candidate set outright, since `.glob()` returns files too and the existing
+    # is_dir()-filtered `iterdir()` enumeration must stay the single source of "is this a
+    # directory" truth). The default "projects/*" intersects to the SAME set in the SAME
+    # order as the pre-M11 walk, so default output stays byte-identical.
     projects_dir_is_dir = False
     projects_dir: Path | None = None
     if projects_dir_name is not None:
@@ -1907,49 +1920,56 @@ def walk_always_loaded(
         except OSError as e:
             errors.append(f"projects is_dir failed for {projects_dir}: {e}")
             projects_dir_is_dir = False
-    if projects_dir_is_dir and projects_dir is not None:
+    projects_glob_pattern = profile["projects_glob"]
+    slug_dirs: list[Path] = []
+    if projects_dir_is_dir and projects_dir is not None and projects_glob_pattern is not None:
         try:
-            slug_dirs = sorted(p for p in projects_dir.iterdir() if p.is_dir())
+            candidate_dirs = sorted(p for p in projects_dir.iterdir() if p.is_dir())
         except OSError:
-            slug_dirs = []
-        for slug_dir in slug_dirs:
-            if memory_dir_name is None or memory_index_name is None:
+            candidate_dirs = []
+        try:
+            glob_matches = set(root.glob(projects_glob_pattern))
+        except OSError:
+            glob_matches = set()
+        slug_dirs = [p for p in candidate_dirs if p in glob_matches]
+    for slug_dir in slug_dirs:
+        if memory_dir_name is None or memory_index_name is None:
+            continue
+        idx = slug_dir / memory_dir_name / memory_index_name
+        present, ok = _safe_exists(idx)
+        if not ok:
+            # A single locked slug dir is marked inaccessible; the loop continues so one
+            # bad project does not blank the rest of the inventory.
+            inaccessible.append({"path": _rel(root, idx), "reason": "unreadable"})
+            continue
+        if not present:
+            continue
+        slug = slug_dir.name
+        if slug == active_slug:
+            key = _physical_key(idx)
+            if key not in seen:
+                entry = _file_entry(root, idx, "memory", inaccessible)
+                if entry:
+                    if compose:
+                        entry["tier"] = "operator"
+                    files.append(entry)
+                    seen.add(key)
+        else:
+            text = _read_checked(root, idx, inaccessible)
+            if text is None:
                 continue
-            idx = slug_dir / memory_dir_name / memory_index_name
-            present, ok = _safe_exists(idx)
-            if not ok:
-                # A single locked slug dir is marked inaccessible; the loop continues so one
-                # bad project does not blank the rest of the inventory.
-                inaccessible.append({"path": _rel(root, idx), "reason": "unreadable"})
-                continue
-            if not present:
-                continue
-            slug = slug_dir.name
-            if slug == active_slug:
-                key = _physical_key(idx)
-                if key not in seen:
-                    entry = _file_entry(root, idx, "memory", inaccessible)
-                    if entry:
-                        if compose:
-                            entry["tier"] = "operator"
-                        files.append(entry)
-                        seen.add(key)
-            else:
-                text = _read_checked(root, idx, inaccessible)
-                if text is None:
-                    continue
-                words, lines, tokens_est = _metrics(text)
-                variant = {
-                    "path": _rel(root, idx),
-                    "project_slug": slug,
-                    "words": words,
-                    "lines": lines,
-                    "tokens_est": tokens_est,
-                    "evidence": "VERIFIED",
-                }
-                if compose:
-                    variant["tier"] = "operator"
-                conditional_variants.append(variant)
+            words, lines, tokens_est = _metrics(text)
+            variant = {
+                "path": _rel(root, idx),
+                "project_slug": slug,
+                "words": words,
+                "lines": lines,
+                "tokens_est": tokens_est,
+                "evidence": "VERIFIED",
+            }
+            if compose:
+                variant["tier"] = "operator"
+            conditional_variants.append(variant)
 
     # Note (comment per task spec): root ~/.claude/MEMORY.md does NOT exist in the live
     # harness — only the memory/ stub directory. We still count memory/MEMORY.md when present.
@@ -1978,13 +1998,19 @@ def walk_always_loaded(
     rules_dir_name = container_dirs["rules"]
     rule_dirs = [(root / rules_dir_name, "rule")] if rules_dir_name is not None else []
     skills_dir_name = container_dirs["skills"]
-    # skills/*/rules/*.md's middle segment names each sub-skill's own rules dir — derived
-    # from rules_globs (never a second literal) so it can never drift from what
-    # _deduped_instruction_files reads.
+    # <skills>/*/<sub-rules>/*.md's middle segment names each sub-skill's own rules dir —
+    # matched against `skills_dir_name` (container_dirs["skills"]), never the literal
+    # "skills" (M11 exit gate, Codex round, Finding 4: an earlier version of this comment
+    # claimed the match was "derived from rules_globs (never a second literal)", which was
+    # false -- "skills" WAS a second literal, so a profile renaming container_dirs["skills"]
+    # (e.g. to "abilities") silently lost every nested rules_globs entry shaped like
+    # "<renamed>/*/<sub>/*.md" from this walk, with no disclosure at all). `skills_dir_name`
+    # being None (no skills concept) makes this comparison never match any glob segment,
+    # same as before.
     sub_rules_dir_name = None
     for g in profile["rules_globs"]:
         segs = g.split("/")
-        if len(segs) == 4 and segs[0] == "skills" and segs[1] == "*" and segs[3] == "*.md":
+        if len(segs) == 4 and segs[0] == skills_dir_name and segs[1] == "*" and segs[3] == "*.md":
             sub_rules_dir_name = segs[2]
             break
     skills_root_is_dir = False
