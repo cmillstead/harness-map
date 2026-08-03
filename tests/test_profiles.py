@@ -189,6 +189,23 @@ def test_default_profile_matches_claude_code_layout(fake_harness, tmp_path):
     assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
 
 
+def test_profile_hook_command_remap_is_profile_driven(fake_harness, tmp_path):
+    """The `~/.claude/hooks/...` literal remap comes from hook_command_remaps, not from a
+    hard-coded string. A profile with an empty remap list leaves a ~-prefixed command
+    unremapped, so it resolves to the REAL expanduser path and reports as an orphan
+    registration rather than silently resolving under --root."""
+    (fake_harness / "hooks" / "x.py").write_text("# hook\n")
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 ~/.claude/hooks/x.py"}]}]}}))
+    default_doc = json.loads(run_collector_raw(fake_harness).stdout)
+    assert any(r["script"].endswith("hooks/x.py")
+               for r in default_doc["enforcement"]["hooks"]["registered"])
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("hook_command_remaps", []))
+    no_remap = json.loads(run_collector_raw(fake_harness, "--profile", str(p)).stdout)
+    assert no_remap["enforcement"]["hooks"]["registered"] == []
+
+
 def test_default_profile_matches_claude_code_layout_in_compose_mode(fake_harness):
     """Same guard with --compose on, so the project-tier path is exercised too."""
     proj = fake_harness.parent / "active-repo"

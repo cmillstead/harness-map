@@ -1273,9 +1273,14 @@ def _read_checked(root, path, inaccessible, rel_root=None):
     return text
 
 
-def _script_from_command(command, root):
+def _script_from_command(command, root, *, profile: dict[str, Any] | None = None):
     """Return (script_path | None, note | None). `note` is set when the command form is
-    unsupported or yields no script token, so the caller SURFACES it (never silent)."""
+    unsupported or yields no script token, so the caller SURFACES it (never silent).
+
+    M11 (SPEC_7 §2): the `~`-prefixed remap below tries each configured
+    profile["hook_command_remaps"] pair in order, first match wins — reproducing the
+    single "~/.claude/hooks" -> root/"hooks" remap byte-for-byte on the default profile."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -1301,10 +1306,12 @@ def _script_from_command(command, root):
         # (and every fixture in these tests) reconciles against the actual registered
         # hook path instead of the real, unrelated $HOME.
         expanded = raw.expanduser()
-        try:
-            return (root / "hooks") / expanded.relative_to(Path("~/.claude/hooks").expanduser()), None
-        except ValueError:
-            return expanded, None
+        for literal_prefix, rel_dir in profile["hook_command_remaps"]:
+            try:
+                return (root / rel_dir) / expanded.relative_to(Path(literal_prefix).expanduser()), None
+            except ValueError:
+                continue
+        return expanded, None
     if raw.is_absolute():
         return raw, None
     # A relative directly-executable token (e.g. "./hooks/x.py") resolves against --root,
@@ -1478,7 +1485,7 @@ def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
 # skill/agent/command discovery here is a NEW read/traverse surface (T4) — every path is
 # routed through T3's `_project_tier_gate` (H2 containment), same as `_walk_project_tier`.
 
-def _walk_operator_tier_nodes(root, inaccessible=None):
+def _walk_operator_tier_nodes(root, inaccessible=None, *, profile: dict[str, Any] | None = None):
     """Operator-tier skill/agent/command nodes (T4). A lean single-level existence walk
     (no body read — the node model needs only the collision key + path for the shadow
     resolver; word/line metrics stay owned by collect_descriptions/collect_on_demand).
@@ -1491,28 +1498,41 @@ def _walk_operator_tier_nodes(root, inaccessible=None):
     to abort this walk and — via build_document, which has no per-section handler — replace
     the whole document with a crash envelope. Each surface dir that cannot be probed is now
     recorded here and skipped, so an unreadable surface is DISCLOSED rather than silently
-    absent from a report that would otherwise read as clean."""
+    absent from a report that would otherwise read as clean.
+
+    M11 (SPEC_7 §2): dir names come from profile["container_dirs"], the manifest name from
+    profile["skill_manifest_name"]; a None role means this layout has no such surface, and
+    the corresponding block is skipped."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    container_dirs = profile["container_dirs"]
     nodes: list[dict[str, Any]] = []
     if inaccessible is None:
         inaccessible = []
-    skills_dir = root / "skills"
-    try:
-        skills_dir_is_dir = _probe_is_dir(skills_dir)
-    except OSError:
-        _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
-        skills_dir_is_dir = False
-    if skills_dir_is_dir:
+    skills_dir_name = container_dirs["skills"]
+    skill_manifest_name = profile["skill_manifest_name"]
+    skills_dir_is_dir = False
+    if skills_dir_name is not None:
+        skills_dir = root / skills_dir_name
+        try:
+            skills_dir_is_dir = _probe_is_dir(skills_dir)
+        except OSError:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+            skills_dir_is_dir = False
+    if skills_dir_is_dir and skill_manifest_name is not None:
         try:
             skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
         except OSError:
             skill_dirs = []
         for skill_dir in skill_dirs:
-            skill_md = skill_dir / "SKILL.md"
+            skill_md = skill_dir / skill_manifest_name
             present, ok = _safe_exists(skill_md)
             if ok and present:
                 nodes.append({"surface": "skill", "name": skill_dir.name,
                               "tier": "operator", "path": _rel(root, skill_md)})
-    for surface, dirname in (("agent", "agents"), ("command", "commands")):
+    for surface, role in (("agent", "agents"), ("command", "commands")):
+        dirname = container_dirs[role]
+        if dirname is None:
+            continue
         d = root / dirname
         try:
             d_is_dir = _probe_is_dir(d)
@@ -1763,6 +1783,8 @@ def walk_always_loaded(
     errors: list[str],
     compose: bool = False,
     out_of_root_refs: list[Any] | None = None,
+    *,
+    profile: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Collect always-loaded surfaces: harness CLAUDE.md, the active project's memory
     index only (other projects' indexes go to conditional_variants), the active
@@ -1774,7 +1796,15 @@ def walk_always_loaded(
     end), and appends that project-tier walk's own entries to `files`. Default
     (compose=False) behavior is UNCHANGED byte-for-byte. `out_of_root_refs` (T3/H2) is
     mutated in place with any project-tier path that escaped containment; only consulted
-    when `compose=True` and `project_root` is set."""
+    when `compose=True` and `project_root` is set.
+
+    M11 (SPEC_7 §2): every fixed path below is sourced from `profile` (defaulting to
+    PROFILE_CLAUDE_CODE); a None role means this layout has no such surface, and the
+    corresponding block is skipped — never `root / None`."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    top_level_files = profile["top_level_files"]
+    container_dirs = profile["container_dirs"]
+    root_instructions_name = top_level_files["root_instructions"]
     files = []
     conditional_variants = []
     # A file reachable via multiple glob paths (a rules/ deploy symlink pointing at its
@@ -1785,21 +1815,25 @@ def walk_always_loaded(
     # this set: those are different projects' distinct MEMORY.md files, not glob duplicates.
     seen = set()
 
-    root_claude = root / "CLAUDE.md"
-    present, ok = _safe_exists(root_claude)
-    if not ok:
-        inaccessible.append({"path": _rel(root, root_claude), "reason": "unreadable"})
-    elif present:
-        key = _physical_key(root_claude)
-        if key not in seen:
-            entry = _file_entry(root, root_claude, "claude_md", inaccessible)
-            if entry:
-                if compose:
-                    entry["tier"] = "operator"
-                files.append(entry)
-                seen.add(key)
+    if root_instructions_name is not None:
+        root_claude = root / root_instructions_name
+        present, ok = _safe_exists(root_claude)
+        if not ok:
+            inaccessible.append({"path": _rel(root, root_claude), "reason": "unreadable"})
+        elif present:
+            key = _physical_key(root_claude)
+            if key not in seen:
+                entry = _file_entry(root, root_claude, "claude_md", inaccessible)
+                if entry:
+                    if compose:
+                        entry["tier"] = "operator"
+                    files.append(entry)
+                    seen.add(key)
 
     active_slug = None
+    projects_dir_name = container_dirs["projects"]
+    memory_dir_name = container_dirs["memory"]
+    memory_index_name = profile["memory_index_name"]
     if project_root is not None:
         active_slug = _project_slug(project_root)
         # Only count this project's CLAUDE.md via THIS legacy branch if the project is
@@ -1811,14 +1845,16 @@ def walk_always_loaded(
         # `_probe_is_dir` re-raises EACCES from an unreadable ancestor (it swallows only the
         # ENOENT family) — an escape here aborts walk_always_loaded and, via build_document,
         # replaces the ENTIRE report with a crash envelope. Record and treat as absent.
-        legacy_memory_dir = root / "projects" / active_slug / "memory"
-        try:
-            legacy_memory_present = _probe_is_dir(legacy_memory_dir)
-        except OSError as e:
-            errors.append(f"projects memory is_dir failed for {legacy_memory_dir}: {e}")
-            legacy_memory_present = False
-        if not compose and legacy_memory_present:
-            proj_claude = Path(project_root) / "CLAUDE.md"
+        legacy_memory_present = False
+        if projects_dir_name is not None and memory_dir_name is not None:
+            legacy_memory_dir = root / projects_dir_name / active_slug / memory_dir_name
+            try:
+                legacy_memory_present = _probe_is_dir(legacy_memory_dir)
+            except OSError as e:
+                errors.append(f"projects memory is_dir failed for {legacy_memory_dir}: {e}")
+                legacy_memory_present = False
+        if not compose and legacy_memory_present and root_instructions_name is not None:
+            proj_claude = Path(project_root) / root_instructions_name
             present, ok = _safe_exists(proj_claude)
             if not ok:
                 inaccessible.append({"path": _rel(project_root, proj_claude), "reason": "unreadable"})
@@ -1835,19 +1871,24 @@ def walk_always_loaded(
     # walk to follow symlinks through. A symlinked skill/rule DIR is followed and reported
     # under its harness-relative name by design. Recursive, symlink-loop-prone trees (hooks/)
     # are handled in Task 3 with explicit name+target recording instead of a body read.
-    projects_dir = root / "projects"
-    try:
-        projects_dir_is_dir = _probe_is_dir(projects_dir)
-    except OSError as e:
-        errors.append(f"projects is_dir failed for {projects_dir}: {e}")
-        projects_dir_is_dir = False
-    if projects_dir_is_dir:
+    projects_dir_is_dir = False
+    projects_dir: Path | None = None
+    if projects_dir_name is not None:
+        projects_dir = root / projects_dir_name
+        try:
+            projects_dir_is_dir = _probe_is_dir(projects_dir)
+        except OSError as e:
+            errors.append(f"projects is_dir failed for {projects_dir}: {e}")
+            projects_dir_is_dir = False
+    if projects_dir_is_dir and projects_dir is not None:
         try:
             slug_dirs = sorted(p for p in projects_dir.iterdir() if p.is_dir())
         except OSError:
             slug_dirs = []
         for slug_dir in slug_dirs:
-            idx = slug_dir / "memory" / "MEMORY.md"
+            if memory_dir_name is None or memory_index_name is None:
+                continue
+            idx = slug_dir / memory_dir_name / memory_index_name
             present, ok = _safe_exists(idx)
             if not ok:
                 # A single locked slug dir is marked inaccessible; the loop continues so one
@@ -1885,19 +1926,21 @@ def walk_always_loaded(
 
     # Note (comment per task spec): root ~/.claude/MEMORY.md does NOT exist in the live
     # harness — only the memory/ stub directory. We still count memory/MEMORY.md when present.
-    stub = root / "memory" / "MEMORY.md"
-    present, ok = _safe_exists(stub)
-    if not ok:
-        inaccessible.append({"path": _rel(root, stub), "reason": "unreadable"})
-    elif present:
-        key = _physical_key(stub)
-        if key not in seen:
-            entry = _file_entry(root, stub, "memory", inaccessible)
-            if entry:
-                if compose:
-                    entry["tier"] = "operator"
-                files.append(entry)
-                seen.add(key)
+    memory_index_rel = top_level_files["memory_index"]
+    if memory_index_rel is not None:
+        stub = root / memory_index_rel
+        present, ok = _safe_exists(stub)
+        if not ok:
+            inaccessible.append({"path": _rel(root, stub), "reason": "unreadable"})
+        elif present:
+            key = _physical_key(stub)
+            if key not in seen:
+                entry = _file_entry(root, stub, "memory", inaccessible)
+                if entry:
+                    if compose:
+                        entry["tier"] = "operator"
+                    files.append(entry)
+                    seen.add(key)
 
     # Deliberately single-level: glob("*.md") only, no recursion into subdirectories.
     # root/rules/*.md is scanned FIRST so a rule reachable via BOTH a rules/ deploy symlink and
@@ -1905,21 +1948,35 @@ def walk_always_loaded(
     # `seen` dedup below drops the later sub-skill duplicate. Generalized from coding-team-only to
     # any skills/*/rules/ for release portability; coding-team keeps its "coding_team_rule" label
     # (baseline continuity), every other sub-skill's rules get "skill_rule".
-    rule_dirs = [(root / "rules", "rule")]
-    skills_root = root / "skills"
-    try:
-        skills_root_is_dir = _probe_is_dir(skills_root)
-    except OSError as e:
-        errors.append(f"skills is_dir failed for {skills_root}: {e}")
-        skills_root_is_dir = False
-    if skills_root_is_dir:
+    rules_dir_name = container_dirs["rules"]
+    rule_dirs = [(root / rules_dir_name, "rule")] if rules_dir_name is not None else []
+    skills_dir_name = container_dirs["skills"]
+    # skills/*/rules/*.md's middle segment names each sub-skill's own rules dir — derived
+    # from rules_globs (never a second literal) so it can never drift from what
+    # _deduped_instruction_files reads.
+    sub_rules_dir_name = None
+    for g in profile["rules_globs"]:
+        segs = g.split("/")
+        if len(segs) == 4 and segs[0] == "skills" and segs[1] == "*" and segs[3] == "*.md":
+            sub_rules_dir_name = segs[2]
+            break
+    skills_root_is_dir = False
+    skills_root: Path | None = None
+    if skills_dir_name is not None:
+        skills_root = root / skills_dir_name
+        try:
+            skills_root_is_dir = _probe_is_dir(skills_root)
+        except OSError as e:
+            errors.append(f"skills is_dir failed for {skills_root}: {e}")
+            skills_root_is_dir = False
+    if skills_root_is_dir and sub_rules_dir_name is not None and skills_root is not None:
         try:
             sub_skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
         except OSError as e:
             errors.append(f"skills iterdir failed for {skills_root}: {e}")
             sub_skill_dirs = []
         for skill_dir in sub_skill_dirs:
-            sub_rules = skill_dir / "rules"
+            sub_rules = skill_dir / sub_rules_dir_name
             try:
                 is_rules_dir = _probe_is_dir(sub_rules)
             except OSError as e:
@@ -1959,28 +2016,39 @@ def walk_always_loaded(
 
 
 def collect_descriptions(
-    root: Path, inaccessible: list[dict[str, Any]]
+    root: Path, inaccessible: list[dict[str, Any]], *,
+    profile: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Collect skill/agent front-matter `description` word counts."""
+    """Collect skill/agent front-matter `description` word counts.
+
+    M11 (SPEC_7 §2): dir names come from profile["container_dirs"], the manifest name from
+    profile["skill_manifest_name"] (defaulting to PROFILE_CLAUDE_CODE); a None role means
+    this layout has no such surface, and the corresponding block is skipped."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    container_dirs = profile["container_dirs"]
+    skill_manifest_name = profile["skill_manifest_name"]
     skill_descriptions = []
     agent_descriptions = []
 
     # Deliberately single-level: iterdir()/glob("*.md") only, no recursion — so there is no
     # walk to follow symlinks through. A symlinked skill DIR is followed and reported under
     # its harness-relative name by design.
-    skills_dir = root / "skills"
-    try:
-        skills_dir_is_dir = _probe_is_dir(skills_dir)
-    except OSError:
-        _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
-        skills_dir_is_dir = False
-    if skills_dir_is_dir:
+    skills_dir_name = container_dirs["skills"]
+    skills_dir_is_dir = False
+    if skills_dir_name is not None:
+        skills_dir = root / skills_dir_name
+        try:
+            skills_dir_is_dir = _probe_is_dir(skills_dir)
+        except OSError:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+            skills_dir_is_dir = False
+    if skills_dir_is_dir and skill_manifest_name is not None:
         try:
             skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
         except OSError:
             skill_dirs = []
         for skill_dir in skill_dirs:
-            skill_md = skill_dir / "SKILL.md"
+            skill_md = skill_dir / skill_manifest_name
             present, ok = _safe_exists(skill_md)
             if not ok:
                 inaccessible.append({"path": _rel(root, skill_md), "reason": "unreadable"})
@@ -1997,12 +2065,15 @@ def collect_descriptions(
                 "evidence": "VERIFIED",
             })
 
-    agents_dir = root / "agents"
-    try:
-        agents_dir_is_dir = _probe_is_dir(agents_dir)
-    except OSError:
-        _append_inaccessible_once(inaccessible, _rel_safe(root, agents_dir))
-        agents_dir_is_dir = False
+    agents_dir_name = container_dirs["agents"]
+    agents_dir_is_dir = False
+    if agents_dir_name is not None:
+        agents_dir = root / agents_dir_name
+        try:
+            agents_dir_is_dir = _probe_is_dir(agents_dir)
+        except OSError:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, agents_dir))
+            agents_dir_is_dir = False
     if agents_dir_is_dir:
         try:
             agent_files = sorted(agents_dir.glob("*.md"))
@@ -2023,10 +2094,18 @@ def collect_descriptions(
 
 
 def collect_on_demand(
-    root: Path, project_root: Path | None, inaccessible: list[dict[str, Any]]
+    root: Path, project_root: Path | None, inaccessible: list[dict[str, Any]], *,
+    profile: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Collect on-demand bodies: skill SKILL.md bodies, skill-internal phases/prompts/agents,
-    and the active project's memory bodies (excluding the always-loaded MEMORY.md index)."""
+    and the active project's memory bodies (excluding the always-loaded MEMORY.md index).
+
+    M11 (SPEC_7 §2): dir/file names come from `profile` (defaulting to PROFILE_CLAUDE_CODE);
+    a None role means this layout has no such surface, and the corresponding block is
+    skipped. The phases/prompts/agents skill-internal subdir tuple stays literal, deferred."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    container_dirs = profile["container_dirs"]
+    skill_manifest_name = profile["skill_manifest_name"]
     skills = []
     skill_internal_bodies = []
     memory_bodies = []
@@ -2034,20 +2113,23 @@ def collect_on_demand(
     # Deliberately single-level: iterdir()/glob("*.md") only, no recursion — so there is no
     # walk to follow symlinks through. A symlinked skill DIR is followed and reported under
     # its harness-relative name by design.
-    skills_dir = root / "skills"
-    try:
-        skills_dir_is_dir = _probe_is_dir(skills_dir)
-    except OSError:
-        _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
-        skills_dir_is_dir = False
-    if skills_dir_is_dir:
+    skills_dir_name = container_dirs["skills"]
+    skills_dir_is_dir = False
+    if skills_dir_name is not None:
+        skills_dir = root / skills_dir_name
+        try:
+            skills_dir_is_dir = _probe_is_dir(skills_dir)
+        except OSError:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+            skills_dir_is_dir = False
+    if skills_dir_is_dir and skill_manifest_name is not None:
         try:
             skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
         except OSError:
             skill_dirs = []
         for skill_dir in skill_dirs:
             name = skill_dir.name
-            skill_md = skill_dir / "SKILL.md"
+            skill_md = skill_dir / skill_manifest_name
             present, ok = _safe_exists(skill_md)
             if not ok:
                 inaccessible.append({"path": _rel(root, skill_md), "reason": "unreadable"})
@@ -2099,19 +2181,23 @@ def collect_on_demand(
 
     if project_root is not None:
         active_slug = _project_slug(project_root)
-        mem_dir = root / "projects" / active_slug / "memory"
-        try:
-            mem_dir_is_dir = _probe_is_dir(mem_dir)
-        except OSError:
-            _append_inaccessible_once(inaccessible, _rel_safe(root, mem_dir))
-            mem_dir_is_dir = False
+        projects_dir_name = container_dirs["projects"]
+        memory_dir_name = container_dirs["memory"]
+        mem_dir_is_dir = False
+        if projects_dir_name is not None and memory_dir_name is not None:
+            mem_dir = root / projects_dir_name / active_slug / memory_dir_name
+            try:
+                mem_dir_is_dir = _probe_is_dir(mem_dir)
+            except OSError:
+                _append_inaccessible_once(inaccessible, _rel_safe(root, mem_dir))
+                mem_dir_is_dir = False
         if mem_dir_is_dir:
             try:
                 mem_files = sorted(mem_dir.glob("*.md"))
             except OSError:
                 mem_files = []
             for f in mem_files:
-                if f.name == "MEMORY.md":
+                if f.name == profile["memory_index_name"]:
                     continue
                 text = _read_checked(root, f, inaccessible)
                 if text is None:
@@ -2345,18 +2431,25 @@ def reconcile_hooks(
     settings: dict[str, Any],
     inaccessible: list[dict[str, Any]],
     blind_spots: list[str],
+    *,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Dispatcher-aware reconciliation: resolve every hook `command` registered in
     settings.json against hooks/ on disk, then fan reachability through any registered
     *-dispatcher.py's string-literal CHECKS-style list. Registration evidence (the
     settings.json line was read) and target status (stat() of the resolved script) are
-    always kept as distinct facts — see schema.md Note 3."""
+    always kept as distinct facts — see schema.md Note 3.
+
+    M11 (SPEC_7 §2): `profile` (defaulting to PROFILE_CLAUDE_CODE) supplies the dispatcher
+    filename suffix and is forwarded to _script_from_command/_hook_disk_files so a
+    non-default profile's hooks dir and remaps are used consistently throughout."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
     registered = []
     orphan_registrations = []
     direct_registered_names = set()
 
     for command in _iter_hook_commands(settings):
-        script_path, note = _script_from_command(command, root)
+        script_path, note = _script_from_command(command, root, profile=profile)
         if note:
             blind_spots.append(note)
         if script_path is None:
@@ -2385,7 +2478,7 @@ def reconcile_hooks(
             "target_evidence": "VERIFIED",
         })
 
-    disk_files = _hook_disk_files(root)
+    disk_files = _hook_disk_files(root, profile=profile)
     disk_names = {p.name for p in disk_files}
 
     # Containment decision per disk file, computed ONCE. A file whose real path escapes root
@@ -2407,8 +2500,12 @@ def reconcile_hooks(
         if not fp_inside[fp]:
             blind_spots.append(f"hook {fp.name} resolves outside the harness root — not read")
 
+    # M11 (SPEC_7 §2): profile["dispatcher_suffix"], defaulting to "-dispatcher.py"; None ->
+    # this layout has no dispatcher concept, so no dispatcher fans out reachability at all.
+    dispatcher_suffix = profile["dispatcher_suffix"]
     dispatcher_reached_names = set()
-    for disp in (p for p in disk_files if p.name.endswith("-dispatcher.py")):
+    for disp in (p for p in disk_files
+                 if dispatcher_suffix is not None and p.name.endswith(dispatcher_suffix)):
         if disp.name not in direct_registered_names:
             continue  # a dispatcher confers reachability only if it is itself registered
         if not fp_inside[disp]:
@@ -2805,11 +2902,15 @@ def collect_composed_mcp(project_root, errors, blind_spots, out_of_root_refs):
 INSTRUCTION_LINE_LIMIT = 200
 
 
-# --- Task 3B: watched-input glob sets — single source of truth shared between each
-# collector scan and iter_input_paths(), so the live-dashboard filesystem watcher (T4)
-# cannot drift out of sync with what the collector actually reads. Each tuple is consumed
-# BOTH by the collector function named in its comment AND by iter_input_paths(); add a new
-# collector input glob HERE (never inline it in a scan) so the watcher automatically sees it.
+# --- Task 3B (superseded by M11, SPEC_7 §2): these tuples are now a PINNED HISTORICAL
+# REFERENCE, not a live source of truth -- PROFILE_CLAUDE_CODE below is the runtime source
+# of truth for every collector input glob. A new collector input glob goes in
+# PROFILE_CLAUDE_CODE, never here. Their only remaining consumer is
+# tests/test_profiles.py::test_default_profile_reproduces_the_shared_glob_constants, which
+# is the tripwire proving the default profile still reproduces this pinned set byte-for-byte
+# -- keep them in sync with PROFILE_CLAUDE_CODE; do not delete them. The watcher-sync
+# property this block used to name directly (every glob a scan reads is also unioned by
+# iter_input_paths()) still holds; it is now enforced through the profile.
 _INSTRUCTION_GLOBS = ("rules/*.md", "skills/*/rules/*.md", "skills/*/SKILL.md",
                       "skills/*/*/SKILL.md", "skills/*/phases/*.md", "skills/*/prompts/*.md",
                       "skills/*/agents/*.md", "commands/*.md", "agents/*.md")  # flag_long_instructions
@@ -2985,8 +3086,8 @@ def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
     """Shared glob-walk + dedup for the instruction-file corpus (S2.M3): the SINGLE
     definition of "the deduped instruction-file set" consumed by BOTH
     flag_long_instructions (line-count flags) and collect_git_age's caller (staleness
-    signal) -- add a new instruction-file glob to _INSTRUCTION_GLOBS, never inline a
-    second glob loop here or elsewhere.
+    signal) -- add a new instruction-file glob to PROFILE_CLAUDE_CODE's rules_globs /
+    skills_globs, never inline a second glob loop here or elsewhere.
 
     M11 (SPEC_7 §2): `profile` (defaulting to PROFILE_CLAUDE_CODE) supplies the glob
     set via _instruction_globs(profile), reproducing _INSTRUCTION_GLOBS byte-for-byte
@@ -4420,13 +4521,14 @@ def check_phantom_refs(
     collector never claims a file outside its scanned scope is phantom; it genuinely
     cannot see it either way, so it only classifies, never asserts absence.
 
-    M11 (SPEC_7 §2): `profile` is accepted for call-site uniformity with build_document's
-    other helpers, but this function's own literal homes (the `~/.claude/` prefix, the
-    commands/ + skills/ slash-command resolution paths below) are deliberately deferred —
-    generalizing THEM is out of scope for this milestone."""
+    M11 (SPEC_7 §2): `profile` is forwarded to _hooks_body_corpus so a non-default profile's
+    hooks corpus is read from ITS hooks dir, not PROFILE_CLAUDE_CODE's. This function's own
+    literal homes (the `~/.claude/` prefix, the commands/ + skills/ slash-command resolution
+    paths below) are deliberately deferred — generalizing THEM is out of scope for this
+    milestone."""
     refs: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
-    hooks_corpus, hooks_corpus_complete = _hooks_body_corpus(root, inaccessible)
+    hooks_corpus, hooks_corpus_complete = _hooks_body_corpus(root, inaccessible, profile=profile)
     # S6b.M2.1: computed ONCE per call, not per token -- reused by BOTH candidate loops
     # below to filter out-of-root candidates before any stat. A `root` that cannot be
     # stat'd makes containment undecidable for every candidate, so `_in_root` skips them
@@ -4774,16 +4876,17 @@ def collect_promotion_candidates(
     it. Advisory SIGNALS only — synthesis proposes extending an EXISTING covered hook
     before creating a new one; this collector never makes that judgment itself.
 
-    M11 (SPEC_7 §2): `profile` is accepted for call-site uniformity with build_document's
-    other helpers; this function's corpus already arrives pre-built by its caller, so
-    nothing here needs to read the profile directly."""
+    M11 (SPEC_7 §2): `profile` is forwarded to _hooks_body_corpus so a non-default profile's
+    hooks corpus is read from ITS hooks dir, not PROFILE_CLAUDE_CODE's; corpus_files itself
+    already arrives pre-built by this function's caller, so nothing else here needs to read
+    the profile directly."""
     candidates: list[dict[str, Any]] = []
     # `complete` is unused HERE on purpose: every promotion candidate already ships as
     # evidence=INFERRED and `hook_covered` is an advisory hint, not a verdict, so there is
     # no confident negative to downgrade. `inaccessible` is not threaded in either — the
     # phantom-ref pass records the very same unreadable hooks, and _append_inaccessible_once
     # dedupes across callers, so passing it would only duplicate that work.
-    hooks_corpus_lower = _hooks_body_corpus(root)[0].lower()
+    hooks_corpus_lower = _hooks_body_corpus(root, profile=profile)[0].lower()
     commands_lower = "\n".join(_iter_hook_commands(settings)).lower()
     combined_lower = hooks_corpus_lower + "\n" + commands_lower
 
@@ -5230,11 +5333,12 @@ def iter_input_paths(
     #   settings.json          parse_settings -> permissions, config, hook registrations
     #   memory/MEMORY.md       walk_always_loaded (root stub index)
     #   plugins/*.json         collect_config._read_json_name_list (two fixed names)
-    paths.add(root / "CLAUDE.md")
-    paths.add(root / "settings.json")
-    paths.add(root / "memory" / "MEMORY.md")
-    paths.add(root / "plugins" / "known_marketplaces.json")
-    paths.add(root / "plugins" / "installed_plugins.json")
+    # M11 (SPEC_7 §2): sourced from profile["top_level_files"]; a None role is skipped.
+    top_level_files = profile["top_level_files"]
+    for role in ("root_instructions", "settings", "memory_index",
+                 "plugin_marketplaces", "plugin_installed"):
+        if top_level_files[role] is not None:
+            paths.add(root / top_level_files[role])
 
     # -- active project's own CLAUDE.md (lives OUTSIDE --root); walk_always_loaded gates it on
     #    the projects/<slug>/memory dir. Yielded unconditionally when given: a harmless superset. --
@@ -5332,7 +5436,7 @@ def iter_input_paths(
     settings, _parsed_ok = parse_settings(root, [], [])
     root_resolved = root.resolve()
     for command in _iter_hook_commands(settings):
-        script_path, _note = _script_from_command(command, root)
+        script_path, _note = _script_from_command(command, root, profile=profile)
         if script_path is None:
             continue
         # Root-containment is decided LEXICALLY (Codex r5 FIX 2): resolve only the DIRECTORY
@@ -5388,14 +5492,16 @@ def build_document(
     _weight_inaccessible_before = len(inaccessible)
     files, conditional_variants = walk_always_loaded(root, project_root, inaccessible, errors,
                                                       compose=compose,
-                                                      out_of_root_refs=out_of_root_refs)
+                                                      out_of_root_refs=out_of_root_refs,
+                                                      profile=profile)
     weight_excluded_count = ((len(out_of_root_refs) - _weight_out_of_root_before)
                               + (len(inaccessible) - _weight_inaccessible_before))
-    skill_descriptions, agent_descriptions = collect_descriptions(root, inaccessible)
-    skills, skill_internal_bodies, memory_bodies = collect_on_demand(root, project_root, inaccessible)
+    skill_descriptions, agent_descriptions = collect_descriptions(root, inaccessible, profile=profile)
+    skills, skill_internal_bodies, memory_bodies = collect_on_demand(
+        root, project_root, inaccessible, profile=profile)
 
     settings, settings_parsed_ok = parse_settings(root, errors, blind_spots)
-    hooks_section = reconcile_hooks(root, settings, inaccessible, blind_spots)
+    hooks_section = reconcile_hooks(root, settings, inaccessible, blind_spots, profile=profile)
     permissions_section = collect_permissions(settings, settings_parsed_ok)
     config_section = collect_config(root, settings, settings_parsed_ok, blind_spots)
     instruction_length_flags = flag_long_instructions(root, inaccessible, blind_spots,
@@ -5616,7 +5722,7 @@ def build_document(
         # same compose-only pattern as inspected_roots/out_of_root_refs above. 'claude_md'
         # and 'hook' (P2-A) reuse `files[]`/`composed_hooks` (both already
         # built/tier-tagged above) rather than re-walking or re-reading disk.
-        raw_nodes = _walk_operator_tier_nodes(root, inaccessible)
+        raw_nodes = _walk_operator_tier_nodes(root, inaccessible, profile=profile)
         if project_root is not None:
             raw_nodes += _walk_project_tier_nodes(project_root, out_of_root_refs, errors)
         raw_nodes += _rule_nodes_from_files(files)
