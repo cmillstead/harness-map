@@ -6275,6 +6275,141 @@ def test_write_text_contained_reports_a_symlink_loop_as_an_oserror(tmp_path):
             loop_a / "r.json", "x", [guard], input_paths=[tmp_path / "unrelated.json"])
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_write_text_contained_writes_into_an_unreadable_drop_box(tmp_path):
+    """P2-1 REGRESSION: the fd-pinned write must not demand MORE permission than the
+    pre-S7 mkstemp write it replaced.
+
+    mkstemp needs write + execute on the output directory. `os.open(parent, O_RDONLY)`
+    additionally needs READ, so a 0o333 drop-box -- writable, deliberately not listable --
+    started failing EACCES where it used to succeed. Reproduced live before the fix.
+    The default report directory is 0o755, which is why nothing else in this file caught it.
+
+    The assertion is deliberately about the OUTCOME (the bytes land) rather than about
+    which open flag was used: the flag is a platform detail, the permission floor is the
+    contract."""
+    assert _collector._dir_fd_write_supported() is True, (
+        "this test is only meaningful on the fd-pinned branch")
+    guard = _guard_root(tmp_path)
+    out_dir = tmp_path / "dropbox"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    os.chmod(out_dir, 0o333)
+    try:
+        _collector.write_text_contained(target, '{"a":1}', [guard])
+    finally:
+        os.chmod(out_dir, 0o755)
+    assert target.read_text(encoding="utf-8") == '{"a":1}'
+    assert list(out_dir.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_write_text_contained_writes_below_a_traverse_only_ancestor(tmp_path):
+    """P2-1 REGRESSION, the WIDER half: the fd-anchored `..` walk climbs to the namespace
+    root, so ONE unreadable ancestor anywhere above the output directory broke the write --
+    even when the output directory itself was a perfectly ordinary 0o755.
+
+    0o111 is the shape that matters: traversable, not listable. That is a normal way to
+    expose a deep path without exposing the directory's contents, and the pre-S7 write
+    handled it because mkstemp never opened an ancestor at all. The walk only ever
+    `fstat`s what it opens and uses it as the anchor for the next `..`; it never lists
+    entries, so requiring read here was privilege the walk does not use."""
+    assert _collector._dir_fd_write_supported() is True, (
+        "this test is only meaningful on the fd-pinned branch")
+    guard = _guard_root(tmp_path)
+    ancestor = tmp_path / "traverse-only"
+    out_dir = ancestor / "reports"
+    out_dir.mkdir(parents=True)
+    target = out_dir / "r.json"
+    os.chmod(ancestor, 0o111)
+    try:
+        _collector.write_text_contained(target, "PAYLOAD", [guard])
+    finally:
+        os.chmod(ancestor, 0o755)
+    assert target.read_text(encoding="utf-8") == "PAYLOAD"
+    assert list(out_dir.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_write_text_contained_without_a_search_only_flag_keeps_the_old_behaviour(
+        tmp_path, monkeypatch):  # mock-ok: swaps a real capability probe, filesystem stays real
+    """The search-only downgrade is a PLATFORM CAPABILITY, so its absence must degrade to
+    the previous behaviour rather than crash. Simulates a platform with no usable
+    search-only directory flag (no O_SEARCH) by neutering the probe -- the filesystem and
+    every open stay real.
+
+    Two halves, both required: an ordinary directory still writes (the ladder's first rung
+    is unchanged O_RDONLY), and the unreadable drop-box surfaces the plain PermissionError
+    from that rung instead of a masked or swallowed one.
+
+    NOTE the assertion on `_dir_fd_write_supported()`: monkeypatching around this helper is
+    exactly where a test can silently drift onto the fallback branch and assert nothing."""
+    monkeypatch.setattr(_collector, "_search_only_dir_flag", lambda: None)  # mock-ok: real capability probe, real fs
+    assert _collector._dir_fd_write_supported() is True, (
+        "this test is only meaningful on the fd-pinned branch")
+    guard = _guard_root(tmp_path)
+    ordinary = tmp_path / "reports"
+    ordinary.mkdir()
+    _collector.write_text_contained(ordinary / "r.json", "OK", [guard])
+    assert (ordinary / "r.json").read_text(encoding="utf-8") == "OK"
+
+    out_dir = tmp_path / "dropbox"
+    out_dir.mkdir()
+    os.chmod(out_dir, 0o333)
+    try:
+        with pytest.raises(PermissionError):
+            _collector.write_text_contained(out_dir / "r.json", "x", [guard])
+    finally:
+        os.chmod(out_dir, 0o755)
+    assert list(out_dir.iterdir()) == [], "a refused open must leave no residue"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_traverse_only_open_ladder_does_not_weaken_the_symlinked_parent_refusal(tmp_path):
+    """CLASS 1 MUST NOT WEAKEN under the permission downgrade. Two halves, and the second
+    is the one that says something the flag names do not.
+
+    (a) The retry rung ACCEPTS the caller's extra flags: a 0o333 directory opens through
+        `_open_dir_traverse_only` with O_NOFOLLOW|O_NONBLOCK still requested. If the retry
+        rejected that flag combination the write would fail on every drop-box.
+
+    (b) A symlinked final component is still refused when the symlink's TARGET is 0o333 --
+        the permission regime that only became reachable with this change.
+
+    MEASURED, and it is stronger than "O_NOFOLLOW is carried on both rungs": O_NOFOLLOW is
+    evaluated during resolution of the final component, BEFORE the target's permission bits
+    are consulted, so rung 1 refuses a symlink with ENOTDIR and the EACCES retry is never
+    entered for this case at all. Class 1 is therefore not reachable through the new rung
+    rather than merely defended on it. Do not "strengthen" this test by asserting the
+    search-only descriptor refuses the symlink -- that path cannot be constructed, and a
+    test claiming to exercise it would be asserting nothing."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link"
+    os.symlink(real_dir, link_dir)
+    os.chmod(real_dir, 0o333)
+    try:
+        # (a) the retry rung honours extra_flags rather than refusing them
+        fd = _collector._open_dir_traverse_only(
+            real_dir, extra_flags=os.O_NOFOLLOW | os.O_NONBLOCK)
+        os.close(fd)
+        # (b) the symlinked final component is refused, target permissions notwithstanding
+        with pytest.raises(OSError) as refusal:
+            _collector._open_dir_traverse_only(
+                link_dir, extra_flags=os.O_NOFOLLOW | os.O_NONBLOCK)
+        assert not isinstance(refusal.value, PermissionError), (
+            "O_NOFOLLOW must refuse before permission is consulted, so the EACCES retry "
+            "is never reached for a symlinked final component")
+        with pytest.raises(OSError):
+            _collector.write_text_contained(
+                link_dir / "r.json", "x", [_guard_root(tmp_path)])
+        exists_through_link = os.path.lexists(link_dir / "r.json")
+    finally:
+        os.chmod(real_dir, 0o755)
+    assert not exists_through_link
+    assert not (real_dir / "r.json").exists()
+
+
 def test_collector_main_out_write_preserves_hardlinked_inode(tmp_path):
     """End-to-end F5 through the real CLI path, not just the helper unit."""
     root = tmp_path / "harness"

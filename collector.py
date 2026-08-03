@@ -489,6 +489,69 @@ def _dir_fd_write_supported():
                for fn in (os.open, os.rename, os.unlink, os.stat))
 
 
+def _search_only_dir_flag():
+    """This platform's SEARCH-ONLY directory open flag, or None where there is no VERIFIED
+    one. Read at call time, matching `_dir_fd_write_supported`'s posture above, so a test
+    can simulate a platform without one instead of the absence branch going dark.
+
+    O_SEARCH ONLY, DELIBERATELY NOT O_PATH. Both are nominally search-only, but they are
+    not interchangeable and the difference is not something to guess at in the module's one
+    physical write path. On darwin, O_SEARCH was MEASURED here (2026-08-02, CPython 3.11.14,
+    os.O_SEARCH == 0x40100000) to support every dir_fd operation this write performs --
+    os.open(O_CREAT|O_EXCL, dir_fd=), os.stat(dir_fd=), os.replace(src_dir_fd=, dst_dir_fd=),
+    os.fstat -- while os.scandir(fd) fails EBADF, which is exactly the privilege being given
+    up. Linux's O_PATH is documented for a RESTRICTED set of *at() uses (fchownat, fstatat,
+    linkat, readlinkat); renameat is not named in it even though it is often observed to
+    work, and "often works in practice" is not a basis for the containment guarantees this
+    helper carries. No Linux host is available here to measure it on, so O_PATH is left out
+    rather than adopted unverified: on a platform with no O_SEARCH the ladder simply stays on
+    O_RDONLY, i.e. the pre-existing behaviour, and an unreadable output directory keeps
+    failing EACCES there. Do not add O_PATH from the man page alone -- add it when a Linux
+    host has run the four operations above against an O_PATH descriptor."""
+    flag = getattr(os, "O_SEARCH", None)
+    return flag if isinstance(flag, int) else None
+
+
+def _open_dir_traverse_only(path, *, extra_flags=0, dir_fd=None):
+    """Open a directory for TRAVERSAL ONLY -- `fstat` it, and anchor *at() calls at it.
+    Never to list it. `os.scandir` on the returned descriptor may fail, and that is the
+    point: a caller that needs entries must open its own read-capable descriptor.
+
+    WHY THIS EXISTS (P2-1). The fd-pinned write replaced `tempfile.mkstemp`, which needs
+    only write + execute on the output directory, with `os.open(dir, O_RDONLY)`, which also
+    needs READ. That silently raised the permission floor of every write: a 0o333 drop-box
+    stopped working, and so did any 0o755 output directory sitting under a single 0o111
+    ancestor, because the `..` walk climbs to the namespace root. Neither caller ever lists
+    the directories it opens, so read was privilege taken and not used.
+
+    THE LADDER IS O_RDONLY FIRST, SEARCH-ONLY ONLY ON EACCES, and the order is the point.
+    The common case keeps running on the descriptor type every other test in this module
+    already exercises; the less-travelled one is confined to the case that would otherwise
+    fail outright, where the alternative is not writing at all. `raise` on a missing
+    search-only flag re-raises the ORIGINAL PermissionError, so a platform without one
+    reports exactly what it reported before this change.
+
+    RETRYING THE OPEN DOES NOT WIDEN ANY WINDOW. The first attempt failed, so it pinned
+    nothing and no check was decided on it; every containment check in this module runs
+    against the descriptor this function RETURNS.
+
+    CLASS 1 OF THE WRITE-SIDE THREAT MODEL IS UNREACHABLE THROUGH THE RETRY, which is a
+    stronger statement than "O_NOFOLLOW is carried on both rungs" (it is, `extra_flags` is
+    applied identically to each). O_NOFOLLOW is evaluated while resolving the FINAL
+    component, before the target's permission bits are consulted, so a symlinked parent
+    fails rung 1 with ENOTDIR -- not EACCES -- and the retry is never entered for that case.
+    Measured on darwin both ways: O_RDONLY|O_NOFOLLOW and O_SEARCH|O_NOFOLLOW refuse a
+    symlinked directory identically."""
+    flags = os.O_DIRECTORY | extra_flags
+    try:
+        return os.open(path, os.O_RDONLY | flags, dir_fd=dir_fd)
+    except PermissionError:
+        search_flag = _search_only_dir_flag()
+        if search_flag is None:
+            raise
+        return os.open(path, search_flag | flags, dir_fd=dir_fd)
+
+
 def _reject_if_parent_inside_guard_roots(parent_real, parent_fstat, guard_roots):
     """PATHNAME-based containment for a write's parent directory.
 
@@ -586,7 +649,10 @@ def _reject_if_pinned_dir_inside_guard_roots(dir_fd, guard_roots):
                     raise WriteContainmentError(
                         f"refusing to write: the target directory is {guard_root} or lies "
                         f"inside it (established from the opened descriptor)")
-            parent_fd = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=current_fd)
+            # TRAVERSE-ONLY (P2-1): this walk `fstat`s each ancestor and anchors the next
+            # `..` at it. It never lists one, so it must not demand read -- a single 0o111
+            # ancestor anywhere above the output directory would otherwise fail the write.
+            parent_fd = _open_dir_traverse_only("..", dir_fd=current_fd)
             try:
                 at_root = os.path.samestat(os.fstat(parent_fd), current_stat)
             except OSError:
@@ -831,7 +897,12 @@ def write_text_contained(out_path, text, guard_roots, *, input_paths=(),
         return _write_text_contained_fallback(
             out_path, parent, text, guard_roots, input_paths, encoding_errors)
 
-    dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    # TRAVERSE-ONLY (P2-1): this descriptor creates, stats and replaces entries in the
+    # pinned directory; it never lists them. Requiring read would hold the write to a
+    # HIGHER permission bar than the mkstemp shape it replaced, breaking a write-only
+    # drop-box. O_NOFOLLOW rides on both rungs of the ladder -- see the helper.
+    dir_fd = _open_dir_traverse_only(
+        parent, extra_flags=os.O_NOFOLLOW | os.O_NONBLOCK)
     tmp_name = None
     try:
         parent_fstat = os.fstat(dir_fd)
