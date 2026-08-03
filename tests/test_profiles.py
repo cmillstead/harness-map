@@ -218,3 +218,114 @@ def test_default_profile_matches_claude_code_layout_in_compose_mode(fake_harness
     a.pop("generated_at")
     b.pop("generated_at")
     assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+_FOREIGN_PROFILE = {
+    "name": "bare-agents-md",
+    "top_level_files": {"root_instructions": "AGENTS.md", "settings": None,
+                        "memory_index": None, "plugin_marketplaces": None,
+                        "plugin_installed": None},
+    "container_dirs": {"skills": None, "rules": "rules", "commands": None, "agents": None,
+                       "hooks": None, "hook_tests": None, "projects": None, "memory": None},
+    "projects_glob": None, "memory_index_name": None, "skill_manifest_name": None,
+    "rules_globs": ["rules/*.md"], "skills_globs": [],
+    "commands_glob": None, "agents_glob": None,
+    "hook_script_globs": [], "hook_test_globs": [],
+    "dispatcher_suffix": None, "hook_command_remaps": [],
+    "duplication_globs": ["rules/*.md"],
+    "settings_format": "none",
+}
+
+
+@pytest.fixture
+def bare_agents_repo(tmp_path):
+    """A real, minimal NON-Claude-Code harness: an AGENTS.md plus a rules dir. No
+    settings.json, no skills/, no hooks/ -- the layout the seam has to prove itself on."""
+    repo = tmp_path / "foreign-harness"
+    (repo / "rules").mkdir(parents=True)
+    (repo / "AGENTS.md").write_text("# Agent instructions\n" + "policy word " * 40)
+    (repo / "rules" / "style.md").write_text("Style rule body " * 30)
+    (repo / "rules" / "safety.md").write_text("Safety rule body " * 30)
+    return repo
+
+
+def test_foreign_profile_maps_bare_agents_md_repo(bare_agents_repo, tmp_path):
+    """SPEC_7 §2 stage gate: a synthetic non-CC layout genuinely mapped -- the instruction
+    files are found and a valid FULL-envelope document is emitted.
+    # Changing this value requires a spec change (SPEC_7 §2)."""
+    p = tmp_path / "foreign.json"
+    p.write_text(json.dumps(_FOREIGN_PROFILE))
+    proc = run_collector_raw(bare_agents_repo, "--profile", str(p),
+                             project_root=bare_agents_repo)
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)
+    for key in ("schema_version", "generated_at", "root", "headline", "always_loaded",
+                "on_demand", "enforcement", "config", "instruction_length_flags",
+                "duplication", "phantom_refs", "promotion_candidates", "test_coverage",
+                "staleness", "metric_definitions", "inaccessible", "blind_spots", "errors"):
+        assert key in doc, f"foreign-profile document missing top-level key: {key}"
+    paths = {f["path"] for f in doc["always_loaded"]["files"]}
+    assert "AGENTS.md" in paths
+    assert {"rules/style.md", "rules/safety.md"} <= paths
+    assert doc["headline"]["always_loaded_file_count"] == 3
+    assert doc["headline"]["always_loaded_words"] > 0
+    # settings_format "none": no settings read at all, disclosed rather than silent.
+    assert doc["config"]["evidence"] == "INACCESSIBLE"
+    assert doc["enforcement"]["hooks"]["registered"] == []
+    assert any("settings_format" in b for b in doc["blind_spots"])
+    assert doc["errors"] == []
+
+
+def test_foreign_profile_never_reads_settings_json(bare_agents_repo, tmp_path):
+    """settings_format 'none' must SKIP the file, not merely fail to parse it: a
+    settings.json placed in the foreign repo is ignored entirely and contributes no
+    errors[] entry."""
+    (bare_agents_repo / "settings.json").write_text("{ this is not json")
+    p = tmp_path / "foreign.json"
+    p.write_text(json.dumps(_FOREIGN_PROFILE))
+    doc = json.loads(run_collector_raw(bare_agents_repo, "--profile", str(p),
+                                       project_root=bare_agents_repo).stdout)
+    assert not any("settings.json" in e for e in doc["errors"])
+
+
+def test_foreign_profile_with_compose_discloses_project_tier_limitation(
+        bare_agents_repo, tmp_path):
+    """Flagged gap, disclosed not silent: the project tier still uses the Claude Code
+    layout (.claude/, CLAUDE.local.md, .mcp.json) regardless of profile. --compose under a
+    non-claude-code profile must SAY so in blind_spots.
+    # Changing this value requires a spec change (SPEC_7 §2)."""
+    p = tmp_path / "foreign.json"
+    p.write_text(json.dumps(_FOREIGN_PROFILE))
+    doc = json.loads(run_collector_raw(bare_agents_repo, "--compose", "--profile", str(p),
+                                       project_root=bare_agents_repo).stdout)
+    assert any("project tier" in b and "Claude Code" in b for b in doc["blind_spots"])
+
+
+def test_foreign_profile_skips_plugin_reads_even_when_files_exist(bare_agents_repo, tmp_path):
+    """Coverage gap check: _FOREIGN_PROFILE alone can't prove the settings_format
+    short-circuit does anything, because it ALSO sets plugin_marketplaces/plugin_installed
+    to None -- the orthogonal per-role guard in collect_config would produce the identical
+    empty result even with the short-circuit deleted entirely (verified by disabling it:
+    the naive version of this test still passed). This profile keeps settings_format
+    "none" but points plugin_marketplaces/plugin_installed at REAL, well-formed files (the
+    shape a claude-code profile WOULD read), isolating the short-circuit as the only thing
+    that can be skipping them."""
+    profile = dict(_FOREIGN_PROFILE)
+    profile["top_level_files"] = dict(_FOREIGN_PROFILE["top_level_files"])
+    profile["top_level_files"]["plugin_marketplaces"] = "plugins/known_marketplaces.json"
+    profile["top_level_files"]["plugin_installed"] = "plugins/installed_plugins.json"
+    (bare_agents_repo / "plugins").mkdir()
+    (bare_agents_repo / "plugins" / "known_marketplaces.json").write_text(json.dumps(
+        {"marketplaces": {"acme-market": {"url": "https://example.invalid/acme"}}}))
+    (bare_agents_repo / "plugins" / "installed_plugins.json").write_text(json.dumps(
+        {"installed": {"acme-plugin": {"version": "1.0.0"}}}))
+    p = tmp_path / "foreign.json"
+    p.write_text(json.dumps(profile))
+    doc = json.loads(run_collector_raw(bare_agents_repo, "--profile", str(p),
+                                       project_root=bare_agents_repo).stdout)
+    assert doc["config"]["marketplaces"] == []
+    assert doc["config"]["marketplace_count"] == 0
+    assert doc["config"]["installed_plugins"] == []
+    assert doc["config"]["installed_plugin_count"] == 0
+    assert not any("known_marketplaces.json" in b or "installed_plugins.json" in b
+                   for b in doc["blind_spots"])

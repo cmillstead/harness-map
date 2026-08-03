@@ -2215,7 +2215,8 @@ def collect_on_demand(
 
 
 def parse_settings(
-    root: Path, errors: list[str], blind_spots: list[str]
+    root: Path, errors: list[str], blind_spots: list[str], *,
+    profile: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Read + parse root/settings.json. Three distinct outcomes, all NON-fatal —
     build_document always continues and populates every settings-INDEPENDENT section
@@ -2242,8 +2243,22 @@ def parse_settings(
       instead of silent. (main()'s top-level `except Exception` guard remains a
       defense-in-depth backstop for anything unanticipated; it no longer has an organic
       trigger via settings.json specifically — the intended, more robust outcome.)
+
+      M11 (SPEC_7 §2): `profile` (defaulting to PROFILE_CLAUDE_CODE) gates this entirely —
+      settings_format == "none" or top_level_files["settings"] is None means this layout
+      has no settings file this collector can parse, so the file is never even looked at.
+      Short-circuits to ({}, False) with a blind_spots note, NOT an errors[] entry (a
+      profile declaring no settings surface is not an anomaly).
       Returns (settings_dict, parsed_ok)."""
-    settings_path = root / "settings.json"
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    settings_name = profile["top_level_files"]["settings"]
+    if profile["settings_format"] == "none" or settings_name is None:
+        blind_spots.append(
+            f"profile '{profile['name']}' declares settings_format=none; permissions, "
+            "config and hook REGISTRATIONS are not collected (hook SCRIPTS on disk still "
+            "are).")
+        return {}, False
+    settings_path = root / settings_name
     try:
         is_regular_file = _probe_is_file(settings_path)   # follows symlinks; False for FIFO/socket/dir/broken-symlink/absent
     except OSError as e:
@@ -2367,8 +2382,25 @@ def _read_json_name_list(path, key, blind_spots):
 
 
 def collect_config(
-    root: Path, settings: dict[str, Any], parsed_ok: bool, blind_spots: list[str]
+    root: Path, settings: dict[str, Any], parsed_ok: bool, blind_spots: list[str], *,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # M11 (SPEC_7 §2): settings_format == "none" mirrors parse_settings' own short-circuit
+    # — a profile that declares no settings surface has no plugin registry to read either
+    # (both live under the same operator-config concept this collector treats as one
+    # surface), so this returns the SAME 12-key shape as the normal path, empty/zero
+    # throughout, evidence INACCESSIBLE (parsed_ok would already be False here, but this
+    # short-circuits BEFORE the plugin reads below rather than relying on that).
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    if profile["settings_format"] == "none":
+        return {
+            "env_keys": [], "env_key_count": 0, "model": None, "cleanup_period_days": 0,
+            "sandbox": False, "enabled_plugins": [], "plugin_count": 0,
+            "marketplaces": [], "marketplace_count": 0,
+            "installed_plugins": [], "installed_plugin_count": 0,
+            "evidence": "INACCESSIBLE",
+        }
+
     # secret-leak guard: never serialize env values — env_keys is names ONLY.
     env = settings.get("env", {})
     env_keys = sorted(env.keys()) if isinstance(env, dict) else []
@@ -2377,10 +2409,17 @@ def collect_config(
     enabled_plugins = ([{"name": k, "enabled": bool(v)} for k, v in enabled_plugins_raw.items()]
                         if isinstance(enabled_plugins_raw, dict) else [])
 
-    marketplaces, marketplace_count = _read_json_name_list(
-        root / "plugins" / "known_marketplaces.json", "marketplaces", blind_spots)
-    installed_plugins, installed_plugin_count = _read_json_name_list(
-        root / "plugins" / "installed_plugins.json", "installed", blind_spots)
+    # Orthogonal to the settings_format short-circuit above: a claude-code-format profile
+    # may still declare a null plugin_marketplaces/plugin_installed role (no such surface
+    # in this layout), independent of whether settings.json itself parsed.
+    marketplaces_name = profile["top_level_files"]["plugin_marketplaces"]
+    installed_name = profile["top_level_files"]["plugin_installed"]
+    marketplaces, marketplace_count = (
+        _read_json_name_list(root / marketplaces_name, "marketplaces", blind_spots)
+        if marketplaces_name is not None else ([], 0))
+    installed_plugins, installed_plugin_count = (
+        _read_json_name_list(root / installed_name, "installed", blind_spots)
+        if installed_name is not None else ([], 0))
 
     # The live settings.json shape is a nested object ({"sandbox": {"enabled": bool, ...}}),
     # NOT a bare bool — bool(non-empty dict) is always True, so a naive bool(settings.get(...))
@@ -5433,7 +5472,7 @@ def iter_input_paths(
     #    OUTSIDE hooks/ (e.g. "./scripts/x.py"). A command resolving to an ABSOLUTE path outside
     #    root is un-watchable via a root walk (disclosed in the docstring's blind-spot list); the
     #    settings.json edit that registers it IS watched (settings.json is yielded above). --
-    settings, _parsed_ok = parse_settings(root, [], [])
+    settings, _parsed_ok = parse_settings(root, [], [], profile=profile)
     root_resolved = root.resolve()
     for command in _iter_hook_commands(settings):
         script_path, _note = _script_from_command(command, root, profile=profile)
@@ -5500,10 +5539,10 @@ def build_document(
     skills, skill_internal_bodies, memory_bodies = collect_on_demand(
         root, project_root, inaccessible, profile=profile)
 
-    settings, settings_parsed_ok = parse_settings(root, errors, blind_spots)
+    settings, settings_parsed_ok = parse_settings(root, errors, blind_spots, profile=profile)
     hooks_section = reconcile_hooks(root, settings, inaccessible, blind_spots, profile=profile)
     permissions_section = collect_permissions(settings, settings_parsed_ok)
-    config_section = collect_config(root, settings, settings_parsed_ok, blind_spots)
+    config_section = collect_config(root, settings, settings_parsed_ok, blind_spots, profile=profile)
     instruction_length_flags = flag_long_instructions(root, inaccessible, blind_spots,
                                                        profile=profile)
     duplication_section = scan_duplication(root, blind_spots, project_root=project_root,
@@ -5573,6 +5612,15 @@ def build_document(
         "Placeholder and glob tokens are recognized only when they are PATH-SHAPED — a "
         "backticked `<slug>.md`, `{session}.md` or `*.md` with no directory separator is "
         "not detected as a reference at all, so it is neither resolved nor reported.")
+    # M11 (SPEC_7 §2): same deliberate-position reasoning as the two appends above — the
+    # project tier is not profile-aware (it always scans the Claude Code project layout,
+    # .claude/ + CLAUDE.local.md + .mcp.json), so a --compose run under a non-default
+    # profile must disclose that gap rather than let it read as silently covered.
+    if compose and profile["name"] != PROFILE_CLAUDE_CODE["name"]:
+        blind_spots.append(
+            "The project tier (--compose) is scanned with the Claude Code layout "
+            "(.claude/, CLAUDE.local.md, .mcp.json) regardless of --profile; layout "
+            "profiles cover the operator tier only in v1.")
 
     totals = {
         "words": sum(f["words"] for f in files),
