@@ -5730,6 +5730,38 @@ def test_project_tier_duplication_corpus_unreadable_claude_records_blind_spots(t
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_project_tier_nodes_unreadable_claude_records_errors(tmp_path):
+    """_walk_project_tier_nodes's `except OSError: is_skills_dir/is_dir = False` swallows
+    (collector.py ~1409, ~1441) each let an unreadable project-tier surface yield an
+    empty node list with NO signal -- the project-tier twin of
+    _walk_operator_tier_nodes's inaccessible fix (T4/S7), scanning the exact same
+    .claude/skills, .claude/agents, .claude/commands directories as
+    test_project_tier_duplication_corpus_unreadable_claude_records_blind_spots above. A
+    single chmod(0) on `.claude` reaches BOTH remaining swallows in one pass:
+    skills_dir.is_dir() and the agents/commands loop's d.is_dir() (twice) all re-raise
+    EACCES from the unsearchable parent. `errors` (matching `_walk_project_tier`'s
+    channel for the IDENTICAL os.stat/is_dir failures, S7) is the recording channel --
+    pinning the specific entries so a regression that dropped even one silently would
+    fail this test instead of a generic non-empty check passing."""
+    project_root = tmp_path / "repo"
+    claude = project_root / ".claude"
+    (claude / "skills").mkdir(parents=True)
+    (claude / "agents").mkdir(parents=True)
+    (claude / "commands").mkdir(parents=True)
+    os.chmod(claude, 0o600)
+    try:
+        out_of_root_refs: list = []
+        errors: list = []
+        nodes = _collector._walk_project_tier_nodes(project_root, out_of_root_refs, errors)
+    finally:
+        os.chmod(claude, 0o755)
+    assert nodes == []
+    assert any(f"project skills is_dir failed for {claude / 'skills'}" in e for e in errors)
+    assert any(f"project agents is_dir failed for {claude / 'agents'}" in e for e in errors)
+    assert any(f"project commands is_dir failed for {claude / 'commands'}" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
 def test_skill_has_test_asset_unreadable_nested_dir_records_error(tmp_path):
     """_iter_descendant_dirs's os.walk (collector.py ~4122) previously ran with the
     default onerror=None, which SILENTLY DISCARDS a per-directory listing failure

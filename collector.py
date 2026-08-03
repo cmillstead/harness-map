@@ -1378,27 +1378,36 @@ def _walk_operator_tier_nodes(root, inaccessible=None):
     return nodes
 
 
-def _walk_project_tier_nodes(project_root, out_of_root_refs):
+def _walk_project_tier_nodes(project_root, out_of_root_refs, errors):
     """Project-tier skill/agent/command nodes (T4): `<repo>/.claude/{skills,agents,
     commands}/`. Existence + identity ONLY (same rationale as
     `_walk_operator_tier_nodes` — no body read needed for the collision-key model).
     EVERY path (surface dir, skill dir, leaf file) is routed through T3's
     `_project_tier_gate` (H2) — an escaping symlink at any level is recorded as an
     `out_of_root_ref` and excluded from the node list, mirroring `_walk_project_tier`'s
-    rules-dir handling exactly (reused, not reimplemented)."""
+    rules-dir handling exactly (reused, not reimplemented).
+
+    `errors` (S7): same disclosure channel `_walk_project_tier` already uses for the
+    IDENTICAL `os.stat(project_root)`/`is_dir()` failures (its containment-root and
+    rules-dir checks) — matched here rather than `_walk_operator_tier_nodes`'
+    `inaccessible` so project-tier disclosure stays on one channel. An unreadable
+    containment root or surface dir used to yield a silently truncated (or empty) node
+    list with zero record anywhere; inaccessible is NOT clean."""
     project_root = Path(project_root)
     harness_root = project_root / ".claude"
     nodes: list[dict[str, Any]] = []
     seen_refs: set[str] = set()
     try:
         containment_stat = os.stat(project_root)
-    except OSError:
+    except OSError as e:
+        errors.append(f"project containment root not accessible: {project_root}: {e}")
         return nodes
 
     skills_dir = harness_root / "skills"
     try:
         is_skills_dir = skills_dir.is_dir()
-    except OSError:
+    except OSError as e:
+        errors.append(f"project skills is_dir failed for {skills_dir}: {e}")
         is_skills_dir = False
     if is_skills_dir:
         contained, _identity = _project_tier_gate(skills_dir, project_root, containment_stat)
@@ -1429,7 +1438,8 @@ def _walk_project_tier_nodes(project_root, out_of_root_refs):
         d = harness_root / dirname
         try:
             is_dir = d.is_dir()
-        except OSError:
+        except OSError as e:
+            errors.append(f"project {dirname} is_dir failed for {d}: {e}")
             is_dir = False
         if not is_dir:
             continue
@@ -5190,7 +5200,7 @@ def build_document(
         # built/tier-tagged above) rather than re-walking or re-reading disk.
         raw_nodes = _walk_operator_tier_nodes(root, inaccessible)
         if project_root is not None:
-            raw_nodes += _walk_project_tier_nodes(project_root, out_of_root_refs)
+            raw_nodes += _walk_project_tier_nodes(project_root, out_of_root_refs, errors)
         raw_nodes += _rule_nodes_from_files(files)
         raw_nodes += _claude_md_nodes_from_files(files)
         raw_nodes += _hook_nodes_from_composed(composed_hooks)
