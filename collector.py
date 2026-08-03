@@ -3083,12 +3083,62 @@ def _check_profile_path_safe(value: str, key: str, profile_path: Path) -> None:
     is not absolute under a POSIX `Path` and is therefore not rejected here, but it is
     also harmless there: POSIX `Path` treats a backslash as an ordinary filename
     character, so `root / "C:\\x"` stays a single relative component INSIDE root -- not a
-    containment escape, just a filename that is unlikely to exist."""
+    containment escape, just a filename that is unlikely to exist.
+
+    M11 exit gate, Codex round, Finding 2 (P2): also rejects an EMPTY or whitespace-only
+    value here, at the same validation boundary. Every value this function checks is later
+    either joined onto `root` (`root / value`) OR passed to `root.glob(value)` -- an empty
+    string passes both checks above (`Path("").parts == ()`, not absolute) and
+    load_profile's earlier `isinstance(value, str)` type check, then reaches
+    `root.glob("")`, which raises a bare `ValueError("Unacceptable pattern: ''")` that
+    main()'s outer `except Exception` turns into a full `_empty_document` reported at EXIT
+    0 -- the identical "total inventory loss read as a clean harness" shape the absolute-
+    path fix above was written to close, now through a third vector: not absolute, not
+    '..'-bearing, but unusable. A whitespace-only value never crashes `.glob()` (pathlib
+    treats it as one ordinary path component) but can never usefully name or match a real
+    file either, so it is rejected here for the same reason. (A bare `"."` and an invalid
+    `"**"` placement are a FOURTH and FIFTH vector through the identical hole --
+    `_check_profile_glob_parses`, below, closes those for the glob-consuming keys.)"""
     candidate = Path(value)
+    if value.strip() == "":
+        raise ProfileError(
+            f"profile {profile_path.name}: {key} must not be empty or whitespace-only")
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ProfileError(
             f"profile {profile_path.name}: {key} must be a relative path with no "
             "'..' component")
+
+
+def _check_profile_glob_parses(value: str, key: str, profile_path: Path) -> None:
+    """Reject a glob-pattern value that Python's own pathlib glob parser cannot compile
+    (M11 exit gate, Codex round, Finding 2 follow-up): `_check_profile_path_safe` closes
+    the STRING-shape vectors (absolute, '..', empty/whitespace), but a syntactically odd
+    pattern can still crash a later `root.glob(pattern)` call with a ValueError OR
+    (measured, CPython 3.11.14: `Path(".").glob(".")` raises `IndexError: tuple index out
+    of range`) an IndexError -- neither is caught anywhere between the collector's many
+    `root.glob(pattern)` call sites and main()'s outer `except Exception`, so either one
+    crashes an otherwise-valid-looking profile into a full `_empty_document` reported at
+    EXIT 0, same shape as every other vector through this hole.
+
+    Rather than enumerate every such string by hand -- a growing, version-dependent list
+    (`"."`, `"**"` outside its own path component, and whatever else pathlib's parser
+    rejects on a future Python) -- this validates by ACTUALLY calling `.glob(value)`
+    against a placeholder path and forcing its first parse step with `next()`. The parse
+    error is a pure function of the PATTERN STRING, independent of whether the base
+    directory exists (measured: an existing and a nonexistent base raise the identical
+    exception for the identical pattern). Iteration is bounded to one item (`next(...,
+    None)`) since forcing the parse is all that is needed; a placeholder directory that
+    happens to hold many matching entries must not make profile loading slow.
+
+    Scoped to the keys actually passed to `.glob()` (the scalar globs and every
+    `_PROFILE_LIST_KEYS` entry) -- NOT `top_level_files`/`container_dirs`/
+    `hook_command_remaps[1]`, which are joined directly and never globbed, so a value that
+    merely LOOKS like bad glob syntax is not a real hazard for those roles."""
+    try:
+        next(Path(".").glob(value), None)
+    except (ValueError, IndexError, NotImplementedError) as e:
+        raise ProfileError(
+            f"profile {profile_path.name}: {key} is not a usable glob pattern ({e})") from e
 
 
 def _check_profile_bare_name_safe(value: str, key: str, profile_path: Path) -> None:
@@ -3102,10 +3152,18 @@ def _check_profile_bare_name_safe(value: str, key: str, profile_path: Path) -> N
     promises one, and `Path.name` would silently take just "b" rather than reject the
     mismatch. `value != Path(value).name` catches any embedded separator (including a
     leading '/', which is also absolute and would be caught by the equality check itself
-    since `Path("/x").name == "x" != "/x"`); the explicit `("", ".", "..")` exclusion
-    catches the three literal single-token values whose `.name` degenerately survives (or
-    -- for ".." -- equals) that comparison without being a real filename."""
-    if value != Path(value).name or value in ("", ".", ".."):
+    since `Path("/x").name == "x" != "/x"`); the explicit `(".", "..")` exclusion catches
+    the two literal single-token values whose `.name` degenerately survives (or -- for
+    ".." -- equals) that comparison without being a real filename.
+
+    M11 exit gate, Codex round, Finding 2 (P2): `value.strip() == ""` also rejects a
+    whitespace-only bare name (e.g. `"   "`) -- `Path("   ").name == "   "` equals `value`,
+    so the equality check alone lets it straight through, and it is not one of the three
+    literal tokens the old `in (".", "..")` check named. It never crashes (joined as an
+    ordinary, if useless, filename), but it can never name a real file either, so it is
+    rejected here for the same "unusable" reason `_check_profile_path_safe` rejects it for
+    glob/join roles."""
+    if value != Path(value).name or value.strip() == "" or value in (".", ".."):
         raise ProfileError(
             f"profile {profile_path.name}: {key} must be a single path component "
             "(no separators, and not '.' or '..')")
@@ -3213,6 +3271,7 @@ def load_profile(path: Path) -> dict[str, Any]:
         value = data[key]
         if value is not None:
             _check_profile_path_safe(value, key, path)
+            _check_profile_glob_parses(value, key, path)
     for key in ("memory_index_name", "skill_manifest_name"):
         value = data[key]
         if value is not None:
@@ -3220,6 +3279,7 @@ def load_profile(path: Path) -> dict[str, Any]:
     for key in _PROFILE_LIST_KEYS:
         for entry in data[key]:
             _check_profile_path_safe(entry, key, path)
+            _check_profile_glob_parses(entry, key, path)
     for key in _PROFILE_MAP_KEYS:
         for role, entry in data[key].items():
             if entry is not None:
@@ -6115,9 +6175,18 @@ def main(argv: list[str] | None = None) -> int:
     # (Invariant 2 / SPEC_7 §2).
     profile: dict[str, Any] = PROFILE_CLAUDE_CODE
     profile_error: str | None = None
+    # M11 exit gate, Codex round, Finding 1 (P1): the RESOLVED --profile path, tracked
+    # unconditionally (success or ProfileError -- the file was READ either way, so it is a
+    # read input either way) so the --out guard below can never let a write target name the
+    # file the collector just read for --profile. Resolved defensively, same ladder as
+    # validate_write_target's own candidate/input-path resolution: a symlink loop raises
+    # RuntimeError (not OSError) on CPython, so both are caught and the expanded-but-
+    # unresolved path is used as a fallback rather than escaping uncaught.
+    profile_arg_path: Path | None = None
     if args.profile is not None:
+        profile_arg_path = Path(args.profile).expanduser()
         try:
-            profile = load_profile(Path(args.profile).expanduser())
+            profile = load_profile(profile_arg_path)
         except ProfileError as exc:
             profile_error = str(exc)
             profile = PROFILE_CLAUDE_CODE
@@ -6140,10 +6209,20 @@ def main(argv: list[str] | None = None) -> int:
                 # Deliberately the DEFAULT profile: this call feeds validate_write_target's
                 # input_paths guard, and a wider input set is the SAFE direction. On the
                 # profile-error path there is no valid profile to use anyway.
+                # REPLACES input_paths (still [] here), so the --profile path below is
+                # appended AFTER this, never lost to the replacement.
                 input_paths = iter_input_paths(root, args.project_root, compose=True)
+            if profile_arg_path is not None:
+                try:
+                    resolved_profile_path = profile_arg_path.resolve()
+                except (OSError, RuntimeError):  # symlink loop -- see comment above
+                    resolved_profile_path = profile_arg_path
+                input_paths = list(input_paths) + [resolved_profile_path]
             ok, resolved = validate_write_target(args.out, out_roots, input_paths)
             if not ok:
-                ap.error("--out must be outside --root (read-only invariant)")
+                ap.error("--out must be outside --root and away from every file the "
+                          "collector reads, including --profile if given (read-only "
+                          "invariant)")
             out_path = resolved                                # write through the validated resolved path
     if profile_error is not None:
         doc = _empty_document(root)

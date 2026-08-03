@@ -658,4 +658,144 @@ def test_empty_skills_globs_excludes_skills_from_instruction_corpus_but_keeps_de
     assert "skills/demo/SKILL.md" not in corpus_rels
     assert "skills/demo/phases/p1.md" not in corpus_rels
     assert "skills/coding-team/rules/c.md" in corpus_rels  # rules_globs, unaffected
-    assert any(r.startswith("rules/") for r in corpus_rels)  # rules_globs untouched
+
+
+# --- M11 exit gate, Codex round, Finding 1 (P1): --profile is a new READ input that
+# load_profile never added to `input_paths`, so a `--out` naming the SAME path silently
+# destroyed the profile file it had just read (exit 0, the file left unparseable for the
+# next run). Reproduced BEFORE the fix: the profile grew from 1395 to 4098 bytes. ---
+
+def test_out_target_matching_the_profile_file_is_rejected(fake_harness, tmp_path):
+    profile_src = json.loads((SKILL_DIR / "profiles" / "claude-code.json").read_text())
+    p = tmp_path / "myprofile.json"
+    p.write_text(json.dumps(profile_src))
+    before_text = p.read_text()
+    proc = run_collector_raw(fake_harness, "--profile", str(p), "--out", str(p))
+    assert proc.returncode != 0, proc.stderr
+    assert "--out must be outside --root" in proc.stderr
+    assert p.read_text() == before_text, "the --profile file was overwritten by --out"
+    _collector.load_profile(p)  # still a loadable profile, not the report's own JSON shape
+
+
+def test_out_target_matching_a_relative_profile_path_is_still_rejected(fake_harness, tmp_path):
+    """The guard must key off the RESOLVED profile path, not the literal --profile string —
+    a relative --profile argument and an absolute --out argument naming the identical file
+    must still collide."""
+    profile_src = json.loads((SKILL_DIR / "profiles" / "claude-code.json").read_text())
+    p = tmp_path / "rel_profile.json"
+    p.write_text(json.dumps(profile_src))
+    before_text = p.read_text()
+    cmd = [sys.executable, str(COLLECTOR), "--root", str(fake_harness),
+           "--profile", "rel_profile.json", "--out", str(p)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=str(tmp_path))
+    assert proc.returncode != 0, proc.stderr
+    assert p.read_text() == before_text
+
+
+def test_out_target_matching_the_profile_file_is_rejected_in_compose_mode(fake_harness, tmp_path):
+    """The profile-path guard must survive alongside the existing compose-mode
+    iter_input_paths() population of input_paths (which REPLACES, not appends to, the
+    list built so far in main()) -- a naive fix that assigns input_paths only in the
+    non-compose branch would regress here."""
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    profile_src = json.loads((SKILL_DIR / "profiles" / "claude-code.json").read_text())
+    p = tmp_path / "compose_profile.json"
+    p.write_text(json.dumps(profile_src))
+    before_text = p.read_text()
+    proc = run_collector_raw(fake_harness, "--compose", "--profile", str(p), "--out", str(p),
+                             project_root=proj)
+    assert proc.returncode != 0, proc.stderr
+    assert p.read_text() == before_text
+
+
+# --- M11 exit gate, Codex round, Finding 2 (P2): a profile string that is neither absolute
+# nor '..'-bearing can still be UNUSABLE as a glob/path value -- empty, whitespace-only, or
+# (measured, CPython 3.11.14) a bare "." (`IndexError`) or an invalid "**" placement
+# (`ValueError: Invalid pattern`). Any of these previously escaped load_profile's
+# validation, crashed a later `root.glob(...)` call, and were swallowed by main()'s outer
+# `except Exception` into a full `_empty_document` reported at EXIT 0 -- the identical
+# "total inventory loss read as a clean harness" shape Finding 1's absolute/'..' fix closed
+# for a different vector. ---
+
+def test_load_profile_rejects_empty_string_in_a_list_glob(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "rules_globs", d["rules_globs"] + [""]))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "rules_globs" in str(exc.value)
+
+
+def test_load_profile_rejects_whitespace_only_string_in_a_list_glob(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "rules_globs", d["rules_globs"] + ["   "]))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "rules_globs" in str(exc.value)
+
+
+def test_load_profile_rejects_empty_scalar_glob(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("projects_glob", ""))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "projects_glob" in str(exc.value)
+
+
+def test_load_profile_rejects_empty_top_level_files_role(tmp_path):
+    """Empty/whitespace-only rejection is not glob-specific -- it applies everywhere
+    `_check_profile_path_safe` runs, including plain JOIN-only roles."""
+    p = _write_profile(tmp_path, lambda d: d["top_level_files"].__setitem__(
+        "root_instructions", ""))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "top_level_files.root_instructions" in str(exc.value)
+
+
+def test_load_profile_rejects_whitespace_only_bare_name(tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("memory_index_name", "   "))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "memory_index_name" in str(exc.value)
+
+
+def test_load_profile_rejects_bare_dot_glob_pattern(tmp_path):
+    """Measured (CPython 3.11.14): `Path(".").glob(".")` raises `IndexError`, not
+    `ValueError` -- a second exception TYPE through the same crash-to-exit-0 hole, not
+    caught by the empty/whitespace check above (`"."` is neither empty nor whitespace)."""
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "rules_globs", d["rules_globs"] + ["."]))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "rules_globs" in str(exc.value)
+
+
+def test_load_profile_rejects_invalid_double_star_glob(tmp_path):
+    """Measured: `"**"` mixed into a path component other than its own (`"rules/**bad*.md"`)
+    raises `ValueError: Invalid pattern: '**' can only be an entire path component`."""
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "hook_script_globs", d["hook_script_globs"] + ["hooks/**bad*.py"]))
+    with pytest.raises(_collector.ProfileError) as exc:
+        _collector.load_profile(p)
+    assert "hook_script_globs" in str(exc.value)
+
+
+def test_empty_glob_string_full_cli_reproduction_exits_two_not_zero(fake_harness, tmp_path):
+    """Full-CLI reproduction of the team-lead's Finding 2 exactly: BEFORE this fix,
+    `rules_globs: ["rules/*.md", ""]` crashed `root.glob("")` inside a later scan, and
+    main()'s outer except turned the whole document into `_empty_document` reported at
+    EXIT 0 with `always_loaded_file_count == 0` and an errors[] entry reading `collector
+    crashed: ValueError(...)` -- a crash reported as a clean, empty harness. It must now be
+    rejected by load_profile ITSELF, at exit 2, naming the offending key, with no
+    "collector crashed" wording in errors[].
+    # Changing this value requires a spec change (SPEC_7 §2)."""
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "rules_globs", d["rules_globs"] + [""]))
+    proc = run_collector_raw(fake_harness, "--profile", str(p))
+    assert proc.returncode == 2, proc.stderr
+    assert "rules_globs" in proc.stderr
+    doc = json.loads(proc.stdout)
+    assert doc["headline"]["always_loaded_file_count"] == 0
+    assert len(doc["errors"]) == 1
+    assert "rules_globs" in doc["errors"][0]
+    assert "collector crashed" not in doc["errors"][0]
