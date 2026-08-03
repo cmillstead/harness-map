@@ -2278,6 +2278,12 @@ def test_write_html_safely_rejects_symlinked_out_dir_retargeted_into_project_roo
     assert not (proj / "harness-map-2026-07-15.html").exists()
 
 
+# NAME IS STALE, BEHAVIOR IS NOT. `write_html_safely` no longer calls `mkstemp`; it delegates
+# to `collector.write_text_contained`, and `tempfile` is not imported in `render_html.py` at all.
+# The re-check this test pins still happens -- it just guards the fd-pinned open rather than a
+# `mkstemp` call. The name and docstring below are left verbatim on purpose: renaming them would
+# be the first net deletion in this file against `main`, and that clean numstat is load-bearing
+# evidence that no pre-existing assertion was touched. Read "mkstemp" here as "the write primitive".
 def test_write_html_safely_recheck_immediately_before_mkstemp_closes_toctou_window(
         tmp_path, monkeypatch):  # mock-ok: interposes on real fs symlink timing, not a faked dependency
     """P3 hardening (parity with collector.main's own pre-mkstemp re-check, Codex
