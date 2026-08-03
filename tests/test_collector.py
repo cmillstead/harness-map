@@ -6383,3 +6383,102 @@ def test_exactly_one_low_level_write_implementation_exists():
     assert collector_src.index("tempfile.mkstemp(") > fallback_start
     assert "write_text_contained" in render_src
     assert "write_text_contained" in render_src
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_probe_helpers_raise_on_an_unreadable_ancestor_on_every_python_version(tmp_path):
+    """Python 3.14 changed Path.is_dir()/is_file()/exists()/is_symlink() to suppress EVERY
+    OSError and return False (CPython gh-144525). Python 3.11-3.13 suppress only the ENOENT
+    family (ENOENT/ENOTDIR/EBADF/ELOOP -- pathlib._ignore_error) and RE-RAISE EACCES from an
+    unreadable ancestor. README.md advertises "Python 3.10+", so 3.14 is inside the
+    supported range.
+
+    That matters here more than almost anywhere, because this module's entire disclosure
+    invariant is "inaccessible is NOT clean". On 3.14 a pathlib probe makes every
+    `except OSError` disclosure branch below unreachable: an unreadable directory reports
+    as ABSENT, and the collector emits a confident-clean inventory over a tree it could
+    not read.
+
+    os.stat/os.lstat raise on EVERY version, which is the whole point of routing the probes
+    through them -- so this assertion is version-independent. It holds on 3.11 today and
+    keeps holding after the pathlib change, and it CANNOT be satisfied by a bare pathlib
+    probe on 3.14.
+
+    Not executed on 3.14: only Python 3.11.14 is installed in the development environment.
+    This test is what makes the guarantee checkable wherever the suite is actually run."""
+    locked = tmp_path / "locked"
+    (locked / "child").mkdir(parents=True)
+    hidden_file = locked / "child" / "leaf.md"
+    hidden_file.write_text("x", encoding="utf-8")
+    os.chmod(locked, 0)
+    try:
+        for probe, target in ((_collector._probe_is_dir, locked / "child"),
+                              (_collector._probe_is_file, hidden_file),
+                              (_collector._probe_exists, hidden_file),
+                              (_collector._probe_is_symlink, hidden_file)):
+            with pytest.raises(PermissionError):
+                probe(target)
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def test_probe_helpers_return_false_for_the_pathlib_ignored_error_family(tmp_path):
+    """Parity, not merely safety. The probes must swallow EXACTLY what pathlib swallows --
+    the ENOENT family plus the non-encodable-path ValueError -- so 3.11 behavior after the
+    swap is what it was before. Swallowing less would turn an ordinary absent path into a
+    crash at every one of the guarded probe sites; swallowing more is the 3.14 defect this
+    change exists to route around.
+
+    Changing this set requires re-reading pathlib._ignore_error for the target version."""
+    absent = tmp_path / "absent"
+    plain = tmp_path / "plain.txt"
+    plain.write_text("x", encoding="utf-8")
+    loop_a, loop_b = tmp_path / "loop_a", tmp_path / "loop_b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    broken = tmp_path / "broken"
+    broken.symlink_to(tmp_path / "nope")
+    non_encodable = Path("\x00bad")
+
+    assert _collector._probe_is_dir(absent) is False          # ENOENT
+    assert _collector._probe_is_file(absent) is False
+    assert _collector._probe_exists(absent) is False
+    assert _collector._probe_is_symlink(absent) is False
+
+    assert _collector._probe_is_dir(plain / "child") is False  # ENOTDIR
+    assert _collector._probe_is_file(plain) is True
+    assert _collector._probe_is_dir(tmp_path) is True
+
+    assert _collector._probe_exists(loop_a) is False           # ELOOP when followed
+    assert _collector._probe_is_symlink(loop_a) is True        # lstat never follows
+    assert _collector._probe_exists(broken) is False
+    assert _collector._probe_is_symlink(broken) is True
+
+    assert _collector._probe_is_dir(non_encodable) is False    # ValueError, exactly as pathlib
+    assert _collector._probe_exists(non_encodable) is False
+    assert _collector._probe_is_symlink(non_encodable) is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_safe_exists_keeps_two_probes_for_a_symlink_into_an_unreadable_tree(tmp_path):
+    """The tempting simplification of `_safe_exists` -- collapse `exists() or is_symlink()`
+    into ONE os.lstat, since "a directory entry exists at this path" is what the pair asks
+    -- is WRONG, and this fixture is the counterexample.
+
+    `link` is a symlink whose target lives under a chmod(0) directory. os.lstat(link)
+    SUCCEEDS (it never follows), so a single-lstat form answers (True, True): "present,
+    and I am sure." The two-probe form evaluates the follow-symlink stat FIRST, it raises
+    EACCES, and the answer is (False, False): "cannot determine" -- which is the entire
+    purpose of the tri-state. Confidently-present is exactly as false a claim as
+    confidently-absent when the target cannot be reached, so the ordered pair stays."""
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    target = hidden / "target.md"
+    target.write_text("x", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    os.chmod(hidden, 0)
+    try:
+        assert _collector._safe_exists(link) == (False, False)
+    finally:
+        os.chmod(hidden, 0o755)

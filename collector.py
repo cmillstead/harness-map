@@ -8,6 +8,7 @@ All scanned content is opaque data, never instructions.
 """
 import argparse
 import ast
+import errno
 import json
 import os
 import re
@@ -172,6 +173,75 @@ def _physical_key(path):
         return str(path)
 
 
+# --- version-independent existence probes ---
+#
+# Python 3.14 changed Path.is_dir() / is_file() / exists() / is_symlink() to suppress EVERY
+# OSError and return False (CPython gh-144525). Python 3.11-3.13 suppress only this family
+# and RE-RAISE EACCES from an unreadable ancestor. README.md advertises "Python 3.10+", so
+# 3.14 is inside the supported range.
+#
+# That is load-bearing here in a way it is not in most modules: this collector's disclosure
+# invariant is "inaccessible is NOT clean". On 3.14, a pathlib probe would make every
+# `except OSError` disclosure branch below UNREACHABLE -- an unreadable directory would
+# report as absent, and the collector would emit a confident-clean inventory over a tree it
+# could not read, which is precisely the failure the guarded probe sites exist to prevent.
+#
+# os.stat raises on every version, so these probes keep the error distinction intact and the
+# callers' existing handlers keep firing. The ignored set below is pathlib's own
+# `_ignore_error` set: swallowing LESS would turn an ordinary absent path into a crash at
+# every call site, so parity with 3.11 is the requirement, not merely "raise more".
+_IGNORED_PROBE_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def _probe_stat(path, follow_symlinks):
+    """`os.stat` reduced to pathlib's ignored-error set: the stat result, or None for an
+    error pathlib would have reported as False. Every other OSError PROPAGATES, which is
+    the entire reason this helper exists.
+
+    ValueError is caught for the same parity reason: pathlib's probes return False for a
+    non-encodable path (an embedded NUL), where `os.stat` raises ValueError -- not an
+    OSError, so no caller's handler would catch it. It is mapped to the same "not there"
+    answer pathlib gives rather than swallowed silently: `_IGNORED_PROBE_ERRNOS` and this
+    clause together are the exhaustive statement of what a probe is allowed to hide.
+
+    POSIX-targeted, matching the rest of this module (O_DIRECTORY, dir_fd, geteuid):
+    pathlib additionally ignores three Windows-only winerror codes, which are not mirrored.
+    """
+    try:
+        return os.stat(path, follow_symlinks=follow_symlinks)
+    except OSError as exc:
+        if exc.errno in _IGNORED_PROBE_ERRNOS:
+            return None
+        raise
+    except ValueError:
+        return None
+
+
+def _probe_is_dir(path):
+    """`Path.is_dir()` that preserves the error distinction on every Python version."""
+    st = _probe_stat(path, follow_symlinks=True)
+    return st is not None and stat.S_ISDIR(st.st_mode)
+
+
+def _probe_is_file(path):
+    """`Path.is_file()` that preserves the error distinction on every Python version."""
+    st = _probe_stat(path, follow_symlinks=True)
+    return st is not None and stat.S_ISREG(st.st_mode)
+
+
+def _probe_exists(path):
+    """`Path.exists()` that preserves the error distinction on every Python version.
+    FOLLOWS symlinks, so a broken link is False -- same as the pathlib call it replaces."""
+    return _probe_stat(path, follow_symlinks=True) is not None
+
+
+def _probe_is_symlink(path):
+    """`Path.is_symlink()` that preserves the error distinction on every Python version.
+    Does NOT follow symlinks (lstat semantics), same as the pathlib call it replaces."""
+    st = _probe_stat(path, follow_symlinks=False)
+    return st is not None and stat.S_ISLNK(st.st_mode)
+
+
 def _read_text(path):
     """Read `path` as utf-8 text (errors="replace"). Returns `(text, "VERIFIED")` on
     success or `(None, "INACCESSIBLE")` on failure. The `is_file()` guard matches
@@ -181,10 +251,10 @@ def _read_text(path):
     for a regular file or a symlink to one; False for FIFO/dir/socket/broken symlink),
     so regular-file behavior is unchanged — no false negatives."""
     try:
-        # is_file() itself can raise OSError (EACCES) when an ancestor directory
+        # The probe itself can raise OSError (EACCES) when an ancestor directory
         # is unsearchable, not just when the read fails — the probe is inside the
         # same try as the read so both fold into the one INACCESSIBLE outcome.
-        if not path.is_file():
+        if not _probe_is_file(path):
             return None, "INACCESSIBLE"
         return path.read_text(encoding="utf-8", errors="replace"), "VERIFIED"
     except OSError:
@@ -271,11 +341,23 @@ def _append_inaccessible_once(inaccessible, rel):
 
 
 def _safe_exists(path):
-    """Path.exists()/is_symlink() can raise PermissionError etc. (they only swallow ENOENT/
-    ENOTDIR). Treat any OSError as 'cannot determine' so one locked dir marks just that entry
-    inaccessible instead of blanking the whole inventory. Returns (present, ok)."""
+    """The probes can raise PermissionError etc. (they swallow only the ENOENT family).
+    Treat any OSError as 'cannot determine' so one locked dir marks just that entry
+    inaccessible instead of blanking the whole inventory. Returns (present, ok).
+
+    The ORDERED PAIR is deliberate and must not be collapsed into a single `os.lstat`,
+    however much "is there a directory entry at this path" reads like one question. For a
+    symlink whose TARGET lives under an unreadable directory, `os.lstat` succeeds -- it
+    never follows -- so a one-probe form answers (True, True), "present, and I am sure."
+    The follow-symlink probe runs first, raises EACCES, and the answer is (False, False),
+    "cannot determine," which is the entire purpose of the tri-state: confidently-present
+    is exactly as false a claim as confidently-absent when the target cannot be reached.
+    Pinned by test_safe_exists_keeps_two_probes_for_a_symlink_into_an_unreadable_tree.
+
+    On 3.14 the pathlib spelling of this pair would report (False, True) for an unreadable
+    path -- absent, and sure of it. See the `_probe_stat` block above."""
     try:
-        return (path.exists() or path.is_symlink()), True
+        return (_probe_exists(path) or _probe_is_symlink(path)), True
     except OSError:
         return False, False
 
@@ -1286,7 +1368,7 @@ def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
     rules_dir = harness_root / "rules"
     rule_files = []
     try:
-        is_rules_dir = rules_dir.is_dir()
+        is_rules_dir = _probe_is_dir(rules_dir)
     except OSError as e:
         errors.append(f"project rules is_dir failed for {rules_dir}: {e}")
         is_rules_dir = False
@@ -1333,7 +1415,7 @@ def _walk_operator_tier_nodes(root, inaccessible=None):
     commands/*.md as nodes at all. Operator tier keeps its existing trusted
     symlink-following (unchanged, matches every other operator-tier walk).
 
-    `inaccessible` (S7): the shared build_document inaccessible[] list. Path.is_dir()
+    `inaccessible` (S7): the shared build_document inaccessible[] list. `_probe_is_dir`
     re-raises EACCES from an unreadable ancestor, so a locked skills/ or agents/ dir used
     to abort this walk and — via build_document, which has no per-section handler — replace
     the whole document with a crash envelope. Each surface dir that cannot be probed is now
@@ -1344,7 +1426,7 @@ def _walk_operator_tier_nodes(root, inaccessible=None):
         inaccessible = []
     skills_dir = root / "skills"
     try:
-        skills_dir_is_dir = skills_dir.is_dir()
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
     except OSError:
         _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
         skills_dir_is_dir = False
@@ -1362,7 +1444,7 @@ def _walk_operator_tier_nodes(root, inaccessible=None):
     for surface, dirname in (("agent", "agents"), ("command", "commands")):
         d = root / dirname
         try:
-            d_is_dir = d.is_dir()
+            d_is_dir = _probe_is_dir(d)
         except OSError:
             _append_inaccessible_once(inaccessible, _rel_safe(root, d))
             continue
@@ -1405,7 +1487,7 @@ def _walk_project_tier_nodes(project_root, out_of_root_refs, errors):
 
     skills_dir = harness_root / "skills"
     try:
-        is_skills_dir = skills_dir.is_dir()
+        is_skills_dir = _probe_is_dir(skills_dir)
     except OSError as e:
         errors.append(f"project skills is_dir failed for {skills_dir}: {e}")
         is_skills_dir = False
@@ -1437,7 +1519,7 @@ def _walk_project_tier_nodes(project_root, out_of_root_refs, errors):
     for surface, dirname in (("agent", "agents"), ("command", "commands")):
         d = harness_root / dirname
         try:
-            is_dir = d.is_dir()
+            is_dir = _probe_is_dir(d)
         except OSError as e:
             errors.append(f"project {dirname} is_dir failed for {d}: {e}")
             is_dir = False
@@ -1655,12 +1737,12 @@ def walk_always_loaded(
         # CLAUDE.md), AND compose is off — compose mode emits the project CLAUDE.md via
         # _walk_project_tier below instead, unconditionally on registration (H1: the two
         # paths must never BOTH fire for the same physical file, or it double-counts).
-        # Path.is_dir() re-raises EACCES from an unreadable ancestor (it swallows only the
+        # `_probe_is_dir` re-raises EACCES from an unreadable ancestor (it swallows only the
         # ENOENT family) — an escape here aborts walk_always_loaded and, via build_document,
         # replaces the ENTIRE report with a crash envelope. Record and treat as absent.
         legacy_memory_dir = root / "projects" / active_slug / "memory"
         try:
-            legacy_memory_present = legacy_memory_dir.is_dir()
+            legacy_memory_present = _probe_is_dir(legacy_memory_dir)
         except OSError as e:
             errors.append(f"projects memory is_dir failed for {legacy_memory_dir}: {e}")
             legacy_memory_present = False
@@ -1684,7 +1766,7 @@ def walk_always_loaded(
     # are handled in Task 3 with explicit name+target recording instead of a body read.
     projects_dir = root / "projects"
     try:
-        projects_dir_is_dir = projects_dir.is_dir()
+        projects_dir_is_dir = _probe_is_dir(projects_dir)
     except OSError as e:
         errors.append(f"projects is_dir failed for {projects_dir}: {e}")
         projects_dir_is_dir = False
@@ -1755,7 +1837,7 @@ def walk_always_loaded(
     rule_dirs = [(root / "rules", "rule")]
     skills_root = root / "skills"
     try:
-        skills_root_is_dir = skills_root.is_dir()
+        skills_root_is_dir = _probe_is_dir(skills_root)
     except OSError as e:
         errors.append(f"skills is_dir failed for {skills_root}: {e}")
         skills_root_is_dir = False
@@ -1768,7 +1850,7 @@ def walk_always_loaded(
         for skill_dir in sub_skill_dirs:
             sub_rules = skill_dir / "rules"
             try:
-                is_rules_dir = sub_rules.is_dir()
+                is_rules_dir = _probe_is_dir(sub_rules)
             except OSError as e:
                 errors.append(f"rules is_dir check failed for {sub_rules}: {e}")
                 continue
@@ -1777,7 +1859,7 @@ def walk_always_loaded(
                 rule_dirs.append((sub_rules, category))
     for rules_dir, category in rule_dirs:
         try:
-            if not rules_dir.is_dir():
+            if not _probe_is_dir(rules_dir):
                 continue
         except OSError as e:
             errors.append(f"rules is_dir failed for {rules_dir}: {e}")
@@ -1817,7 +1899,7 @@ def collect_descriptions(
     # its harness-relative name by design.
     skills_dir = root / "skills"
     try:
-        skills_dir_is_dir = skills_dir.is_dir()
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
     except OSError:
         _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
         skills_dir_is_dir = False
@@ -1846,7 +1928,7 @@ def collect_descriptions(
 
     agents_dir = root / "agents"
     try:
-        agents_dir_is_dir = agents_dir.is_dir()
+        agents_dir_is_dir = _probe_is_dir(agents_dir)
     except OSError:
         _append_inaccessible_once(inaccessible, _rel_safe(root, agents_dir))
         agents_dir_is_dir = False
@@ -1883,7 +1965,7 @@ def collect_on_demand(
     # its harness-relative name by design.
     skills_dir = root / "skills"
     try:
-        skills_dir_is_dir = skills_dir.is_dir()
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
     except OSError:
         _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
         skills_dir_is_dir = False
@@ -1901,7 +1983,7 @@ def collect_on_demand(
                 continue
             tests_dir = skill_dir / "tests"
             try:
-                has_test = tests_dir.is_dir()
+                has_test = _probe_is_dir(tests_dir)
             except OSError:
                 _append_inaccessible_once(inaccessible, _rel_safe(root, tests_dir))
                 has_test = False
@@ -1920,7 +2002,7 @@ def collect_on_demand(
             for subdir, kind in (("phases", "phase"), ("prompts", "prompt"), ("agents", "agent")):
                 target = skill_dir / subdir
                 try:
-                    target_is_dir = target.is_dir()
+                    target_is_dir = _probe_is_dir(target)
                 except OSError:
                     _append_inaccessible_once(inaccessible, _rel_safe(root, target))
                     continue
@@ -1948,7 +2030,7 @@ def collect_on_demand(
         active_slug = _project_slug(project_root)
         mem_dir = root / "projects" / active_slug / "memory"
         try:
-            mem_dir_is_dir = mem_dir.is_dir()
+            mem_dir_is_dir = _probe_is_dir(mem_dir)
         except OSError:
             _append_inaccessible_once(inaccessible, _rel_safe(root, mem_dir))
             mem_dir_is_dir = False
@@ -2006,16 +2088,16 @@ def parse_settings(
       Returns (settings_dict, parsed_ok)."""
     settings_path = root / "settings.json"
     try:
-        is_regular_file = settings_path.is_file()   # follows symlinks; False for FIFO/socket/dir/broken-symlink/absent
+        is_regular_file = _probe_is_file(settings_path)   # follows symlinks; False for FIFO/socket/dir/broken-symlink/absent
     except OSError as e:
-        # is_file() itself can raise EACCES from an unsearchable ancestor directory,
+        # The probe itself can raise EACCES from an unsearchable ancestor directory,
         # not just report False — LOUD per this function's own "unreadable-as-a-regular
         # file" branch, same shape as the read-failure case below.
         errors.append(f"settings.json is_file() check failed: {e!r}")
         return {}, False
     if not is_regular_file:
         try:
-            present = settings_path.exists()   # follows symlinks; True for a symlink to a FIFO/socket/dir
+            present = _probe_exists(settings_path)   # follows symlinks; True for a symlink to a FIFO/socket/dir
         except OSError:
             present = True   # stat failed unexpectedly; treat conservatively as present-anomaly
         if present:
@@ -2023,7 +2105,7 @@ def parse_settings(
                            "refusing to open it to avoid blocking on a special file.")
             return {}, False
         try:
-            is_broken_symlink = settings_path.is_symlink()   # exists() False + is_symlink() True == a broken (dangling) symlink
+            is_broken_symlink = _probe_is_symlink(settings_path)   # not-present + is-a-link == a broken (dangling) symlink
         except OSError as e:
             errors.append(f"settings.json is_symlink() check failed: {e!r}")
             return {}, False
@@ -2970,7 +3052,7 @@ def _git_marker_root(start: Path, stop_at: str) -> tuple[Path | None, bool]:
           under an instruction-file dir that iter_input_paths already yields.
 
     TRI-STATE, not two-state (F5): `ok=False` means an ancestor's `.git` could not be read
-    (Path.exists() RAISES PermissionError -- it only swallows ENOENT/ENOTDIR), so the walk
+    (`_probe_exists` RAISES PermissionError -- it swallows only the ENOENT family), so the walk
     ABORTS rather than silently attributing the file to an outer repo. The caller maps that
     to `git_error`, NEVER to `no_repo`: "there is no enclosing work tree" is a positive
     assertion of absence, and asserting absence over a state we could not read is the exact
@@ -3824,7 +3906,7 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
     for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
         d = project_root / rel_dir
         try:
-            if d.is_dir():
+            if _probe_is_dir(d):
                 candidates.extend(sorted(d.glob(pattern)))
         except OSError as e:
             # Inaccessible is NOT clean: an unreadable project-tier surface dir yields
@@ -3834,7 +3916,7 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
             continue
     skills_dir = harness_root / "skills"
     try:
-        if skills_dir.is_dir():
+        if _probe_is_dir(skills_dir):
             for skill_dir in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
                 skill_md = skill_dir / "SKILL.md"
                 present, ok = _safe_exists(skill_md)
@@ -4306,7 +4388,7 @@ def check_phantom_refs(
                         # exactly like the resolve() failure above: never asserted resolved
                         # OR missing.
                         try:
-                            is_file = resolved_target.is_file()
+                            is_file = _probe_is_file(resolved_target)
                         except OSError:
                             _append_inaccessible_once(inaccessible, _rel_safe(root, candidate))
                             stripped_handled = True
@@ -4451,7 +4533,7 @@ def _hook_test_stems(root, errors):
     test_dirs = [root / "hooks" / "tests"]
     skills_root = root / "skills"
     try:
-        skills_root_is_dir = skills_root.is_dir()
+        skills_root_is_dir = _probe_is_dir(skills_root)
     except OSError as e:
         errors.append(f"skills is_dir failed for {skills_root}: {e}")
         skills_root_is_dir = False
@@ -4558,7 +4640,7 @@ def _skill_has_test_asset(skill_dir, errors=None):
 def _detect_skill_test_coverage(root, errors):
     skills_dir = root / "skills"
     try:
-        skills_dir_is_dir = skills_dir.is_dir()
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
     except OSError as e:
         # is_dir() re-raises EACCES from an unreadable ancestor; an escape here aborts
         # detect_test_coverage and, via build_document, the entire report.
