@@ -168,3 +168,36 @@ def test_profile_load_never_writes_inside_root(fake_harness, tmp_path):
     run_collector_raw(fake_harness, "--profile",
                       str(SKILL_DIR / "profiles" / "claude-code.json"))
     assert snap(fake_harness) == before
+
+
+def test_default_profile_matches_claude_code_layout(fake_harness, tmp_path):
+    """SPEC_7 §2 scope guard: an explicit --profile profiles/claude-code.json run must
+    produce the SAME document as a no-flag run, modulo generated_at. This is the whole
+    no-behavior-change contract in one assertion.
+    # Changing this value requires a spec change (SPEC_7 §2)."""
+    proj = fake_harness.parent / "active-repo"
+    default_proc = run_collector_raw(fake_harness, project_root=proj)
+    assert default_proc.returncode == 0, default_proc.stderr
+    profiled_proc = run_collector_raw(
+        fake_harness, "--profile", str(SKILL_DIR / "profiles" / "claude-code.json"),
+        project_root=proj)
+    assert profiled_proc.returncode == 0, profiled_proc.stderr
+    a = json.loads(default_proc.stdout)
+    b = json.loads(profiled_proc.stdout)
+    a.pop("generated_at")
+    b.pop("generated_at")
+    assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+def test_default_profile_matches_claude_code_layout_in_compose_mode(fake_harness):
+    """Same guard with --compose on, so the project-tier path is exercised too."""
+    proj = fake_harness.parent / "active-repo"
+    a_proc = run_collector_raw(fake_harness, "--compose", project_root=proj)
+    b_proc = run_collector_raw(
+        fake_harness, "--compose", "--profile",
+        str(SKILL_DIR / "profiles" / "claude-code.json"), project_root=proj)
+    assert a_proc.returncode == 0 and b_proc.returncode == 0
+    a, b = json.loads(a_proc.stdout), json.loads(b_proc.stdout)
+    a.pop("generated_at")
+    b.pop("generated_at")
+    assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)

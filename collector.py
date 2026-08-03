@@ -2314,16 +2314,27 @@ def collect_config(
     }
 
 
-def _hook_disk_files(root):
+def _hook_disk_files(root, *, profile: dict[str, Any] | None = None):
     """hooks/*.py + hooks/*.sh on disk, name-sorted, never raising (an unreadable hooks/
     dir yields []). Deliberately single-level: no recursion, so there is no walk to
     follow symlinks through — a symlinked hook FILE is included by name. Shared by
     reconcile_hooks and _detect_hook_test_coverage, which both need the identical
-    guarded + sorted listing before diverging into their own downstream logic."""
-    hooks_dir = root / "hooks"
+    guarded + sorted listing before diverging into their own downstream logic.
+
+    M11 (SPEC_7 §2): the hooks dir and its script extensions come from `profile`
+    (defaulting to PROFILE_CLAUDE_CODE) — `hook_script_globs` entries are glob patterns
+    ROOTED at container_dirs["hooks"] (e.g. "hooks/*.py"), so only their basename
+    ("*.py") is re-applied against the profile's hooks dir."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    hooks_name = profile["container_dirs"]["hooks"]
+    if hooks_name is None:
+        return []
+    hooks_dir = root / hooks_name
     try:
-        disk_files = sorted(list(hooks_dir.glob("*.py")) + list(hooks_dir.glob("*.sh")),
-                             key=lambda p: p.name)
+        disk_files = sorted(
+            [fp for pattern in profile["hook_script_globs"]
+             for fp in hooks_dir.glob(Path(pattern).name)],
+            key=lambda p: p.name)
     except OSError:
         return []
     return disk_files
@@ -2969,12 +2980,17 @@ def load_profile(path: Path) -> dict[str, Any]:
 
 
 def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
-                               blind_spots: list[str]) -> list[Path]:
+                               blind_spots: list[str], *,
+                               profile: dict[str, Any] | None = None) -> list[Path]:
     """Shared glob-walk + dedup for the instruction-file corpus (S2.M3): the SINGLE
     definition of "the deduped instruction-file set" consumed by BOTH
     flag_long_instructions (line-count flags) and collect_git_age's caller (staleness
     signal) -- add a new instruction-file glob to _INSTRUCTION_GLOBS, never inline a
     second glob loop here or elsewhere.
+
+    M11 (SPEC_7 §2): `profile` (defaulting to PROFILE_CLAUDE_CODE) supplies the glob
+    set via _instruction_globs(profile), reproducing _INSTRUCTION_GLOBS byte-for-byte
+    on the default profile.
 
     `seen` dedupes a file reachable via multiple glob paths (a deploy symlink under
     agents/ + its canonical submodule source under skills/*/agents/). The glob order
@@ -3000,6 +3016,7 @@ def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
     dispatcher read already produced for the same path. A file whose real path escapes
     root is refused before the read and recorded as a blind spot instead, matching the
     hook-script walk's containment gate."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
     seen = set()
     result: list[Path] = []
     try:
@@ -3020,7 +3037,7 @@ def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
         if msg not in blind_spots:      # called twice per run (two callers)
             blind_spots.append(msg)
         return result
-    for pattern in _INSTRUCTION_GLOBS:
+    for pattern in _instruction_globs(profile):
         # Codex #4 (S2 gate fix): sort BEFORE dedup. root.glob() yields in filesystem
         # order, so both the `seen` winner and the returned order were filesystem
         # dependent. D4's budget-exhaustion truncation silences a SUFFIX of this list, so
@@ -3055,9 +3072,11 @@ def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
 
 
 def flag_long_instructions(root: Path, inaccessible: list[dict[str, Any]],
-                           blind_spots: list[str]) -> list[dict[str, Any]]:
+                           blind_spots: list[str], *,
+                           profile: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
     flags: list[dict[str, Any]] = []
-    for fp in _deduped_instruction_files(root, inaccessible, blind_spots):
+    for fp in _deduped_instruction_files(root, inaccessible, blind_spots, profile=profile):
         text, evidence = _read_text(fp)
         if text is None:
             # Codex R2-F11: this is the SECOND read of fp this run. _deduped_
@@ -4190,6 +4209,8 @@ def scan_duplication(
     project_root: Path | None = None,
     compose: bool = False,
     out_of_root_refs: list[Any] | None = None,
+    *,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Candidate near-duplicate pairs by containment coefficient (|A∩B| / min(|A|,|B|))
     over k=8 word shingles — chosen over Jaccard because it correctly flags a short file
@@ -4198,12 +4219,16 @@ def scan_duplication(
     not something this collector decides. `compose=True` (T4/M4) adds the project-tier
     corpus so duplication runs ACROSS BOTH TIERS COMBINED — an operator rule duplicated
     by a project file is a signal ("this repo re-implements an operator rule"). Additive:
-    `compose=False` behavior (corpus, pairs shape, output) is byte-for-byte unchanged."""
+    `compose=False` behavior (corpus, pairs shape, output) is byte-for-byte unchanged.
+
+    M11 (SPEC_7 §2): the operator-tier corpus globs come from `profile["duplication_globs"]`
+    (defaulting to PROFILE_CLAUDE_CODE, which reproduces _DUP_GLOBS)."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
     # Generalized skills/coding-team/rules -> skills/*/rules for release portability; the
     # seen_physical dedup below still collapses a rule reachable via multiple glob paths.
     seen_physical = set()
     corpus = []  # [(rel_path, tier, shingle_set), ...]
-    for pattern in _DUP_GLOBS:
+    for pattern in profile["duplication_globs"]:
         try:
             candidates = sorted(root.glob(pattern))
         except OSError:
@@ -4271,10 +4296,16 @@ def scan_duplication(
     }
 
 
-def _hooks_body_corpus(root, inaccessible=None):
+def _hooks_body_corpus(root, inaccessible=None, *, profile: dict[str, Any] | None = None):
     """Concatenated hooks/*.py + hooks/*.sh bodies, ORIGINAL case, for literal env-flag
     grep and the promotion-candidate hook_covered cross-reference. Returns
     `(corpus, complete)`.
+
+    M11 (SPEC_7 §2): `profile` (defaulting to PROFILE_CLAUDE_CODE) supplies both the
+    hooks dir (container_dirs["hooks"]) and the scandir suffix filter
+    (_hook_body_suffixes(profile), derived from hook_script_globs). A profile with no
+    hooks concept (container_dirs["hooks"] is None) is treated exactly like an ABSENT
+    hooks dir below: known-empty, complete=True.
     Caveat: a hook that reads the flag name from a variable rather than a literal string
     (os.environ[SOME_VAR] indirection) is invisible to this substring check — a
     false-positive "phantom" env flag is possible. Best-effort only.
@@ -4295,8 +4326,12 @@ def _hooks_body_corpus(root, inaccessible=None):
 
     An ABSENT hooks dir is `complete=True`: a harness with no hooks has a known-empty
     corpus, which is a fact, not a blind spot."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    hooks_name = profile["container_dirs"]["hooks"]
+    if hooks_name is None:
+        return "", True
     parts = []
-    hooks_dir = root / "hooks"
+    hooks_dir = root / hooks_name
     present, ok = _safe_exists(hooks_dir)
     if not ok:
         if inaccessible is not None:
@@ -4312,8 +4347,9 @@ def _hooks_body_corpus(root, inaccessible=None):
             _append_inaccessible_once(inaccessible, _rel_safe(root, hooks_dir))
         return "", False
     complete = True
+    body_suffixes = _hook_body_suffixes(profile)
     for name in names:
-        if not name.endswith(_HOOK_BODY_SUFFIXES):
+        if not name.endswith(body_suffixes):
             continue
         fp = hooks_dir / name
         text, _status = _read_text(fp)
@@ -4330,24 +4366,32 @@ def _hooks_body_corpus(root, inaccessible=None):
     return "\n".join(parts), complete
 
 
-def _staleness_corpus(root, inaccessible):
+def _staleness_corpus(root, inaccessible, *, profile: dict[str, Any] | None = None):
     """Corpus for phantom-ref + promotion-candidate scanning: rules/*.md,
     skills/coding-team/rules/*.md, and the harness CLAUDE.md — deduped by physical
-    identity so a symlinked rule (deploy path + submodule source) is scanned once."""
+    identity so a symlinked rule (deploy path + submodule source) is scanned once.
+
+    M11 (SPEC_7 §2): the rule globs come from `profile["rules_globs"]` (defaulting to
+    PROFILE_CLAUDE_CODE, which reproduces _STALENESS_RULE_GLOBS) and the root
+    instructions file from `profile["top_level_files"]["root_instructions"]` — skipped
+    entirely when that role is None (a harness with no root instructions file)."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
     seen = set()
     corpus = []
     paths = []
     # Generalized skills/coding-team/rules -> skills/*/rules for release portability; deduped by
     # physical identity so a symlinked rule (deploy path + sub-skill source) is scanned once.
-    for pattern in _STALENESS_RULE_GLOBS:
+    for pattern in profile["rules_globs"]:
         try:
             paths.extend(sorted(root.glob(pattern)))
         except OSError:
             pass
-    claude = root / "CLAUDE.md"
-    present, ok = _safe_exists(claude)
-    if ok and present:
-        paths.append(claude)
+    root_instructions_name = profile["top_level_files"]["root_instructions"]
+    if root_instructions_name is not None:
+        claude = root / root_instructions_name
+        present, ok = _safe_exists(claude)
+        if ok and present:
+            paths.append(claude)
     for fp in paths:
         key = _physical_key(fp)
         if key in seen:
@@ -4368,11 +4412,18 @@ def check_phantom_refs(
     root: Path,
     corpus_files: list[tuple[str, str]],
     inaccessible: list[dict[str, Any]],
+    *,
+    profile: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Backtick-quoted path and env-flag tokens that don't resolve to anything real. A
     path OUTSIDE --root is reported as kind="external" (INFERRED, resolved: null) — the
     collector never claims a file outside its scanned scope is phantom; it genuinely
-    cannot see it either way, so it only classifies, never asserts absence."""
+    cannot see it either way, so it only classifies, never asserts absence.
+
+    M11 (SPEC_7 §2): `profile` is accepted for call-site uniformity with build_document's
+    other helpers, but this function's own literal homes (the `~/.claude/` prefix, the
+    commands/ + skills/ slash-command resolution paths below) are deliberately deferred —
+    generalizing THEM is out of scope for this milestone."""
     refs: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     hooks_corpus, hooks_corpus_complete = _hooks_body_corpus(root, inaccessible)
@@ -4715,11 +4766,17 @@ def collect_promotion_candidates(
     root: Path,
     corpus_files: list[tuple[str, str]],
     settings: dict[str, Any],
+    *,
+    profile: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Prose in an instruction file that reads like a hard rule (NEVER/ALWAYS/must, a
     numeric cap, a required-file assertion) but may have no corresponding hook enforcing
     it. Advisory SIGNALS only — synthesis proposes extending an EXISTING covered hook
-    before creating a new one; this collector never makes that judgment itself."""
+    before creating a new one; this collector never makes that judgment itself.
+
+    M11 (SPEC_7 §2): `profile` is accepted for call-site uniformity with build_document's
+    other helpers; this function's corpus already arrives pre-built by its caller, so
+    nothing here needs to read the profile directly."""
     candidates: list[dict[str, Any]] = []
     # `complete` is unused HERE on purpose: every promotion candidate already ships as
     # evidence=INFERRED and `hook_covered` is an advisory hint, not a verdict, so there is
@@ -4745,37 +4802,50 @@ def collect_promotion_candidates(
     return candidates
 
 
-def _hook_test_stems(root, errors):
+def _hook_test_stems(root, errors, *, profile: dict[str, Any] | None = None):
     """Normalized (snake_case) stems named by test files under hooks/tests/ and
     skills/*/hooks/tests/ (generalized from the coding-team-only scope for release
     portability) — "test_guard.py" and "guard_test.py" both yield "guard". Read-only,
     single-level glob per dir (no recursion needed: hook tests live directly in these
     known locations). `errors` is the shared build_document errors[] list — an
-    inaccessible ancestor is disclosed there rather than silently swallowed."""
+    inaccessible ancestor is disclosed there rather than silently swallowed.
+
+    M11 (SPEC_7 §2): the root-level test dir and the skills container come from
+    `profile["container_dirs"]` (defaulting to PROFILE_CLAUDE_CODE); either role may be
+    None (no such surface), in which case that source is skipped entirely."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
     stems = set()
     # Generalized skills/coding-team/hooks/tests -> skills/*/hooks/tests for release portability.
     # `stems` is a set, so union order is irrelevant; baseline-stable because coding-team is the
     # only sub-skill with a hooks/tests dir on this harness.
-    test_dirs = [root / "hooks" / "tests"]
-    skills_root = root / "skills"
-    try:
-        skills_root_is_dir = _probe_is_dir(skills_root)
-    except OSError as e:
-        errors.append(f"skills is_dir failed for {skills_root}: {e}")
-        skills_root_is_dir = False
-    if skills_root_is_dir:
+    test_dirs = []
+    hook_tests_name = profile["container_dirs"]["hook_tests"]
+    if hook_tests_name is not None:
+        test_dirs.append(root / hook_tests_name)
+    skills_name = profile["container_dirs"]["skills"]
+    if skills_name is not None:
+        skills_root = root / skills_name
         try:
-            skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
-        except OSError:
-            skill_dirs = []
-        for skill_dir in skill_dirs:
-            candidate = skill_dir / "hooks" / "tests"
+            skills_root_is_dir = _probe_is_dir(skills_root)
+        except OSError as e:
+            errors.append(f"skills is_dir failed for {skills_root}: {e}")
+            skills_root_is_dir = False
+        if skills_root_is_dir:
             try:
-                is_candidate_dir = candidate.is_dir()
+                skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
             except OSError:
-                continue
-            if is_candidate_dir:
-                test_dirs.append(candidate)
+                skill_dirs = []
+            for skill_dir in skill_dirs:
+                # M11 (SPEC_7 §2): the per-skill hooks/tests join stays a literal --
+                # re-deriving it from hook_test_globs's "skills/*/..." entry is
+                # deliberately deferred (out of scope for this task).
+                candidate = skill_dir / "hooks" / "tests"
+                try:
+                    is_candidate_dir = candidate.is_dir()
+                except OSError:
+                    continue
+                if is_candidate_dir:
+                    test_dirs.append(candidate)
     for test_dir in test_dirs:
         try:
             if not test_dir.is_dir():
@@ -4795,13 +4865,17 @@ def _hook_test_stems(root, errors):
     return stems
 
 
-def _detect_hook_test_coverage(root, errors):
+def _detect_hook_test_coverage(root, errors, *, profile: dict[str, Any] | None = None):
     """PRESENCE-only signal: does a hook script have a matching test file? NOT adequacy —
     a hooks/tests/test_x.py with a single trivial assertion counts as covered, same as a
     thorough suite (the "6 of 66" reality). Symlinked hooks are deduped by physical
-    identity so one script counts once even if reachable via multiple glob paths."""
-    disk_files = _hook_disk_files(root)
-    test_stems = _hook_test_stems(root, errors)
+    identity so one script counts once even if reachable via multiple glob paths.
+
+    M11 (SPEC_7 §2): `profile` (defaulting to PROFILE_CLAUDE_CODE) is threaded into
+    both helpers below."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    disk_files = _hook_disk_files(root, profile=profile)
+    test_stems = _hook_test_stems(root, errors, profile=profile)
 
     result = []
     seen_keys = set()
@@ -4863,8 +4937,14 @@ def _skill_has_test_asset(skill_dir, errors=None):
     return False
 
 
-def _detect_skill_test_coverage(root, errors):
-    skills_dir = root / "skills"
+def _detect_skill_test_coverage(root, errors, *, profile: dict[str, Any] | None = None):
+    """M11 (SPEC_7 §2): the skills container comes from `profile["container_dirs"]["skills"]`
+    (defaulting to PROFILE_CLAUDE_CODE); a profile with no skills concept (None) yields []."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    skills_name = profile["container_dirs"]["skills"]
+    if skills_name is None:
+        return []
+    skills_dir = root / skills_name
     try:
         skills_dir_is_dir = _probe_is_dir(skills_dir)
     except OSError as e:
@@ -4882,16 +4962,21 @@ def _detect_skill_test_coverage(root, errors):
 
 
 def detect_test_coverage(
-    root: Path, on_demand: dict[str, Any], errors: list[str]
+    root: Path, on_demand: dict[str, Any], errors: list[str], *,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Whether each hook script and each skill has an associated test ASSET — a
     PRESENCE check, not an adequacy check (the "6 of 66" reality: a tests/ dir holding
     one trivial assertion counts as covered exactly like a thorough suite). Cross-links
     the same per-skill has_test verdict onto on_demand["skills"] (mutated in place) by
     skill name, so both sections agree instead of on_demand carrying its own narrower
-    (tests/-dir-only) check."""
-    hooks_result = _detect_hook_test_coverage(root, errors)
-    skills_result = _detect_skill_test_coverage(root, errors)
+    (tests/-dir-only) check.
+
+    M11 (SPEC_7 §2): `profile` (defaulting to PROFILE_CLAUDE_CODE) is threaded into
+    both helpers below."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
+    hooks_result = _detect_hook_test_coverage(root, errors, profile=profile)
+    skills_result = _detect_skill_test_coverage(root, errors, profile=profile)
 
     skills_has_test = {s["name"]: s["has_test"] for s in skills_result}
     for entry in on_demand.get("skills", []):
@@ -5089,7 +5174,8 @@ def _compose_project_input_paths(project_root):
 
 
 def iter_input_paths(
-    root: Path, project_root: Path | None = None, compose: bool = False
+    root: Path, project_root: Path | None = None, compose: bool = False, *,
+    profile: dict[str, Any] | None = None,
 ) -> list[Path]:
     """SINGLE SOURCE OF TRUTH for the complete filesystem input surface build_document reads
     — the set a live-dashboard filesystem watcher (T4) must observe to know when a re-render
@@ -5135,6 +5221,7 @@ def iter_input_paths(
     Gated on `compose`, NOT merely on `project_root` (which already has a legacy non-compose
     meaning above — the active operator-project's CLAUDE.md), so a non-compose caller's
     watched/read surface for the SAME `project_root` argument stays byte-identical."""
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
     root = Path(root)
     paths = set()
 
@@ -5171,16 +5258,21 @@ def iter_input_paths(
     # -- container dirs whose MEMBERSHIP changes collector output --
     #   skills   : new/removed skill -> descriptions, on_demand, rules, test coverage
     #   projects : new project      -> conditional_variants (each */memory/MEMORY.md)
-    #   agents/hooks/hooks-tests/rules/commands : globbed membership below
-    for d in ("skills", "projects", "agents", "hooks", "hooks/tests", "rules", "commands"):
+    #   agents/hooks/hooks-tests/rules/commands/memory : globbed membership below
+    # M11 (SPEC_7 §2): sourced from profile["container_dirs"] -- sorted() over the dict's
+    # VALUES (never its insertion order) so the watched set stays deterministic across
+    # PYTHONHASHSEED (CLAUDE.md rule 9); a None role (no such surface) is skipped.
+    for d in sorted(v for v in profile["container_dirs"].values() if v):
         paths.add(root / d)
 
     # -- glob-based content files: the SAME pattern tuples the collector scans consume, so the
-    #    read surface and the watched surface are one definition (see _*_GLOBS above). Covers
-    #    rules, skills/*/rules, skills SKILL.md (top + nested), phases/prompts/agents md,
-    #    commands, agents, hooks/*.py|*.sh, and hooks/tests + skills/*/hooks/tests scripts. --
-    for pattern in set(_INSTRUCTION_GLOBS + _DUP_GLOBS + _STALENESS_RULE_GLOBS
-                       + _HOOK_SCRIPT_GLOBS + _HOOK_TEST_GLOBS):
+    #    read surface and the watched surface are one definition (see _*_GLOBS above / the
+    #    profile's glob keys). Covers rules, skills/*/rules, skills SKILL.md (top + nested),
+    #    phases/prompts/agents md, commands, agents, hooks/*.py|*.sh, and hooks/tests +
+    #    skills/*/hooks/tests scripts. --
+    for pattern in set(_instruction_globs(profile) + tuple(profile["duplication_globs"])
+                       + tuple(profile["rules_globs"]) + tuple(profile["hook_script_globs"])
+                       + tuple(profile["hook_test_globs"])):
         try:
             paths.update(root.glob(pattern))
         except OSError:
@@ -5189,8 +5281,12 @@ def iter_input_paths(
     # -- projects/*/memory: MEMORY.md index (walk_always_loaded / conditional_variants) plus,
     #    for the active project, memory bodies (collect_on_demand). Yield each memory dir
     #    (membership) + every *.md (content); MEMORY.md matches the *.md glob. --
+    # M11 (SPEC_7 §2): container_dirs["projects"], defaulting to "projects"; None -> no
+    # projects concept, so this whole block is a no-op.
+    projects_name = profile["container_dirs"]["projects"]
     try:
-        slug_dirs = sorted(p for p in (root / "projects").iterdir() if p.is_dir())
+        slug_dirs = (sorted(p for p in (root / projects_name).iterdir() if p.is_dir())
+                     if projects_name is not None else [])
     except OSError:
         slug_dirs = []
     for slug_dir in slug_dirs:
@@ -5204,8 +5300,12 @@ def iter_input_paths(
     # -- per-skill dirs: each skill dir + ALL descendant dirs (membership) so a test_*.py /
     #    *_eval.* added at any depth flips has_test (_skill_has_test_asset rglob). The skill's
     #    concrete CONTENT files are already covered by the _*_GLOBS union above. --
+    # M11 (SPEC_7 §2): container_dirs["skills"], defaulting to "skills"; None -> no skills
+    # concept, so this whole block is a no-op.
+    skills_name = profile["container_dirs"]["skills"]
     try:
-        skill_dirs = sorted(p for p in (root / "skills").iterdir() if p.is_dir())
+        skill_dirs = (sorted(p for p in (root / skills_name).iterdir() if p.is_dir())
+                      if skills_name is not None else [])
     except OSError:
         skill_dirs = []
     for skill_dir in skill_dirs:
@@ -5216,8 +5316,12 @@ def iter_input_paths(
     #    script for each registered command, and _script_from_command can resolve to a script
     #    NESTED under hooks/<subdir>/. The shallow hooks/*.py|*.sh globs above miss that depth,
     #    so watch hooks/ recursively — the same _iter_descendant_dirs mechanism used for skills. --
-    for sub in _iter_descendant_dirs(root / "hooks"):
-        paths.add(sub)
+    # M11 (SPEC_7 §2): container_dirs["hooks"], defaulting to "hooks"; None -> no hooks
+    # concept, so nothing to watch recursively.
+    hooks_name = profile["container_dirs"]["hooks"]
+    if hooks_name is not None:
+        for sub in _iter_descendant_dirs(root / hooks_name):
+            paths.add(sub)
 
     # -- resolved hook-script paths from REGISTERED settings.json commands: reconcile_hooks
     #    stat()s exactly these. Reuse _script_from_command (its resolution logic is the single
@@ -5254,8 +5358,10 @@ def iter_input_paths(
 
 
 def build_document(
-    root: Path, project_root: Path | None, compose: bool = False
+    root: Path, project_root: Path | None, compose: bool = False, *,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    profile = PROFILE_CLAUDE_CODE if profile is None else profile
     root = Path(root).resolve()
     inaccessible: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -5292,12 +5398,15 @@ def build_document(
     hooks_section = reconcile_hooks(root, settings, inaccessible, blind_spots)
     permissions_section = collect_permissions(settings, settings_parsed_ok)
     config_section = collect_config(root, settings, settings_parsed_ok, blind_spots)
-    instruction_length_flags = flag_long_instructions(root, inaccessible, blind_spots)
+    instruction_length_flags = flag_long_instructions(root, inaccessible, blind_spots,
+                                                       profile=profile)
     duplication_section = scan_duplication(root, blind_spots, project_root=project_root,
-                                            compose=compose, out_of_root_refs=out_of_root_refs)
-    corpus_files = _staleness_corpus(root, inaccessible)
-    phantom_refs = check_phantom_refs(root, corpus_files, inaccessible)
-    promotion_candidates = collect_promotion_candidates(root, corpus_files, settings)
+                                            compose=compose, out_of_root_refs=out_of_root_refs,
+                                            profile=profile)
+    corpus_files = _staleness_corpus(root, inaccessible, profile=profile)
+    phantom_refs = check_phantom_refs(root, corpus_files, inaccessible, profile=profile)
+    promotion_candidates = collect_promotion_candidates(root, corpus_files, settings,
+                                                         profile=profile)
     # S2 gate fix: git-age SIGNAL only (never a "stale" verdict). Topology is discovered
     # ONCE and collect_git_age is pure with respect to it, so git_age_available can never
     # disagree with the timestamps it labels (Codex #5). `available` replaces the deleted
@@ -5309,7 +5418,8 @@ def build_document(
     # `blind_spots`, so a second call would re-walk the corpus at double the I/O for an
     # identical result. Sorting moved into collect_git_age_with_reasons, which keys the
     # same lexicographic order (F11).
-    instruction_files = _deduped_instruction_files(root, inaccessible, blind_spots)
+    instruction_files = _deduped_instruction_files(root, inaccessible, blind_spots,
+                                                    profile=profile)
     # D4/Codex F5: the deadline is computed BEFORE discovery and threaded into BOTH, so
     # the cap is TOTAL for the subsystem rather than per-call.
     git_deadline = time.monotonic() + _GIT_TOTAL_BUDGET
@@ -5385,7 +5495,7 @@ def build_document(
         "memory_bodies": memory_bodies,
     }
 
-    test_coverage_section = detect_test_coverage(root, on_demand, errors)
+    test_coverage_section = detect_test_coverage(root, on_demand, errors, profile=profile)
 
     doc = {
         "schema_version": SCHEMA_VERSION,
@@ -5547,8 +5657,10 @@ def build_document(
 # test_crash_marker_prefix_matches_the_collector_producer.
 _CRASH_ERROR_PREFIX = "collector crashed: "
 
-# M11 (SPEC_7 §2): companion to _CRASH_ERROR_PREFIX above -- read by render_html so a
-# rejected --profile is distinguishable from a build_document crash in the errors[] list.
+# M11 (SPEC_7 §2): companion to _CRASH_ERROR_PREFIX above -- tags an errors[] entry so a
+# rejected --profile is distinguishable from a build_document crash by anyone reading the
+# document. Unlike _CRASH_ERROR_PREFIX there is deliberately no render_html mirror: the
+# renderer is out of scope for M11 (no renderer change).
 _PROFILE_ERROR_PREFIX = "layout profile rejected: "
 
 
@@ -5625,17 +5737,15 @@ def main(argv: list[str] | None = None) -> int:
     # M11: resolve the layout profile BEFORE anything reads the tree. On failure we do not
     # collect at all -- a half-applied profile would silently inventory the wrong surfaces.
     # The --out block below still runs, and the envelope is still emitted and written
-    # (Invariant 2 / SPEC_7 §2). `_profile` (leading underscore) is intentionally unread in
-    # this task: Task 3 threads it into build_document. Task 2 only needs profile_error --
-    # the validation and exit-2 contract, not the value.
-    _profile: dict[str, Any] = PROFILE_CLAUDE_CODE
+    # (Invariant 2 / SPEC_7 §2).
+    profile: dict[str, Any] = PROFILE_CLAUDE_CODE
     profile_error: str | None = None
     if args.profile is not None:
         try:
-            _profile = load_profile(Path(args.profile).expanduser())
+            profile = load_profile(Path(args.profile).expanduser())
         except ProfileError as exc:
             profile_error = str(exc)
-            _profile = PROFILE_CLAUDE_CODE
+            profile = PROFILE_CLAUDE_CODE
             print(f"error: {exc}", file=sys.stderr)
     if args.out is not None:
         try:
@@ -5665,7 +5775,7 @@ def main(argv: list[str] | None = None) -> int:
         doc["errors"].append(f"{_PROFILE_ERROR_PREFIX}{profile_error}")
     else:
         try:
-            doc = build_document(root, args.project_root, compose=args.compose)
+            doc = build_document(root, args.project_root, compose=args.compose, profile=profile)
         except Exception as exc:  # noqa: BLE001 — collector must always emit a FULL-key valid envelope
             doc = _empty_document(root)
             doc["errors"].append(f"{_CRASH_ERROR_PREFIX}{exc!r}")
