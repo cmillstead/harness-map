@@ -65,6 +65,11 @@ Security/containment: the project tier is **UNTRUSTED input**, unlike the operat
 
 Known v1 limitation (disclosed, not silent): in `--compose` the per-file hygiene analyses — `instruction_length_flags`, staleness, `phantom_refs`, `promotion_candidates`, `test_coverage`, hooks-body duplication — scan the OPERATOR tier only; project-tier files are not covered by them, and a `blind_spots` entry says so explicitly. Full per-tier hygiene (thread `project_root`, containment-gate, tier-tag) is deferred to v1.1. Node composition, shadow resolution, settings/hooks/MCP merge, containment, and tier display DO cover both tiers.
 
+## Foreign harnesses — the `--profile` option
+
+`--profile <path.json>` points the collector at a non-Claude-Code layout (a bare `AGENTS.md` repo, Cursor/Windsurf rules): the JSON names where always-loaded context, rules, skills, commands, agents and hooks live. Omit it and the embedded Claude Code default applies — output is byte-identical to before this flag existed. Copy `skills/harness-map/profiles/claude-code.json` as your starting template; a malformed profile exits 2 (naming the bad key) and collects nothing.
+Limits: `settings_format` accepts `"claude-code"` or `"none"` only (no foreign settings adapters), and `--compose` still scans the project tier with the Claude Code layout regardless of profile.
+
 ## Report Contract — 6 Sections
 
 1. **Headline numbers** — always-loaded words, estimated tokens, file count, duplicate-pair count, unchecked-binary count (reserved; always 0 in v1 — no binary scan is performed, the walk reads only `.md`/`.py`/`.sh` via `errors='replace'`; do NOT read this 0 as "clean"), instruction-files-over-200 count, orphan-registration count, orphan-script count.
