@@ -5547,6 +5547,10 @@ def build_document(
 # test_crash_marker_prefix_matches_the_collector_producer.
 _CRASH_ERROR_PREFIX = "collector crashed: "
 
+# M11 (SPEC_7 §2): companion to _CRASH_ERROR_PREFIX above -- read by render_html so a
+# rejected --profile is distinguishable from a build_document crash in the errors[] list.
+_PROFILE_ERROR_PREFIX = "layout profile rejected: "
+
 
 def _empty_document(root: Path) -> dict[str, Any]:
     """Full schema envelope, every top-level key present and empty (F8) — the crash-path
@@ -5604,6 +5608,11 @@ def main(argv: list[str] | None = None) -> int:
                           "is unchanged (operator-only).")
     ap.add_argument("--out", default=None, help="Optional JSON out-path; MUST be outside --root "
                      "(and outside --project-root too when --compose is set).")
+    ap.add_argument("--profile", default=None,
+                     help="Optional layout-profile JSON describing where always-loaded "
+                          "context, skills, rules and hooks live (see "
+                          "profiles/claude-code.json). Omitted: the embedded Claude Code "
+                          "default. A malformed profile exits 2.")
     ap.add_argument("--indent", type=int, default=2)
     args = ap.parse_args(argv)
     root = Path(args.root).expanduser().resolve()
@@ -5613,6 +5622,21 @@ def main(argv: list[str] | None = None) -> int:
                                         # on which --out branch happened to run
     out_roots = [root]                 # guarded roots for BOTH the upfront check and the
                                         # write-time TOCTOU recheck below (P1-6a)
+    # M11: resolve the layout profile BEFORE anything reads the tree. On failure we do not
+    # collect at all -- a half-applied profile would silently inventory the wrong surfaces.
+    # The --out block below still runs, and the envelope is still emitted and written
+    # (Invariant 2 / SPEC_7 §2). `_profile` (leading underscore) is intentionally unread in
+    # this task: Task 3 threads it into build_document. Task 2 only needs profile_error --
+    # the validation and exit-2 contract, not the value.
+    _profile: dict[str, Any] = PROFILE_CLAUDE_CODE
+    profile_error: str | None = None
+    if args.profile is not None:
+        try:
+            _profile = load_profile(Path(args.profile).expanduser())
+        except ProfileError as exc:
+            profile_error = str(exc)
+            _profile = PROFILE_CLAUDE_CODE
+            print(f"error: {exc}", file=sys.stderr)
     if args.out is not None:
         try:
             os.stat(root)                                     # root is expected to be an existing dir
@@ -5628,16 +5652,23 @@ def main(argv: list[str] | None = None) -> int:
                     out_roots.append(project_containment_root)
                 except OSError:
                     pass
+                # Deliberately the DEFAULT profile: this call feeds validate_write_target's
+                # input_paths guard, and a wider input set is the SAFE direction. On the
+                # profile-error path there is no valid profile to use anyway.
                 input_paths = iter_input_paths(root, args.project_root, compose=True)
             ok, resolved = validate_write_target(args.out, out_roots, input_paths)
             if not ok:
                 ap.error("--out must be outside --root (read-only invariant)")
             out_path = resolved                                # write through the validated resolved path
-    try:
-        doc = build_document(root, args.project_root, compose=args.compose)
-    except Exception as exc:  # noqa: BLE001 — collector must always emit a FULL-key valid envelope
+    if profile_error is not None:
         doc = _empty_document(root)
-        doc["errors"].append(f"{_CRASH_ERROR_PREFIX}{exc!r}")
+        doc["errors"].append(f"{_PROFILE_ERROR_PREFIX}{profile_error}")
+    else:
+        try:
+            doc = build_document(root, args.project_root, compose=args.compose)
+        except Exception as exc:  # noqa: BLE001 — collector must always emit a FULL-key valid envelope
+            doc = _empty_document(root)
+            doc["errors"].append(f"{_CRASH_ERROR_PREFIX}{exc!r}")
     # Serialize defensively: a lone UTF-16 surrogate (e.g. surviving json.loads out of a
     # crafted settings.json — Python allows lone surrogates in str) is unencodable as
     # UTF-8 under ensure_ascii=False. Force-detect it HERE (encode, discard the bytes) so
@@ -5687,7 +5718,7 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             print(f"warning: could not write --out: {exc}", file=sys.stderr)
     print(text)  # stdout is the primary contract — always emit the built document, write-or-not
-    return 0
+    return 2 if profile_error is not None else 0
 
 
 if __name__ == "__main__":

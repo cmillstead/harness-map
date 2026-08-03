@@ -96,3 +96,75 @@ def test_load_profile_rejects_unknown_settings_format(tmp_path):
     with pytest.raises(_collector.ProfileError) as exc:
         _collector.load_profile(p)
     assert "settings_format" in str(exc.value)
+
+
+def _write_profile(tmp_path, mutate):
+    src = json.loads((SKILL_DIR / "profiles" / "claude-code.json").read_text())
+    mutate(src)
+    p = tmp_path / "profile.json"
+    p.write_text(json.dumps(src))
+    return p
+
+
+def test_profile_unknown_key_rejected_with_clear_error(fake_harness, tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("nonsense_key", "x"))
+    proc = run_collector_raw(fake_harness, "--profile", str(p))
+    assert proc.returncode == 2, proc.stderr
+    assert "nonsense_key" in proc.stderr
+    assert "unknown key" in proc.stderr
+
+
+def test_profile_missing_required_key_names_the_key(fake_harness, tmp_path):
+    p = _write_profile(tmp_path, lambda d: d.pop("rules_globs"))
+    proc = run_collector_raw(fake_harness, "--profile", str(p))
+    assert proc.returncode == 2, proc.stderr
+    assert "rules_globs" in proc.stderr
+    assert "missing required key" in proc.stderr
+
+
+def test_bad_profile_still_emits_a_full_valid_envelope(fake_harness, tmp_path):
+    """Invariant 2: main() emits a valid JSON envelope on ANY failure. A bad profile is a
+    failure like any other -- exit 2, but stdout is still a full-key empty document, and
+    it records the reason. Also proves the profile NEVER half-applied: every count is 0
+    because build_document was not reached.
+    # Changing this value requires a spec change (SPEC_7 §2)."""
+    p = _write_profile(tmp_path, lambda d: d.pop("skills_globs"))
+    proc = run_collector_raw(fake_harness, "--profile", str(p))
+    assert proc.returncode == 2
+    doc = json.loads(proc.stdout)
+    for key in ("schema_version", "generated_at", "root", "headline", "always_loaded",
+                "on_demand", "enforcement", "config", "instruction_length_flags",
+                "duplication", "phantom_refs", "promotion_candidates", "test_coverage",
+                "inaccessible", "blind_spots", "errors"):
+        assert key in doc, f"crash envelope missing top-level key: {key}"
+    assert doc["headline"]["always_loaded_file_count"] == 0
+    assert any("skills_globs" in e for e in doc["errors"])
+
+
+def test_bad_profile_still_writes_the_envelope_to_out(fake_harness, tmp_path):
+    """SPEC_7 §2: 'exit 2; envelope still emitted if --out given, per Invariant 2'."""
+    out = tmp_path / "reports" / "sidecar.json"
+    out.parent.mkdir(parents=True)
+    p = _write_profile(tmp_path, lambda d: d.pop("agents_glob"))
+    proc = run_collector_raw(fake_harness, "--profile", str(p), "--out", str(out))
+    assert proc.returncode == 2
+    assert out.is_file(), "envelope was not written to --out on the profile-error path"
+    assert json.loads(out.read_text())["schema_version"] == _collector.SCHEMA_VERSION
+
+
+def test_missing_profile_file_exits_two(fake_harness, tmp_path):
+    proc = run_collector_raw(fake_harness, "--profile", str(tmp_path / "nope.json"))
+    assert proc.returncode == 2
+    assert "nope.json" in proc.stderr
+
+
+def test_profile_load_never_writes_inside_root(fake_harness, tmp_path):
+    """Read-only posture (CLAUDE.md rule 4): load_profile adds a READ path, never a write
+    path. Byte-and-mtime snapshot of --root before/after a profiled run."""
+    def snap(root):
+        return {str(p.relative_to(root)): (p.stat().st_mtime_ns, p.stat().st_size)
+                for p in sorted(root.rglob("*")) if p.is_file()}
+    before = snap(fake_harness)
+    run_collector_raw(fake_harness, "--profile",
+                      str(SKILL_DIR / "profiles" / "claude-code.json"))
+    assert snap(fake_harness) == before
