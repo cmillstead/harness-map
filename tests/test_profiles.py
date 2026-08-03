@@ -594,3 +594,68 @@ def test_compose_hooks_user_source_file_reflects_profile_settings_role(fake_harn
     user_records = [h for h in doc["composed_settings"]["hooks"] if h["tier"] == "user"]
     assert len(user_records) == 1, doc["composed_settings"]["hooks"]
     assert Path(user_records[0]["source_file"]).name == "custom_settings.json"
+
+
+# --- M11 exit gate, Finding 7 + Finding 8 (test gaps): _FOREIGN_PROFILE nulls
+# container_dirs["hooks"]/["skills"] alongside dispatcher_suffix/skills_globs, so neither
+# null value is ever exercised against a POPULATED dir of real files. ---
+
+def test_null_dispatcher_suffix_disables_fanout_but_still_inventories_scripts(
+        fake_harness, tmp_path):
+    """Finding 7: _FOREIGN_PROFILE also nulls container_dirs["hooks"], so
+    `_hook_disk_files` short-circuits to `[]` (collector.py ~2454) before the
+    `dispatcher_suffix is not None` guard in `reconcile_hooks` (~2557) ever runs against
+    real files. This profile keeps container_dirs["hooks"] populated (the shipped
+    "hooks") while nulling ONLY dispatcher_suffix, proving the two are independent: no
+    file is treated as a dispatcher regardless of its name, so `CHECKS`-based fan-out
+    never fires, while every hook script on disk is still inventoried."""
+    (fake_harness / "hooks" / "leaf-dispatcher.py").write_text('CHECKS = ["other.py"]\n')
+    (fake_harness / "hooks" / "other.py").write_text('# reachable only via dispatch fan-out\n')
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 hooks/leaf-dispatcher.py"}]}]}}))
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("dispatcher_suffix", None))
+    doc = json.loads(run_collector_raw(fake_harness, "--profile", str(p)).stdout)
+    assert doc["errors"] == []
+    by_name = {s["name"]: s for s in doc["enforcement"]["hooks"]["scripts_on_disk"]}
+    assert {"leaf-dispatcher.py", "other.py"} <= set(by_name), by_name
+    assert by_name["leaf-dispatcher.py"]["registered_via"] == "direct"
+    assert by_name["other.py"]["registered_via"] == "none"  # never dispatcher-reached
+
+
+def test_empty_skills_globs_excludes_skills_from_instruction_corpus_but_keeps_descriptions(
+        fake_harness, tmp_path):
+    """Finding 8: _FOREIGN_PROFILE also nulls container_dirs["skills"], so the
+    independence of skill DESCRIPTIONS (`collect_descriptions`, driven by
+    container_dirs["skills"] + skill_manifest_name) from skill CONTENT reaching the
+    instruction corpus (`_instruction_globs`, driven separately by skills_globs) is never
+    demonstrated. This profile keeps container_dirs["skills"] populated (the shipped
+    "skills") while emptying ONLY skills_globs.
+
+    Note: `duplication_globs` is a SEPARATE, independent profile key, untouched here --
+    skill content still reaches the duplication scan through it (the finding names only
+    skills_globs, and this test proves exactly what skills_globs itself controls). Also
+    note `rules_globs` itself includes "skills/*/rules/*.md" (the coding-team-style
+    generalized rules-in-a-sub-skill pattern) -- that path keeps a "skills/" PREFIX but is
+    governed by rules_globs, not skills_globs, so it correctly stays in the corpus; the
+    assertions below check the skills_globs-owned patterns by exact path, not by prefix."""
+    default_files = _collector._deduped_instruction_files(fake_harness, [], [])
+    default_rels = {str(f.relative_to(fake_harness)) for f in default_files}
+    assert "skills/demo/SKILL.md" in default_rels
+    assert "skills/demo/phases/p1.md" in default_rels
+
+    p = _write_profile(tmp_path, lambda d: d.__setitem__("skills_globs", []))
+    doc = json.loads(run_collector_raw(fake_harness, "--profile", str(p)).stdout)
+    assert doc["errors"] == []
+    # Descriptions still appear: container_dirs["skills"] is untouched by skills_globs.
+    skill_names = {s["name"] for s in doc["always_loaded"]["skill_descriptions"]}
+    assert "demo" in skill_names
+    # But no skills/*/SKILL.md, skills/*/phases/*.md etc. entered the instruction corpus
+    # this profile drives -- proven directly against the loaded profile.
+    profile = _collector.load_profile(p)
+    corpus_files = _collector._deduped_instruction_files(fake_harness, [], [], profile=profile)
+    corpus_rels = {str(f.relative_to(fake_harness)) for f in corpus_files}
+    assert "skills/demo/SKILL.md" not in corpus_rels
+    assert "skills/demo/phases/p1.md" not in corpus_rels
+    assert "skills/coding-team/rules/c.md" in corpus_rels  # rules_globs, unaffected
+    assert any(r.startswith("rules/") for r in corpus_rels)  # rules_globs untouched

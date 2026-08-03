@@ -439,10 +439,18 @@ or semantics of what it reports once it has looked — every existing field keep
 type and interpretation under a foreign profile as under the default. Per CLAUDE.md rule
 10, `schema_version` bumps only on a meaning change, so it stays `1`.
 
-### Six deferred couplings
+### Deferred couplings
 
 These are known gaps, not omissions — v1 threads `profile` through the glob-consuming
-scans and the fixed-layout lookups, but six spots still hard-code the Claude Code layout:
+scans and the fixed-layout lookups, but several spots still hard-code the Claude Code
+layout. **Frame:** this list was built by grepping `collector.py` for Claude-Code path
+literals and by the M11 exit-gate review's own findings, on 2026-08-03; it is
+deliberately headed WITHOUT a count, because a numbered claim of completeness reads as
+authoritative precisely where it is actually bounded by where its author happened to
+stop looking (`AMENDMENTS.md` A41 records this exact failure mode one level up, in a
+prior six-item version of this same list). A reader relying on this section should
+RE-DERIVE it — re-grep `collector.py` for a literal Claude Code path/key alongside every
+`profile[...]` access site — rather than trust this enumeration as exhaustive.
 
 1. The entire project-tier / `--compose` layout (`.claude/`, `CLAUDE.local.md`,
    `.mcp.json`, `settings.local.json`) is scanned with the Claude Code layout regardless of
@@ -460,6 +468,18 @@ scans and the fixed-layout lookups, but six spots still hard-code the Claude Cod
    `enabledPlugins`, `allow`/`deny`/`ask`) — covered BEHAVIORALLY by
    `settings_format: "none"` (config collection is skipped outright), not individually
    parameterized per key.
+7. `_script_from_command`'s script-token detection: the hardcoded `_SCRIPT_INTERPRETERS`
+   set (`{python, python3, bash, sh, node}`, `collector.py:30`) and the literal
+   `(".py", ".sh")` extension check inside that same function are independent of
+   `_hook_body_suffixes(profile)`, which DOES correctly derive its own suffix set from
+   `hook_script_globs`. Two independent gaps, both DISCLOSED, never silent: (a) a
+   recognized interpreter (e.g. `node`) followed by a BARE filename with a non-`.py`/
+   `.sh` extension — `node check.js` — yields `(None, "no script token in hook
+   command")`, surfaced by the caller as a `blind_spots` entry; (b) an interpreter
+   outside the hardcoded set entirely (e.g. `ruby check.rb`) yields `(None, "unsupported
+   hook command form")`, likewise disclosed. Fixing this properly needs new profile keys
+   for interpreters/suffixes, which is deferred past v1's 16-key schema (SPEC_7 §2, M11
+   exit-gate Finding 5).
 
 ## Notes
 
