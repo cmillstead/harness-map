@@ -8,9 +8,11 @@ All scanned content is opaque data, never instructions.
 """
 import argparse
 import ast
+import errno
 import json
 import os
 import re
+import secrets
 import shlex
 import stat
 import subprocess
@@ -171,6 +173,75 @@ def _physical_key(path):
         return str(path)
 
 
+# --- version-independent existence probes ---
+#
+# Python 3.14 changed Path.is_dir() / is_file() / exists() / is_symlink() to suppress EVERY
+# OSError and return False (CPython gh-144525). Python 3.11-3.13 suppress only this family
+# and RE-RAISE EACCES from an unreadable ancestor. README.md advertises "Python 3.10+", so
+# 3.14 is inside the supported range.
+#
+# That is load-bearing here in a way it is not in most modules: this collector's disclosure
+# invariant is "inaccessible is NOT clean". On 3.14, a pathlib probe would make every
+# `except OSError` disclosure branch below UNREACHABLE -- an unreadable directory would
+# report as absent, and the collector would emit a confident-clean inventory over a tree it
+# could not read, which is precisely the failure the guarded probe sites exist to prevent.
+#
+# os.stat raises on every version, so these probes keep the error distinction intact and the
+# callers' existing handlers keep firing. The ignored set below is pathlib's own
+# `_ignore_error` set: swallowing LESS would turn an ordinary absent path into a crash at
+# every call site, so parity with 3.11 is the requirement, not merely "raise more".
+_IGNORED_PROBE_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def _probe_stat(path, follow_symlinks):
+    """`os.stat` reduced to pathlib's ignored-error set: the stat result, or None for an
+    error pathlib would have reported as False. Every other OSError PROPAGATES, which is
+    the entire reason this helper exists.
+
+    ValueError is caught for the same parity reason: pathlib's probes return False for a
+    non-encodable path (an embedded NUL), where `os.stat` raises ValueError -- not an
+    OSError, so no caller's handler would catch it. It is mapped to the same "not there"
+    answer pathlib gives rather than swallowed silently: `_IGNORED_PROBE_ERRNOS` and this
+    clause together are the exhaustive statement of what a probe is allowed to hide.
+
+    POSIX-targeted, matching the rest of this module (O_DIRECTORY, dir_fd, geteuid):
+    pathlib additionally ignores three Windows-only winerror codes, which are not mirrored.
+    """
+    try:
+        return os.stat(path, follow_symlinks=follow_symlinks)
+    except OSError as exc:
+        if exc.errno in _IGNORED_PROBE_ERRNOS:
+            return None
+        raise
+    except ValueError:
+        return None
+
+
+def _probe_is_dir(path):
+    """`Path.is_dir()` that preserves the error distinction on every Python version."""
+    st = _probe_stat(path, follow_symlinks=True)
+    return st is not None and stat.S_ISDIR(st.st_mode)
+
+
+def _probe_is_file(path):
+    """`Path.is_file()` that preserves the error distinction on every Python version."""
+    st = _probe_stat(path, follow_symlinks=True)
+    return st is not None and stat.S_ISREG(st.st_mode)
+
+
+def _probe_exists(path):
+    """`Path.exists()` that preserves the error distinction on every Python version.
+    FOLLOWS symlinks, so a broken link is False -- same as the pathlib call it replaces."""
+    return _probe_stat(path, follow_symlinks=True) is not None
+
+
+def _probe_is_symlink(path):
+    """`Path.is_symlink()` that preserves the error distinction on every Python version.
+    Does NOT follow symlinks (lstat semantics), same as the pathlib call it replaces."""
+    st = _probe_stat(path, follow_symlinks=False)
+    return st is not None and stat.S_ISLNK(st.st_mode)
+
+
 def _read_text(path):
     """Read `path` as utf-8 text (errors="replace"). Returns `(text, "VERIFIED")` on
     success or `(None, "INACCESSIBLE")` on failure. The `is_file()` guard matches
@@ -179,9 +250,12 @@ def _read_text(path):
     a FIFO/socket/dir must not block the collector. `is_file()` follows symlinks (True
     for a regular file or a symlink to one; False for FIFO/dir/socket/broken symlink),
     so regular-file behavior is unchanged — no false negatives."""
-    if not path.is_file():
-        return None, "INACCESSIBLE"
     try:
+        # The probe itself can raise OSError (EACCES) when an ancestor directory
+        # is unsearchable, not just when the read fails — the probe is inside the
+        # same try as the read so both fold into the one INACCESSIBLE outcome.
+        if not _probe_is_file(path):
+            return None, "INACCESSIBLE"
         return path.read_text(encoding="utf-8", errors="replace"), "VERIFIED"
     except OSError:
         return None, "INACCESSIBLE"
@@ -267,11 +341,23 @@ def _append_inaccessible_once(inaccessible, rel):
 
 
 def _safe_exists(path):
-    """Path.exists()/is_symlink() can raise PermissionError etc. (they only swallow ENOENT/
-    ENOTDIR). Treat any OSError as 'cannot determine' so one locked dir marks just that entry
-    inaccessible instead of blanking the whole inventory. Returns (present, ok)."""
+    """The probes can raise PermissionError etc. (they swallow only the ENOENT family).
+    Treat any OSError as 'cannot determine' so one locked dir marks just that entry
+    inaccessible instead of blanking the whole inventory. Returns (present, ok).
+
+    The ORDERED PAIR is deliberate and must not be collapsed into a single `os.lstat`,
+    however much "is there a directory entry at this path" reads like one question. For a
+    symlink whose TARGET lives under an unreadable directory, `os.lstat` succeeds -- it
+    never follows -- so a one-probe form answers (True, True), "present, and I am sure."
+    The follow-symlink probe runs first, raises EACCES, and the answer is (False, False),
+    "cannot determine," which is the entire purpose of the tri-state: confidently-present
+    is exactly as false a claim as confidently-absent when the target cannot be reached.
+    Pinned by test_safe_exists_keeps_two_probes_for_a_symlink_into_an_unreadable_tree.
+
+    On 3.14 the pathlib spelling of this pair would report (False, True) for an unreadable
+    path -- absent, and sure of it. See the `_probe_stat` block above."""
     try:
-        return (path.exists() or path.is_symlink()), True
+        return (_probe_exists(path) or _probe_is_symlink(path)), True
     except OSError:
         return False, False
 
@@ -330,7 +416,13 @@ def validate_write_target(raw_path, roots, input_paths=()):
     lexical = Path(os.path.normpath(str(expanded)))
     try:
         resolved = expanded.resolve()
-    except OSError:
+    except (OSError, RuntimeError):
+        # RuntimeError, not just OSError: on CPython Path.resolve() converts an ELOOP
+        # into RuntimeError("Symlink loop from ...") rather than an OSError subclass, so
+        # a --out path (or, below, a declared input path) that is a symlink loop would
+        # otherwise escape this handler and abort the caller. Same defect and same fix as
+        # the sibling write-time check in _reject_if_target_is_an_input_path (Codex
+        # challenge finding F7); this is the caller-entry twin of that helper's ladder.
         resolved = expanded
     for root in roots:
         root = Path(root)
@@ -347,7 +439,7 @@ def validate_write_target(raw_path, roots, input_paths=()):
             return False, None
         try:
             p_resolved = p_path.resolve()
-        except OSError:
+        except (OSError, RuntimeError):  # see the identical rationale above
             p_resolved = p_path
         if p_resolved == resolved:
             return False, None
@@ -357,6 +449,614 @@ def validate_write_target(raw_path, roots, input_paths=()):
         except OSError:
             pass
     return True, resolved
+
+
+class WriteContainmentError(OSError):
+    """The write target's PINNED parent directory is inside (or IS) a guarded root, or
+    the directory that containment was decided against is not the directory actually
+    held open. Subclasses OSError deliberately: collector.main's existing
+    `except OSError` around its --out write keeps working unchanged, while
+    render_html.write_html_safely can catch THIS type specifically and re-raise its own
+    catchable RenderError.
+
+    Callers DO still need a broader `except OSError` alongside it: the fd path raises a
+    BARE OSError for a refused open (ELOOP from O_NOFOLLOW, ENOENT/EACCES on an
+    unreadable parent), which is not a containment verdict and is not this type. See
+    render_html.write_html_safely, which catches both. (An earlier draft of this docstring
+    claimed no caller needed a broader clause; that was wrong and is corrected here — flagged
+    by the Codex plan gate as P3-7.)"""
+
+
+_TMP_NAME_ATTEMPTS = 8       # O_EXCL collision retries; token_hex(16) makes >1 collision
+                             # astronomically unlikely, so a bounded loop is honest rather
+                             # than optimistic — exhaustion raises instead of looping.
+
+
+def _dir_fd_write_supported():
+    """True when this platform can do the whole fd-pinned write: open/rename/unlink/stat
+    all accepting dir_fd. Read from os.supports_dir_fd AT CALL TIME, never cached at
+    import, so the fallback branch is reachable in a test by monkeypatching the capability
+    set (F4) — a fallback nobody can execute is a dark path, not a fallback.
+
+    PROBES os.rename, NOT os.replace. CPython does not register os.replace in
+    os.supports_dir_fd even though it accepts src_dir_fd/dst_dir_fd — it is the same
+    renameat syscall as os.rename, which IS registered. Verified 2026-08-02 on this
+    platform: `os.replace in os.supports_dir_fd` is False while a real dir-fd os.replace
+    succeeds. Gating on os.replace would return False forever, silently routing EVERY
+    production write through the vulnerable fallback and shipping this entire hardening
+    dark. Do not "correct" this back to os.replace."""
+    return all(fn in os.supports_dir_fd
+               for fn in (os.open, os.rename, os.unlink, os.stat))
+
+
+def _search_only_dir_flag():
+    """This platform's SEARCH-ONLY directory open flag, or None where there is no VERIFIED
+    one. Read at call time, matching `_dir_fd_write_supported`'s posture above, so a test
+    can simulate a platform without one instead of the absence branch going dark.
+
+    O_SEARCH ONLY, DELIBERATELY NOT O_PATH. Both are nominally search-only, but they are
+    not interchangeable and the difference is not something to guess at in the module's one
+    physical write path. On darwin, O_SEARCH was MEASURED here (2026-08-02, CPython 3.11.14,
+    os.O_SEARCH == 0x40100000) to support every dir_fd operation this write performs --
+    os.open(O_CREAT|O_EXCL, dir_fd=), os.stat(dir_fd=), os.replace(src_dir_fd=, dst_dir_fd=),
+    os.fstat -- while os.scandir(fd) fails EBADF, which is exactly the privilege being given
+    up. Linux's O_PATH is documented for a RESTRICTED set of *at() uses (fchownat, fstatat,
+    linkat, readlinkat); renameat is not named in it even though it is often observed to
+    work, and "often works in practice" is not a basis for the containment guarantees this
+    helper carries. No Linux host is available here to measure it on, so O_PATH is left out
+    rather than adopted unverified: on a platform with no O_SEARCH the ladder simply stays on
+    O_RDONLY, i.e. the pre-existing behaviour, and an unreadable output directory keeps
+    failing EACCES there. Do not add O_PATH from the man page alone -- add it when a Linux
+    host has run the four operations above against an O_PATH descriptor."""
+    flag = getattr(os, "O_SEARCH", None)
+    return flag if isinstance(flag, int) else None
+
+
+def _open_dir_traverse_only(path, *, extra_flags=0, dir_fd=None):
+    """Open a directory for TRAVERSAL ONLY -- `fstat` it, and anchor *at() calls at it.
+    Never to list it. `os.scandir` on the returned descriptor may fail, and that is the
+    point: a caller that needs entries must open its own read-capable descriptor.
+
+    WHY THIS EXISTS (P2-1). The fd-pinned write replaced `tempfile.mkstemp`, which needs
+    only write + execute on the output directory, with `os.open(dir, O_RDONLY)`, which also
+    needs READ. That silently raised the permission floor of every write: a 0o333 drop-box
+    stopped working, and so did any 0o755 output directory sitting under a single 0o111
+    ancestor, because the `..` walk climbs to the namespace root. Neither caller ever lists
+    the directories it opens, so read was privilege taken and not used.
+
+    THE LADDER IS O_RDONLY FIRST, SEARCH-ONLY ONLY ON EACCES, and the order is the point.
+    The common case keeps running on the descriptor type every other test in this module
+    already exercises; the less-travelled one is confined to the case that would otherwise
+    fail outright, where the alternative is not writing at all. `raise` on a missing
+    search-only flag re-raises the ORIGINAL PermissionError, so a platform without one
+    reports exactly what it reported before this change.
+
+    RETRYING THE OPEN DOES NOT WIDEN ANY WINDOW. The first attempt failed, so it pinned
+    nothing and no check was decided on it; every containment check in this module runs
+    against the descriptor this function RETURNS.
+
+    CLASS 1 OF THE WRITE-SIDE THREAT MODEL IS UNREACHABLE THROUGH THE RETRY, which is a
+    stronger statement than "O_NOFOLLOW is carried on both rungs" (it is, `extra_flags` is
+    applied identically to each). O_NOFOLLOW is evaluated while resolving the FINAL
+    component, before the target's permission bits are consulted, so a symlinked parent
+    fails rung 1 with ENOTDIR -- not EACCES -- and the retry is never entered for that case.
+    Measured on darwin both ways: O_RDONLY|O_NOFOLLOW and O_SEARCH|O_NOFOLLOW refuse a
+    symlinked directory identically."""
+    flags = os.O_DIRECTORY | extra_flags
+    try:
+        return os.open(path, os.O_RDONLY | flags, dir_fd=dir_fd)
+    except PermissionError:
+        search_flag = _search_only_dir_flag()
+        if search_flag is None:
+            raise
+        return os.open(path, search_flag | flags, dir_fd=dir_fd)
+
+
+def _reject_if_parent_inside_guard_roots(parent_real, parent_fstat, guard_roots):
+    """PATHNAME-based containment for a write's parent directory.
+
+    FALLBACK BRANCH ONLY. The dir_fd branch must NOT call this — it calls
+    `_reject_if_pinned_dir_inside_guard_roots` below, which decides about the opened
+    descriptor instead. Deciding containment about a pathname and then writing through a
+    descriptor is what made the class-2 grandparent attack land; this function is kept
+    solely because `_write_text_contained_fallback` has no descriptor to anchor to, and
+    that branch's documented limitation covers the resulting exposure.
+
+    Reuses the SAME two mechanisms the read paths use — `_resolves_inside_root`
+    (Path.parents + os.path.samestat, never str.startswith) and a direct inode compare —
+    rather than introducing a second containment predicate. A second predicate is a
+    drift source and was itself a finding in the previous stage.
+
+    Two checks per guard root, both required:
+      (a) inode identity: the pinned directory IS the guard root;
+      (b) ancestry: the pinned directory's realpath lies inside the guard root.
+    Neither subsumes the other — (a) catches a case-insensitive or hard-linked alias of
+    the root itself, (b) catches a descendant.
+
+    A guard root that cannot be stat'd is SKIPPED (nothing safe to compare against),
+    matching validate_write_target's existing posture for the same situation. The dir_fd
+    path deliberately DIVERGES from that posture — see the Y4 note in
+    `_reject_if_pinned_dir_inside_guard_roots`."""
+    for guard_root in guard_roots:
+        guard_root_path = Path(guard_root)
+        try:
+            guard_root_stat = os.stat(guard_root_path)
+        except OSError:
+            continue
+        if os.path.samestat(parent_fstat, guard_root_stat):
+            raise WriteContainmentError(
+                f"refusing to write: the target directory IS the guarded root {guard_root_path}")
+        if _resolves_inside_root(parent_real, guard_root_path, guard_root_stat):
+            raise WriteContainmentError(
+                f"refusing to write: {parent_real} resolves inside the guarded root "
+                f"{guard_root_path}")
+
+
+def _reject_if_pinned_dir_inside_guard_roots(dir_fd, guard_roots):
+    """Containment decided about the OPENED DESCRIPTOR, not about any pathname.
+
+    Walks upward from the pinned directory using `..` resolved BY THE KERNEL relative to
+    each successive descriptor, comparing every ancestor's (st_dev, st_ino) against each
+    guard root. Because no pathname is ever re-resolved, a symlink or rename applied to
+    any component — parent, grandparent, or higher — after the pin cannot change the
+    result. This is what closes class 2 (the grandparent attack), which O_NOFOLLOW alone
+    does not: O_NOFOLLOW constrains only the FINAL component.
+
+    Scope of this check — see the six-class table in `write_text_contained`'s docstring.
+    It closes classes 1–4 together with the rest of the helper; classes 5 and 6 are
+    ACCEPTED residuals, not oversights, and are recorded at RISK_REGISTER R11 / AMENDMENTS
+    A36. Do not describe this walk as making ancestry immutable — it does not.
+
+    DENY ON UNCERTAINTY, BUT NOT ON ABSENCE (Y4). A guard root that EXISTS but cannot be
+    stat'd (EACCES, ELOOP, or any other OSError) is unverifiable, and for a tool whose core
+    invariant is "zero writes under the mapped root" that is exactly when writing is unsafe
+    — so it RAISES rather than being skipped. This deliberately diverges from
+    validate_write_target's older skip-on-unstattable posture.
+
+    A guard root that simply DOES NOT EXIST (ENOENT / FileNotFoundError) is a different
+    case and is PERMITTED. Both render paths add `Path.home() / ".claude"` as a permanent
+    floor root (render_html.py:5163, serve.py:246), and in a public standalone install that
+    directory legitimately may not exist — denying on absence would reject EVERY write for
+    a user whose only sin is not having a ~/.claude. A nonexistent directory also cannot
+    contain the target, so permitting it is sound rather than merely convenient: there is
+    nothing to be inside of. Absent roots are still covered LEXICALLY by
+    validate_write_target at caller entry, which compares configured pathnames and does not
+    require the root to exist."""
+    guard_stats = []
+    for guard_root in guard_roots:
+        try:
+            guard_stats.append((guard_root, os.stat(guard_root)))
+        except FileNotFoundError:
+            continue          # absent != unverifiable; see docstring. Nothing to be inside of.
+        except OSError as exc:
+            raise WriteContainmentError(
+                f"refusing to write: guarded root {guard_root} exists but cannot be stat'd "
+                f"({exc.strerror}), so containment cannot be established") from exc
+
+    # DESCRIPTOR OWNERSHIP (Y3). An earlier draft leaked one fd per SUCCESSFUL traversal:
+    # at the filesystem root it returned while `parent_fd` was still open, and the outer
+    # finally closed only `current_fd`. Codex executed that loop 20 times and the process
+    # gained 20 descriptors. The shape below keeps EXACTLY ONE owned descriptor in
+    # `current_fd` at all times, and `parent_fd` is owned by its own try/finally until
+    # ownership is explicitly transferred -- so every exit path, including the root return
+    # and a raising os.close, closes exactly what it owns and nothing twice.
+    current_fd = os.dup(dir_fd)          # dup: never consume the caller's descriptor
+    try:
+        while True:
+            current_stat = os.fstat(current_fd)
+            for guard_root, guard_stat in guard_stats:
+                if os.path.samestat(current_stat, guard_stat):
+                    raise WriteContainmentError(
+                        f"refusing to write: the target directory is {guard_root} or lies "
+                        f"inside it (established from the opened descriptor)")
+            # TRAVERSE-ONLY (P2-1): this walk `fstat`s each ancestor and anchors the next
+            # `..` at it. It never lists one, so it must not demand read -- a single 0o111
+            # ancestor anywhere above the output directory would otherwise fail the write.
+            parent_fd = _open_dir_traverse_only("..", dir_fd=current_fd)
+            try:
+                at_root = os.path.samestat(os.fstat(parent_fd), current_stat)
+            except OSError:
+                os.close(parent_fd)
+                raise
+            if at_root:
+                os.close(parent_fd)   # `..` is itself: namespace root, containment clean
+                return                # current_fd closed by the outer finally
+            # TRANSFER OWNERSHIP BEFORE CLOSING THE OLD FD. Rebinding first means the outer
+            # finally always owns exactly one live descriptor, so even if this os.close
+            # raises (POSIX leaves the fd state unspecified after a failed close) there is
+            # no path on which the outer finally closes an fd a second time.
+            stale_fd, current_fd = current_fd, parent_fd
+            os.close(stale_fd)
+    finally:
+        os.close(current_fd)
+
+
+def _reject_if_target_is_an_input_path(out_path, input_paths):
+    """Write-time re-check of the `input_paths` dimension (F-P2, added at plan review).
+
+    `validate_write_target` rejects a target that IS one of the collector's own read
+    inputs; that is what stops `--out ~/.claude.json`, a file sitting OUTSIDE every
+    directory root where guard-root containment alone would wrongly allow the overwrite.
+    The pre-change code re-checked this immediately before mkstemp. Dropping it when the
+    write moved into this helper would have silently narrowed the guarantee, so it is
+    re-checked here at the latest possible moment.
+
+    Mirrors validate_write_target's own comparison ladder EXACTLY rather than inventing a
+    looser one: literal (lexical/resolved equality), then resolved-realpath equality, then
+    an os.path.samestat inode compare where both sides exist — that last rung is what
+    catches an alias a string compare cannot see (an input that is itself a symlink onto
+    the target). A path that cannot be stat'd is skipped, same posture as elsewhere.
+
+    RuntimeError IS CAUGHT ALONGSIDE OSError, and it is not defensive padding: on CPython
+    `Path.resolve()` converts an ELOOP into `RuntimeError("Symlink loop from ...")`, which
+    is NOT an OSError. REPRODUCED on 3.11.14 by the Codex challenge (finding F7) -- a
+    declared input that is a symlink loop escaped every caller's `except OSError` as an
+    unhandled RuntimeError. Pinned by
+    `test_write_text_contained_reports_a_symlink_loop_as_an_oserror`. Falling back to the
+    unresolved path is the same posture the OSError arm already takes: an unresolvable
+    path is compared literally rather than silently dropped."""
+    if not input_paths:
+        return
+    lexical = Path(os.path.normpath(str(out_path)))
+    try:
+        resolved = out_path.resolve()
+    except (OSError, RuntimeError):
+        resolved = out_path
+    for candidate_input in input_paths:
+        input_path = Path(candidate_input)
+        if input_path in (lexical, resolved):
+            raise WriteContainmentError(
+                f"refusing to write: {out_path} is one of this tool's own read inputs")
+        try:
+            input_resolved = input_path.resolve()
+        except (OSError, RuntimeError):
+            input_resolved = input_path
+        if input_resolved == resolved:
+            raise WriteContainmentError(
+                f"refusing to write: {out_path} resolves onto the read input {input_path}")
+        # NOTE: WriteContainmentError SUBCLASSES OSError, so the raise must sit OUTSIDE
+        # the try -- raising it inside would be swallowed by this same `except OSError`.
+        # (validate_write_target has the identical shape and is safe only because its
+        # raise-equivalent is a `return`. Do not "simplify" this back into the try.)
+        try:
+            same_file = os.path.samestat(os.stat(input_resolved), os.stat(resolved))
+        except OSError:
+            same_file = False
+        if same_file:
+            raise WriteContainmentError(
+                f"refusing to write: {out_path} is the same file as the read input "
+                f"{input_path}")
+
+
+def _reject_if_pinned_target_is_an_input_path(dir_fd, out_name, input_paths):
+    """Class-4 check RE-BOUND to the pinned directory (Y5). The pre-open rung above is
+    kept for its better error messages on the common case; THIS is the one that is not
+    defeatable by an intermediate-component swap.
+
+    `_reject_if_target_is_an_input_path` decides about a PATHNAME before the parent is
+    opened, so a redirect applied after it runs re-points what it cleared. Once `dir_fd`
+    pins the parent inode, `os.stat(out_name, dir_fd=dir_fd)` names the file the write will
+    actually land on — and that is what must be compared against the declared read inputs.
+    Without this rung, a redirect can route the write onto one of the tool's own inputs
+    sitting OUTSIDE every guard root, where guard-root containment alone would wrongly
+    permit it. That is exactly why class 4 is listed as closed rather than subsumed by
+    class 2: guard-root containment does not cover an input outside every root.
+
+    EXCEPTION POLICY — ABSENCE PERMITS, AMBIGUITY DENIES. This is the same split Y4
+    established for guard roots in `_reject_if_pinned_dir_inside_guard_roots`; the two must
+    not be allowed to drift apart:
+      * target FileNotFoundError -> return. A target that does not exist yet aliases
+        nothing, and this is the COMMON case (every first write), so denying here would
+        reject ordinary runs.
+      * target OSError (EACCES, ELOOP, ...) -> RAISE. The name exists but its identity is
+        unverifiable, and "cannot tell" is not "safe" for a tool whose core invariant is
+        that it never writes over its own read surface.
+      * input FileNotFoundError -> skip THAT input, continue with the rest. A declared
+        input that is gone cannot be the file being written.
+      * input OSError -> RAISE, same reasoning as the target.
+
+    `follow_symlinks=False` on the TARGET is deliberate and load-bearing: `os.replace`
+    retargets the NAME, unlinking whatever it currently denotes and linking the fresh temp
+    inode in its place. It does NOT write through a symlink, so a symlinked target name
+    leaves the pointed-at input's bytes untouched — the identity that matters here is the
+    name's own. The INPUT side resolves normally, because an input declared as a symlink
+    ONTO the target is precisely the alias this rung exists to catch.
+
+    KNOWN SEAM, stated rather than papered over: a target NAME that is itself a declared
+    input symlink is caught by the pre-open rung's literal/resolved comparison, not by the
+    samestat here (lstat sees the link's own inode, while the INPUT side is resolved).
+    Both rungs run, so the case is covered ON A STABLE FILESYSTEM. It is NOT covered when
+    a redirect lands between the two rungs: the pre-open rung then cleared a different
+    pathname, and this rung's lstat/stat asymmetry misses the match, so `os.replace` can
+    retarget a declared input symlink. Raised by the Codex challenge (finding F1) and
+    stated here rather than closed, for two reasons: reaching it requires write access to
+    the output parent chain, which is the same privilege that makes accepted residual
+    class 5 unclosable (see the six-class table in `write_text_contained`), and the fix
+    would be a third stat mode — the accumulating-checks failure mode that got the st_dev
+    tripwire declined. Do NOT add that third stat mode. Do not upgrade this paragraph into
+    a claim that the seam is closed."""
+    if not input_paths:
+        return
+    try:
+        target_stat = os.stat(out_name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return          # nothing on disk under that name yet -> it cannot alias an input
+    except OSError as exc:
+        raise WriteContainmentError(
+            f"refusing to write: {out_name} exists in the pinned directory but cannot be "
+            f"stat'd ({exc.strerror}), so it cannot be cleared against this tool's own "
+            f"read inputs") from exc
+    for candidate_input in input_paths:
+        input_path = Path(candidate_input)
+        try:
+            input_stat = os.stat(input_path)
+        except FileNotFoundError:
+            continue    # a declared input that no longer exists cannot be the write target
+        except OSError as exc:
+            raise WriteContainmentError(
+                f"refusing to write: read input {input_path} cannot be stat'd "
+                f"({exc.strerror}), so the pinned target cannot be cleared against it"
+            ) from exc
+        if os.path.samestat(target_stat, input_stat):
+            raise WriteContainmentError(
+                f"refusing to write: the pinned target {out_name} is the same file as the "
+                f"read input {input_path}")
+
+
+def write_text_contained(out_path, text, guard_roots, *, input_paths=(),
+                         encoding_errors="strict"):
+    """THE single physical write for every sink in this tool — collector.main's `--out`
+    and render_html.write_html_safely both call exactly this. Neither grows its own copy
+    of the mechanics (that seam produced four findings in the previous stage).
+
+    WRITE-SIDE THREAT MODEL — SIX CLASSES CONSIDERED, FOUR CLOSED, TWO ACCEPTED.
+    Settled 2026-08-02; authoritative record RISK_REGISTER R11 + AMENDMENTS A36. A later
+    reviewer re-finding classes 5 or 6 is EXPECTED and pre-answered — point it there rather
+    than re-deriving. This is the honest claim about this helper; there is no stronger one.
+
+        1 Symlinked PARENT of the target ................. CLOSED  O_NOFOLLOW on the open
+        2 Swapped GRANDPARENT / intermediate component ... CLOSED  fd-anchored `..` walk
+        3 Hard-link truncation of a shared inode ......... CLOSED  O_CREAT|O_EXCL+replace
+        4 Overwriting one of this tool's own read inputs . CLOSED  pinned-identity check
+        5 Concurrent RENAME of the pinned directory ...... ACCEPTED
+        6 Bind-mount alias of a guard-root descendant .... ACCEPTED
+
+    An fd pins an INODE, not where that inode lives. Classes 5 and 6 were reproduced on a
+    real filesystem and are not closable in portable POSIX. They are accepted because ANY
+    attacker positioned to exploit them can already modify this tool's own source, so no
+    in-process check can be load-bearing against them: class 5 needs write access to the
+    output parent chain (`$HOME` for the default report directory) and class 6 needs mount
+    privileges. Either principal can edit this file, swap a hook, or rewrite settings.json
+    without racing anything. A guard cannot be a security boundary against a principal who
+    owns the code implementing the guard. Classes 1–4 are exactly those reachable WITHOUT
+    that privilege, which is where the real risk lives. (The weaker framing — "it's a
+    single-user local tool" — is explicitly rejected: single-user machines run untrusted
+    code all day.) What would VOID this acceptance is a THIRD class reachable without that
+    privilege line; a further variant of 5 or 6 is the same accepted class.
+
+    On the dir_fd path: the parent directory is opened ONCE with O_NOFOLLOW (a symlinked
+    parent is refused outright, not followed) and the returned fd PINS that directory's
+    inode for the rest of the call. Containment is then decided against the PINNED INODE
+    via `_reject_if_pinned_dir_inside_guard_roots`, never against a pathname, and the temp
+    file is created RELATIVE TO THAT FD. The old shape re-validated a PATHNAME and then
+    handed that same pathname to tempfile.mkstemp; deciding about a pathname and writing
+    through a descriptor is what made class 2 exploitable. This is the write-side mirror of
+    the read-side closure `_read_project_file` and `_walk_contained_dirs` already implement.
+
+    ABA binding: the realpath used for the ancestry check must `samestat` a FRESH stat
+    taken now, against the OPENED fd. If they differ, the directory containment was
+    decided about is not the directory being written into, and the write is refused —
+    the same both-directions check the read paths carry. It is defence in depth, NOT the
+    closure mechanism; the fd-anchored walk is.
+
+    HARD-LINK DEFENSE (F5), preserved exactly: an outside-root hard link whose inode is
+    also linked under a guarded root passes every resolve()-based path check, because
+    hard links are invisible to path resolution. Writing in place would truncate that
+    shared inode — a read-only-invariant bypass. So a FRESH inode is created in the same
+    directory (O_CREAT|O_EXCL) and os.replace only ever retargets the out-path NAME at
+    it; the under-root hard-linked inode keeps its original bytes.
+
+    `input_paths` (class 4): the collector's own read surface. The caller-entry
+    `validate_write_target` already rejects a target that IS one of these, which is what
+    stops `--out ~/.claude.json` — a read input that sits OUTSIDE every directory root, so
+    guard-root containment alone would wrongly allow overwriting it. That dimension is
+    re-checked TWICE here: once pre-open against the pathname (better error messages), and
+    again AFTER the pin against the target's identity in the pinned directory, which is the
+    rung an intermediate-component swap cannot defeat. Threading it through matters even
+    though no current caller passes a non-empty value: the previous shape re-checked
+    `input_paths` immediately before mkstemp, and dropping it silently would have been a
+    real (if currently inert) regression in a guarantee this tool advertises.
+
+    `encoding_errors` is the text-encoding error mode ONLY (render_html needs
+    "backslashreplace" so a lone UTF-16 surrogate degrades to a literal escape instead of
+    aborting the write with no report produced). It changes nothing about path security.
+
+    Raises WriteContainmentError (an OSError) on a containment rejection, OSError on any
+    filesystem failure, UnicodeEncodeError on an unencodable payload under
+    encoding_errors="strict". On every failure path the temp file is unlinked
+    BEST-EFFORT: cleanup errors are swallowed so the original write failure is what
+    propagates, so residue is possible if the unlink itself fails."""
+    out_path = Path(out_path)
+    parent = out_path.parent
+    out_name = out_path.name
+    if not out_name:
+        raise WriteContainmentError(f"refusing to write: no file name in target {out_path}")
+    guard_roots = [r for r in guard_roots if r]
+    # MATERIALISE ONCE (Codex challenge, finding F2). `input_paths` is checked by TWO
+    # rungs -- pre-open and post-pin -- so a one-shot iterable (a generator expression at
+    # a call site) would be drained by the first and leave the AUTHORITATIVE second rung
+    # iterating zero inputs. That fails OPEN and does so silently: a generator is truthy,
+    # so the `if not input_paths` early-return does not catch it either. Today's callers
+    # pass `iter_input_paths()`, which returns a list, so nothing currently trips this --
+    # which is exactly why it needs pinning here rather than at a call site.
+    input_paths = tuple(input_paths)
+
+    _reject_if_target_is_an_input_path(out_path, input_paths)
+
+    if not _dir_fd_write_supported():
+        return _write_text_contained_fallback(
+            out_path, parent, text, guard_roots, input_paths, encoding_errors)
+
+    # TRAVERSE-ONLY (P2-1): this descriptor creates, stats and replaces entries in the
+    # pinned directory; it never lists them. Requiring read would hold the write to a
+    # HIGHER permission bar than the mkstemp shape it replaced, breaking a write-only
+    # drop-box. O_NOFOLLOW rides on both rungs of the ladder -- see the helper.
+    dir_fd = _open_dir_traverse_only(
+        parent, extra_flags=os.O_NOFOLLOW | os.O_NONBLOCK)
+    tmp_name = None
+    try:
+        parent_fstat = os.fstat(dir_fd)
+        parent_real = Path(_physical_key(parent))
+        try:
+            parent_real_stat = os.stat(parent_real)
+        except OSError as exc:
+            raise WriteContainmentError(
+                f"refusing to write: could not stat the resolved parent {parent_real}") from exc
+        # TOCTOU: the path containment is decided about must BE the directory held open.
+        # Defence in depth only -- the fd-anchored walk below is the actual mechanism.
+        if not os.path.samestat(parent_real_stat, parent_fstat):
+            raise WriteContainmentError(
+                f"refusing to write: {parent_real} is no longer the opened directory (TOCTOU)")
+        # CONTAINMENT IS DECIDED ABOUT THE DESCRIPTOR, NOT THE PATHNAME. Do NOT call
+        # _reject_if_parent_inside_guard_roots here -- that is the FALLBACK branch's
+        # pathname predicate, and deciding about a pathname while writing through a
+        # descriptor is exactly what made class 2 (the grandparent swap) exploitable.
+        _reject_if_pinned_dir_inside_guard_roots(dir_fd, guard_roots)
+        # Class 4, re-bound to the pin. Must run BEFORE the temp file is created: once the
+        # temp exists, a failure here would leave residue for the finally to clean up for
+        # no reason, and the decision does not depend on the temp.
+        _reject_if_pinned_target_is_an_input_path(dir_fd, out_name, input_paths)
+
+        # tempfile.mkstemp does NOT accept dir_fd, so the name is generated here and
+        # created with O_EXCL relative to the pinned fd. Bounded retry: exhaustion raises
+        # rather than spinning.
+        file_fd = None
+        for _attempt in range(_TMP_NAME_ATTEMPTS):
+            candidate = f".harness-map-{secrets.token_hex(16)}.tmp"
+            try:
+                file_fd = os.open(
+                    candidate,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+            except FileExistsError:
+                continue
+            tmp_name = candidate
+            break
+        # BOTH are tested, not just file_fd: they are set together on the successful
+        # iteration, so either being None means the loop never succeeded. Testing only
+        # file_fd leaves tmp_name typed `str | None` at the os.replace below, which is
+        # a genuine type error rather than a mypy quibble -- the plan's block tested
+        # file_fd alone and did not type-check.
+        if file_fd is None or tmp_name is None:
+            raise OSError(
+                f"could not create a unique temporary file in {parent} after "
+                f"{_TMP_NAME_ATTEMPTS} attempts")
+
+        # closefd=False + one explicit close (X5). os.fdopen can raise BEFORE the wrapper
+        # takes ownership of the raw descriptor, which leaks it. With closefd=False the
+        # wrapper NEVER closes file_fd, so this finally is the single owner on every path
+        # -- including a raise from inside os.fdopen itself, which is why the try opens
+        # before the call rather than around the with-body. There is no double-close
+        # precisely because nothing else is permitted to close it.
+        try:
+            with os.fdopen(file_fd, "w", encoding="utf-8", errors=encoding_errors,
+                           closefd=False) as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            os.close(file_fd)
+        os.replace(tmp_name, out_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass          # best-effort cleanup; the write failure is what propagates
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+    return None
+
+
+def _write_text_contained_fallback(out_path, parent, text, guard_roots, input_paths,
+                                   encoding_errors):
+    """EXPLICIT platform fallback (F4) for a system whose os.open/os.replace/os.unlink do
+    not accept dir_fd. Behaviorally identical to the pre-S7 write: re-resolve and re-check
+    the target immediately before mkstemp, then mkstemp/fsync/os.replace in the target's
+    own directory.
+
+    The hard-link defense (F5) is UNCHANGED here — mkstemp still creates a fresh inode in
+    the same directory and os.replace still only retargets the name.
+
+    LIMITATION, true on THIS branch only, and WIDER than the dir_fd path's. With no
+    descriptor to anchor to, containment is decided about a pathname and the write then
+    goes through that pathname, so classes 1 and 2 (symlinked parent, swapped grandparent)
+    are narrowed but not fully closed here — the residual window sits between the re-check below
+    and the mkstemp call, and a parent-directory symlink swapped into it can still redirect
+    the write. Class 3 still holds on this branch unconditionally: mkstemp creates a fresh
+    inode and os.replace only retargets the name. Class 4 holds only as far as
+    `_reject_if_target_is_an_input_path` reaches, which is a pathname comparison with no
+    pinned re-check behind it.
+
+    TWO FAIL-OPEN POINTS specific to this branch, named rather than left implicit (Codex
+    challenge, finding F4). `_reject_if_parent_inside_guard_roots` SKIPS a guard root that
+    exists but cannot be stat'd, and `_reject_if_target_is_an_input_path` treats an
+    unstattable input as "not the same file". The dir_fd branch denies on that same
+    ambiguity. The divergence is deliberate — it matches `validate_write_target`'s
+    long-standing posture, and this branch has no authoritative pinned rung to fall back on
+    — but it is a weaker posture, not an equivalent one, and it should be revisited if this
+    branch ever becomes reachable on a supported platform.
+
+    This branch is reached only where the platform cannot do dir_fd writes at all, so the
+    alternative is not writing. Do not describe it as equivalent to the dir_fd path, and do
+    not justify it as "fine for a single-user local tool" — that framing is explicitly
+    rejected (RISK_REGISTER R11). See `write_text_contained`'s six-class table for the
+    posture that does apply, and note that classes 1 and 2 are listed CLOSED there on the
+    strength of the dir_fd path, which is the one production actually takes."""
+    resolved_parent = Path(_physical_key(parent))
+    try:
+        parent_stat = os.stat(resolved_parent)
+    except OSError as exc:
+        raise WriteContainmentError(
+            f"refusing to write: could not stat the resolved parent {resolved_parent}") from exc
+    _reject_if_parent_inside_guard_roots(resolved_parent, parent_stat, guard_roots)
+    # CHECK THE PATH THIS BRANCH ACTUALLY WRITES THROUGH, not the caller's spelling
+    # (Codex challenge, finding F3). The write below lands at
+    # `resolved_parent / out_path.name`; clearing `out_path` instead compared a DIFFERENT
+    # pathname snapshot, so on a concurrent redirect the branch could clear one file and
+    # replace another. The two derivations are identical on a stable filesystem, which is
+    # why no static test distinguishes them -- that is a reason to make them the same
+    # expression, not a reason to leave them different.
+    written_path = resolved_parent / out_path.name
+    _reject_if_target_is_an_input_path(written_path, input_paths)
+    tmp_name = None
+    try:
+        file_fd, tmp_name = tempfile.mkstemp(dir=str(resolved_parent), suffix=".tmp")
+        # closefd=False + one explicit close, same ownership rule as the dir_fd branch:
+        # os.fdopen can raise before taking ownership of the raw fd. Both branches must
+        # carry this or the leak simply moves to whichever one was left alone.
+        try:
+            with os.fdopen(file_fd, "w", encoding="utf-8", errors=encoding_errors,
+                           closefd=False) as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            os.close(file_fd)
+        os.replace(tmp_name, written_path)
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    return None
 
 
 # --- T3: project-tier read gate (H2 containment) + TOCTOU-closed read ---
@@ -739,7 +1439,7 @@ def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
     rules_dir = harness_root / "rules"
     rule_files = []
     try:
-        is_rules_dir = rules_dir.is_dir()
+        is_rules_dir = _probe_is_dir(rules_dir)
     except OSError as e:
         errors.append(f"project rules is_dir failed for {rules_dir}: {e}")
         is_rules_dir = False
@@ -778,16 +1478,30 @@ def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
 # skill/agent/command discovery here is a NEW read/traverse surface (T4) — every path is
 # routed through T3's `_project_tier_gate` (H2 containment), same as `_walk_project_tier`.
 
-def _walk_operator_tier_nodes(root):
+def _walk_operator_tier_nodes(root, inaccessible=None):
     """Operator-tier skill/agent/command nodes (T4). A lean single-level existence walk
     (no body read — the node model needs only the collision key + path for the shadow
     resolver; word/line metrics stay owned by collect_descriptions/collect_on_demand).
     Commands get their FIRST node collection here — no prior section inventoried
     commands/*.md as nodes at all. Operator tier keeps its existing trusted
-    symlink-following (unchanged, matches every other operator-tier walk)."""
+    symlink-following (unchanged, matches every other operator-tier walk).
+
+    `inaccessible` (S7): the shared build_document inaccessible[] list. `_probe_is_dir`
+    re-raises EACCES from an unreadable ancestor, so a locked skills/ or agents/ dir used
+    to abort this walk and — via build_document, which has no per-section handler — replace
+    the whole document with a crash envelope. Each surface dir that cannot be probed is now
+    recorded here and skipped, so an unreadable surface is DISCLOSED rather than silently
+    absent from a report that would otherwise read as clean."""
     nodes: list[dict[str, Any]] = []
+    if inaccessible is None:
+        inaccessible = []
     skills_dir = root / "skills"
-    if skills_dir.is_dir():
+    try:
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
+    except OSError:
+        _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+        skills_dir_is_dir = False
+    if skills_dir_is_dir:
         try:
             skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
         except OSError:
@@ -800,7 +1514,12 @@ def _walk_operator_tier_nodes(root):
                               "tier": "operator", "path": _rel(root, skill_md)})
     for surface, dirname in (("agent", "agents"), ("command", "commands")):
         d = root / dirname
-        if not d.is_dir():
+        try:
+            d_is_dir = _probe_is_dir(d)
+        except OSError:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, d))
+            continue
+        if not d_is_dir:
             continue
         try:
             files = sorted(d.glob("*.md"))
@@ -812,27 +1531,36 @@ def _walk_operator_tier_nodes(root):
     return nodes
 
 
-def _walk_project_tier_nodes(project_root, out_of_root_refs):
+def _walk_project_tier_nodes(project_root, out_of_root_refs, errors):
     """Project-tier skill/agent/command nodes (T4): `<repo>/.claude/{skills,agents,
     commands}/`. Existence + identity ONLY (same rationale as
     `_walk_operator_tier_nodes` — no body read needed for the collision-key model).
     EVERY path (surface dir, skill dir, leaf file) is routed through T3's
     `_project_tier_gate` (H2) — an escaping symlink at any level is recorded as an
     `out_of_root_ref` and excluded from the node list, mirroring `_walk_project_tier`'s
-    rules-dir handling exactly (reused, not reimplemented)."""
+    rules-dir handling exactly (reused, not reimplemented).
+
+    `errors` (S7): same disclosure channel `_walk_project_tier` already uses for the
+    IDENTICAL `os.stat(project_root)`/`is_dir()` failures (its containment-root and
+    rules-dir checks) — matched here rather than `_walk_operator_tier_nodes`'
+    `inaccessible` so project-tier disclosure stays on one channel. An unreadable
+    containment root or surface dir used to yield a silently truncated (or empty) node
+    list with zero record anywhere; inaccessible is NOT clean."""
     project_root = Path(project_root)
     harness_root = project_root / ".claude"
     nodes: list[dict[str, Any]] = []
     seen_refs: set[str] = set()
     try:
         containment_stat = os.stat(project_root)
-    except OSError:
+    except OSError as e:
+        errors.append(f"project containment root not accessible: {project_root}: {e}")
         return nodes
 
     skills_dir = harness_root / "skills"
     try:
-        is_skills_dir = skills_dir.is_dir()
-    except OSError:
+        is_skills_dir = _probe_is_dir(skills_dir)
+    except OSError as e:
+        errors.append(f"project skills is_dir failed for {skills_dir}: {e}")
         is_skills_dir = False
     if is_skills_dir:
         contained, _identity = _project_tier_gate(skills_dir, project_root, containment_stat)
@@ -862,8 +1590,9 @@ def _walk_project_tier_nodes(project_root, out_of_root_refs):
     for surface, dirname in (("agent", "agents"), ("command", "commands")):
         d = harness_root / dirname
         try:
-            is_dir = d.is_dir()
-        except OSError:
+            is_dir = _probe_is_dir(d)
+        except OSError as e:
+            errors.append(f"project {dirname} is_dir failed for {d}: {e}")
             is_dir = False
         if not is_dir:
             continue
@@ -1079,7 +1808,16 @@ def walk_always_loaded(
         # CLAUDE.md), AND compose is off — compose mode emits the project CLAUDE.md via
         # _walk_project_tier below instead, unconditionally on registration (H1: the two
         # paths must never BOTH fire for the same physical file, or it double-counts).
-        if not compose and (root / "projects" / active_slug / "memory").is_dir():
+        # `_probe_is_dir` re-raises EACCES from an unreadable ancestor (it swallows only the
+        # ENOENT family) — an escape here aborts walk_always_loaded and, via build_document,
+        # replaces the ENTIRE report with a crash envelope. Record and treat as absent.
+        legacy_memory_dir = root / "projects" / active_slug / "memory"
+        try:
+            legacy_memory_present = _probe_is_dir(legacy_memory_dir)
+        except OSError as e:
+            errors.append(f"projects memory is_dir failed for {legacy_memory_dir}: {e}")
+            legacy_memory_present = False
+        if not compose and legacy_memory_present:
             proj_claude = Path(project_root) / "CLAUDE.md"
             present, ok = _safe_exists(proj_claude)
             if not ok:
@@ -1098,7 +1836,12 @@ def walk_always_loaded(
     # under its harness-relative name by design. Recursive, symlink-loop-prone trees (hooks/)
     # are handled in Task 3 with explicit name+target recording instead of a body read.
     projects_dir = root / "projects"
-    if projects_dir.is_dir():
+    try:
+        projects_dir_is_dir = _probe_is_dir(projects_dir)
+    except OSError as e:
+        errors.append(f"projects is_dir failed for {projects_dir}: {e}")
+        projects_dir_is_dir = False
+    if projects_dir_is_dir:
         try:
             slug_dirs = sorted(p for p in projects_dir.iterdir() if p.is_dir())
         except OSError:
@@ -1165,7 +1908,7 @@ def walk_always_loaded(
     rule_dirs = [(root / "rules", "rule")]
     skills_root = root / "skills"
     try:
-        skills_root_is_dir = skills_root.is_dir()
+        skills_root_is_dir = _probe_is_dir(skills_root)
     except OSError as e:
         errors.append(f"skills is_dir failed for {skills_root}: {e}")
         skills_root_is_dir = False
@@ -1178,7 +1921,7 @@ def walk_always_loaded(
         for skill_dir in sub_skill_dirs:
             sub_rules = skill_dir / "rules"
             try:
-                is_rules_dir = sub_rules.is_dir()
+                is_rules_dir = _probe_is_dir(sub_rules)
             except OSError as e:
                 errors.append(f"rules is_dir check failed for {sub_rules}: {e}")
                 continue
@@ -1187,7 +1930,7 @@ def walk_always_loaded(
                 rule_dirs.append((sub_rules, category))
     for rules_dir, category in rule_dirs:
         try:
-            if not rules_dir.is_dir():
+            if not _probe_is_dir(rules_dir):
                 continue
         except OSError as e:
             errors.append(f"rules is_dir failed for {rules_dir}: {e}")
@@ -1226,7 +1969,12 @@ def collect_descriptions(
     # walk to follow symlinks through. A symlinked skill DIR is followed and reported under
     # its harness-relative name by design.
     skills_dir = root / "skills"
-    if skills_dir.is_dir():
+    try:
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
+    except OSError:
+        _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+        skills_dir_is_dir = False
+    if skills_dir_is_dir:
         try:
             skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
         except OSError:
@@ -1250,7 +1998,12 @@ def collect_descriptions(
             })
 
     agents_dir = root / "agents"
-    if agents_dir.is_dir():
+    try:
+        agents_dir_is_dir = _probe_is_dir(agents_dir)
+    except OSError:
+        _append_inaccessible_once(inaccessible, _rel_safe(root, agents_dir))
+        agents_dir_is_dir = False
+    if agents_dir_is_dir:
         try:
             agent_files = sorted(agents_dir.glob("*.md"))
         except OSError:
@@ -1282,7 +2035,12 @@ def collect_on_demand(
     # walk to follow symlinks through. A symlinked skill DIR is followed and reported under
     # its harness-relative name by design.
     skills_dir = root / "skills"
-    if skills_dir.is_dir():
+    try:
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
+    except OSError:
+        _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+        skills_dir_is_dir = False
+    if skills_dir_is_dir:
         try:
             skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
         except OSError:
@@ -1294,7 +2052,12 @@ def collect_on_demand(
             if not ok:
                 inaccessible.append({"path": _rel(root, skill_md), "reason": "unreadable"})
                 continue
-            has_test = (skill_dir / "tests").is_dir()
+            tests_dir = skill_dir / "tests"
+            try:
+                has_test = _probe_is_dir(tests_dir)
+            except OSError:
+                _append_inaccessible_once(inaccessible, _rel_safe(root, tests_dir))
+                has_test = False
             if present:
                 text = _read_checked(root, skill_md, inaccessible)
                 if text is not None:
@@ -1309,7 +2072,12 @@ def collect_on_demand(
 
             for subdir, kind in (("phases", "phase"), ("prompts", "prompt"), ("agents", "agent")):
                 target = skill_dir / subdir
-                if not target.is_dir():
+                try:
+                    target_is_dir = _probe_is_dir(target)
+                except OSError:
+                    _append_inaccessible_once(inaccessible, _rel_safe(root, target))
+                    continue
+                if not target_is_dir:
                     continue
                 try:
                     body_files = sorted(target.glob("*.md"))
@@ -1332,7 +2100,12 @@ def collect_on_demand(
     if project_root is not None:
         active_slug = _project_slug(project_root)
         mem_dir = root / "projects" / active_slug / "memory"
-        if mem_dir.is_dir():
+        try:
+            mem_dir_is_dir = _probe_is_dir(mem_dir)
+        except OSError:
+            _append_inaccessible_once(inaccessible, _rel_safe(root, mem_dir))
+            mem_dir_is_dir = False
+        if mem_dir_is_dir:
             try:
                 mem_files = sorted(mem_dir.glob("*.md"))
             except OSError:
@@ -1385,16 +2158,29 @@ def parse_settings(
       trigger via settings.json specifically — the intended, more robust outcome.)
       Returns (settings_dict, parsed_ok)."""
     settings_path = root / "settings.json"
-    if not settings_path.is_file():   # follows symlinks; False for FIFO/socket/dir/broken-symlink/absent
+    try:
+        is_regular_file = _probe_is_file(settings_path)   # follows symlinks; False for FIFO/socket/dir/broken-symlink/absent
+    except OSError as e:
+        # The probe itself can raise EACCES from an unsearchable ancestor directory,
+        # not just report False — LOUD per this function's own "unreadable-as-a-regular
+        # file" branch, same shape as the read-failure case below.
+        errors.append(f"settings.json is_file() check failed: {e!r}")
+        return {}, False
+    if not is_regular_file:
         try:
-            present = settings_path.exists()   # follows symlinks; True for a symlink to a FIFO/socket/dir
+            present = _probe_exists(settings_path)   # follows symlinks; True for a symlink to a FIFO/socket/dir
         except OSError:
             present = True   # stat failed unexpectedly; treat conservatively as present-anomaly
         if present:
             errors.append("settings.json exists but is not a regular file (FIFO/socket/directory); "
                            "refusing to open it to avoid blocking on a special file.")
             return {}, False
-        if settings_path.is_symlink():   # exists() False + is_symlink() True == a broken (dangling) symlink
+        try:
+            is_broken_symlink = _probe_is_symlink(settings_path)   # not-present + is-a-link == a broken (dangling) symlink
+        except OSError as e:
+            errors.append(f"settings.json is_symlink() check failed: {e!r}")
+            return {}, False
+        if is_broken_symlink:
             errors.append("settings.json is a broken symlink (target does not exist)")
             return {}, False
         blind_spots.append("settings.json not found; permissions/config/hooks reflect defaults.")
@@ -2337,7 +3123,7 @@ def _git_marker_root(start: Path, stop_at: str) -> tuple[Path | None, bool]:
           under an instruction-file dir that iter_input_paths already yields.
 
     TRI-STATE, not two-state (F5): `ok=False` means an ancestor's `.git` could not be read
-    (Path.exists() RAISES PermissionError -- it only swallows ENOENT/ENOTDIR), so the walk
+    (`_probe_exists` RAISES PermissionError -- it swallows only the ENOENT family), so the walk
     ABORTS rather than silently attributing the file to an outer repo. The caller maps that
     to `git_error`, NEVER to `no_repo`: "there is no enclosing work tree" is a positive
     assertion of absence, and asserting absence over a state we could not read is the exact
@@ -3191,20 +3977,26 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
     for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
         d = project_root / rel_dir
         try:
-            if d.is_dir():
+            if _probe_is_dir(d):
                 candidates.extend(sorted(d.glob(pattern)))
-        except OSError:
+        except OSError as e:
+            # Inaccessible is NOT clean: an unreadable project-tier surface dir yields
+            # zero candidates for it, which reads identically to "nothing there" unless
+            # recorded. blind_spots is the existing recording channel for this function.
+            blind_spots.append(f"project {rel_dir} not probed for duplication scan: {e}")
             continue
     skills_dir = harness_root / "skills"
     try:
-        if skills_dir.is_dir():
+        if _probe_is_dir(skills_dir):
             for skill_dir in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
                 skill_md = skill_dir / "SKILL.md"
                 present, ok = _safe_exists(skill_md)
                 if ok and present:
                     candidates.append(skill_md)
-    except OSError:
-        pass
+    except OSError as e:
+        # Same "inaccessible is NOT clean" invariant: an unreadable .claude/skills yields
+        # zero skill SKILL.md candidates with no signal unless recorded here.
+        blind_spots.append(f"project skills not probed for duplication scan: {e}")
 
     for fp in candidates:
         key = _physical_key(fp)
@@ -3658,7 +4450,21 @@ def check_phantom_refs(
                         # `is_file()` on the already-resolved path keeps S-9 closed (a
                         # real DIRECTORY still does not make an extension-bearing token
                         # "resolve") without re-touching the original symlink chain.
-                        if resolved_target.is_file():
+                        # `resolved_target` sits under a validated in-root ancestor chain
+                        # for `candidate`, but is a DIFFERENT path post-`resolve()` and can
+                        # itself sit beneath an unreadable in-root ancestor -- reachable
+                        # WITHOUT a race. An OSError here must not become a distinguishable
+                        # outcome (that would reopen the existence oracle the block above
+                        # closes), so this candidate is recorded inaccessible and handled
+                        # exactly like the resolve() failure above: never asserted resolved
+                        # OR missing.
+                        try:
+                            is_file = _probe_is_file(resolved_target)
+                        except OSError:
+                            _append_inaccessible_once(inaccessible, _rel_safe(root, candidate))
+                            stripped_handled = True
+                            break
+                        if is_file:
                             stripped_handled = True
                             break
                     if stripped_handled:
@@ -3798,7 +4604,7 @@ def _hook_test_stems(root, errors):
     test_dirs = [root / "hooks" / "tests"]
     skills_root = root / "skills"
     try:
-        skills_root_is_dir = skills_root.is_dir()
+        skills_root_is_dir = _probe_is_dir(skills_root)
     except OSError as e:
         errors.append(f"skills is_dir failed for {skills_root}: {e}")
         skills_root_is_dir = False
@@ -3854,7 +4660,7 @@ def _detect_hook_test_coverage(root, errors):
     return result
 
 
-def _skill_has_test_asset(skill_dir):
+def _skill_has_test_asset(skill_dir, errors=None):
     """PRESENCE-only signal (see _detect_hook_test_coverage docstring): a tests/ dir, an
     evals/ dir, or any test_*.py / *_eval.* file anywhere under the skill dir. Unlike
     _safe_exists, Path.is_dir() does NOT swallow PermissionError (only ENOENT-family
@@ -3868,13 +4674,27 @@ def _skill_has_test_asset(skill_dir):
     the watcher does not observe. This keeps the two walks equal BY CONSTRUCTION: a
     test/eval file this function can see is always inside a directory the watcher also
     yields, and a test/eval file planted under a pruned dir (e.g. node_modules) is
-    intentionally excluded from BOTH signals."""
+    intentionally excluded from BOTH signals.
+
+    `errors` (S7.M3c, optional): os.walk's default onerror silently discards a
+    per-directory listing failure partway through the descendant walk, which would
+    otherwise make an unreadable nested subtree return a DETERMINED has_test: False
+    rather than surfacing the gap — this is NOT the same swallow the tests/evals check
+    above documents (that one is a top-level check already reported elsewhere; this one
+    is unreported and partway through an unbounded recursive walk), so it is recorded
+    here instead when a caller supplies a list. Defaults to None (discarded) so this
+    function's pre-existing single-argument call shape keeps working."""
     try:
         if (skill_dir / "tests").is_dir() or (skill_dir / "evals").is_dir():
             return True
     except OSError:
         pass
-    for d in _iter_descendant_dirs(skill_dir):
+
+    def _record_walk_error(exc):
+        if errors is not None:
+            errors.append(f"skill descendant walk failed under {skill_dir}: {exc}")
+
+    for d in _iter_descendant_dirs(skill_dir, onerror=_record_walk_error):
         try:
             if next(d.glob("test_*.py"), None) is not None:
                 return True
@@ -3888,15 +4708,22 @@ def _skill_has_test_asset(skill_dir):
     return False
 
 
-def _detect_skill_test_coverage(root):
+def _detect_skill_test_coverage(root, errors):
     skills_dir = root / "skills"
-    if not skills_dir.is_dir():
+    try:
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
+    except OSError as e:
+        # is_dir() re-raises EACCES from an unreadable ancestor; an escape here aborts
+        # detect_test_coverage and, via build_document, the entire report.
+        errors.append(f"skills is_dir failed for {skills_dir}: {e}")
+        return []
+    if not skills_dir_is_dir:
         return []
     try:
         skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
     except OSError:
         skill_dirs = []
-    return [{"name": d.name, "has_test": _skill_has_test_asset(d)} for d in skill_dirs]
+    return [{"name": d.name, "has_test": _skill_has_test_asset(d, errors)} for d in skill_dirs]
 
 
 def detect_test_coverage(
@@ -3909,7 +4736,7 @@ def detect_test_coverage(
     skill name, so both sections agree instead of on_demand carrying its own narrower
     (tests/-dir-only) check."""
     hooks_result = _detect_hook_test_coverage(root, errors)
-    skills_result = _detect_skill_test_coverage(root)
+    skills_result = _detect_skill_test_coverage(root, errors)
 
     skills_has_test = {s["name"]: s["has_test"] for s in skills_result}
     for entry in on_demand.get("skills", []):
@@ -3963,13 +4790,20 @@ _PRUNED_WALK_DIRS = frozenset({
 })
 
 
-def _iter_descendant_dirs(base):
+def _iter_descendant_dirs(base, onerror=None):
     """Yield `base` and every non-pruned directory beneath it (each membership-watchable).
     _skill_has_test_asset (Codex r4 fix) now SHARES this exact walk for its recursive
     test_*.py / *_eval.* glob search instead of Path.rglob() — the two are equal BY
     CONSTRUCTION, not by a duplicated constant that could drift: a test/eval file added at
     ANY non-pruned depth flips a skill's has_test AND is watched, while one planted under a
     pruned dir (node_modules, .venv, caches, ...) is intentionally invisible to BOTH.
+
+    `onerror` (optional): os.walk's default `onerror=None` SILENTLY DISCARDS a
+    per-directory listing failure partway through the walk, making an unreadable
+    subtree indistinguishable from a genuinely empty one to every caller. Pass a
+    callback here to record that failure (S7.M3c) instead of losing it; the
+    watcher call site (iter_input_paths, consumed by serve.py) omits it and keeps
+    its prior silent-on-walk-error behavior unchanged.
 
     followlinks=False (Codex r3 FIX 3): os.walk still ENTERS `base` even when `base` itself is a
     deploy-symlinked skill dir (the first hop stays -- os.walk always descends into the walk
@@ -3992,7 +4826,7 @@ def _iter_descendant_dirs(base):
             return
     except OSError:
         return
-    for dirpath, dirnames, _ in os.walk(base, followlinks=False):
+    for dirpath, dirnames, _ in os.walk(base, followlinks=False, onerror=onerror):
         # Prune generated/non-input subtrees IN PLACE so os.walk never descends into them.
         dirnames[:] = [d for d in dirnames if d not in _PRUNED_WALK_DIRS]
         yield Path(dirpath)
@@ -4517,9 +5351,9 @@ def build_document(
         # same compose-only pattern as inspected_roots/out_of_root_refs above. 'claude_md'
         # and 'hook' (P2-A) reuse `files[]`/`composed_hooks` (both already
         # built/tier-tagged above) rather than re-walking or re-reading disk.
-        raw_nodes = _walk_operator_tier_nodes(root)
+        raw_nodes = _walk_operator_tier_nodes(root, inaccessible)
         if project_root is not None:
-            raw_nodes += _walk_project_tier_nodes(project_root, out_of_root_refs)
+            raw_nodes += _walk_project_tier_nodes(project_root, out_of_root_refs, errors)
         raw_nodes += _rule_nodes_from_files(files)
         raw_nodes += _claude_md_nodes_from_files(files)
         raw_nodes += _hook_nodes_from_composed(composed_hooks)
@@ -4619,6 +5453,9 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     out_path = None
+    input_paths: list[Path] = []       # bound unconditionally: the write block below passes
+                                        # it to write_text_contained, and must never depend
+                                        # on which --out branch happened to run
     out_roots = [root]                 # guarded roots for BOTH the upfront check and the
                                         # write-time TOCTOU recheck below (P1-6a)
     if args.out is not None:
@@ -4630,7 +5467,6 @@ def main(argv: list[str] | None = None) -> int:
             # build_document/print so the always-valid-JSON-envelope invariant holds.
             print(f"warning: --root not accessible, skipping --out write: {e}", file=sys.stderr)
         else:
-            input_paths = []
             if args.compose:
                 try:
                     project_containment_root = Path(args.project_root).expanduser().resolve()
@@ -4659,17 +5495,29 @@ def main(argv: list[str] | None = None) -> int:
     except (UnicodeEncodeError, TypeError):
         text = json.dumps(doc, indent=args.indent, ensure_ascii=True)
     if out_path is not None:
-        # Re-validate IMMEDIATELY before writing (narrows the TOCTOU window between the
-        # earlier check and this write — the residual window between THIS check and the
-        # mkstemp call below is an accepted, documented low-risk limitation for a
-        # single-user local tool; not fully closed). Write hard-link-safely: an
-        # outside-root HARD LINK whose inode is also linked under --root passes
-        # resolve()-based path checks (hard links are invisible to path resolution), so a
-        # naive write_text() would truncate that shared inode — a read-only bypass.
-        # Writing to a temp file in the SAME directory, then os.replace()-ing it onto
-        # out_path, only ever retargets the out-path NAME at a fresh inode; any
-        # under-root hard-linked inode keeps its original, untouched content.
-        tmp_name = None
+        # Re-validate IMMEDIATELY before writing (the earlier --out guard ran before
+        # build_document; this catches a target retargeted since). The physical write then
+        # goes through the SHARED write_text_contained helper — the same helper
+        # render_html.write_html_safely uses, so the two sinks cannot drift.
+        #
+        # TOCTOU: the helper's write-side threat model is SIX CLASSES CONSIDERED, FOUR
+        # CLOSED, TWO ACCEPTED — see write_text_contained's docstring for the table and
+        # RISK_REGISTER R11 for the settled rationale. On the dir_fd path the helper opens
+        # this file's parent directory once with O_NOFOLLOW, pins that inode with the
+        # returned fd, decides containment against the PINNED inode, and creates the temp
+        # file relative to that fd — so a parent path COMPONENT swapped in afterward cannot
+        # redirect the write. It does NOT defeat a concurrent rename of the pinned
+        # directory itself, or a bind-mount alias; those are the two accepted residuals,
+        # and any principal who can reach them can already edit this file. On a platform
+        # without dir_fd support the helper takes its documented fallback branch, whose
+        # exposure is wider; that limitation is stated there.
+        #
+        # Hard-link safety is unchanged and still load-bearing: an outside-root HARD LINK
+        # whose inode is also linked under --root passes resolve()-based path checks
+        # (hard links are invisible to path resolution), so a naive write_text() would
+        # truncate that shared inode — a read-only bypass. The helper still creates a
+        # fresh inode in the target's directory and os.replace()s it onto the name, so
+        # any under-root hard-linked inode keeps its original, untouched content.
         try:
             resolved_recheck = out_path.resolve()
             for guard_root in out_roots:
@@ -4679,21 +5527,10 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if _resolves_inside_root(resolved_recheck, Path(guard_root), guard_root_stat):
                     raise OSError("--out resolved inside a guarded root at write time (TOCTOU)")
-            fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(text)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_name, out_path)
-            tmp_name = None
+            write_text_contained(resolved_recheck, text, out_roots,
+                                 input_paths=input_paths)
         except OSError as exc:
             print(f"warning: could not write --out: {exc}", file=sys.stderr)
-        finally:
-            if tmp_name is not None:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
     print(text)  # stdout is the primary contract — always emit the built document, write-or-not
     return 0
 

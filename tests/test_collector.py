@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -2514,6 +2515,48 @@ def test_validate_write_target_rejects_out_matching_symlinked_input_target(tmp_p
     ok, resolved = _collector.validate_write_target(
         str(real_result), roots=(), input_paths=(str(claude_json_link),))
     assert ok is False and resolved is None
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_validate_write_target_reports_a_symlink_loop_as_an_oserror(tmp_path):
+    """F7 (Codex challenge), reproduced before fixing: Path.resolve() raises RuntimeError
+    -- NOT OSError -- on a symlink loop (measured on CPython 3.11: "Symlink loop from
+    ..."). validate_write_target's two `.resolve()` sites (the candidate itself, and each
+    declared input path) sat inside `except OSError:` only, so a looping path escaped this
+    SINGLE shared caller-entry guard as an unhandled RuntimeError past every caller, which
+    only ever catches OSError. Same defect, same fix, as the write-time sibling
+    `_reject_if_target_is_an_input_path`
+    (test_write_text_contained_reports_a_symlink_loop_as_an_oserror) -- this is the
+    caller-entry twin of that helper's ladder.
+
+    Both directions are pinned because both `.resolve()` sites in this function can loop:
+    the candidate target itself, and a declared input path. The contract asserted is only
+    that no RuntimeError escapes -- not that a loop is permitted or refused, which is not
+    the point here."""
+    root = tmp_path / "root"
+    root.mkdir()
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    assert loop_a.is_symlink(), "fixture must really be a loop, not a broken link"
+
+    # (a) looping TARGET path: resolution of the candidate itself is what loops.
+    try:
+        ok, _ = _collector.validate_write_target(str(loop_a), [root])
+    except RuntimeError as exc:      # pragma: no cover - this is the defect being fixed
+        pytest.fail(f"symlink-loop target escaped as RuntimeError, not handled: {exc}")
+    else:
+        assert isinstance(ok, bool)
+
+    # (b) looping INPUT path: resolution of a declared input is what loops.
+    target = tmp_path / "outside.json"
+    try:
+        ok, resolved = _collector.validate_write_target(str(target), [root], [loop_a])
+    except RuntimeError as exc:      # pragma: no cover - this is the defect being fixed
+        pytest.fail(f"symlink-loop input escaped as RuntimeError, not handled: {exc}")
+    else:
+        assert ok is True and resolved == target.resolve()
 
 
 def test_compose_document_deterministic_across_hashseed(fake_harness, tmp_path):
@@ -5413,3 +5456,1164 @@ def test_empty_document_carries_metric_definitions(fake_harness):
     computed."""
     env = _collector._empty_document(fake_harness)
     assert env["metric_definitions"] == {}
+
+
+# S7.M1 (F6): eight is_dir() call sites in walk_always_loaded / collect_descriptions /
+# collect_on_demand were unguarded against an ancestor directory that stats fine but
+# cannot be listed (search bit cleared). Path.is_dir() re-raises EACCES from that case
+# (it swallows only the ENOENT family) -- an escape there aborts the whole scan and, via
+# build_document, replaces the ENTIRE report with a crash envelope. Every one of the five
+# tests below builds a REAL unreadable directory (no mocks) and asserts the OSError is
+# recorded into inaccessible[]/errors[] instead of propagating.
+
+@pytest.fixture
+def unsearchable_root(tmp_path):
+    """A real harness root whose children cannot be stat'd (search bit cleared).
+    os.stat(root) itself still succeeds -- only descent fails, which is precisely the
+    ancestor-unreadable case Path.is_dir() re-raises instead of swallowing."""
+    root = tmp_path / "harness"
+    (root / "skills" / "demo").mkdir(parents=True)
+    (root / "skills" / "demo" / "SKILL.md").write_text("---\ndescription: d\n---\nbody\n")
+    (root / "agents").mkdir()
+    (root / "projects" / "slug" / "memory").mkdir(parents=True)
+    os.chmod(root, 0o600)
+    try:
+        yield root
+    finally:
+        os.chmod(root, 0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_descriptions_unsearchable_root_records_inaccessible(unsearchable_root):
+    inaccessible = []
+    skill_desc, agent_desc = _collector.collect_descriptions(unsearchable_root, inaccessible)
+    assert skill_desc == []
+    assert agent_desc == []
+    recorded = {e["path"] for e in inaccessible}
+    assert "skills" in recorded
+    assert "agents" in recorded
+    assert all(e["reason"] == "unreadable" for e in inaccessible)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_on_demand_unsearchable_root_records_inaccessible(unsearchable_root):
+    inaccessible = []
+    skills, internal, memory = _collector.collect_on_demand(unsearchable_root, None, inaccessible)
+    assert skills == []
+    assert internal == []
+    assert memory == []
+    assert "skills" in {e["path"] for e in inaccessible}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_on_demand_unreadable_skill_subdirs_record_inaccessible(tmp_path):
+    """1297 (tests/) and 1312 (phases|prompts|agents): the skill dir AND its SKILL.md are
+    both listable/readable (so the earlier _safe_exists(skill_md) guard does not
+    short-circuit the loop via `continue`), but "tests" and "phases" are each a symlink
+    into an unreadable-parent target -- same real-filesystem technique as
+    test_walk_always_loaded_skills_root_inaccessible_records_error_not_crash above --
+    so is_dir() on the symlink itself raises EACCES rather than returning False."""
+    root = tmp_path / "harness"
+    skill_dir = root / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("body\n")
+    hidden = tmp_path / "hidden-subdir-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skill_dir / "tests").symlink_to(hidden / "tests")
+    (skill_dir / "phases").symlink_to(hidden / "phases")
+    try:
+        inaccessible = []
+        skills, internal, _memory = _collector.collect_on_demand(root, None, inaccessible)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert internal == []
+    recorded = {e["path"] for e in inaccessible}
+    assert "skills/demo/tests" in recorded
+    assert "skills/demo/phases" in recorded
+    assert skills and skills[0]["has_test"] is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_on_demand_unreadable_memory_dir_records_inaccessible(tmp_path):
+    root = tmp_path / "harness"
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    slug = _collector._project_slug(project_root)
+    (root / "projects" / slug / "memory").mkdir(parents=True)
+    os.chmod(root / "projects" / slug, 0o600)
+    try:
+        inaccessible = []
+        _skills, _internal, memory = _collector.collect_on_demand(root, project_root, inaccessible)
+        assert memory == []
+        assert any("memory" in e["path"] for e in inaccessible)
+    finally:
+        os.chmod(root / "projects" / slug, 0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_always_loaded_unsearchable_root_records_error(unsearchable_root):
+    inaccessible, errors = [], []
+    files, variants = _collector.walk_always_loaded(
+        unsearchable_root, None, inaccessible, errors)
+    assert files == []
+    assert variants == []
+    assert any("projects" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_walk_operator_tier_nodes_unsearchable_root_records_inaccessible(unsearchable_root):
+    inaccessible = []
+    nodes = _collector._walk_operator_tier_nodes(unsearchable_root, inaccessible)
+    assert nodes == []
+    recorded = {e["path"] for e in inaccessible}
+    assert "skills" in recorded
+    assert "agents" in recorded
+    assert "commands" in recorded
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_detect_skill_test_coverage_unsearchable_root_records_error(unsearchable_root):
+    errors = []
+    result = _collector._detect_skill_test_coverage(unsearchable_root, errors)
+    assert result == []
+    assert any("skills" in e for e in errors)
+
+# S7.M3b (F6): _read_text's is_file() probe and parse_settings's is_file()/is_symlink()
+# probes were the last unguarded ENOENT-only-swallow sites in this same class -- each one
+# also re-raises EACCES from an unsearchable ancestor. Guarded now; the two tests below
+# prove the guarded outcome instead of a propagated crash.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_read_text_unsearchable_ancestor_returns_inaccessible(unsearchable_root):
+    """_read_text's is_file() probe (collector.py:182) re-raises EACCES from an
+    unsearchable ancestor exactly like the is_dir() sites above; the probe now lives
+    inside the same try as the read so both fold into (None, "INACCESSIBLE") instead
+    of propagating. Reachability: unsearchable_root's SKILL.md sits two levels below
+    the chmod'd root, so descending to it needs the cleared search bit."""
+    text, status = _collector._read_text(unsearchable_root / "skills" / "demo" / "SKILL.md")
+    assert text is None
+    assert status == "INACCESSIBLE"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_parse_settings_unsearchable_root_records_error_not_crash(unsearchable_root):
+    """parse_settings's settings_path.is_file() probe (collector.py:1451) re-raises
+    EACCES from the same unsearchable-ancestor condition; guarded now so the run
+    degrades to ({}, False) plus an errors[] entry instead of propagating out of
+    build_document. Reachability: settings.json would live directly under
+    unsearchable_root, which itself has the cleared search bit, so even a
+    same-level stat needs the missing bit."""
+    errors, blind_spots = [], []
+    settings, parsed_ok = _collector.parse_settings(unsearchable_root, errors, blind_spots)
+    assert settings == {}
+    assert parsed_ok is False
+    assert any("settings.json" in e for e in errors)
+
+
+# The is_symlink() probe guarded alongside is_file() above (collector.py: ~1470) is not
+# independently exercised by a third test: reaching it requires is_file() (stat, follows
+# symlinks) AND the already-guarded exists() to both return cleanly without raising on
+# this exact path, and os.lstat()'s directory-traversal work (what is_symlink() uses) is
+# a strict subset of os.stat()'s -- so any EACCES/ELOOP that could reach lstat() would
+# already have surfaced in one of the two preceding stat()-based calls. No mock-free,
+# non-racy filesystem construction reaches this except-block in isolation; it is kept as
+# defensive symmetry with the function's established idiom, not as independently-tested
+# behavior.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_build_document_unsearchable_root_is_degraded_not_crashed(unsearchable_root):
+    """S7.M2/M3 deferred this: build_document's chain used to RAISE on this fixture via
+    parse_settings's settings_path.is_file() before S7.M3b guarded it. Now the whole
+    document degrades instead of crashing. `_CRASH_ERROR_PREFIX` is only ever added by
+    main()'s wrapper, never by build_document itself, so that check alone can't
+    distinguish "degraded gracefully" from "crashed and got wrapped" at this call level
+    -- the load-bearing assertions pin the ACTUAL recorded content: the pre-existing
+    "skills" is_dir() guard (Task 1/2) still fires, and this task's own is_file() guard
+    names the probe it caught, so a future regression that silently drops either
+    recording fails this test instead of a truthy check passing on unrelated content."""
+    doc = _collector.build_document(unsearchable_root, None)
+    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+    recorded = {e["path"]: e["reason"] for e in doc["inaccessible"]}
+    assert recorded.get("skills") == "unreadable"
+    assert any("settings.json is_file() check failed" in e for e in doc["errors"])
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_build_document_compose_unsearchable_root_is_degraded_not_crashed(
+    unsearchable_root, tmp_path
+):
+    """Compose-tier analog of the test above: same fixture, project_root supplied so
+    tier_composition is populated too. Same specific-content assertions as above --
+    see that test's docstring for why a truthy check is insufficient here."""
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    doc = _collector.build_document(unsearchable_root, project_root, compose=True)
+    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+    assert "tier_composition" in doc
+    recorded = {e["path"]: e["reason"] for e in doc["inaccessible"]}
+    assert recorded.get("skills") == "unreadable"
+    assert any("settings.json is_file() check failed" in e for e in doc["errors"])
+
+
+# S7.M3c (F6): three more unguarded-EACCES sites closing this chain -- check_phantom_refs'
+# resolved_target.is_file() probe, _project_tier_duplication_corpus's two silent `except
+# OSError: continue|pass` swallows, and _iter_descendant_dirs's os.walk (default
+# onerror=None discards a per-directory listing failure). Each test below builds a REAL
+# unreadable construction (no mocks) and confirms the OSError is recorded rather than
+# either propagating or vanishing silently.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_check_phantom_refs_stripped_target_permission_denied_recorded_inaccessible(tmp_path):
+    """check_phantom_refs' `resolved_target.is_file()` probe (collector.py ~3740) is
+    reachable WITHOUT a race: `_safe_exists(candidate)` validates the CANDIDATE's own
+    ancestor chain, but `candidate.resolve()` can legitimately succeed (pathlib's
+    non-strict resolve() lexically pops a `..` segment without ever stat-ing the
+    component it cancels) while landing on a resolved_target that sits beneath a
+    DIFFERENT, genuinely unreadable in-root ancestor that the original candidate's own
+    stat-based exists() check never had to touch. Reachability, confirmed empirically:
+    `root/rules/x.md` -> `../nonexistent_dir/../mid/deep/target.md` (relative symlink).
+    `_safe_exists` on the symlink itself returns present=True via the is_symlink()
+    shortcut (exists() cleanly hits ENOENT on the never-created `nonexistent_dir` and
+    stops there, never reaching the real `mid`), but pathlib's resolve() pops the
+    `nonexistent_dir/..` pair PURELY LEXICALLY (no filesystem check for `..`) and lands
+    on the real, chmod(0) `mid/deep/target.md` -- so a subsequent is_file() on that
+    resolved path raises EACCES where the original probe raised nothing.
+
+    Load-bearing anti-oracle assertion: the token must be DROPPED (recorded inaccessible,
+    never asserted resolved OR missing) -- reporting it either way would reopen the
+    existence oracle S6b.M7 closes."""
+    root = tmp_path / "harness"
+    (root / "rules").mkdir(parents=True)
+    (root / "mid" / "deep").mkdir(parents=True)
+    (root / "mid" / "deep" / "target.md").write_text("body\n")
+    (root / "rules" / "x.md").symlink_to("../nonexistent_dir/../mid/deep/target.md")
+    os.chmod(root / "mid", 0)
+    try:
+        inaccessible: list = []
+        corpus_files = [("CLAUDE.md", "See `rules/x.md:12` for details.")]
+        refs = _collector.check_phantom_refs(root, corpus_files, inaccessible)
+    finally:
+        os.chmod(root / "mid", 0o755)
+    assert refs == []
+    assert inaccessible == [{"path": "rules/x.md", "reason": "unreadable"}]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_tier_duplication_corpus_unreadable_claude_records_blind_spots(tmp_path):
+    """_project_tier_duplication_corpus's two `except OSError: continue|pass` swallows
+    (collector.py ~3270, ~3286) each let an unreadable project-tier surface yield zero
+    candidates with NO signal -- indistinguishable from a genuinely empty/absent surface.
+    A single chmod(0) on `.claude` reaches BOTH swallows in one pass: every
+    `_PROJECT_DUP_SURFACE_DIRS` entry (rules/agents/commands) is-dir() re-raises EACCES
+    from the unsearchable ancestor, and so does the separate `skills_dir.is_dir()` check
+    below it. blind_spots (already a parameter of this function) is the recording
+    channel -- pinning all four specific entries so a regression that dropped even one
+    silently would fail this test instead of a generic non-empty check passing."""
+    project_root = tmp_path / "repo"
+    claude = project_root / ".claude"
+    (claude / "rules").mkdir(parents=True)
+    (claude / "skills").mkdir(parents=True)
+    os.chmod(claude, 0o600)
+    try:
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        corpus = _collector._project_tier_duplication_corpus(
+            project_root, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(claude, 0o755)
+    assert corpus == []
+    assert any(".claude/rules" in b for b in blind_spots)
+    assert any(".claude/agents" in b for b in blind_spots)
+    assert any(".claude/commands" in b for b in blind_spots)
+    assert any("skills" in b for b in blind_spots)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_project_tier_nodes_unreadable_claude_records_errors(tmp_path):
+    """_walk_project_tier_nodes's `except OSError: is_skills_dir/is_dir = False` swallows
+    (collector.py ~1409, ~1441) each let an unreadable project-tier surface yield an
+    empty node list with NO signal -- the project-tier twin of
+    _walk_operator_tier_nodes's inaccessible fix (T4/S7), scanning the exact same
+    .claude/skills, .claude/agents, .claude/commands directories as
+    test_project_tier_duplication_corpus_unreadable_claude_records_blind_spots above. A
+    single chmod(0) on `.claude` reaches BOTH remaining swallows in one pass:
+    skills_dir.is_dir() and the agents/commands loop's d.is_dir() (twice) all re-raise
+    EACCES from the unsearchable parent. `errors` (matching `_walk_project_tier`'s
+    channel for the IDENTICAL os.stat/is_dir failures, S7) is the recording channel --
+    pinning the specific entries so a regression that dropped even one silently would
+    fail this test instead of a generic non-empty check passing."""
+    project_root = tmp_path / "repo"
+    claude = project_root / ".claude"
+    (claude / "skills").mkdir(parents=True)
+    (claude / "agents").mkdir(parents=True)
+    (claude / "commands").mkdir(parents=True)
+    os.chmod(claude, 0o600)
+    try:
+        out_of_root_refs: list = []
+        errors: list = []
+        nodes = _collector._walk_project_tier_nodes(project_root, out_of_root_refs, errors)
+    finally:
+        os.chmod(claude, 0o755)
+    assert nodes == []
+    assert any(f"project skills is_dir failed for {claude / 'skills'}" in e for e in errors)
+    assert any(f"project agents is_dir failed for {claude / 'agents'}" in e for e in errors)
+    assert any(f"project commands is_dir failed for {claude / 'commands'}" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_skill_has_test_asset_unreadable_nested_dir_records_error(tmp_path):
+    """_iter_descendant_dirs's os.walk (collector.py ~4122) previously ran with the
+    default onerror=None, which SILENTLY DISCARDS a per-directory listing failure
+    partway through the walk -- making an unreadable nested subtree return a DETERMINED
+    has_test: False instead of surfacing the gap. `errors` is optional (defaults to
+    None) so the pre-existing single-argument callers (see
+    test_skill_has_test_asset_ignores_pruned_dirs above) keep working unmodified.
+    Reachability: the skill dir's own tests/evals check (the DO-NOT-TOUCH guard, already
+    reported elsewhere) must pass cleanly first -- `locked` is neither name, so os.walk
+    reaches it and its own os.scandir(locked) raises EACCES when os.walk tries to
+    recurse into it, invoking the new onerror callback."""
+    skill_dir = tmp_path / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    locked = skill_dir / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0)
+    try:
+        errors: list = []
+        has_test = _collector._skill_has_test_asset(skill_dir, errors)
+    finally:
+        os.chmod(locked, 0o755)
+    assert has_test is False
+    assert any("locked" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_build_document_unreadable_nested_skill_dir_is_degraded_not_crashed(tmp_path):
+    """build_document-level integration of the _skill_has_test_asset walk-error guard
+    above: proves the new onerror recording reaches all the way to the top-level errors[]
+    without build_document crashing, and that test_coverage still reports a (conservative)
+    has_test: False for the affected skill rather than raising. Specific-content
+    assertion (not a truthy check) so a regression that silently dropped the recording,
+    while the run still completed, would fail this test."""
+    root = tmp_path / "harness"
+    skill_dir = root / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\ndescription: d\n---\nbody\n")
+    locked = skill_dir / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0)
+    try:
+        doc = _collector.build_document(root, None)
+    finally:
+        os.chmod(locked, 0o755)
+    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+    assert any("skill descendant walk failed" in e and "locked" in e for e in doc["errors"])
+    skills_result = {s["name"]: s["has_test"] for s in doc["test_coverage"]["skills"]}
+    assert skills_result.get("demo") is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_main_unsearchable_root_never_triggers_crash_backstop(unsearchable_root):
+    """`_CRASH_ERROR_PREFIX` is appended in exactly ONE place: main()'s top-level `except
+    Exception` around the build_document(...) call. parse_settings's own docstring
+    claims that backstop "no longer has an organic trigger via settings.json
+    specifically" now that every is_dir()/is_file()/is_symlink()/os.walk site in this F6
+    chain (Tasks 1-3c) is guarded. This test proves that claim via the real CLI
+    subprocess entry point (run_collector) against the same unsearchable_root fixture
+    every guard test above uses -- nothing here asserts the backstop is unreachable in
+    general, only that THIS fixture, which used to crash before S7.M2/M3b, no longer
+    reaches it."""
+    doc = run_collector(unsearchable_root)
+    assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+
+
+# ---------------------------------------------------------------------------------
+# WRITE-SIDE CONTAINMENT — what these tests do and do NOT pin.
+#
+# Six attack classes were enumerated against write_text_contained. FOUR ARE CLOSED and
+# each has a pinned regression test below; TWO ARE ACCEPTED RESIDUALS and deliberately
+# have NO test, because there is nothing to assert:
+#
+#   1 symlinked PARENT ................. CLOSED  ..._rejects_symlinked_parent
+#   2 swapped GRANDPARENT / intermediate  CLOSED  ..._rejects_parent_reached_through_a_
+#                                                   symlinked_grandparent, and the walk
+#                                                   itself in test_reject_if_pinned_dir_*
+#   3 hard-link truncation ............. CLOSED  ..._preserves_hardlinked_inode
+#   4 overwriting a read input ......... CLOSED  ..._refuses_to_overwrite_one_of_its_own_
+#                                                   read_inputs (pre-open) and
+#                                                   ..._reject_if_pinned_target_is_an_
+#                                                   input_path_* (post-pin)
+#   5 concurrent RENAME of the pinned directory into a guard root ......... ACCEPTED
+#   6 bind-mount alias of a guard-root descendant ......................... ACCEPTED
+#
+# Classes 5 and 6 were reproduced on a real filesystem and are not closable in portable
+# POSIX -- an fd pins an inode, not where that inode lives. They are accepted because any
+# attacker positioned to exploit them can already modify this tool's own source, so no
+# in-process check can be load-bearing against them. Settled 2026-08-02; authoritative
+# record RISK_REGISTER R11 + AMENDMENTS A36. If you are here because a review re-found
+# class 5 or 6: that is expected and pre-answered -- read R11 rather than re-deriving it.
+# A further VARIANT of 5 or 6 is the same accepted class. What would void the acceptance
+# is a THIRD class reachable without that privilege line.
+#
+# Do not add a test that asserts classes 5/6 are prevented; they are not.
+#
+# A THIRD documented limitation, distinct from 5 and 6: class 4's PRE-OPEN input_paths
+# rung (`_reject_if_target_is_an_input_path`, checked against `out_path` before the
+# parent is even opened) is NOT independently pinned by any test. Mutation testing found
+# that stubbing the post-pin rung alone fails its own test, and stubbing BOTH rungs fails
+# the e2e test, but stubbing the pre-open rung ALONE leaves the whole suite green -- the
+# two rungs are mutually redundant on every static filesystem layout this suite can build,
+# the same reason the plan gives for the post-pin rung's own coverage gap. This is a
+# DECISION, not an oversight: binding condition 4 ("each closed class carries a pinned
+# regression test") IS satisfied for class 4 -- the class is pinned by the post-pin rung,
+# which is the authoritative one. What is unpinned is one of two redundant rungs, not the
+# class itself. A test that cannot fail would report coverage that does not exist, which
+# is the same dishonesty the F6 half of this stage spent five tasks removing, relocated
+# into the suite -- so no test is added for it here.
+# ---------------------------------------------------------------------------------
+
+
+def _guard_root(tmp_path):
+    root = tmp_path / "guarded"
+    root.mkdir()
+    return root
+
+
+def test_write_text_contained_writes_content(tmp_path):
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    _collector.write_text_contained(target, '{"a":1}', [_guard_root(tmp_path)])
+    assert target.read_text(encoding="utf-8") == '{"a":1}'
+    assert list(out_dir.glob("*.tmp")) == []
+
+
+def test_write_text_contained_rejects_symlinked_parent(tmp_path):
+    """O_NOFOLLOW: a parent whose FINAL component is a symlink is refused outright.
+    Both real callers pass a path validate_write_target already resolve()d, so this
+    only fires when the parent became a symlink AFTER resolution — the attack."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link"
+    os.symlink(real_dir, link_dir)
+    with pytest.raises(OSError):
+        _collector.write_text_contained(link_dir / "r.json", "x", [_guard_root(tmp_path)])
+    assert not (real_dir / "r.json").exists()
+
+
+def test_write_text_contained_rejects_parent_that_is_a_guard_root(tmp_path):
+    guard = _guard_root(tmp_path)
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(guard / "r.json", "x", [guard])
+    assert not (guard / "r.json").exists()
+
+
+def test_write_text_contained_rejects_parent_inside_a_guard_root(tmp_path):
+    guard = _guard_root(tmp_path)
+    inner = guard / "nested" / "deeper"
+    inner.mkdir(parents=True)
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(inner / "r.json", "x", [guard])
+    assert not (inner / "r.json").exists()
+
+
+def test_write_text_contained_preserves_hardlinked_inode(tmp_path):
+    """F5: an outside-root path hard-linked to an inode ALSO linked under --root passes
+    every resolve()-based check (hard links are invisible to path resolution). The write
+    must retarget the NAME at a fresh inode, never truncate the shared one."""
+    guard = _guard_root(tmp_path)
+    protected = guard / "protected.md"
+    protected.write_text("ORIGINAL", encoding="utf-8")
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    os.link(protected, target)
+    original_ino = os.stat(protected).st_ino
+    assert os.stat(target).st_ino == original_ino
+
+    _collector.write_text_contained(target, "REPLACED", [guard])
+
+    assert protected.read_text(encoding="utf-8") == "ORIGINAL"
+    assert os.stat(protected).st_ino == original_ino
+    assert target.read_text(encoding="utf-8") == "REPLACED"
+    assert os.stat(target).st_ino != original_ino
+
+
+def test_write_text_contained_removes_temp_file_on_encode_failure(tmp_path):
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    with pytest.raises(UnicodeEncodeError):
+        _collector.write_text_contained(
+            target, "lone \ud800 surrogate", [_guard_root(tmp_path)])
+    assert list(out_dir.iterdir()) == [], "no temp residue may survive a failed write"
+    assert not target.exists()
+
+
+def test_write_text_contained_reports_dir_fd_support_on_this_platform():
+    """F4: the fast path must actually be taken here, or every other test in this file
+    is silently exercising only the fallback."""
+    assert _collector._dir_fd_write_supported() is True
+
+
+def test_write_text_contained_falls_back_when_dir_fd_unsupported(
+        tmp_path, monkeypatch):  # mock-ok: swaps a real capability set, filesystem stays real
+    """F4: the fallback is an EXPLICIT branch, not a dark path. Only the capability
+    check is monkeypatched — the filesystem stays real."""
+    monkeypatch.setattr(os, "supports_dir_fd", frozenset())  # mock-ok: real capability set, real fs
+    assert _collector._dir_fd_write_supported() is False
+
+    guard = _guard_root(tmp_path)
+    protected = guard / "protected.md"
+    protected.write_text("ORIGINAL", encoding="utf-8")
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    os.link(protected, target)
+
+    _collector.write_text_contained(target, "REPLACED", [guard])
+
+    assert target.read_text(encoding="utf-8") == "REPLACED"
+    assert protected.read_text(encoding="utf-8") == "ORIGINAL"  # F5 holds on the fallback too
+    assert list(out_dir.glob("*.tmp")) == []
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(guard / "r.json", "x", [guard])
+
+
+def test_write_text_contained_refuses_to_overwrite_one_of_its_own_read_inputs(tmp_path):
+    """F-P2 (added at plan review): the `input_paths` dimension must be re-checked at
+    WRITE time, not only at caller entry. The motivating case is a read input that sits
+    OUTSIDE every guarded root -- guard-root containment alone would wrongly allow it, so
+    this is the only check standing between `--out <a read input>` and overwriting it.
+
+    Three rungs, matching validate_write_target's ladder: literal equality, resolved
+    equality, and inode identity through a symlinked input. The third is the one a string
+    compare cannot catch."""
+    guard = _guard_root(tmp_path)
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+
+    literal_input = out_dir / "config.json"
+    literal_input.write_text("KEEP ME", encoding="utf-8")
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(
+            literal_input, "CLOBBERED", [guard], input_paths=[literal_input])
+    assert literal_input.read_text(encoding="utf-8") == "KEEP ME"
+
+    # Inode identity: the declared input is a SYMLINK onto the write target, so neither
+    # the literal nor the resolved-string compare sees a match -- only samestat does.
+    real_target = out_dir / "result.json"
+    real_target.write_text("KEEP ME TOO", encoding="utf-8")
+    aliased_input = tmp_path / "alias.json"
+    aliased_input.symlink_to(real_target)
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(
+            real_target, "CLOBBERED", [guard], input_paths=[aliased_input])
+    assert real_target.read_text(encoding="utf-8") == "KEEP ME TOO"
+
+    # Control: an unrelated declared input must NOT block a legitimate write.
+    unrelated = tmp_path / "unrelated.json"
+    unrelated.write_text("x", encoding="utf-8")
+    _collector.write_text_contained(
+        out_dir / "fresh.json", "WRITTEN", [guard], input_paths=[unrelated])
+    assert (out_dir / "fresh.json").read_text(encoding="utf-8") == "WRITTEN"
+
+
+def test_write_text_contained_refuses_when_pinned_parent_stops_matching_its_realpath(
+        tmp_path, monkeypatch):  # mock-ok: interposes on real fs timing, delegates to the real os.stat
+    """The ABA `samestat` branch is the ONE guard in this helper that no other test
+    forces. `rejects_symlinked_parent` exercises O_NOFOLLOW at open() and
+    `rejects_parent_inside_a_guard_root` exercises the ancestry check -- BOTH take the
+    no-mismatch path through the samestat comparison, so without this test the branch
+    that actually closes the ABA race is never executed. Plan review flagged it.
+
+    This does NOT fake a return value: it performs a REAL directory swap on a REAL
+    filesystem at the moment the helper resolves the parent, then delegates to the real
+    os.stat. Every value the helper sees is a genuine kernel result -- the interposition
+    only controls WHEN the swap happens, deterministically forcing the interleaving a
+    true race would hit only intermittently. Same technique, and same `mock-ok`
+    justification, as the pre-existing
+    test_write_html_safely_recheck_immediately_before_mkstemp_closes_toctou_window."""
+    guard = _guard_root(tmp_path)
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    target = out_dir / "r.json"
+
+    real_stat = os.stat
+    swapped = {"done": False}
+
+    def _swap_parent_then_stat(path, *args, **kwargs):
+        # ORDER IS LOAD-BEARING (Codex plan gate, P2-6): the swap must happen BEFORE
+        # delegating to the real os.stat. An earlier draft called real_stat FIRST and
+        # returned the pre-swap result -- which still samestat'd the pinned fstat, so the
+        # mismatch branch never fired and the test proved nothing. Swap, THEN stat, so the
+        # value the helper receives describes the NEW directory while its fd still pins the
+        # old one. That divergence is precisely the ABA condition under test.
+        if not swapped["done"] and Path(path) == out_dir:
+            swapped["done"] = True
+            out_dir.rename(tmp_path / "reports-moved")
+            decoy.rename(out_dir)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", _swap_parent_then_stat)  # mock-ok: real fs swap, real os.stat delegate
+    # THE CAPABILITY SET MUST BE REPAIRED, or this test silently proves nothing.
+    # `os.supports_dir_fd` holds FUNCTION OBJECTS, not names, so replacing `os.stat`
+    # removes it from that set -- `_dir_fd_write_supported()` then returns False and the
+    # whole call routes to the FALLBACK branch, whose documented TOCTOU limitation means
+    # the write COMPLETES into the swapped-in decoy and no WriteContainmentError is ever
+    # raised. Measured, not theorised: without these two lines this test fails DID NOT
+    # RAISE and the bytes land in the decoy directory. Re-registering the wrapper keeps
+    # the dir_fd branch selected while changing nothing about the filesystem.
+    monkeypatch.setattr(  # mock-ok: re-registers the real-delegating wrapper in the real capability set
+        os, "supports_dir_fd",
+        frozenset({os.open, os.rename, os.unlink, _swap_parent_then_stat}))
+    assert _collector._dir_fd_write_supported() is True, \
+        "this test must exercise the dir_fd branch, not the fallback"
+
+    with pytest.raises(_collector.WriteContainmentError) as excinfo:
+        _collector.write_text_contained(target, "x", [guard])
+    monkeypatch.undo()  # mock-ok: restores the real os.stat before the assertions below
+
+    assert "TOCTOU" in str(excinfo.value) or "no longer the opened directory" in str(excinfo.value)
+    assert swapped["done"], "the swap never fired — the test proved nothing; fix the trigger"
+    assert not (tmp_path / "reports" / "r.json").exists()
+    assert not (tmp_path / "reports-moved" / "r.json").exists()
+
+
+def test_reject_if_pinned_dir_inside_guard_roots_decides_from_the_descriptor(tmp_path):
+    """Class 2's MECHANISM, unit-tested directly rather than through the helper.
+
+    The end-to-end test below proves a symlinked grandparent is refused, but it cannot
+    prove WHICH rung refused it -- the ABA samestat check and the pathname predicate would
+    both also fire on that shape. This test calls the walk on its own, so a regression that
+    quietly reverted the dir_fd branch to `_reject_if_parent_inside_guard_roots` would fail
+    here even while the end-to-end test kept passing.
+
+    Also pins Y3 (descriptor ownership) and Y4 (absence permits / ambiguity denies), which
+    until now were verified only by a throwaway probe. Making them permanent is the point:
+    the Y3 leak was one fd per SUCCESSFUL traversal, so it is invisible to any test that
+    only checks the raise."""
+    guard = _guard_root(tmp_path)
+    nested = guard / "nested" / "deeper"
+    nested.mkdir(parents=True)
+    outside = tmp_path / "reports"
+    outside.mkdir()
+
+    def _open_fd_count():
+        # Bounded at 4096 deliberately: RLIMIT_NOFILE can be very large (or unlimited),
+        # and this runs inside a loop. A fixed ceiling is fine because the assertion is a
+        # DELTA -- a leak shifts the count regardless of where the window ends.
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        limit = 4096 if soft == resource.RLIM_INFINITY else min(soft, 4096)
+        n = 0
+        for candidate in range(limit):
+            try:
+                os.fstat(candidate)
+            except OSError:
+                continue
+            n += 1
+        return n
+
+    # (a) a descriptor OUTSIDE every guard root is permitted, and leaks nothing.
+    outside_fd = os.open(outside, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        before = _open_fd_count()
+        for _ in range(20):
+            _collector._reject_if_pinned_dir_inside_guard_roots(outside_fd, [guard])
+        assert _open_fd_count() == before, \
+            "the ancestry walk leaked a descriptor per traversal (Y3)"
+
+        # (b) an ABSENT guard root permits -- ~/.claude legitimately may not exist, and
+        #     both render paths add it as a permanent floor root (Y4).
+        _collector._reject_if_pinned_dir_inside_guard_roots(
+            outside_fd, [tmp_path / "does-not-exist"])
+    finally:
+        os.close(outside_fd)
+
+    # (c) a descriptor INSIDE a guard root is refused, established purely by walking `..`.
+    nested_fd = os.open(nested, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        before = _open_fd_count()
+        with pytest.raises(_collector.WriteContainmentError):
+            _collector._reject_if_pinned_dir_inside_guard_roots(nested_fd, [guard])
+        assert _open_fd_count() == before, "the raising path leaked a descriptor (Y3)"
+    finally:
+        os.close(nested_fd)
+
+    # (d) the descriptor IS the guard root.
+    guard_fd = os.open(guard, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(_collector.WriteContainmentError):
+            _collector._reject_if_pinned_dir_inside_guard_roots(guard_fd, [guard])
+    finally:
+        os.close(guard_fd)
+
+
+def test_write_text_contained_rejects_parent_reached_through_a_symlinked_grandparent(
+        tmp_path):
+    """Class 2, end to end. O_NOFOLLOW constrains only the FINAL component, so an
+    INTERMEDIATE symlink is still followed by os.open and the fd ends up pinned inside the
+    guard root while the caller's spelling of the path looks safe. The write must be
+    refused. `deeper` is a real directory -- only `grand` is a symlink -- so O_NOFOLLOW
+    alone is satisfied and cannot be what saves us.
+
+    WHAT THIS PINS, precisely: that the fd-anchored walk is WIRED and load-bearing on the
+    dir_fd path. Verified by mutation while writing this plan -- stub the walk out and the
+    write COMPLETES, landing under the guard root.
+
+    WHAT IT DOES NOT PIN: that the walk is strictly stronger than the old pathname
+    predicate on THIS layout. Also measured: `_reject_if_parent_inside_guard_roots` refuses
+    this same static shape too, because `_physical_key` is `os.path.realpath` and so
+    resolves the intermediate symlink before the ancestry compare. The walk's advantage is
+    structural rather than visible here -- it decides about the object actually written
+    through instead of relying on a separate resolution agreeing with the kernel's -- and
+    the shapes where the two genuinely diverge need a concurrent swap, which is a timing
+    condition no static test can stage. Do not "strengthen" this docstring into a claim the
+    test does not support."""
+    guard = _guard_root(tmp_path)
+    (guard / "nested" / "deeper").mkdir(parents=True)
+    grand = tmp_path / "grand"
+    grand.symlink_to(guard / "nested")
+
+    with pytest.raises(_collector.WriteContainmentError):
+        _collector.write_text_contained(grand / "deeper" / "r.json", "x", [guard])
+    assert not (guard / "nested" / "deeper" / "r.json").exists()
+    assert list((guard / "nested" / "deeper").iterdir()) == [], "no temp residue either"
+
+
+def test_reject_if_pinned_target_is_an_input_path_binds_identity_to_the_descriptor(
+        tmp_path):
+    """Class 4's POST-PIN rung (Y5), unit-tested directly — and here is why it is NOT
+    tested end-to-end through write_text_contained.
+
+    On a STATIC filesystem the pre-open rung already catches every case this one does: its
+    third comparison is an os.path.samestat, so it sees hard links and symlink aliases too.
+    Any end-to-end scenario I can set up deterministically is therefore caught BEFORE the
+    pin, and an end-to-end test would pass without this rung existing at all — the X6
+    failure mode (a test that proves nothing because a different guard fired). What this
+    rung adds is coverage of a REDIRECT APPLIED AFTER the pre-open check, which is a timing
+    condition, not a filesystem layout. So it is pinned at the unit level, where the
+    identity comparison and the exception policy can both be asserted honestly.
+
+    The exception policy is asserted in BOTH directions deliberately: 'absence permits' and
+    'ambiguity denies' are one edit away from collapsing into a single branch, and either
+    collapse is silent — permit-on-ambiguity fails open, deny-on-absence rejects every
+    first write."""
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    target.write_text("ON DISK", encoding="utf-8")
+
+    dir_fd = os.open(out_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        # (a) identity match through a path the name compare cannot see: the declared
+        #     input is a hard link to the same inode, under a different name.
+        aliased = tmp_path / "input-alias.json"
+        os.link(target, aliased)
+        with pytest.raises(_collector.WriteContainmentError):
+            _collector._reject_if_pinned_target_is_an_input_path(
+                dir_fd, "r.json", [aliased])
+
+        # (b) unrelated input: permitted.
+        unrelated = tmp_path / "unrelated.json"
+        unrelated.write_text("x", encoding="utf-8")
+        _collector._reject_if_pinned_target_is_an_input_path(dir_fd, "r.json", [unrelated])
+
+        # (c) ABSENCE PERMITS, target side: a name with nothing under it yet cannot alias
+        #     anything. This is every first write.
+        _collector._reject_if_pinned_target_is_an_input_path(
+            dir_fd, "not-created-yet.json", [aliased])
+
+        # (d) ABSENCE PERMITS, input side: a declared input that is gone is skipped, and
+        #     the remaining inputs are still checked -- not short-circuited past.
+        os.unlink(unrelated)
+        with pytest.raises(_collector.WriteContainmentError):
+            _collector._reject_if_pinned_target_is_an_input_path(
+                dir_fd, "r.json", [unrelated, aliased])
+
+        # (e) empty input list is a no-op.
+        _collector._reject_if_pinned_target_is_an_input_path(dir_fd, "r.json", [])
+    finally:
+        os.close(dir_fd)
+
+
+def test_write_text_contained_reports_a_symlink_loop_as_an_oserror(tmp_path):
+    """Codex challenge finding F7, REPRODUCED before fixing: `Path.resolve()` raises
+    RuntimeError -- NOT OSError -- on a symlink loop (measured on CPython 3.11:
+    "Symlink loop from ..."). Both `.resolve()` sites in
+    `_reject_if_target_is_an_input_path` sat inside `except OSError`, so a looping path
+    escaped as an unhandled RuntimeError past every caller's `except OSError`.
+
+    Both directions are pinned because both were reproduced: a looping INPUT path and a
+    looping TARGET path. The contract this asserts is only that the failure arrives as an
+    OSError (WriteContainmentError is one) -- it deliberately does NOT assert that a loop
+    is *permitted* or *refused*, because that is not the point: the point is that the
+    documented exception policy holds instead of a foreign exception type escaping."""
+    guard = _guard_root(tmp_path)
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    assert loop_a.is_symlink(), "fixture must really be a loop, not a broken link"
+
+    # (a) looping INPUT path: resolution of the declared input is what loops.
+    try:
+        _collector.write_text_contained(
+            out_dir / "r.json", "x", [guard], input_paths=[loop_a])
+    except OSError:
+        pass
+    except RuntimeError as exc:      # pragma: no cover - this is the defect being fixed
+        pytest.fail(f"symlink-loop input escaped as RuntimeError, not OSError: {exc}")
+
+    # (b) looping TARGET path: resolution of out_path itself is what loops.
+    with pytest.raises(OSError):
+        _collector.write_text_contained(
+            loop_a / "r.json", "x", [guard], input_paths=[tmp_path / "unrelated.json"])
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_write_text_contained_writes_into_an_unreadable_drop_box(tmp_path):
+    """P2-1 REGRESSION: the fd-pinned write must not demand MORE permission than the
+    pre-S7 mkstemp write it replaced.
+
+    mkstemp needs write + execute on the output directory. `os.open(parent, O_RDONLY)`
+    additionally needs READ, so a 0o333 drop-box -- writable, deliberately not listable --
+    started failing EACCES where it used to succeed. Reproduced live before the fix.
+    The default report directory is 0o755, which is why nothing else in this file caught it.
+
+    The assertion is deliberately about the OUTCOME (the bytes land) rather than about
+    which open flag was used: the flag is a platform detail, the permission floor is the
+    contract."""
+    assert _collector._dir_fd_write_supported() is True, (
+        "this test is only meaningful on the fd-pinned branch")
+    guard = _guard_root(tmp_path)
+    out_dir = tmp_path / "dropbox"
+    out_dir.mkdir()
+    target = out_dir / "r.json"
+    os.chmod(out_dir, 0o333)
+    try:
+        _collector.write_text_contained(target, '{"a":1}', [guard])
+    finally:
+        os.chmod(out_dir, 0o755)
+    assert target.read_text(encoding="utf-8") == '{"a":1}'
+    assert list(out_dir.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_write_text_contained_writes_below_a_traverse_only_ancestor(tmp_path):
+    """P2-1 REGRESSION, the WIDER half: the fd-anchored `..` walk climbs to the namespace
+    root, so ONE unreadable ancestor anywhere above the output directory broke the write --
+    even when the output directory itself was a perfectly ordinary 0o755.
+
+    0o111 is the shape that matters: traversable, not listable. That is a normal way to
+    expose a deep path without exposing the directory's contents, and the pre-S7 write
+    handled it because mkstemp never opened an ancestor at all. The walk only ever
+    `fstat`s what it opens and uses it as the anchor for the next `..`; it never lists
+    entries, so requiring read here was privilege the walk does not use."""
+    assert _collector._dir_fd_write_supported() is True, (
+        "this test is only meaningful on the fd-pinned branch")
+    guard = _guard_root(tmp_path)
+    ancestor = tmp_path / "traverse-only"
+    out_dir = ancestor / "reports"
+    out_dir.mkdir(parents=True)
+    target = out_dir / "r.json"
+    os.chmod(ancestor, 0o111)
+    try:
+        _collector.write_text_contained(target, "PAYLOAD", [guard])
+    finally:
+        os.chmod(ancestor, 0o755)
+    assert target.read_text(encoding="utf-8") == "PAYLOAD"
+    assert list(out_dir.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_write_text_contained_without_a_search_only_flag_keeps_the_old_behaviour(
+        tmp_path, monkeypatch):  # mock-ok: swaps a real capability probe, filesystem stays real
+    """The search-only downgrade is a PLATFORM CAPABILITY, so its absence must degrade to
+    the previous behaviour rather than crash. Simulates a platform with no usable
+    search-only directory flag (no O_SEARCH) by neutering the probe -- the filesystem and
+    every open stay real.
+
+    Two halves, both required: an ordinary directory still writes (the ladder's first rung
+    is unchanged O_RDONLY), and the unreadable drop-box surfaces the plain PermissionError
+    from that rung instead of a masked or swallowed one.
+
+    NOTE the assertion on `_dir_fd_write_supported()`: monkeypatching around this helper is
+    exactly where a test can silently drift onto the fallback branch and assert nothing."""
+    monkeypatch.setattr(_collector, "_search_only_dir_flag", lambda: None)  # mock-ok: real capability probe, real fs
+    assert _collector._dir_fd_write_supported() is True, (
+        "this test is only meaningful on the fd-pinned branch")
+    guard = _guard_root(tmp_path)
+    ordinary = tmp_path / "reports"
+    ordinary.mkdir()
+    _collector.write_text_contained(ordinary / "r.json", "OK", [guard])
+    assert (ordinary / "r.json").read_text(encoding="utf-8") == "OK"
+
+    out_dir = tmp_path / "dropbox"
+    out_dir.mkdir()
+    os.chmod(out_dir, 0o333)
+    try:
+        with pytest.raises(PermissionError):
+            _collector.write_text_contained(out_dir / "r.json", "x", [guard])
+    finally:
+        os.chmod(out_dir, 0o755)
+    assert list(out_dir.iterdir()) == [], "a refused open must leave no residue"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_traverse_only_open_ladder_does_not_weaken_the_symlinked_parent_refusal(tmp_path):
+    """CLASS 1 MUST NOT WEAKEN under the permission downgrade. Two halves, and the second
+    is the one that says something the flag names do not.
+
+    (a) The retry rung ACCEPTS the caller's extra flags: a 0o333 directory opens through
+        `_open_dir_traverse_only` with O_NOFOLLOW|O_NONBLOCK still requested. If the retry
+        rejected that flag combination the write would fail on every drop-box.
+
+    (b) A symlinked final component is still refused when the symlink's TARGET is 0o333 --
+        the permission regime that only became reachable with this change.
+
+    MEASURED, and it is stronger than "O_NOFOLLOW is carried on both rungs": O_NOFOLLOW is
+    evaluated during resolution of the final component, BEFORE the target's permission bits
+    are consulted, so rung 1 refuses a symlink with ENOTDIR and the EACCES retry is never
+    entered for this case at all. Class 1 is therefore not reachable through the new rung
+    rather than merely defended on it. Do not "strengthen" this test by asserting the
+    search-only descriptor refuses the symlink -- that path cannot be constructed, and a
+    test claiming to exercise it would be asserting nothing."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link"
+    os.symlink(real_dir, link_dir)
+    os.chmod(real_dir, 0o333)
+    try:
+        # (a) the retry rung honours extra_flags rather than refusing them
+        fd = _collector._open_dir_traverse_only(
+            real_dir, extra_flags=os.O_NOFOLLOW | os.O_NONBLOCK)
+        os.close(fd)
+        # (b) the symlinked final component is refused, target permissions notwithstanding
+        with pytest.raises(OSError) as refusal:
+            _collector._open_dir_traverse_only(
+                link_dir, extra_flags=os.O_NOFOLLOW | os.O_NONBLOCK)
+        assert not isinstance(refusal.value, PermissionError), (
+            "O_NOFOLLOW must refuse before permission is consulted, so the EACCES retry "
+            "is never reached for a symlinked final component")
+        with pytest.raises(OSError):
+            _collector.write_text_contained(
+                link_dir / "r.json", "x", [_guard_root(tmp_path)])
+        exists_through_link = os.path.lexists(link_dir / "r.json")
+    finally:
+        os.chmod(real_dir, 0o755)
+    assert not exists_through_link
+    assert not (real_dir / "r.json").exists()
+
+
+def test_collector_main_out_write_preserves_hardlinked_inode(tmp_path):
+    """End-to-end F5 through the real CLI path, not just the helper unit."""
+    root = tmp_path / "harness"
+    (root / "skills").mkdir(parents=True)
+    protected = root / "protected.md"
+    protected.write_text("ORIGINAL", encoding="utf-8")
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    out_path = out_dir / "r.json"
+    os.link(protected, out_path)
+
+    rc = _collector.main(["--root", str(root), "--project-root", str(tmp_path),
+                         "--out", str(out_path)])
+    assert rc == 0
+    assert protected.read_text(encoding="utf-8") == "ORIGINAL"
+    assert json.loads(out_path.read_text(encoding="utf-8"))["root"]
+
+
+def test_collector_main_out_write_through_symlinked_out_dir_still_works(tmp_path):
+    """REGRESSION GUARD for O_NOFOLLOW: validate_write_target resolve()s the target
+    before the helper ever sees it, so a legitimately symlinked --out dir must still
+    write. O_NOFOLLOW must only reject a parent that became a symlink AFTER resolution."""
+    root = tmp_path / "harness"
+    (root / "skills").mkdir(parents=True)
+    real_out = tmp_path / "real-reports"
+    real_out.mkdir()
+    link_out = tmp_path / "link-reports"
+    os.symlink(real_out, link_out)
+
+    rc = _collector.main(["--root", str(root), "--project-root", str(tmp_path),
+                         "--out", str(link_out / "r.json")])
+    assert rc == 0
+    assert (real_out / "r.json").exists()
+
+
+def test_collector_main_still_prints_json_and_leaves_no_temp_residue(tmp_path, capsys):
+    """The stdout contract is primary: the document is always emitted, write-or-not."""
+    root = tmp_path / "harness"
+    (root / "skills").mkdir(parents=True)
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+
+    rc = _collector.main(["--root", str(root), "--project-root", str(tmp_path),
+                         "--out", str(out_dir / "r.json")])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["schema_version"] == _collector.SCHEMA_VERSION
+    assert list(out_dir.glob("*.tmp")) == []
+
+
+def test_no_module_claims_the_write_toctou_window_is_open_on_the_fd_path():
+    """F3: a comment asserting a window is open where it is narrowed is itself a defect.
+    The 'not fully closed' claim may survive ONLY inside the documented fallback helper,
+    where it is still true — never in collector.main or write_html_safely."""
+    collector_src = Path(_collector.__file__).read_text(encoding="utf-8")
+    render_src = (Path(_collector.__file__).parent / "render_html.py").read_text(encoding="utf-8")
+    assert "not fully closed" not in render_src
+    assert collector_src.count("not fully closed") == 1, (
+        "the accepted-limitation claim must appear exactly once, in "
+        "_write_text_contained_fallback, where it is still true")
+    fallback_start = collector_src.index("def _write_text_contained_fallback")
+    assert collector_src.index("not fully closed") > fallback_start
+
+
+def test_no_module_overclaims_the_write_toctou_as_fixed():
+    """BINDING CONDITION 2, enforced rather than merely asserted in a document.
+
+    The write-side threat model is six classes considered, four closed, two ACCEPTED. A
+    comment or docstring that says the TOCTOU is 'fixed', or that the window is closed
+    without qualification, is false and will send the next reader looking for a guarantee
+    that does not exist -- which is exactly how classes 5 and 6 got re-litigated once
+    already. Settled record: RISK_REGISTER R11 / AMENDMENTS A36.
+
+    Note for anyone extending this test: the ban is on the CLAIM, so the assertion can be
+    literal here. Do not port this check to a document that also DEFINES the prohibition --
+    there the banned phrase legitimately appears and a naive grep matches its own rule."""
+    parent_dir = Path(_collector.__file__).parent
+    for module_name in ("collector.py", "render_html.py", "serve.py"):
+        src = (parent_dir / module_name).read_text(encoding="utf-8").lower()
+        for banned in ("toctou fixed", "toctou is fixed", "window is closed",
+                       "window is now closed", "toctou is closed"):
+            assert banned not in src, (
+                f"{module_name} claims '{banned}'. Four classes are closed and TWO ARE "
+                f"ACCEPTED -- say 'four closed, two accepted with rationale' instead. "
+                f"See RISK_REGISTER R11.")
+
+
+def test_exactly_one_low_level_write_implementation_exists():
+    """S6b produced four findings from the two write sinks drifting apart. Pin the
+    consolidation structurally: mkstemp may be CALLED only in the collector's documented
+    fallback helper, and render_html must not carry a second write implementation.
+
+    Counting the bare string "tempfile.mkstemp" would over-match: the module's docstrings
+    and comments name it twice in prose (explaining why the dir_fd path does NOT use it),
+    which is documentation, not a second implementation. The actual call syntax carries
+    an open paren, so counting "tempfile.mkstemp(" isolates the one real invocation."""
+    collector_src = Path(_collector.__file__).read_text(encoding="utf-8")
+    render_src = (Path(_collector.__file__).parent / "render_html.py").read_text(encoding="utf-8")
+
+    assert "tempfile" not in render_src, (
+        "render_html must not own a second write implementation — it routes through "
+        "collector.write_text_contained")
+    assert collector_src.count("tempfile.mkstemp(") == 1, (
+        "mkstemp may be CALLED only in _write_text_contained_fallback")
+    fallback_start = collector_src.index("def _write_text_contained_fallback")
+    assert collector_src.index("tempfile.mkstemp(") > fallback_start
+    assert "write_text_contained" in render_src
+    assert "write_text_contained" in render_src
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_probe_helpers_raise_on_an_unreadable_ancestor_on_every_python_version(tmp_path):
+    """Python 3.14 changed Path.is_dir()/is_file()/exists()/is_symlink() to suppress EVERY
+    OSError and return False (CPython gh-144525). Python 3.11-3.13 suppress only the ENOENT
+    family (ENOENT/ENOTDIR/EBADF/ELOOP -- pathlib._ignore_error) and RE-RAISE EACCES from an
+    unreadable ancestor. README.md advertises "Python 3.10+", so 3.14 is inside the
+    supported range.
+
+    That matters here more than almost anywhere, because this module's entire disclosure
+    invariant is "inaccessible is NOT clean". On 3.14 a pathlib probe makes every
+    `except OSError` disclosure branch below unreachable: an unreadable directory reports
+    as ABSENT, and the collector emits a confident-clean inventory over a tree it could
+    not read.
+
+    os.stat/os.lstat raise on EVERY version, which is the whole point of routing the probes
+    through them -- so this assertion is version-independent. It holds on 3.11 today and
+    keeps holding after the pathlib change, and it CANNOT be satisfied by a bare pathlib
+    probe on 3.14.
+
+    Not executed on 3.14: only Python 3.11.14 is installed in the development environment.
+    This test is what makes the guarantee checkable wherever the suite is actually run."""
+    locked = tmp_path / "locked"
+    (locked / "child").mkdir(parents=True)
+    hidden_file = locked / "child" / "leaf.md"
+    hidden_file.write_text("x", encoding="utf-8")
+    os.chmod(locked, 0)
+    try:
+        for probe, target in ((_collector._probe_is_dir, locked / "child"),
+                              (_collector._probe_is_file, hidden_file),
+                              (_collector._probe_exists, hidden_file),
+                              (_collector._probe_is_symlink, hidden_file)):
+            with pytest.raises(PermissionError):
+                probe(target)
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def test_probe_helpers_return_false_for_the_pathlib_ignored_error_family(tmp_path):
+    """Parity, not merely safety. The probes must swallow EXACTLY what pathlib swallows --
+    the ENOENT family plus the non-encodable-path ValueError -- so 3.11 behavior after the
+    swap is what it was before. Swallowing less would turn an ordinary absent path into a
+    crash at every one of the guarded probe sites; swallowing more is the 3.14 defect this
+    change exists to route around.
+
+    Changing this set requires re-reading pathlib._ignore_error for the target version."""
+    absent = tmp_path / "absent"
+    plain = tmp_path / "plain.txt"
+    plain.write_text("x", encoding="utf-8")
+    loop_a, loop_b = tmp_path / "loop_a", tmp_path / "loop_b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    broken = tmp_path / "broken"
+    broken.symlink_to(tmp_path / "nope")
+    non_encodable = Path("\x00bad")
+
+    assert _collector._probe_is_dir(absent) is False          # ENOENT
+    assert _collector._probe_is_file(absent) is False
+    assert _collector._probe_exists(absent) is False
+    assert _collector._probe_is_symlink(absent) is False
+
+    assert _collector._probe_is_dir(plain / "child") is False  # ENOTDIR
+    assert _collector._probe_is_file(plain) is True
+    assert _collector._probe_is_dir(tmp_path) is True
+
+    assert _collector._probe_exists(loop_a) is False           # ELOOP when followed
+    assert _collector._probe_is_symlink(loop_a) is True        # lstat never follows
+    assert _collector._probe_exists(broken) is False
+    assert _collector._probe_is_symlink(broken) is True
+
+    assert _collector._probe_is_dir(non_encodable) is False    # ValueError, exactly as pathlib
+    assert _collector._probe_exists(non_encodable) is False
+    assert _collector._probe_is_symlink(non_encodable) is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_safe_exists_keeps_two_probes_for_a_symlink_into_an_unreadable_tree(tmp_path):
+    """The tempting simplification of `_safe_exists` -- collapse `exists() or is_symlink()`
+    into ONE os.lstat, since "a directory entry exists at this path" is what the pair asks
+    -- is WRONG, and this fixture is the counterexample.
+
+    `link` is a symlink whose target lives under a chmod(0) directory. os.lstat(link)
+    SUCCEEDS (it never follows), so a single-lstat form answers (True, True): "present,
+    and I am sure." The two-probe form evaluates the follow-symlink stat FIRST, it raises
+    EACCES, and the answer is (False, False): "cannot determine" -- which is the entire
+    purpose of the tri-state. Confidently-present is exactly as false a claim as
+    confidently-absent when the target cannot be reached, so the ordered pair stays."""
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    target = hidden / "target.md"
+    target.write_text("x", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    os.chmod(hidden, 0)
+    try:
+        assert _collector._safe_exists(link) == (False, False)
+    finally:
+        os.chmod(hidden, 0o755)
