@@ -1,0 +1,60 @@
+{
+  "name": "claude-code",
+  "top_level_files": {
+    "root_instructions": "CLAUDE.md",
+    "settings": "settings.json",
+    "memory_index": "memory/MEMORY.md",
+    "plugin_marketplaces": "plugins/known_marketplaces.json",
+    "plugin_installed": "plugins/installed_plugins.json"
+  },
+  "container_dirs": {
+    "skills": "skills",
+    "rules": "rules",
+    "commands": "commands",
+    "agents": "agents",
+    "hooks": "hooks",
+    "hook_tests": "hooks/tests",
+    "projects": "projects",
+    "memory": "memory"
+  },
+  "projects_glob": "projects/*",
+  "memory_index_name": "MEMORY.md",
+  "skill_manifest_name": "SKILL.md",
+  "rules_globs": [
+    "rules/*.md",
+    "skills/*/rules/*.md"
+  ],
+  "skills_globs": [
+    "skills/*/SKILL.md",
+    "skills/*/*/SKILL.md",
+    "skills/*/phases/*.md",
+    "skills/*/prompts/*.md",
+    "skills/*/agents/*.md"
+  ],
+  "commands_glob": "commands/*.md",
+  "agents_glob": "agents/*.md",
+  "hook_script_globs": [
+    "hooks/*.py",
+    "hooks/*.sh"
+  ],
+  "hook_test_globs": [
+    "hooks/tests/*.py",
+    "skills/*/hooks/tests/*.py"
+  ],
+  "dispatcher_suffix": "-dispatcher.py",
+  "hook_command_remaps": [
+    [
+      "~/.claude/hooks",
+      "hooks"
+    ]
+  ],
+  "duplication_globs": [
+    "rules/*.md",
+    "skills/*/rules/*.md",
+    "skills/*/SKILL.md",
+    "skills/*/phases/*.md",
+    "agents/*.md",
+    "commands/*.md"
+  ],
+  "settings_format": "claude-code"
+}

@@ -2813,6 +2813,161 @@ _HOOK_BODY_SUFFIXES = (".py", ".sh")
 _HOOK_TEST_GLOBS = ("hooks/tests/*.py", "skills/*/hooks/tests/*.py")  # mirrors _hook_test_stems
 
 
+# --- M11 (SPEC_7 §2): layout profiles. PROFILE_CLAUDE_CODE is AUTHORITATIVE at runtime;
+# profiles/claude-code.json is its exported twin (documentation + a template for sharers),
+# pinned equal by tests/test_profiles.py::test_profile_file_matches_embedded_constant.
+# Tuples, not lists: a profile is read-only config and ORDER IS LOAD-BEARING
+# (_deduped_instruction_files is first-match-wins -- see its docstring).
+PROFILE_CLAUDE_CODE: dict[str, Any] = {
+    "name": "claude-code",
+    # Role -> root-relative path. None means "this harness has no such file".
+    "top_level_files": {
+        "root_instructions": "CLAUDE.md",
+        "settings": "settings.json",
+        "memory_index": "memory/MEMORY.md",
+        "plugin_marketplaces": "plugins/known_marketplaces.json",
+        "plugin_installed": "plugins/installed_plugins.json",
+    },
+    # Role -> root-relative dir name. None means absent. Reached by iterdir(), not glob.
+    "container_dirs": {
+        "skills": "skills", "rules": "rules", "commands": "commands",
+        "agents": "agents", "hooks": "hooks", "hook_tests": "hooks/tests",
+        "projects": "projects", "memory": "memory",
+    },
+    "projects_glob": "projects/*",
+    "memory_index_name": "MEMORY.md",
+    "skill_manifest_name": "SKILL.md",
+    "rules_globs": ("rules/*.md", "skills/*/rules/*.md"),
+    "skills_globs": ("skills/*/SKILL.md", "skills/*/*/SKILL.md", "skills/*/phases/*.md",
+                     "skills/*/prompts/*.md", "skills/*/agents/*.md"),
+    "commands_glob": "commands/*.md",
+    "agents_glob": "agents/*.md",
+    "hook_script_globs": ("hooks/*.py", "hooks/*.sh"),
+    "hook_test_globs": ("hooks/tests/*.py", "skills/*/hooks/tests/*.py"),
+    "dispatcher_suffix": "-dispatcher.py",
+    # [[literal_prefix, root_relative_dir], ...] -- the "~/.claude/hooks" remap.
+    "hook_command_remaps": (("~/.claude/hooks", "hooks"),),
+    "duplication_globs": ("rules/*.md", "skills/*/rules/*.md", "skills/*/SKILL.md",
+                          "skills/*/phases/*.md", "agents/*.md", "commands/*.md"),
+    "settings_format": "claude-code",
+}
+
+# Scalar keys accept `str | None`; None means "this harness has no such surface".
+_PROFILE_SCALAR_KEYS = ("name", "projects_glob", "memory_index_name", "skill_manifest_name",
+                        "commands_glob", "agents_glob", "dispatcher_suffix", "settings_format")
+_PROFILE_LIST_KEYS = ("rules_globs", "skills_globs", "hook_script_globs", "hook_test_globs",
+                      "duplication_globs")
+_PROFILE_MAP_KEYS = ("top_level_files", "container_dirs")
+_PROFILE_PAIR_LIST_KEYS = ("hook_command_remaps",)
+_PROFILE_SETTINGS_FORMATS = ("claude-code", "none")
+
+
+class ProfileError(ValueError):
+    """A --profile file that is unreadable, malformed, or schema-invalid. Raised BEFORE
+    any profile value is applied, so a bad profile can never HALF-apply (SPEC_7 §2)."""
+
+
+def _instruction_globs(profile: dict[str, Any]) -> tuple[str, ...]:
+    """The instruction-file corpus, in DEDUP-SIGNIFICANT order (never sorted)."""
+    return (tuple(profile["rules_globs"]) + tuple(profile["skills_globs"])
+            + tuple(g for g in (profile["commands_glob"], profile["agents_glob"]) if g))
+
+
+def _hook_body_suffixes(profile: dict[str, Any]) -> tuple[str, ...]:
+    """Suffixes for _hooks_body_corpus's scandir filter, derived from hook_script_globs
+    so the two can never disagree. sorted() -> deterministic across PYTHONHASHSEED."""
+    return tuple(sorted({Path(g).suffix for g in profile["hook_script_globs"] if Path(g).suffix}))
+
+
+def load_profile(path: Path) -> dict[str, Any]:
+    """Read + strictly validate a layout profile. READ-ONLY: this opens `path` for reading
+    and nothing else -- it is a new READ path, never a write path (CLAUDE.md rule 4).
+
+    Every check runs BEFORE the result dict is built, so a malformed profile never
+    half-applies. Unknown key -> error naming the key(s). Missing required key -> error
+    naming the key(s). Both name-lists are sorted, so the message is deterministic across
+    PYTHONHASHSEED (CLAUDE.md rule 9).
+
+    The is_file() gate mirrors parse_settings: open()-for-read on a FIFO with no writer
+    blocks forever and never raises, so a special file at this path must be rejected
+    BEFORE the read, not after."""
+    try:
+        is_regular = _probe_is_file(path)
+    except OSError as e:
+        raise ProfileError(f"profile {path.name}: cannot stat ({e!r})") from e
+    if not is_regular:
+        raise ProfileError(f"profile {path.name}: not a readable regular file")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ProfileError(f"profile {path.name}: unreadable ({e!r})") from e
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ProfileError(f"profile {path.name}: not valid JSON ({e})") from e
+    if not isinstance(data, dict):
+        raise ProfileError(f"profile {path.name}: top level must be a JSON object")
+
+    unknown = sorted(set(data) - set(PROFILE_CLAUDE_CODE))
+    if unknown:
+        raise ProfileError(f"profile {path.name}: unknown key(s): {', '.join(unknown)}")
+    missing = sorted(set(PROFILE_CLAUDE_CODE) - set(data))
+    if missing:
+        raise ProfileError(f"profile {path.name}: missing required key(s): {', '.join(missing)}")
+
+    for key in _PROFILE_SCALAR_KEYS:
+        if data[key] is not None and not isinstance(data[key], str):
+            raise ProfileError(f"profile {path.name}: {key} must be a string or null")
+    if data["name"] is None:
+        raise ProfileError(f"profile {path.name}: name must not be null")
+    if data["settings_format"] not in _PROFILE_SETTINGS_FORMATS:
+        raise ProfileError(
+            f"profile {path.name}: settings_format must be one of "
+            f"{', '.join(_PROFILE_SETTINGS_FORMATS)} (v1 supports no other adapters)")
+    for key in _PROFILE_LIST_KEYS:
+        value = data[key]
+        if not isinstance(value, list) or not all(isinstance(g, str) for g in value):
+            raise ProfileError(f"profile {path.name}: {key} must be a list of strings")
+    for key in _PROFILE_MAP_KEYS:
+        value = data[key]
+        if not isinstance(value, dict):
+            raise ProfileError(f"profile {path.name}: {key} must be a JSON object")
+        unknown_roles = sorted(set(value) - set(PROFILE_CLAUDE_CODE[key]))
+        if unknown_roles:
+            raise ProfileError(
+                f"profile {path.name}: {key} has unknown role(s): {', '.join(unknown_roles)}")
+        missing_roles = sorted(set(PROFILE_CLAUDE_CODE[key]) - set(value))
+        if missing_roles:
+            raise ProfileError(
+                f"profile {path.name}: {key} is missing role(s): {', '.join(missing_roles)}")
+        for role, entry in value.items():
+            if entry is not None and not isinstance(entry, str):
+                raise ProfileError(
+                    f"profile {path.name}: {key}.{role} must be a string or null")
+    for key in _PROFILE_PAIR_LIST_KEYS:
+        value = data[key]
+        if not isinstance(value, list):
+            raise ProfileError(f"profile {path.name}: {key} must be a list")
+        for pair in value:
+            if (not isinstance(pair, list) or len(pair) != 2
+                    or not all(isinstance(s, str) for s in pair)):
+                raise ProfileError(
+                    f"profile {path.name}: {key} entries must be [prefix, dir] string pairs")
+
+    # Built only after EVERY check passed. Lists -> tuples: order preserved, never sorted.
+    result: dict[str, Any] = {}
+    for key, value in data.items():
+        if key in _PROFILE_LIST_KEYS:
+            result[key] = tuple(value)
+        elif key in _PROFILE_PAIR_LIST_KEYS:
+            result[key] = tuple(tuple(pair) for pair in value)
+        elif key in _PROFILE_MAP_KEYS:
+            result[key] = dict(value)
+        else:
+            result[key] = value
+    return result
+
+
 def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
                                blind_spots: list[str]) -> list[Path]:
     """Shared glob-walk + dedup for the instruction-file corpus (S2.M3): the SINGLE
