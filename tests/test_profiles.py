@@ -880,3 +880,40 @@ def test_projects_glob_ignores_non_directory_matches(fake_harness):
     assert doc["errors"] == []
     slugs = {v["project_slug"] for v in doc["always_loaded"]["conditional_variants"]}
     assert "not-a-project.txt" not in slugs
+
+
+# --- M11 exit gate, Codex round, Finding 5 (P2): the compose-mode "project tier is not
+# profile-aware" disclosure gated on `profile["name"] != PROFILE_CLAUDE_CODE["name"]` --
+# `name` is an UNCONSTRAINED free-text label, so a user who copies profiles/claude-code.json,
+# changes the LAYOUT, and leaves `name: "claude-code"` got NO disclosure at all. ---
+
+def test_compose_discloses_gap_even_when_name_is_spoofed_to_claude_code(fake_harness, tmp_path):
+    """A profile with a genuinely different layout (container_dirs.skills renamed) but
+    `name` left as the literal default "claude-code" must still trigger the disclosure --
+    proving the check is content-based, not name-based."""
+    proj = fake_harness.parent / "active-repo"
+
+    def mutate(d):
+        assert d["name"] == "claude-code"          # sanity: the spoofed value IS the default
+        d["container_dirs"]["skills"] = "abilities"
+
+    p = _write_profile(tmp_path, mutate)
+    doc = json.loads(run_collector_raw(fake_harness, "--compose", "--profile", str(p),
+                                       project_root=proj).stdout)
+    assert any("project tier" in b and "Claude Code" in b for b in doc["blind_spots"]), \
+        doc["blind_spots"]
+
+
+def test_compose_omits_the_gap_disclosure_for_a_byte_identical_default_profile(
+        fake_harness, tmp_path):
+    """Regression guard for the fix itself: an explicit --profile that is a byte-identical
+    copy of profiles/claude-code.json (the common "I want to see my own layout file"
+    case) must NOT trigger the disclosure -- the content-based check must not become
+    OVER-eager relative to the old name-based one."""
+    proj = fake_harness.parent / "active-repo"
+    p = tmp_path / "same.json"
+    p.write_text((SKILL_DIR / "profiles" / "claude-code.json").read_text())
+    doc = json.loads(run_collector_raw(fake_harness, "--compose", "--profile", str(p),
+                                       project_root=proj).stdout)
+    assert not any("project tier" in b and "Claude Code" in b for b in doc["blind_spots"]), \
+        doc["blind_spots"]

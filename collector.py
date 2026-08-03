@@ -3080,6 +3080,32 @@ _PROFILE_PAIR_LIST_KEYS = ("hook_command_remaps",)
 _PROFILE_SETTINGS_FORMATS = ("claude-code", "none")
 
 
+def _is_default_layout(profile: dict[str, Any]) -> bool:
+    """True iff `profile`'s LAYOUT -- every key except the free-text `name` label -- is
+    identical to `PROFILE_CLAUDE_CODE` (M11 exit gate, Codex round, Finding 5): the
+    compose-mode "project tier is not profile-aware" disclosure used to gate on
+    `profile["name"] != PROFILE_CLAUDE_CODE["name"]`, but `name` is an UNCONSTRAINED
+    free-text label with no uniqueness or provenance guarantee -- a user who copies
+    `profiles/claude-code.json`, changes `container_dirs`/`rules_globs`/etc. to a genuinely
+    different layout, and leaves `name: "claude-code"` (the common case: nothing prompts
+    them to rename it) got NO disclosure at all that the project tier still assumes the
+    Claude Code layout regardless.
+
+    Chosen over threading extra CLI state (e.g. "was --profile passed at all") through
+    build_document/walk_always_loaded: this is a pure function of the two dicts already in
+    hand at the call site, needs no new parameter plumbed through every intermediate
+    caller, and is correct for the "I want to see MY OWN copy of claude-code.json" case
+    too -- an explicit `--profile profiles/claude-code.json` run must NOT trigger the
+    disclosure (its layout genuinely IS the default), which a CLI-state-based "was
+    --profile passed" check would get wrong.
+
+    Every list-valued role is a tuple on BOTH sides (`load_profile` normalizes lists to
+    tuples; `PROFILE_CLAUDE_CODE` is authored as tuples directly), and every map-valued
+    role is a plain dict on both sides, so `==` compares like-for-like without any
+    coercion here."""
+    return all(profile[k] == PROFILE_CLAUDE_CODE[k] for k in PROFILE_CLAUDE_CODE if k != "name")
+
+
 class ProfileError(ValueError):
     """A --profile file that is unreadable, malformed, or schema-invalid. Raised BEFORE
     any profile value is applied, so a bad profile can never HALF-apply (SPEC_7 §2)."""
@@ -5914,7 +5940,13 @@ def build_document(
     # project tier is not profile-aware (it always scans the Claude Code project layout,
     # .claude/ + CLAUDE.local.md + .mcp.json), so a --compose run under a non-default
     # profile must disclose that gap rather than let it read as silently covered.
-    if compose and profile["name"] != PROFILE_CLAUDE_CODE["name"]:
+    #
+    # M11 exit gate, Codex round, Finding 5 (P2): gated on `_is_default_layout(profile)`,
+    # not `profile["name"] != PROFILE_CLAUDE_CODE["name"]` -- `name` is an unconstrained
+    # free-text label a foreign profile could leave (or spoof) as "claude-code" while its
+    # actual layout differs, which would silently suppress this disclosure under the old
+    # name-based check.
+    if compose and not _is_default_layout(profile):
         blind_spots.append(
             "The project tier (--compose) is scanned with the Claude Code layout "
             "(.claude/, CLAUDE.local.md, .mcp.json) regardless of --profile; layout "

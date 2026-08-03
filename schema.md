@@ -480,6 +480,17 @@ RE-DERIVE it — re-grep `collector.py` for a literal Claude Code path/key along
    hook command form")`, likewise disclosed. Fixing this properly needs new profile keys
    for interpreters/suffixes, which is deferred past v1's 16-key schema (SPEC_7 §2, M11
    exit-gate Finding 5).
+8. `serve.py` has no `--profile` flag at all: its argparse (`main`) accepts none, and the
+   in-process collector invocation it builds (`_run_collector`'s `argv`) never includes
+   one, so `collector.main()` always runs under the DEFAULT profile when served live. A
+   foreign harness can be collected and rendered STATICALLY (`collector.py --profile ... `
+   piped into `render_html.py`) but cannot be served live — `serve.py --root
+   <foreign-root>` renders a near-empty dashboard with no indication a profile was ever
+   needed. This is a scope limit, not a correctness bug: the watcher-sync invariant (the
+   filesystem watcher and the served collector run must agree on what they scan) still
+   holds, because BOTH sides consistently use the default profile — there is no drift
+   between what is watched and what is collected, only a v1 limit on which layouts can be
+   served live at all (M11 exit-gate Finding 6).
 
 ## Notes
 
