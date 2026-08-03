@@ -518,7 +518,12 @@ def test_hooks_body_corpus_leaf_symlink_escape_is_gated_not_read(fake_harness, t
     outside --root). AFTER the fix, the flag is correctly flagged AND downgraded to
     resolved=None (not the confirmed-broken False) because the corpus is now known-
     incomplete -- exactly the D2 treatment `_hooks_body_corpus`'s own docstring
-    describes for an unseen hook body."""
+    describes for an unseen hook body. Disclosed via blind_spots, not inaccessible: a
+    protected test_collector.py assertion
+    (test_out_of_root_registered_dispatcher_does_not_drive_reachability) pins "an
+    out-of-root target is a blind-spot, NOT an inaccessible entry" for this identical
+    hooks/-symlink shape via reconcile_hooks' own pre-existing gate, so
+    _hooks_body_corpus's new gate follows the same convention."""
     outside = tmp_path / "outside3"
     outside.mkdir()
     (outside / "real_hook.py").write_text("import os\nos.environ.get('SUPER_GUARD_FLAG')\n")
@@ -531,4 +536,61 @@ def test_hooks_body_corpus_leaf_symlink_escape_is_gated_not_read(fake_harness, t
                 if r.get("kind") == "env_flag" and r.get("ref") == "SUPER_GUARD_FLAG"]
     assert len(env_rows) == 1, doc["phantom_refs"]
     assert env_rows[0]["resolved"] is None
-    assert any("escaped_hook.py" in e.get("path", "") for e in doc["inaccessible"])
+    assert not any("escaped_hook.py" in e.get("path", "") for e in doc["inaccessible"])
+    assert any("escaped_hook.py" in b for b in doc["blind_spots"])
+
+
+# --- M11 exit gate, Finding 3 (P2) + Finding 4 (P3): _compose_hooks must forward the
+# active profile ONLY to the profile-aware user tier, and the user-tier hook record's
+# source_file label must come from the profile's own settings role. ---
+
+def test_compose_hooks_forwards_profile_only_to_user_tier(fake_harness, tmp_path):
+    """Finding 3: _compose_hooks used to call `_script_from_command(command,
+    resolve_root)` with NO profile argument at all -- every tier, including the
+    profile-AWARE user tier, silently remapped a `~/.claude/hooks/...` command against
+    PROFILE_CLAUDE_CODE's hook_command_remaps regardless of --profile. Uses a
+    settings_format='claude-code' profile with settings PRESENT (unlike
+    _FOREIGN_PROFILE, whose settings_format='none' makes `if not settings` skip the
+    tier before this bug ever executes -- the gap the team-lead's brief names
+    explicitly) and a DISTINCTIVE hook_command_remaps target, so the user-tier record's
+    resolved `script` differs depending on whether the custom remap was actually used.
+    The project tier must resolve to the DEFAULT Claude Code remap regardless (schema.md
+    deferred coupling #1) -- proving `profile` is forwarded to user only, never
+    blanket-forwarded."""
+    proj = tmp_path / "active-repo"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 ~/.claude/hooks/proj_hook.py"}]}]}}))
+    (fake_harness / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 ~/.claude/hooks/user_hook.py"}]}]}}))
+    p = _write_profile(tmp_path, lambda d: d.__setitem__(
+        "hook_command_remaps", [["~/.claude/hooks", "custom_hooks_dir"]]))
+    doc = json.loads(run_collector_raw(fake_harness, "--compose", "--profile", str(p),
+                                       project_root=proj).stdout)
+    hooks = doc["composed_settings"]["hooks"]
+    user_records = [h for h in hooks if h["tier"] == "user"]
+    project_records = [h for h in hooks if h["tier"] == "project"]
+    assert len(user_records) == 1, hooks
+    assert len(project_records) == 1, hooks
+    assert user_records[0]["script"] == "custom_hooks_dir/user_hook.py"
+    assert project_records[0]["script"] == "hooks/proj_hook.py"
+
+
+def test_compose_hooks_user_source_file_reflects_profile_settings_role(fake_harness, tmp_path):
+    """Finding 4: the user-tier hook record's source_file used to be the hardcoded
+    literal `str(root / "settings.json")` -- a profile naming a custom
+    top_level_files.settings labeled composed hooks with a file that was never even
+    read. It must now name the file the profile actually declares."""
+    proj = fake_harness.parent / "active-repo"
+    (fake_harness / "custom_settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 hooks/x.py"}]}]}}))
+    p = _write_profile(tmp_path, lambda d: d["top_level_files"].__setitem__(
+        "settings", "custom_settings.json"))
+    doc = json.loads(run_collector_raw(fake_harness, "--compose", "--profile", str(p),
+                                       project_root=proj).stdout)
+    user_records = [h for h in doc["composed_settings"]["hooks"] if h["tier"] == "user"]
+    assert len(user_records) == 1, doc["composed_settings"]["hooks"]
+    assert Path(user_records[0]["source_file"]).name == "custom_settings.json"

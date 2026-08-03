@@ -2722,7 +2722,7 @@ def _merge_permissions_union_deny_wins(settings_stack_with_ok):
     }
 
 
-def _compose_hooks(sources, project_root, out_of_root_refs):
+def _compose_hooks(sources, project_root, out_of_root_refs, *, profile: dict[str, Any] | None = None):
     """T5 R5-B: source-aware hook UNION across User/Project/Local (§3: hooks merge by
     union — every matching hook fires regardless of tier, unlike settings scalars/MCP
     which pick one precedence winner). Each record retains `event`, `matcher`, `tier`, and
@@ -2735,7 +2735,20 @@ def _compose_hooks(sources, project_root, out_of_root_refs):
     project/local tier script path is routed through T3's `_project_tier_gate` (H2
     containment) before its existence is reported — an escaping symlink target is
     recorded as an `out_of_root_ref`, `exists` reported as `None` (unknown/untrusted),
-    never followed."""
+    never followed.
+
+    M11 exit gate, Finding 3 (P2): `profile` is forwarded to `_script_from_command` ONLY
+    for the `tier == "user"` source -- that is the single PROFILE-AWARE tier (it resolves
+    against the OPERATOR root, the one --profile describes). Project and local tiers keep
+    the Claude Code layout unconditionally (schema.md's deferred coupling #1) by passing
+    `profile=None`, which defaults `_script_from_command` back to `PROFILE_CLAUDE_CODE`
+    regardless of the active profile -- blanket-forwarding `profile` to every tier would
+    remap a project/local `~/.claude/hooks/...` command under a non-default profile's
+    `hook_command_remaps`, which is a REGRESSION, not a fix. This is the third instance of
+    this class (the first two, `_hooks_body_corpus`'s callers and `_hook_disk_files` via
+    `reconcile_hooks`, were fixed earlier in M11); every other `_script_from_command`
+    caller in this module reads `root/--root`, the operator tree `--profile` describes,
+    so this is the only site where "which tier" and "which profile" can disagree."""
     containment_stat = None
     if project_root is not None:
         try:
@@ -2748,7 +2761,8 @@ def _compose_hooks(sources, project_root, out_of_root_refs):
         if not settings or resolve_root is None:
             continue
         for event, matcher, command in _iter_hook_entries(settings):
-            script_path, _note = _script_from_command(command, resolve_root)
+            script_path, _note = _script_from_command(
+                command, resolve_root, profile=profile if tier == "user" else None)
             script_rel = _rel_safe(resolve_root, script_path) if script_path is not None else None
             if script_path is None:
                 exists = None
@@ -4563,7 +4577,8 @@ def scan_duplication(
     }
 
 
-def _hooks_body_corpus(root, inaccessible=None, *, profile: dict[str, Any] | None = None):
+def _hooks_body_corpus(root, inaccessible=None, blind_spots=None, *,
+                       profile: dict[str, Any] | None = None):
     """Concatenated hooks/*.py + hooks/*.sh bodies, ORIGINAL case, for literal env-flag
     grep and the promotion-candidate hook_covered cross-reference. Returns
     `(corpus, complete)`.
@@ -4601,12 +4616,13 @@ def _hooks_body_corpus(root, inaccessible=None, *, profile: dict[str, Any] | Non
     '..' role STRING, not a symlink on disk). Each candidate file's containment is now
     checked via `_resolves_inside_root` before its body is read -- same `fp_inside`
     pattern `reconcile_hooks` already uses for the identical hooks/ walk, reused here
-    rather than invented twice. Disclosed through `inaccessible[]` (this function's own
-    established sink for every other disclosure below), not a new `blind_spots` param --
-    adding one would mean threading it through `check_phantom_refs` and
-    `collect_promotion_candidates` too, for a case `inaccessible[]` already covers under
-    this project's "reaches inaccessible[], errors[], or blind_spots[]" disclosure
-    contract."""
+    rather than invented twice, INCLUDING that function's choice of sink:
+    `test_out_of_root_registered_dispatcher_does_not_drive_reachability`
+    (test_collector.py) pins "an out-of-root target is a blind-spot, NOT an inaccessible
+    entry (never opened)" for that identical hooks/-symlink shape, so a containment
+    REFUSAL is disclosed via `blind_spots` here too, same message text reconcile_hooks
+    already uses -- `inaccessible[]` stays reserved for a genuine post-containment read
+    failure (the branch immediately below this one)."""
     profile = PROFILE_CLAUDE_CODE if profile is None else profile
     hooks_name = profile["container_dirs"]["hooks"]
     if hooks_name is None:
@@ -4644,10 +4660,14 @@ def _hooks_body_corpus(root, inaccessible=None, *, profile: dict[str, Any] | Non
             fp_inside = False
         if not fp_inside:
             # Same posture as an unreadable body below: unseen is unseen, whether the
-            # cause is a permission error or a resolved path outside --root.
+            # cause is a permission error or a resolved path outside --root. Disclosed
+            # via blind_spots, not inaccessible -- see the docstring's cross-reference to
+            # reconcile_hooks' identical containment refusal for this same hooks/ shape.
             complete = False
-            if inaccessible is not None:
-                _append_inaccessible_once(inaccessible, _rel_safe(root, fp))
+            if blind_spots is not None:
+                msg = f"hook {name} resolves outside the harness root — not read"
+                if msg not in blind_spots:
+                    blind_spots.append(msg)
             continue
         text, _status = _read_text(fp)
         if text is None:
@@ -4725,6 +4745,7 @@ def check_phantom_refs(
     root: Path,
     corpus_files: list[tuple[str, str]],
     inaccessible: list[dict[str, Any]],
+    blind_spots: list[str] | None = None,
     *,
     profile: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
@@ -4737,10 +4758,16 @@ def check_phantom_refs(
     hooks corpus is read from ITS hooks dir, not PROFILE_CLAUDE_CODE's. This function's own
     literal homes (the `~/.claude/` prefix, the commands/ + skills/ slash-command resolution
     paths below) are deliberately deferred — generalizing THEM is out of scope for this
-    milestone."""
+    milestone.
+
+    M11 exit gate, Finding 2 (P2): `blind_spots` (additive, defaults to None for a caller
+    with no such list handy) is forwarded to `_hooks_body_corpus` so a hooks/ symlink
+    escaping --root is disclosed there, not silently dropped -- see that function's own
+    docstring for why it is `blind_spots`, not `inaccessible`, for this specific case."""
     refs: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
-    hooks_corpus, hooks_corpus_complete = _hooks_body_corpus(root, inaccessible, profile=profile)
+    hooks_corpus, hooks_corpus_complete = _hooks_body_corpus(
+        root, inaccessible, blind_spots, profile=profile)
     # S6b.M2.1: computed ONCE per call, not per token -- reused by BOTH candidate loops
     # below to filter out-of-root candidates before any stat. A `root` that cannot be
     # stat'd makes containment undecidable for every candidate, so `_in_root` skips them
@@ -5734,7 +5761,7 @@ def build_document(
                                             compose=compose, out_of_root_refs=out_of_root_refs,
                                             profile=profile)
     corpus_files = _staleness_corpus(root, inaccessible, blind_spots, profile=profile)
-    phantom_refs = check_phantom_refs(root, corpus_files, inaccessible, profile=profile)
+    phantom_refs = check_phantom_refs(root, corpus_files, inaccessible, blind_spots, profile=profile)
     promotion_candidates = collect_promotion_candidates(root, corpus_files, settings,
                                                          profile=profile)
     # S2 gate fix: git-age SIGNAL only (never a "stale" verdict). Topology is discovered
@@ -5938,11 +5965,20 @@ def build_document(
                                     if project_containment_root else None)
         local_settings_source = (str(project_containment_root / ".claude" / "settings.local.json")
                                   if project_containment_root else None)
+        # M11 exit gate, Finding 4 (P3): sourced from the profile's own settings role,
+        # not the hardcoded literal "settings.json" -- the user tier IS profile-aware
+        # (parse_settings above already reads `profile["top_level_files"]["settings"]`),
+        # so a profile naming a custom settings file must label composed hooks with the
+        # file that was actually read, not one that never was. None-guarded: a profile
+        # with no settings surface at all (settings_format == "none" or the role is
+        # null) has no file to name.
+        user_settings_name = profile["top_level_files"]["settings"]
+        user_settings_source = str(root / user_settings_name) if user_settings_name is not None else None
         composed_hooks = _compose_hooks(
-            [("user", settings, str(root / "settings.json"), root),
+            [("user", settings, user_settings_source, root),
              ("project", project_settings, project_settings_source, project_containment_root),
              ("local", local_settings, local_settings_source, project_containment_root)],
-            project_containment_root, out_of_root_refs)
+            project_containment_root, out_of_root_refs, profile=profile)
 
         doc["composed_settings"] = {
             "permissions": _merge_permissions_union_deny_wins(settings_stack_with_ok),
