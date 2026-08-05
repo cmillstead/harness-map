@@ -356,6 +356,142 @@ parsed but unmatched, undated, or future-skipped, contributing zero to the total
 counted on the card. This is deliberate, disclosed in words by the sentence beneath each card,
 and is not a defect.
 
+## Layout profiles (M11)
+
+`collector.py --profile <path.json>` retargets the collector at a non-Claude-Code harness
+layout (a bare `AGENTS.md` repo, Cursor/Windsurf rules) by supplying a JSON profile that
+names where every scanned surface lives. Omitted, the collector uses its embedded
+`PROFILE_CLAUDE_CODE` default and output is byte-identical to before this option existed.
+
+### The 16 keys
+
+A profile is a flat JSON object with exactly these 16 top-level keys (unknown keys and
+missing keys both reject the profile — see "The exit-2 contract" below):
+
+| Key | Type | `null` semantics |
+|---|---|---|
+| `name` | string (never `null`) | — |
+| `top_level_files` | object, 5 roles: `root_instructions`, `settings`, `memory_index`, `plugin_marketplaces`, `plugin_installed` | a role's value may be `null` |
+| `container_dirs` | object, 8 roles: `skills`, `rules`, `commands`, `agents`, `hooks`, `hook_tests`, `projects`, `memory` | a role's value may be `null` |
+| `projects_glob` | string or `null` | |
+| `memory_index_name` | string or `null` | |
+| `skill_manifest_name` | string or `null` | |
+| `rules_globs` | list of strings | empty list, never `null` |
+| `skills_globs` | list of strings | empty list, never `null` |
+| `commands_glob` | string or `null` | |
+| `agents_glob` | string or `null` | |
+| `hook_script_globs` | list of strings | empty list, never `null` |
+| `hook_test_globs` | list of strings | empty list, never `null` |
+| `dispatcher_suffix` | string or `null` | |
+| `hook_command_remaps` | list of `[prefix, dir]` string pairs | empty list, never `null` |
+| `duplication_globs` | list of strings | empty list, never `null` |
+| `settings_format` | string, `"claude-code"` or `"none"` | never `null` |
+
+Every `null` (a scalar role, or a `top_level_files`/`container_dirs` role) means "this
+harness has no such surface" — the collector code guards on it and skips constructing a
+path for that role entirely, rather than probing a fabricated one. This is why the two map
+keys' roles are individually nullable but the keys themselves are required: a profile
+declares its full shape (every role named) even where a given harness has nothing to put
+there.
+
+### [DECISION] `PROFILE_CLAUDE_CODE` is authoritative
+
+`PROFILE_CLAUDE_CODE` (embedded in `collector.py`) is the RUNTIME source of truth — every
+scan function threads `profile: dict[str, Any] | None = None` and defaults it to this
+constant. `profiles/claude-code.json` is its exported TWIN: documentation, and a copyable
+starting template for anyone writing a foreign-layout profile. The two are pinned equal by
+`tests/test_profiles.py::test_profile_file_matches_embedded_constant` — they can never
+silently drift apart.
+
+### The exit-2 contract
+
+`load_profile` runs every structural and value check against the parsed JSON BEFORE
+building the result dict it returns — a malformed profile can never half-apply. On
+rejection (unreadable file, invalid JSON, non-object top level, unknown key, missing key,
+wrong-typed value, an unrecognized `settings_format`), `collector.py`:
+
+1. prints `error: profile <name>: <what was wrong>` to stderr, naming the offending key(s)
+   (sorted, deterministic across `PYTHONHASHSEED`);
+2. falls back to `PROFILE_CLAUDE_CODE` for nothing else to run against, but does NOT
+   collect with it — `build_document` is skipped entirely on this path;
+3. still emits a full-key JSON envelope (`_empty_document`, the same envelope a
+   `build_document` crash produces) to stdout, with one `errors[]` entry prefixed
+   `layout profile rejected: `;
+4. still WRITES that envelope to `--out` when `--out` was given, through the same
+   validated, contained write path as every other run;
+5. exits with status code **2** (distinct from the crash path's `0` — a rejected profile
+   is a caller error, not a runtime crash).
+
+The envelope rule (CLAUDE.md rule 5) holds on this path exactly as it does on the crash
+path: every top-level key is present, null/empty, valid JSON, always.
+
+### No `profile` field on the document
+
+Amendment A42: the collector document gains no new field recording which profile produced
+it. A report carries no self-describing provenance for this — a reader cannot tell, from
+the JSON alone, whether a given sidecar was collected under `PROFILE_CLAUDE_CODE` or a
+foreign profile. Do not go looking for one.
+
+### `schema_version` is not bumped
+
+No field's MEANING changed. `--profile` changes where the collector looks, not the shape
+or semantics of what it reports once it has looked — every existing field keeps the same
+type and interpretation under a foreign profile as under the default. Per CLAUDE.md rule
+10, `schema_version` bumps only on a meaning change, so it stays `1`.
+
+### Deferred couplings
+
+These are known gaps, not omissions — v1 threads `profile` through the glob-consuming
+scans and the fixed-layout lookups, but several spots still hard-code the Claude Code
+layout. **Frame:** this list was built by grepping `collector.py` for Claude-Code path
+literals and by the M11 exit-gate review's own findings, on 2026-08-03; it is
+deliberately headed WITHOUT a count, because a numbered claim of completeness reads as
+authoritative precisely where it is actually bounded by where its author happened to
+stop looking (`AMENDMENTS.md` A41 records this exact failure mode one level up, in a
+prior six-item version of this same list). A reader relying on this section should
+RE-DERIVE it — re-grep `collector.py` for a literal Claude Code path/key alongside every
+`profile[...]` access site — rather than trust this enumeration as exhaustive.
+
+1. The entire project-tier / `--compose` layout (`.claude/`, `CLAUDE.local.md`,
+   `.mcp.json`, `settings.local.json`) is scanned with the Claude Code layout regardless of
+   `--profile`. A `--compose` run under a non-default profile discloses this in
+   `blind_spots` at runtime.
+2. `_default_operator_root()`'s `$CLAUDE_CONFIG_DIR` / `$HOME/.claude` default — this only
+   affects the `--root` argparse default; a foreign-profile user always passes `--root`
+   explicitly, so the coupling is unreachable in practice.
+3. `check_phantom_refs`'s `~/.claude/` prefix strip and its slash-command home list
+   (`commands/<ns>/…/<name>.md`, `skills/<seg0>/SKILL.md`).
+4. `_project_slug`'s `[/.]`→`-` rule — only reachable via `projects_glob`.
+5. `collect_on_demand`'s skill-internal subdir tuple (`phases`/`prompts`/`agents`) and
+   `_skill_has_test_asset`'s `tests`/`evals` names.
+6. Claude Code settings key names (`env`, `model`, `cleanupPeriodDays`, `sandbox`,
+   `enabledPlugins`, `allow`/`deny`/`ask`) — covered BEHAVIORALLY by
+   `settings_format: "none"` (config collection is skipped outright), not individually
+   parameterized per key.
+7. `_script_from_command`'s script-token detection: the hardcoded `_SCRIPT_INTERPRETERS`
+   set (`{python, python3, bash, sh, node}`, `collector.py:30`) and the literal
+   `(".py", ".sh")` extension check inside that same function are independent of
+   `_hook_body_suffixes(profile)`, which DOES correctly derive its own suffix set from
+   `hook_script_globs`. Two independent gaps, both DISCLOSED, never silent: (a) a
+   recognized interpreter (e.g. `node`) followed by a BARE filename with a non-`.py`/
+   `.sh` extension — `node check.js` — yields `(None, "no script token in hook
+   command")`, surfaced by the caller as a `blind_spots` entry; (b) an interpreter
+   outside the hardcoded set entirely (e.g. `ruby check.rb`) yields `(None, "unsupported
+   hook command form")`, likewise disclosed. Fixing this properly needs new profile keys
+   for interpreters/suffixes, which is deferred past v1's 16-key schema (SPEC_7 §2, M11
+   exit-gate Finding 5).
+8. `serve.py` has no `--profile` flag at all: its argparse (`main`) accepts none, and the
+   in-process collector invocation it builds (`_run_collector`'s `argv`) never includes
+   one, so `collector.main()` always runs under the DEFAULT profile when served live. A
+   foreign harness can be collected and rendered STATICALLY (`collector.py --profile ... `
+   piped into `render_html.py`) but cannot be served live — `serve.py --root
+   <foreign-root>` renders a near-empty dashboard with no indication a profile was ever
+   needed. This is a scope limit, not a correctness bug: the watcher-sync invariant (the
+   filesystem watcher and the served collector run must agree on what they scan) still
+   holds, because BOTH sides consistently use the default profile — there is no drift
+   between what is watched and what is collected, only a v1 limit on which layouts can be
+   served live at all (M11 exit-gate Finding 6).
+
 ## Notes
 
 1. **Signals vs. judgments.** The collector emits SIGNALS (A) — it counts, reads, and classifies mechanically (file categories, evidence labels, line thresholds). The model produces JUDGMENTS (B) — CIVC classification, drag outcomes, "give it one home" decisions. The collector never classifies a verb coverage or condemns a duplicate pair as dead weight; it only reports that the pair exists above threshold.
