@@ -6589,16 +6589,45 @@ def _check_civc_regressions(prior_synth: dict[str, Any], newest_synth: dict[str,
     return findings
 
 
-def run_check(doc: dict[str, Any], out_dir: str) -> tuple[int, str]:
+def check_load_baseline(out_dir: str) -> tuple[tuple[str, dict[str, Any] | None, str | None],
+                                               tuple[dict[str, Any], dict[str, Any]] | None]:
+    """Every disk read run_check needs, performed in one place so main() can do it BEFORE
+    build_document and therefore before BOTH --out blocks -- the validation block
+    (`if args.out is not None:`) and the write block (`if out_path is not None:`) (F1).
+    Pre-fix, the --out WRITE ran first and could overwrite the very sidecar the comparison
+    was about to select, so `--check DIR --out DIR/<the baseline>` compared the run against
+    itself and reported CLEAN. Reading first makes the comparison independent of what --out
+    later does to the directory; it does NOT narrow the --out-alongside---check combination,
+    which SPEC_7 §1 explicitly permits.
+
+    Returns (prior_selection, synthesis_pair) -- exactly the two values run_check consumes.
+    No write, no mutation: --check writes nothing (CLAUDE.md rule 4)."""
+    today = datetime.now(timezone.utc).date().isoformat()  # D-1: one clock frame per module
+    out_path = Path(out_dir)
+    return (_check_select_prior_sidecar(out_path, today),
+            _check_select_synthesis_pair(out_path, today))
+
+
+def run_check(doc: dict[str, Any], out_dir: str,
+              baseline: tuple[tuple[str, dict[str, Any] | None, str | None],
+                              tuple[dict[str, Any], dict[str, Any]] | None] | None = None,
+              ) -> tuple[int, str]:
     """SPEC_7 §1 / AMENDMENTS A48 entry point. `doc` is the CURRENT run's already-built
     document -- main() intercepts a current-run crash/profile-rejection BEFORE calling
     this (comparing a crash envelope would emit fabricated regressions, never done here).
+
+    `baseline` is the preloaded (prior_selection, synthesis_pair) pair from
+    check_load_baseline. main() always passes it, read before build_document and before
+    both --out blocks (F1); the default None re-reads here, which keeps this function
+    callable standalone with just (doc, out_dir) -- the shape
+    test_check_exit_one_on_band_crossing_at_the_5000_boundary drives.
+
     Returns (exit_code, text): text is what --check prints to stdout INSTEAD OF the JSON
     document (SPEC_7 §1's one carve-out to the always-emit-JSON invariant, which governs
     the default mode only)."""
-    today = datetime.now(timezone.utc).date().isoformat()  # D-1: one clock frame per module
-    out_path = Path(out_dir)
-    status, prior_doc, detail = _check_select_prior_sidecar(out_path, today)
+    if baseline is None:
+        baseline = check_load_baseline(out_dir)
+    (status, prior_doc, detail), synth_pair = baseline
     if status in ("malformed", "unreadable"):
         return 2, f"error: {detail}"
     findings: list[str] = []
@@ -6606,7 +6635,6 @@ def run_check(doc: dict[str, Any], out_dir: str) -> tuple[int, str]:
         assert prior_doc is not None
         findings.extend(_check_headline_regressions(
             doc.get("headline") or {}, prior_doc.get("headline") or {}))
-    synth_pair = _check_select_synthesis_pair(out_path, today)
     if synth_pair is not None:
         prior_synth, newest_synth = synth_pair
         findings.extend(_check_civc_regressions(prior_synth, newest_synth))
@@ -6650,6 +6678,35 @@ def main(argv: list[str] | None = None) -> int:
                                         # on which --out branch happened to run
     out_roots = [root]                 # guarded roots for BOTH the upfront check and the
                                         # write-time TOCTOU recheck below (P1-6a)
+    # M10 / TRK-051 pre-flight (F2 + F1). --check has no JSON envelope to fall back on --
+    # it prints findings -- so an input it cannot measure must EXIT 2, never reach the
+    # comparison. Pre-fix, build_document() did not raise on a missing root, so the
+    # current document came back empty, every real prior value read as an improvement,
+    # and a typo'd --root printed "No regression detected" with exit 0. SPEC_7 §1 line 23:
+    # exit 2 is for collection errors; errors must not masquerade as clean.
+    #
+    # Deliberately --check ONLY. The default mode's contract is the opposite (always emit
+    # a valid JSON envelope, CLAUDE.md rule 5), and the --out VALIDATION block below keeps
+    # its own softer os.stat() warning unchanged.
+    #
+    # THREE probes, not one: os.stat() succeeds on a regular file, and is_dir() is True
+    # for a directory whose contents cannot be listed -- both of those measure nothing and
+    # would report CLEAN.
+    check_baseline = None
+    if args.check is not None:
+        try:
+            if not root.is_dir():
+                print(f"error: --check requires --root to be a directory: {root}", file=sys.stderr)
+                return 2
+            os.listdir(root)
+        except OSError as exc:
+            print(f"error: --check requires an accessible --root: {exc}", file=sys.stderr)
+            return 2
+        # F1: read the baseline BEFORE build_document and before the --out WRITE block
+        # (`if out_path is not None:`), which may target a path inside OUT_DIR (SPEC_7 §1
+        # line 24 permits --out alongside --check). Reading first is what stops the run
+        # from comparing against itself.
+        check_baseline = check_load_baseline(args.check)
     # M11: resolve the layout profile BEFORE anything reads the tree. On failure we do not
     # collect at all -- a half-applied profile would silently inventory the wrong surfaces.
     # The --out block below still runs, and the envelope is still emitted and written
@@ -6776,7 +6833,7 @@ def main(argv: list[str] | None = None) -> int:
         if current_run_crash_reason is not None:
             print(f"error: current run did not measure anything -- {current_run_crash_reason}")
             return 2
-        check_exit, check_text = run_check(doc, args.check)
+        check_exit, check_text = run_check(doc, args.check, baseline=check_baseline)
         print(check_text)
         return check_exit
     print(text)  # stdout is the primary contract — always emit the built document, write-or-not

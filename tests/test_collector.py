@@ -7148,3 +7148,109 @@ def test_check_synthesis_regex_matches_render_html_naming(tmp_path):
     found_doc, err = render_html_mod.load_synthesis(tmp_path, sample_date)
     assert err is None
     assert found_doc == sidecar_doc
+
+def test_check_nonexistent_root_exits_two_not_clean(tmp_path):
+    # F2 (P1): pre-fix, a nonexistent --root produced an empty current document, every
+    # real prior value read as an improvement, and --check printed
+    # "No regression detected (baseline: ...)" with EXIT 0. A typo in a SessionStart
+    # hook's --root made the gate permanently green -- "inaccessible reads as clean",
+    # the exact invariant this codebase exists to enforce, reintroduced inside the gate.
+    # SPEC_7 §1 line 23: exit 2 is for collection errors; errors must not masquerade as
+    # clean.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 4, "orphan_registration_count": 0, "orphan_script_count": 0})
+    missing = tmp_path / "no-such-root"
+    rc, out, err = run_check(missing, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert "No regression detected" not in out
+    assert "--root" in (out + err)
+
+def test_check_root_that_is_a_file_exits_two(tmp_path):
+    # F2 sibling: os.stat() SUCCEEDS on a regular file, so an os.stat-only gate would
+    # still walk nothing and report CLEAN. The gate must require a DIRECTORY.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 4, "orphan_registration_count": 0, "orphan_script_count": 0})
+    not_a_dir = tmp_path / "root-is-a-file"
+    not_a_dir.write_text("not a harness\n")
+    rc, out, err = run_check(not_a_dir, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert "No regression detected" not in out
+
+def test_check_unlistable_root_exits_two(tmp_path):
+    # F2 sibling: a directory whose contents cannot be listed measures nothing. os.stat
+    # succeeds and is_dir() is True, so the gate must actually probe listability.
+    # Skipped as root (uid 0 bypasses the mode bits).
+    if os.geteuid() == 0:
+        pytest.skip("mode bits do not restrict uid 0")
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 4, "orphan_registration_count": 0, "orphan_script_count": 0})
+    locked = tmp_path / "locked-root"
+    locked.mkdir()
+    os.chmod(locked, 0o000)
+    try:
+        rc, out, err = run_check(locked, out_dir, project_root=proj)
+    finally:
+        os.chmod(locked, 0o700)      # always restore, or tmp_path cleanup fails
+    assert rc == 2, (out, err)
+    assert "No regression detected" not in out
+
+def test_default_mode_with_bad_root_still_emits_envelope(tmp_path):
+    # Regression guard for the F2 fix's blast radius: the root gate is --check ONLY.
+    # Without --check, a bad --root must keep today's behavior exactly -- a stderr
+    # warning and a VALID JSON envelope on stdout, per the envelope rule (CLAUDE.md §5).
+    proj = _check_empty_project(tmp_path)
+    missing = tmp_path / "no-such-root"
+    cmd = [sys.executable, str(COLLECTOR), "--root", str(missing),
+           "--project-root", str(proj)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)          # must parse -- envelope rule
+    assert "headline" in doc
+
+def test_check_out_writing_the_baseline_does_not_mask_the_regression(tmp_path, fake_harness):
+    # F1 (P1): pre-fix, main() ran the --out write block BEFORE the --check branch, so
+    # `--check DIR --out DIR/harness-map-<prior-date>.json` overwrote the baseline and
+    # then compared the run against ITSELF -- identical inputs, opposite verdicts (exit 1
+    # without --out, exit 0 with it). SPEC_7 §1 line 24 explicitly permits --out alongside
+    # --check, so the flag combination is not the bug; the ORDERING is. The baseline must
+    # be READ INTO MEMORY before any write can touch it.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    prior_date = _days_ago(1)
+    # A prior whose over-200 count is BELOW what the current run will measure, so the
+    # comparison must fire. Two extra instruction files push the current run over it.
+    for name in ("long_one.md", "long_two.md"):
+        (fake_harness / "rules" / name).write_text("# long\n" + "word\n" * 260)
+    _write_check_sidecar(out_dir, prior_date, {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    target = out_dir / f"harness-map-{prior_date}.json"
+    rc, out, err = run_check(fake_harness, out_dir, "--out", str(target), project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: instruction_files_over_200 increased (0 ->" in out
+
+def test_check_unreadable_out_dir_still_exits_two(tmp_path, fake_harness):
+    # Regression guard: moving the baseline READ earlier must not lose the exit-2 path
+    # for an unlistable OUT_DIR (_check_select_prior_sidecar's "unreadable" status).
+    if os.geteuid() == 0:
+        pytest.skip("mode bits do not restrict uid 0")
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    os.chmod(out_dir, 0o000)
+    try:
+        rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    finally:
+        os.chmod(out_dir, 0o700)
+    assert rc == 2, (out, err)
+    assert out.startswith("error:")
