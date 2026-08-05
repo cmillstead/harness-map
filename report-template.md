@@ -4,7 +4,7 @@ Fill-in skeleton for the synthesis pass. Every `{placeholder}` is replaced with 
 
 ## 1. Headline Numbers
 
-The collector's 8 headline fields, each with an always-visible benchmark band and a footnote gloss. Bands come from the FIXED thresholds in the table below — never invented per-run, so successive runs are comparable.
+The collector's original 8 headline fields, each with an always-visible benchmark band and a footnote gloss. Bands come from the FIXED thresholds in the table below — never invented per-run, so successive runs are comparable. A 9th line (TRK-025) follows: an additive coverage DENOMINATOR, not a defect count — it carries neither a band nor an "informational"/"reserved" marker, unlike every one of the 8 above.
 
 - Always-loaded words: {always_loaded_words} — **{weight_band}**[^words]
 - Always-loaded estimated tokens: {always_loaded_tokens_est} — **{weight_band}**[^tokens]

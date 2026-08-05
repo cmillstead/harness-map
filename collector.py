@@ -1319,38 +1319,74 @@ class _HookCommandResolution(NamedTuple):
     kind: str
 
 
-# TRK-025 T1: an unrecognized command form is classified "no_script" only when its FIRST
-# token is one of these known text/terminal shell builtins — commands that structurally
-# emit output/notifications and never wrap or dispatch to a script. This is deliberately
-# a CLOSED, narrow allowlist rather than "any unrecognized form with no .py/.sh token":
-# an arbitrary opaque program name (a real installed CLI tool, e.g. a task-tracker binary
-# invoked as `mytool subcommand args`) gives no positive evidence it ISN'T itself wrapping
-# a script somewhere, so it stays "unparsed" (a real, disclosed blind spot) by default.
-# Grown only from a measured real case; the motivating one is `printf` writing a terminal
-# escape sequence (the team-lead's cited real 8 commands).
-_NON_SCRIPT_SHELL_BUILTINS = frozenset({"printf", "echo", "osascript", "say", "afplay", "open"})
+# TRK-025 P1 crash fix: a real hook command's inline-shell token can be ~1500 characters
+# (an embedded awk/shell program, measured on the live harness). `Path.is_file()` only
+# swallows ENOENT/ENOTDIR/EBADF/ELOOP (pathlib's own `_ignore_error`) — ENAMETOOLONG is
+# NOT in that set and RE-RAISES OSError, which escaped `reconcile_hooks` uncaught and hit
+# main()'s catch-all, turning the whole run into an all-zero crash envelope. A token this
+# long cannot name a real hook script, so it is rejected before the syscall ever runs.
+_MAX_SCRIPT_TOKEN_LEN = 255  # practical NAME_MAX
+
+
+def _looks_like_existing_hook_script(hooks_dir, token):
+    """Guarded `is_file()` probe (TRK-025 P1) — see `_MAX_SCRIPT_TOKEN_LEN` above for why
+    the length check exists. The `except OSError` is kept regardless of the length guard:
+    a read-only classifier must never be able to take the whole document down over a
+    single unusual token (a hostile/garbled path, a filesystem-specific limit other than
+    NAME_MAX, ...) — the length guard avoids the KNOWN failure mode cheaply, the guard
+    below closes the class."""
+    name = Path(token).name
+    if len(name) > _MAX_SCRIPT_TOKEN_LEN:
+        return False
+    try:
+        return (hooks_dir / name).is_file()
+    except OSError:
+        return False
 
 
 def _references_script_token(tokens, root, profile):
-    """Conservative scan (TRK-025 T1, Trap 2) used ONLY for an unrecognized command form
-    whose first token is a known non-script builtin (`_NON_SCRIPT_SHELL_BUILTINS`): does
-    ANY token still look like it names a script? Deliberately does NOT use the bare
-    `"/" in p` rule the recognized-form branches use below — measured against real
-    inline-shell hook commands, that rule false-positives on shell redirection/tty
-    tokens (`2>/dev/null`, `__tty=/dev/tty`, `>/dev/null`), which would silently
-    reclassify every one of them as "references a script". A token counts here only when
-    it carries a `.py`/`.sh` suffix, or names a file that actually exists under the
-    profile's hooks dir.
+    """Conservative scan (TRK-025 T1, Trap 2) used for an unrecognized command form: does
+    ANY token look like it names a script? Deliberately does NOT use the bare `"/" in p`
+    rule the recognized-form branches use below — measured against real inline-shell hook
+    commands, that rule false-positives on shell redirection/tty tokens (`2>/dev/null`,
+    `__tty=/dev/tty`, `>/dev/null`), which would silently reclassify every one of them as
+    "references a script". A token counts here only when it carries a `.py`/`.sh` suffix,
+    or names a file that actually exists under the profile's hooks dir. This check runs
+    FIRST (see `_script_from_command`'s unrecognized-form branch) and unconditionally
+    wins: a command that appears to reference a script stays `unparsed` regardless of
+    what `_has_shell_control_syntax` below says (this is what keeps the Trap 2 guard,
+    `caffeinate -i hooks/mystery.py`, a blind spot).
 
     Residual gap, documented rather than solved: an extensionless script (e.g. a
-    relative `bin/track`) invoked from a KNOWN builtin and absent from the hooks dir will
-    still classify as `no_script` here. That is narrower than the previous silent drop,
-    but not perfect."""
+    relative `bin/track`) invoked from an unrecognized compound form and absent from the
+    hooks dir will still classify as `no_script` here. That is narrower than the
+    previous silent drop, but not perfect."""
     hooks_name = profile["container_dirs"]["hooks"]
     hooks_dir = (root / hooks_name) if hooks_name is not None else None
     return any(
-        p.endswith((".py", ".sh")) or (hooks_dir is not None and (hooks_dir / Path(p).name).is_file())
+        p.endswith((".py", ".sh")) or (hooks_dir is not None and _looks_like_existing_hook_script(hooks_dir, p))
         for p in tokens)
+
+
+# TRK-025 T1 (corrected per team-lead review — a NAME allowlist swept up an opaque
+# program like `rtk hook claude`, which could plausibly dispatch to a script, into the
+# same bucket as self-evidently inline shell). This is a SYNTAX-based discriminator
+# instead: does the RAW command contain shell control syntax at all? A `[ ... ] && ... `
+# compound, a pipeline, a subshell/substitution, or a redirection is unambiguously being
+# interpreted BY a shell rather than exec'd as a single external program — a bare
+# `prog arg arg` invocation is not, and gives no positive evidence about what `prog`
+# does internally. Bounded and bug-for-bug reproducible (unlike a name allowlist, which
+# would need to grow forever): measured against the real 8 commands, every one contains
+# at least one of these; `rtk hook claude` and `caffeinate -i hooks/mystery.py` contain
+# none. Checked against the RAW `command` string, not the shlex tokens — tokenizing
+# strips quoting, which would hide a `&&`/`;`/`$(...)` embedded inside a quoted argument.
+_SHELL_CONTROL_SYNTAX = frozenset(("$(", "&&", "||", "|", ";", "<", ">", "{", "}", "`"))
+
+
+def _has_shell_control_syntax(command):
+    """True when `command` contains any `_SHELL_CONTROL_SYNTAX` token — see that
+    constant's comment for the reasoning."""
+    return any(tok in command for tok in _SHELL_CONTROL_SYNTAX)
 
 
 def _script_from_command(command, root, *, profile: dict[str, Any] | None = None) -> _HookCommandResolution:
@@ -1380,16 +1416,24 @@ def _script_from_command(command, root, *, profile: dict[str, Any] | None = None
     elif "/" in tokens[0] or tokens[0].endswith((".py", ".sh")):
         rest = tokens
     else:
-        # TRK-025 T1: an unrecognized first token that is a KNOWN non-script builtin
-        # (e.g. inline shell like `printf`, `osascript`) is not automatically a coverage
-        # gap — classify it "no_script" only when it ALSO genuinely appears to reference
-        # no script. Any other unrecognized form (an opaque/arbitrary program name we
-        # have no positive evidence about) conservatively stays "unparsed" — a real
-        # blind spot, matching the pre-existing behavior for a command like a bespoke
-        # CLI tool that could itself be wrapping a script.
-        if (first in _NON_SCRIPT_SHELL_BUILTINS
-                and not _references_script_token(tokens, root, profile)):
+        # TRK-025 T1: an unrecognized first token is NOT automatically a coverage gap,
+        # but a NAME-based judgment about it is a mistake (a real coding-team review
+        # caught this: `rtk hook claude` is an opaque program that could plausibly
+        # dispatch to a script, and must NOT be waved through as `no_script` just
+        # because it looks like `printf`-style inline shell). Three-way, in order:
+        if _references_script_token(tokens, root, profile):
+            # 1. Genuinely appears to reference a script (Trap 2 guard) -> unparsed,
+            #    regardless of shell syntax.
+            return _HookCommandResolution(
+                None, f"unsupported hook command form: {command[:80]}", "unparsed")
+        if _has_shell_control_syntax(command):
+            # 2. No script reference, but the RAW command is unambiguously being
+            #    interpreted BY a shell (a `[ ... ] && ...` compound, a pipeline, a
+            #    subshell/substitution, a redirection) -> no_script, fully examined.
             return _HookCommandResolution(None, None, "no_script")
+        # 3. A bare `prog arg arg` invocation with no shell syntax and no script
+        #    reference -- an opaque program we have no positive evidence about (e.g.
+        #    `rtk hook claude`) -> unparsed, a real disclosed blind spot.
         return _HookCommandResolution(
             None, f"unsupported hook command form: {command[:80]}", "unparsed")
     token = next((p for p in rest if "/" in p or p.endswith((".py", ".sh"))), None)

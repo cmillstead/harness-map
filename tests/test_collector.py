@@ -249,20 +249,54 @@ def _hooks_settings(commands):
 
 
 def test_inline_shell_hook_command_is_no_script_and_not_a_blind_spot(fake_harness):
-    # TRK-025 T1/T4#1: an inline-shell command with NO script token anywhere (the real
-    # measured case is a `printf` writing a terminal escape sequence; modeled here
-    # structurally as a plain unrecognized-form command with no script-shaped token)
+    # TRK-025 T1/T4#1: a genuinely inline-shell command (unambiguous shell control
+    # syntax -- here `&&` and a redirection -- with no script-shaped token anywhere)
     # tokenizes fine and is fully examined -- it must land in commands_no_script and
-    # never in blind_spots. The bare `"/" in p` rule the old code effectively fell back
-    # to would have false-positived this via reconcile_hooks's "unsupported hook command
-    # form" note (Trap 2).
+    # never in blind_spots. A bare `prog arg arg` invocation with NO shell syntax does
+    # NOT qualify here -- see test_bare_opaque_invocation_stays_unparsed below, which
+    # pins that boundary deliberately.
     (fake_harness / "settings.json").write_text(
-        json.dumps(_hooks_settings(["printf 'hello world'"])))
+        json.dumps(_hooks_settings(["[ \"$X\" = \"1\" ] && printf 'hi' 2>/dev/null"])))
     doc = run_collector(fake_harness)
     hooks = doc["enforcement"]["hooks"]
     assert hooks["commands_no_script"] == 1
     assert hooks["commands_unparsed"] == 0
     assert not any("printf" in bs for bs in doc["blind_spots"])
+
+
+def test_bare_opaque_invocation_stays_unparsed(fake_harness):
+    # TRK-025 T1 step 3, pinned deliberately (per team-lead review): a bare `prog arg arg`
+    # invocation with NO shell control syntax and no script-shaped token -- an opaque
+    # program we have no positive evidence about (the exact shape of the pre-existing
+    # test_unsupported_command_form_surfaced_not_dropped's "rtk hook claude") -- must NOT
+    # be waved through as no_script just because it superficially resembles inline shell.
+    # It stays "unparsed", a real, disclosed blind spot.
+    (fake_harness / "settings.json").write_text(
+        json.dumps(_hooks_settings(["mytool subcommand argument"])))
+    doc = run_collector(fake_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_unparsed"] == 1
+    assert hooks["commands_no_script"] == 0
+    assert any("unsupported hook command form" in bs for bs in doc["blind_spots"])
+
+
+def test_oversized_inline_token_is_no_script_and_does_not_crash_the_run(fake_harness):
+    # TRK-025 P1 regression (the exact real-harness shape): an unrecognized `[`-leading
+    # compound command carrying a ~1500-character inline awk program as a SINGLE shlex
+    # token (plus a /dev/null-style redirection), the actual measured form of 8 real
+    # hook commands. Path.is_file() re-raises OSError(ENAMETOOLONG) on a token this long
+    # (unguarded, this crashed the whole run into an all-zero envelope) -- this must
+    # produce a REAL document (errors empty), classify the command no_script, and never
+    # add it to blind_spots.
+    huge_awk_program = "BEGIN{" + "x" * 1490 + "}"
+    command = f'[ "$CLAUDE_HOOK_EVENT" = "PreToolUse" ] && awk \'{huge_awk_program}\' 2>/dev/null'
+    (fake_harness / "settings.json").write_text(json.dumps(_hooks_settings([command])))
+    doc = run_collector(fake_harness)
+    assert doc["errors"] == []
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == 1
+    assert hooks["commands_unparsed"] == 0
+    assert not any("unsupported hook command form" in bs for bs in doc["blind_spots"])
 
 
 def test_unrecognized_form_referencing_script_stays_unparsed_and_blind_spot(fake_harness):
@@ -307,7 +341,7 @@ def test_hook_command_coverage_totals_and_headline_denominator(fake_harness):
     _build_hooks_harness(fake_harness)  # 3 "resolved" commands: dispatcher, direct.py, absent.py
     settings = json.loads((fake_harness / "settings.json").read_text())
     settings["hooks"]["PostToolUse"] = [{"hooks": [
-        {"type": "command", "command": "printf 'hello world'"},
+        {"type": "command", "command": "[ \"$X\" = \"1\" ] && printf 'hi' 2>/dev/null"},
         {"type": "command", "command": "caffeinate -i hooks/mystery.py"},
     ]}]
     (fake_harness / "settings.json").write_text(json.dumps(settings))
