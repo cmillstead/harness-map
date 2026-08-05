@@ -1486,7 +1486,10 @@ _SKIP_FUTURE = object()
 
 def _new_date_counters():
     """The five date-provenance counters, in a FIXED insertion order so the rendered raw
-    counters are byte-deterministic across PYTHONHASHSEED."""
+    counters are byte-deterministic across PYTHONHASHSEED. Both the key SET and this
+    insertion ORDER are pinned by test_new_date_counters_ordered_key_set_is_pinned
+    (TRK-027).
+    # Changing this value requires a spec change (S6 §4.3, finding #12)."""
     return {"records_dated_as_of": 0, "records_undated": 0, "records_invalid_date": 0,
             "records_conflicting_date": 0, "records_skipped_future": 0}
 
