@@ -1300,9 +1300,64 @@ def _read_checked(root, path, inaccessible, rel_root=None):
     return text
 
 
-def _script_from_command(command, root, *, profile: dict[str, Any] | None = None):
-    """Return (script_path | None, note | None). `note` is set when the command form is
-    unsupported or yields no script token, so the caller SURFACES it (never silent).
+class _HookCommandResolution(NamedTuple):
+    """Outcome of resolving one hook `command` string (TRK-025 T1). `kind` classifies
+    every one of `_script_from_command`'s branches for coverage counting, since a bare
+    `script_path is None` used to conflate two very different situations:
+
+    - `"resolved"` — a script token was derived (`script_path` is not `None`); the
+      caller's own `stat()` later decides whether that target exists, is missing, or is
+      unreadable — this classification is about tokenization, not disk state.
+    - `"no_script"` — the command tokenizes fine but demonstrably references no script at
+      all (e.g. inline shell emitting a terminal escape sequence). Fully examined, zero
+      orphan risk, so the caller must NOT treat it as a blind spot.
+    - `"unparsed"` — `shlex` could not tokenize the command, or an unrecognized command
+      form still APPEARS to reference a script. A real coverage gap: the caller keeps it
+      as a blind spot."""
+    script_path: Path | None
+    note: str | None
+    kind: str
+
+
+# TRK-025 T1: an unrecognized command form is classified "no_script" only when its FIRST
+# token is one of these known text/terminal shell builtins — commands that structurally
+# emit output/notifications and never wrap or dispatch to a script. This is deliberately
+# a CLOSED, narrow allowlist rather than "any unrecognized form with no .py/.sh token":
+# an arbitrary opaque program name (a real installed CLI tool, e.g. a task-tracker binary
+# invoked as `mytool subcommand args`) gives no positive evidence it ISN'T itself wrapping
+# a script somewhere, so it stays "unparsed" (a real, disclosed blind spot) by default.
+# Grown only from a measured real case; the motivating one is `printf` writing a terminal
+# escape sequence (the team-lead's cited real 8 commands).
+_NON_SCRIPT_SHELL_BUILTINS = frozenset({"printf", "echo", "osascript", "say", "afplay", "open"})
+
+
+def _references_script_token(tokens, root, profile):
+    """Conservative scan (TRK-025 T1, Trap 2) used ONLY for an unrecognized command form
+    whose first token is a known non-script builtin (`_NON_SCRIPT_SHELL_BUILTINS`): does
+    ANY token still look like it names a script? Deliberately does NOT use the bare
+    `"/" in p` rule the recognized-form branches use below — measured against real
+    inline-shell hook commands, that rule false-positives on shell redirection/tty
+    tokens (`2>/dev/null`, `__tty=/dev/tty`, `>/dev/null`), which would silently
+    reclassify every one of them as "references a script". A token counts here only when
+    it carries a `.py`/`.sh` suffix, or names a file that actually exists under the
+    profile's hooks dir.
+
+    Residual gap, documented rather than solved: an extensionless script (e.g. a
+    relative `bin/track`) invoked from a KNOWN builtin and absent from the hooks dir will
+    still classify as `no_script` here. That is narrower than the previous silent drop,
+    but not perfect."""
+    hooks_name = profile["container_dirs"]["hooks"]
+    hooks_dir = (root / hooks_name) if hooks_name is not None else None
+    return any(
+        p.endswith((".py", ".sh")) or (hooks_dir is not None and (hooks_dir / Path(p).name).is_file())
+        for p in tokens)
+
+
+def _script_from_command(command, root, *, profile: dict[str, Any] | None = None) -> _HookCommandResolution:
+    """Resolve one hook `command` string to a `_HookCommandResolution`. `note` is set
+    whenever the command is not a clean "resolved" (so the caller never has to infer a
+    reason from a bare `None`); whether that note becomes a visible blind spot is the
+    caller's call, keyed on `kind` (see `_HookCommandResolution`).
 
     M11 (SPEC_7 §2): the `~`-prefixed remap below tries each configured
     profile["hook_command_remaps"] pair in order, first match wins — reproducing the
@@ -1311,9 +1366,12 @@ def _script_from_command(command, root, *, profile: dict[str, Any] | None = None
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return None, f"unparseable hook command: {command[:80]}"
+        return _HookCommandResolution(None, f"unparseable hook command: {command[:80]}", "unparsed")
     if not tokens:
-        return None, None
+        # TRK-025 T1: this used to be a SILENT (None, None) — closing that silent path,
+        # an empty command tokenizes fine and references nothing, so it is benign
+        # (no_script), but the caller still gets a note explaining why.
+        return _HookCommandResolution(None, "empty hook command", "no_script")
     first = Path(tokens[0]).name
     if first == "env":
         rest = tokens[2:]
@@ -1322,10 +1380,22 @@ def _script_from_command(command, root, *, profile: dict[str, Any] | None = None
     elif "/" in tokens[0] or tokens[0].endswith((".py", ".sh")):
         rest = tokens
     else:
-        return None, f"unsupported hook command form: {command[:80]}"
+        # TRK-025 T1: an unrecognized first token that is a KNOWN non-script builtin
+        # (e.g. inline shell like `printf`, `osascript`) is not automatically a coverage
+        # gap — classify it "no_script" only when it ALSO genuinely appears to reference
+        # no script. Any other unrecognized form (an opaque/arbitrary program name we
+        # have no positive evidence about) conservatively stays "unparsed" — a real
+        # blind spot, matching the pre-existing behavior for a command like a bespoke
+        # CLI tool that could itself be wrapping a script.
+        if (first in _NON_SCRIPT_SHELL_BUILTINS
+                and not _references_script_token(tokens, root, profile)):
+            return _HookCommandResolution(None, None, "no_script")
+        return _HookCommandResolution(
+            None, f"unsupported hook command form: {command[:80]}", "unparsed")
     token = next((p for p in rest if "/" in p or p.endswith((".py", ".sh"))), None)
     if token is None:
-        return None, f"no script token in hook command: {command[:80]}"
+        return _HookCommandResolution(
+            None, f"no script token in hook command: {command[:80]}", "no_script")
     raw = Path(token)
     if str(raw).startswith("~"):
         # Registered commands literally read "~/.claude/hooks/...": remap that literal
@@ -1335,15 +1405,17 @@ def _script_from_command(command, root, *, profile: dict[str, Any] | None = None
         expanded = raw.expanduser()
         for literal_prefix, rel_dir in profile["hook_command_remaps"]:
             try:
-                return (root / rel_dir) / expanded.relative_to(Path(literal_prefix).expanduser()), None
+                return _HookCommandResolution(
+                    (root / rel_dir) / expanded.relative_to(Path(literal_prefix).expanduser()),
+                    None, "resolved")
             except ValueError:
                 continue
-        return expanded, None
+        return _HookCommandResolution(expanded, None, "resolved")
     if raw.is_absolute():
-        return raw, None
+        return _HookCommandResolution(raw, None, "resolved")
     # A relative directly-executable token (e.g. "./hooks/x.py") resolves against --root,
     # NEVER against the process's cwd (R6) — joining (not .resolve()) avoids symlink surprises.
-    return (root / raw), None
+    return _HookCommandResolution((root / raw), None, "resolved")
 
 
 def _dispatcher_string_literals(source):
@@ -2539,11 +2611,21 @@ def reconcile_hooks(
     registered = []
     orphan_registrations = []
     direct_registered_names = set()
+    commands_resolved = commands_no_script = commands_unparsed = 0
 
     for command in _iter_hook_commands(settings):
-        script_path, note = _script_from_command(command, root, profile=profile)
-        if note:
-            blind_spots.append(note)
+        script_path, note, kind = _script_from_command(command, root, profile=profile)
+        if kind == "resolved":
+            commands_resolved += 1
+        elif kind == "no_script":
+            commands_no_script += 1
+        else:
+            # TRK-025 [DECISION]: only a command we genuinely could not read reduces
+            # coverage — a "no_script" note (e.g. an inline shell command that tokenizes
+            # fine but references nothing) is fully examined and must never appear here.
+            commands_unparsed += 1
+            if note:
+                blind_spots.append(note)
         if script_path is None:
             continue
         try:
@@ -2665,6 +2747,12 @@ def reconcile_hooks(
         "orphan_registrations": orphan_registrations,
         "scripts_on_disk": scripts_on_disk,
         "orphan_scripts": orphan_scripts,
+        # TRK-025 T2: the coverage denominator behind the headline — a command lands in
+        # EXACTLY one bucket, so commands_total always equals the other three summed.
+        "commands_total": commands_resolved + commands_no_script + commands_unparsed,
+        "commands_resolved": commands_resolved,
+        "commands_no_script": commands_no_script,
+        "commands_unparsed": commands_unparsed,
     }
 
 
@@ -2787,7 +2875,7 @@ def _compose_hooks(sources, project_root, out_of_root_refs, *, profile: dict[str
         if not settings or resolve_root is None:
             continue
         for event, matcher, command in _iter_hook_entries(settings):
-            script_path, _note = _script_from_command(
+            script_path, _note, _kind = _script_from_command(
                 command, resolve_root, profile=profile if tier == "user" else None)
             script_rel = _rel_safe(resolve_root, script_path) if script_path is not None else None
             if script_path is None:
@@ -5478,6 +5566,17 @@ def build_headline(
         "instruction_files_over_200": len(instruction_length_flags),
         "orphan_registration_count": len(hooks_section["orphan_registrations"]),
         "orphan_script_count": len(hooks_section["orphan_scripts"]),
+        # TRK-025 T3: the coverage denominator behind the two orphan counts above — an
+        # "examined" hook command is one _script_from_command could actually classify
+        # ("resolved" or "no_script"); "hook_commands_total" is every command registered
+        # in settings.json, including any "unparsed" one a future parser limit leaves
+        # out of the orphan counts entirely. Additive fields, not part of the original
+        # eight-metric headline diff unit (schema.md Note, HEADLINE_KEYS) — a future
+        # unparsed command now shows up as a shrinking numerator instead of vanishing
+        # silently.
+        "hook_commands_examined": (hooks_section["commands_resolved"]
+                                    + hooks_section["commands_no_script"]),
+        "hook_commands_total": hooks_section["commands_total"],
     }
 
 
@@ -5626,7 +5725,7 @@ def _compose_project_input_paths(project_root):
     project_root_resolved = project_root.resolve()
     for settings in (proj_settings, local_settings):
         for command in _iter_hook_commands(settings):
-            script_path, _note = _script_from_command(command, project_root)
+            script_path, _note, _kind = _script_from_command(command, project_root)
             if script_path is None:
                 continue
             try:
@@ -5799,7 +5898,7 @@ def iter_input_paths(
     settings, _parsed_ok = parse_settings(root, [], [], profile=profile)
     root_resolved = root.resolve()
     for command in _iter_hook_commands(settings):
-        script_path, _note = _script_from_command(command, root, profile=profile)
+        script_path, _note, _kind = _script_from_command(command, root, profile=profile)
         if script_path is None:
             continue
         # Root-containment is decided LEXICALLY (Codex r5 FIX 2): resolve only the DIRECTORY
@@ -6167,13 +6266,15 @@ def _empty_document(root: Path) -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(), "root": str(root),
         "headline": {k: 0 for k in ("always_loaded_words", "always_loaded_tokens_est",
             "always_loaded_file_count", "duplicate_pair_count", "unchecked_binary_count",
-            "instruction_files_over_200", "orphan_registration_count", "orphan_script_count")},
+            "instruction_files_over_200", "orphan_registration_count", "orphan_script_count",
+            "hook_commands_examined", "hook_commands_total")},
         "always_loaded": {"files": [], "conditional_variants": [], "skill_descriptions": [],
                           "agent_descriptions": [],
                           "totals": {"words": 0, "tokens_est": 0, "file_count": 0}},
         "on_demand": {"skills": [], "skill_internal_bodies": [], "memory_bodies": []},
         "enforcement": {"hooks": {"registered": [], "orphan_registrations": [],
-            "scripts_on_disk": [], "orphan_scripts": []},
+            "scripts_on_disk": [], "orphan_scripts": [], "commands_total": 0,
+            "commands_resolved": 0, "commands_no_script": 0, "commands_unparsed": 0},
             "permissions": {"allow_count": 0, "deny_count": 0, "ask_count": 0, "evidence": "INACCESSIBLE"}},
         "config": {"env_keys": [], "env_key_count": 0, "model": None, "cleanup_period_days": 0,
                    "sandbox": False, "enabled_plugins": [], "plugin_count": 0,

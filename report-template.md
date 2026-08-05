@@ -14,6 +14,7 @@ The collector's 8 headline fields, each with an always-visible benchmark band an
 - Instruction-files-over-200 count: {instruction_files_over_200} — **{over200_band}**[^over200]
 - Orphan-registration count: {orphan_registration_count} — **{orphanreg_band}**[^orphanreg]
 - Orphan-script count: {orphan_script_count} — **{orphanscript_band}**[^orphanscript]
+- Hook commands examined: {hook_commands_examined} / {hook_commands_total}[^hookcoverage] — state this denominator EVERY time the two orphan counts above are reported, so "0 orphans" never reads as "0 orphans out of everything" when it is really "0 orphans out of a partial scan"
 
 ### Fixed band thresholds (apply verbatim every run)
 
@@ -36,6 +37,7 @@ The collector's 8 headline fields, each with an always-visible benchmark band an
 [^over200]: 0 CLEAN / ≥1 → that many compliance-risk files. The harness's operative threshold: context saturation degrades instruction compliance beyond ~200 lines per file, so each flagged file is one unit of compliance risk.
 [^orphanreg]: 0 CLEAN / >0 ACT — a registration pointing at a missing script is dead enforcement (a hook that will never fire). Any >0 is structural breakage to act on.
 [^orphanscript]: 0 CLEAN / >0 ACT — a script on disk reached by no registration and no dispatcher is dead code (best-effort static; a dynamic-dispatch caveat applies). Any >0 warrants action.
+[^hookcoverage]: Not a defect count — a coverage denominator (`enforcement.hooks.commands_total`/`.commands_resolved`/`.commands_no_script`/`.commands_unparsed`). `hook_commands_examined` is `commands_resolved + commands_no_script`: every registered hook command the collector could actually classify, whether or not it names a script. The gap between the two numbers is `commands_unparsed` — a real coverage gap the collector could not read, disclosed in `blind_spots`. A "0 orphans" reading with `hook_commands_examined` below `hook_commands_total` means "0 orphans found among what was examined," never "0 orphans, full stop."
 
 ## 2. System Map
 
