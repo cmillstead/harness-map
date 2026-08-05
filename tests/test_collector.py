@@ -6898,15 +6898,25 @@ def _check_empty_project(tmp_path):
     proj.mkdir()
     return proj
 
-def _write_check_sidecar(out_dir, date_str, headline=None, crashed=False):
+def _write_check_sidecar(out_dir, date_str, headline=None, crashed=False, profile_rejected=False):
     """A real harness-map-<date>.json fixture. `crashed=True` writes a well-formed CRASH
     ENVELOPE -- all-zero headline plus the actual _CRASH_ERROR_PREFIX marker main() itself
-    writes on a build_document exception -- ignoring any `headline` passed alongside it."""
+    writes on a build_document exception -- ignoring any `headline` passed alongside it.
+    `profile_rejected=True` writes the OTHER unmeasured-run envelope shape (F3): the same
+    all-zero headline, tagged with _PROFILE_ERROR_PREFIX instead -- the marker main()
+    writes when the resolved --profile fails validation. Both flags produce a well-formed,
+    all-zero, UNMEASURED envelope; they differ only in which marker main() would actually
+    have written."""
     if crashed:
         headline = {k: 0 for k in ("always_loaded_words", "always_loaded_tokens_est",
             "always_loaded_file_count", "duplicate_pair_count", "unchecked_binary_count",
             "instruction_files_over_200", "orphan_registration_count", "orphan_script_count")}
         errors = [f"{_collector._CRASH_ERROR_PREFIX}RuntimeError('synthetic crash')"]
+    elif profile_rejected:
+        headline = {k: 0 for k in ("always_loaded_words", "always_loaded_tokens_est",
+            "always_loaded_file_count", "duplicate_pair_count", "unchecked_binary_count",
+            "instruction_files_over_200", "orphan_registration_count", "orphan_script_count")}
+        errors = [f"{_collector._PROFILE_ERROR_PREFIX}profiles/foo.json: bad key"]
     else:
         errors = []
     doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00",
@@ -7085,6 +7095,57 @@ def test_check_all_priors_crashed_emits_verbatim_notice(fake_harness, tmp_path):
     assert rc == 0, err
     assert out.strip() == "No comparison baseline available — every prior run crashed."
 
+def test_check_skips_profile_rejection_envelope_prior(fake_harness, tmp_path):
+    # F3 (P1): pre-fix, _check_is_crash_envelope matched only _CRASH_ERROR_PREFIX, so a
+    # PROFILE-REJECTION envelope -- all-zero headline, errors[] tagged
+    # "layout profile rejected: " -- was accepted as a MEASURED baseline. Its fabricated
+    # zeros made every real current number read as an increase:
+    # "REGRESSION: instruction_files_over_200 increased (0 -> 8)" against a harness where
+    # nothing had changed. A run that rejected its profile measured nothing, exactly as a
+    # crashed run measured nothing, and D7 says skip an unmeasured prior and continue to
+    # the next-older candidate.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_sidecar(out_dir, older, {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    _write_check_sidecar(out_dir, newer, profile_rejected=True)
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    assert "REGRESSION" not in out
+    assert f"harness-map-{older}.json" in out
+    assert f"harness-map-{newer}.json" not in out
+
+def test_check_all_priors_unmeasured_mixed_markers(fake_harness, tmp_path):
+    # A crash envelope and a profile-rejection envelope are both unmeasured, so with only
+    # those two present there is no baseline at all. The notice text is SKILL.md:92's
+    # verbatim D7 wording and is deliberately NOT reworded here -- changing it would need
+    # a spec change (SPEC_7 §1). Its "every prior run crashed" phrasing is the umbrella
+    # term for "measured nothing".
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), profile_rejected=True)
+    _write_check_sidecar(out_dir, _days_ago(2), crashed=True)
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    # Build the expected string from the CONSTANT, never by retyping the literal: it
+    # contains an em-dash (U+2014), and a retyped hyphen would fail this assert for a
+    # reason that has nothing to do with the behavior under test.
+    assert out.strip() == _collector._CHECK_BASELINE_ALL_CRASHED
+
+def test_profile_marker_prefix_matches_the_renderer_reader():
+    # Two-home pin, collector side. Mirrors
+    # test_crash_marker_prefix_matches_the_collector_producer for the OTHER unmeasured-run
+    # marker. Pre-fix render_html had no mirror at all, so a profile-rejection envelope
+    # written to --out was rendered as a real measurement.
+    render_html_path = Path(__file__).resolve().parents[1] / "render_html.py"
+    spec = importlib.util.spec_from_file_location("harness_map_render_html_for_check_drift", render_html_path)
+    render_html_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(render_html_mod)
+    assert _collector._PROFILE_ERROR_PREFIX == render_html_mod.PROFILE_ERROR_PREFIX
+
 def test_check_civc_unallowlisted_verdict_is_ignored_not_coerced(fake_harness, tmp_path):
     # D-3: an unallowlisted verdict makes the CURRENT-side cell absent, not 'empty' -- if
     # it were coerced (render_html.build_civc_model's rendering behavior) this would read
@@ -7148,3 +7209,340 @@ def test_check_synthesis_regex_matches_render_html_naming(tmp_path):
     found_doc, err = render_html_mod.load_synthesis(tmp_path, sample_date)
     assert err is None
     assert found_doc == sidecar_doc
+
+def test_check_nonexistent_root_exits_two_not_clean(tmp_path):
+    # F2 (P1): pre-fix, a nonexistent --root produced an empty current document, every
+    # real prior value read as an improvement, and --check printed
+    # "No regression detected (baseline: ...)" with EXIT 0. A typo in a SessionStart
+    # hook's --root made the gate permanently green -- "inaccessible reads as clean",
+    # the exact invariant this codebase exists to enforce, reintroduced inside the gate.
+    # SPEC_7 §1 line 23: exit 2 is for collection errors; errors must not masquerade as
+    # clean.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 4, "orphan_registration_count": 0, "orphan_script_count": 0})
+    missing = tmp_path / "no-such-root"
+    rc, out, err = run_check(missing, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert "No regression detected" not in out
+    assert "--root" in (out + err)
+
+def test_check_root_that_is_a_file_exits_two(tmp_path):
+    # F2 sibling: os.stat() SUCCEEDS on a regular file, so an os.stat-only gate would
+    # still walk nothing and report CLEAN. The gate must require a DIRECTORY.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 4, "orphan_registration_count": 0, "orphan_script_count": 0})
+    not_a_dir = tmp_path / "root-is-a-file"
+    not_a_dir.write_text("not a harness\n")
+    rc, out, err = run_check(not_a_dir, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert "No regression detected" not in out
+
+def test_check_unlistable_root_exits_two(tmp_path):
+    # F2 sibling: a directory whose contents cannot be listed measures nothing. os.stat
+    # succeeds and is_dir() is True, so the gate must actually probe listability.
+    # Skipped as root (uid 0 bypasses the mode bits).
+    if os.geteuid() == 0:
+        pytest.skip("mode bits do not restrict uid 0")
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 4, "orphan_registration_count": 0, "orphan_script_count": 0})
+    locked = tmp_path / "locked-root"
+    locked.mkdir()
+    os.chmod(locked, 0o000)
+    try:
+        rc, out, err = run_check(locked, out_dir, project_root=proj)
+    finally:
+        os.chmod(locked, 0o700)      # always restore, or tmp_path cleanup fails
+    assert rc == 2, (out, err)
+    assert "No regression detected" not in out
+
+def test_default_mode_with_bad_root_still_emits_envelope(tmp_path):
+    # Regression guard for the F2 fix's blast radius: the root gate is --check ONLY.
+    # Without --check, a bad --root must keep today's behavior exactly -- a stderr
+    # warning and a VALID JSON envelope on stdout, per the envelope rule (CLAUDE.md §5).
+    proj = _check_empty_project(tmp_path)
+    missing = tmp_path / "no-such-root"
+    cmd = [sys.executable, str(COLLECTOR), "--root", str(missing),
+           "--project-root", str(proj)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)          # must parse -- envelope rule
+    assert "headline" in doc
+
+def test_check_out_writing_the_baseline_does_not_mask_the_regression(tmp_path, fake_harness):
+    # F1 (P1): pre-fix, main() ran the --out write block BEFORE the --check branch, so
+    # `--check DIR --out DIR/harness-map-<prior-date>.json` overwrote the baseline and
+    # then compared the run against ITSELF -- identical inputs, opposite verdicts (exit 1
+    # without --out, exit 0 with it). SPEC_7 §1 line 24 explicitly permits --out alongside
+    # --check, so the flag combination is not the bug; the ORDERING is. The baseline must
+    # be READ INTO MEMORY before any write can touch it.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    prior_date = _days_ago(1)
+    # A prior whose over-200 count is BELOW what the current run will measure, so the
+    # comparison must fire. Two extra instruction files push the current run over it.
+    for name in ("long_one.md", "long_two.md"):
+        (fake_harness / "rules" / name).write_text("# long\n" + "word\n" * 260)
+    _write_check_sidecar(out_dir, prior_date, {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    target = out_dir / f"harness-map-{prior_date}.json"
+    rc, out, err = run_check(fake_harness, out_dir, "--out", str(target), project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: instruction_files_over_200 increased (0 ->" in out
+
+def test_check_unreadable_out_dir_still_exits_two(tmp_path, fake_harness):
+    # Regression guard: moving the baseline READ earlier must not lose the exit-2 path
+    # for an unlistable OUT_DIR (_check_select_prior_sidecar's "unreadable" status).
+    if os.geteuid() == 0:
+        pytest.skip("mode bits do not restrict uid 0")
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    os.chmod(out_dir, 0o000)
+    try:
+        rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    finally:
+        os.chmod(out_dir, 0o700)
+    assert rc == 2, (out, err)
+    assert out.startswith("error:")
+
+def test_check_non_numeric_prior_headline_exits_two_not_one(fake_harness, tmp_path):
+    # F6 (P1-adjacent): pre-fix, a prior headline of {"instruction_files_over_200": "bad"}
+    # raised an UNCAUGHT TypeError in _check_headline_regressions -- exiting 1, the code
+    # that means "regression found", with NO "REGRESSION:" line on stdout. A hook
+    # branching on the exit code read a malformed file as a failing gate. SPEC_7 §1
+    # line 23: a malformed prior sidecar is exit 2.
+    # Changing this value requires a spec change (SPEC_7 §1).
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": "bad", "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert out.startswith("error:") and "malformed prior sidecar" in out
+    assert "REGRESSION" not in out
+    assert "Traceback" not in err
+
+def test_check_non_dict_prior_headline_exits_two(fake_harness, tmp_path):
+    # Same class: a headline that is a list/string/number is not comparable at all.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    doc = {"schema_version": 1, "generated_at": f"{_days_ago(1)}T00:00:00+00:00",
+           "root": "/fake", "headline": ["not", "a", "dict"], "errors": []}
+    (out_dir / f"harness-map-{_days_ago(1)}.json").write_text(json.dumps(doc))
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert "malformed prior sidecar" in out
+
+def test_check_boolean_prior_headline_count_exits_two(fake_harness, tmp_path):
+    # A bool is an int in Python (True > 0 is True), so a boolean count would compare as
+    # 1 and read as a real measurement. A count that is not a count is malformed, and the
+    # same reasoning schema.md:167 applies to definition versions applies here.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": True, "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert "malformed prior sidecar" in out
+
+def test_check_absent_prior_headline_keys_still_compare(fake_harness, tmp_path):
+    # Regression guard on the F6 fix's blast radius: only a PRESENT non-numeric value is
+    # malformed. An ABSENT key is normal (older schemas, partial headlines) and must keep
+    # taking the .get(key, 0) path -- turning absence into exit 2 would break every
+    # existing partial-headline fixture and disable the gate on legacy sidecars.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "No regression detected" in out
+
+def test_check_non_list_civc_does_not_discard_headline_findings(fake_harness, tmp_path):
+    # F6, second half: a non-list "civc" raised a TypeError inside _check_civc_cells --
+    # AFTER _check_headline_regressions had already accumulated findings, so a real
+    # regression was converted into a traceback and the findings were lost. The synthesis
+    # comparison is best-effort by design (SPEC_7 §1 gates it on ">= 2 exist", and
+    # _check_select_synthesis_pair already returns None on unreadable input), so an
+    # unusable civc means "no cells" -- it must NOT crash, and must NOT suppress the
+    # headline findings that were already collected.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_sidecar(out_dir, newer, {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    for date_str in (older, newer):
+        (out_dir / f"harness-synthesis-{date_str}.json").write_text(
+            json.dumps({"schema_version": 1, "civc": 7}))     # non-list, non-iterable
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")   # forces a real finding
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: orphan_script_count increased" in out
+    assert "Traceback" not in err
+
+def test_check_skips_a_metric_whose_definition_version_changed(fake_harness, tmp_path):
+    # F7: --check ignored METRIC_DEFINITIONS entirely, so the next detector bump would
+    # read as a REGRESSION against every prior sidecar -- a false positive in exactly the
+    # direction the RISK_REGISTER kill signal watches. A prior declaring a DIFFERENT
+    # version for a metric means that metric is incomparable: omit it and SAY SO.
+    # Changing this value requires a spec change (SPEC_7 §1).
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    date_str = _days_ago(1)
+    doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+           "headline": {"always_loaded_tokens_est": 200, "instruction_files_over_200": 0,
+                        "orphan_registration_count": 0, "orphan_script_count": 0},
+           "metric_definitions": {"orphan_script_count": 99}, "errors": []}
+    (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+    current_version = _collector.METRIC_DEFINITIONS["orphan_script_count"]
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")   # would fire, if compared
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert f"notice: orphan_script_count skipped (definition v99 -> v{current_version})" in out
+    assert "REGRESSION: orphan_script_count" not in out
+    assert "No regression detected" in out
+
+def test_check_definition_skip_does_not_suppress_other_metrics(fake_harness, tmp_path):
+    # The skip is PER-METRIC. One bumped detector must not blind the gate to the metrics
+    # that are still comparable -- a whole-run abort would be the silent-green shape again.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    date_str = _days_ago(1)
+    doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+           "headline": {"always_loaded_tokens_est": 200, "instruction_files_over_200": 0,
+                        "orphan_registration_count": 0, "orphan_script_count": 0},
+           "metric_definitions": {"always_loaded_tokens_est": 99}, "errors": []}
+    (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "notice: always_loaded_tokens_est skipped" in out
+    assert "REGRESSION: orphan_script_count increased" in out
+
+def test_check_missing_definitions_map_compares_rather_than_skipping(fake_harness, tmp_path):
+    # THE F2 SHAPE IN A NEW PLACE, and the reason this test exists. _empty_document sets
+    # metric_definitions to {} deliberately ("measured nothing, so defines nothing"), and a
+    # LEGACY sidecar predating S6b carries no map at all. Reading absence as "every metric
+    # changed definition" would skip every comparison and print a clean-looking verdict for
+    # a run that compared nothing -- the gate silently green again. Absent MUST compare.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # _write_check_sidecar writes no metric_definitions key at all -- the legacy shape.
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "notice:" not in out
+    assert "REGRESSION: orphan_script_count increased" in out
+
+def test_check_empty_definitions_map_compares_rather_than_skipping(fake_harness, tmp_path):
+    # Sibling of the above for an EXPLICIT {} -- the crash-envelope shape. After TRK-051's
+    # F3 fix both envelope kinds are excluded as baselines, so this is defense in depth,
+    # but the semantics must be identical to "absent": compare, do not skip.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    date_str = _days_ago(1)
+    doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+           "headline": {"always_loaded_tokens_est": 200, "instruction_files_over_200": 0,
+                        "orphan_registration_count": 0, "orphan_script_count": 0},
+           "metric_definitions": {}, "errors": []}
+    (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "notice:" not in out
+    assert "REGRESSION: orphan_script_count increased" in out
+
+def test_check_invalid_definition_version_compares_rather_than_skipping(fake_harness, tmp_path):
+    # schema.md:167: a version must be `isinstance(v, int) and not isinstance(v, bool) and
+    # v > 0`; anything else is UNKNOWN, never a default. UNKNOWN takes the same branch as
+    # absent -- COMPARE -- because the safe direction for a gate is to keep watching, not
+    # to fall silent on garbage input. A non-dict map takes the same branch.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    for bad in (True, 0, -1, "1", 1.0, None):
+        date_str = _days_ago(1)
+        doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+               "headline": {"always_loaded_tokens_est": 200, "instruction_files_over_200": 0,
+                            "orphan_registration_count": 0, "orphan_script_count": 0},
+               "metric_definitions": {"orphan_script_count": bad}, "errors": []}
+        (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+        rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+        assert rc == 0, (bad, out, err)
+        assert "notice:" not in out, bad
+    doc["metric_definitions"] = ["not", "a", "dict"]
+    (out_dir / f"harness-map-{_days_ago(1)}.json").write_text(json.dumps(doc))
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "notice:" not in out
+
+def test_check_all_metrics_skipped_still_names_every_skip(fake_harness, tmp_path):
+    # If every compared metric is skipped, exit 0 with only "No regression detected" would
+    # be a NEW silent green -- a clean-looking verdict for a run that compared nothing.
+    # Four notices must precede the verdict line, in the FIXED metric order
+    # _check_headline_regressions emits in (deterministic across PYTHONHASHSEED).
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    date_str = _days_ago(1)
+    keys = ("always_loaded_tokens_est", "instruction_files_over_200",
+            "orphan_registration_count", "orphan_script_count")
+    doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+           "headline": {k: 0 for k in keys},
+           "metric_definitions": {k: 99 for k in keys}, "errors": []}
+    (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    lines = [ln for ln in out.strip().splitlines() if ln]
+    assert [ln.split()[1] for ln in lines if ln.startswith("notice:")] == list(keys)
+    assert lines[-1].startswith("No regression detected")
+
+def test_definition_version_validator_matches_render_html():
+    # BEHAVIORAL two-home pin. collector._check_valid_definition_version and
+    # render_html._valid_definition_version are two INDEPENDENT implementations of one
+    # prose contract (schema.md:167). That is the two-home shape even though no constant
+    # is shared, and A49's lesson is that the unpinned half of a pinned pair is where the
+    # off-by-one ships -- so pin the BEHAVIOR across the battery rather than the text.
+    # The battery's teeth: True must be False in BOTH (a bool is excluded despite
+    # True == 1), and 1.0 must be False in BOTH (isinstance(1.0, int) is False). If
+    # schema.md's prose ever changes, both implementations fail this together -- which is
+    # the point.
+    # Changing this contract requires a spec change (SPEC_7 §1).
+    render_html_path = Path(__file__).resolve().parents[1] / "render_html.py"
+    spec = importlib.util.spec_from_file_location("harness_map_render_html_for_check_drift", render_html_path)
+    render_html_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(render_html_mod)
+    battery = (True, False, 0, -1, 1, 2, "1", 1.0, None)
+    for value in battery:
+        assert (_collector._check_valid_definition_version(value)
+                is render_html_mod._valid_definition_version(value)), value
+    # And pin the shape itself, so "both agree" cannot be satisfied by both being broken.
+    assert _collector._check_valid_definition_version(1) is True
+    assert _collector._check_valid_definition_version(True) is False
+    assert _collector._check_valid_definition_version(1.0) is False
+    assert _collector._check_valid_definition_version(0) is False

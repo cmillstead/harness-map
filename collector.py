@@ -6342,8 +6342,11 @@ _CRASH_ERROR_PREFIX = "collector crashed: "
 
 # M11 (SPEC_7 §2): companion to _CRASH_ERROR_PREFIX above -- tags an errors[] entry so a
 # rejected --profile is distinguishable from a build_document crash by anyone reading the
-# document. Unlike _CRASH_ERROR_PREFIX there is deliberately no render_html mirror: the
-# renderer is out of scope for M11 (no renderer change).
+# document. render_html.PROFILE_ERROR_PREFIX is the reading end, pinned equal to this one
+# by test_profile_marker_prefix_matches_the_renderer_reader. (Through M11 there was no
+# renderer mirror -- an M11 SCOPING decision, not a design property. It was a live defect:
+# main()'s --out block writes this envelope to disk as an ordinary dated sidecar, and the
+# renderer read its eight fabricated zeros as a measurement. Fixed in TRK-051.)
 _PROFILE_ERROR_PREFIX = "layout profile rejected: "
 
 
@@ -6426,6 +6429,10 @@ _CHECK_SIDECAR_RE = re.compile(r"^harness-map-(\d{4}-\d{2}-\d{2})\.json$")
 _CHECK_SYNTHESIS_RE = re.compile(r"^harness-synthesis-(\d{4}-\d{2}-\d{2})\.json$")
 
 _CHECK_BASELINE_NO_PRIOR = "First run — no prior map (baseline)."
+# SKILL.md D7's mandated wording, unchanged by TRK-051 (Rule 7: never edit an existing
+# assertion's subject). "every prior run crashed" is the UMBRELLA term here for "every
+# prior run was unmeasured" -- it now also covers a profile-rejection envelope, which
+# measured nothing for a different reason than a crash but is skipped identically.
 _CHECK_BASELINE_ALL_CRASHED = "No comparison baseline available — every prior run crashed."
 
 
@@ -6457,28 +6464,73 @@ def _check_band(value: Any) -> str:
 
 
 def _check_is_crash_envelope(doc: dict[str, Any]) -> bool:
-    """True when `doc["errors"]` carries the _CRASH_ERROR_PREFIX marker _empty_document
-    writes on a build_document crash -- mirrors render_html._run_was_measured's detector
-    (D-4: reuses this module's OWN _CRASH_ERROR_PREFIX rather than importing the renderer's
-    copy of the same string; the two are pinned equal by
-    test_crash_marker_prefix_matches_the_collector_producer). Defensive on shape: a
+    """True when `doc["errors"]` carries EITHER unmeasured-run marker _empty_document
+    ships with: _CRASH_ERROR_PREFIX (build_document raised) or _PROFILE_ERROR_PREFIX (the
+    --profile was rejected, so nothing was inventoried). Both produce the SAME all-zero
+    headline, and both mean "this run measured nothing" -- so both must be skipped as
+    baselines. Matching only the crash marker (the pre-TRK-051 behavior) let a
+    profile-rejection envelope's fabricated zeros turn every real current number into a
+    manufactured increase.
+
+    Mirrors render_html._run_was_measured's detector (D-4: reuses this module's OWN
+    prefixes rather than importing the renderer's copies; the two are pinned equal by
+    test_crash_marker_prefix_matches_the_collector_producer and
+    test_profile_marker_prefix_matches_the_renderer_reader). Defensive on shape: a
     non-list `errors` is wrapped, non-string entries are skipped rather than raising."""
     errors = doc.get("errors") or []
     entries = errors if isinstance(errors, list) else [errors]
-    return any(isinstance(e, str) and e.startswith(_CRASH_ERROR_PREFIX) for e in entries)
+    markers = (_CRASH_ERROR_PREFIX, _PROFILE_ERROR_PREFIX)
+    return any(isinstance(e, str) and e.startswith(markers) for e in entries)
+
+
+# The four headline keys --check actually compares. Fixed order, matching
+# _check_headline_regressions' emission order (deterministic output, CLAUDE.md rule 9).
+_CHECK_COMPARED_HEADLINE_KEYS = ("always_loaded_tokens_est", "instruction_files_over_200",
+                                 "orphan_registration_count", "orphan_script_count")
+
+
+def _check_headline_is_comparable(headline: Any) -> str | None:
+    """None when `headline` can be compared, else a reason string naming the offending
+    key. Structural validation, run at SELECTION time (A48 D-2: a D7-selected sidecar
+    failing structural validation is FATAL, exit 2, with no fallback to an older file).
+
+    Pre-TRK-051 the `>` comparisons in _check_headline_regressions had no guard at all --
+    only _check_band's `try: float(value)` did -- so a prior headline value of "bad"
+    raised an uncaught TypeError and --check exited 1, the code that means REGRESSION
+    FOUND, printing no REGRESSION: line at all. A hook branching on the exit code could
+    not tell a degraded harness from an unreadable file.
+
+    ABSENT keys are fine and must stay fine: partial headlines are normal (older schemas),
+    and _check_headline_regressions defaults them with .get(key, 0). Only a PRESENT
+    non-numeric value is malformed.
+
+    Bools are rejected explicitly. `True == 1` in Python, so a boolean count would compare
+    as a real measurement of 1 -- the same trap schema.md:167 documents for definition
+    versions."""
+    if not isinstance(headline, dict):
+        return f"headline is {type(headline).__name__}, not an object"
+    for key in _CHECK_COMPARED_HEADLINE_KEYS:
+        if key not in headline:
+            continue
+        value = headline[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return f"headline.{key} is not a number ({value!r})"
+    return None
 
 
 def _check_select_prior_sidecar(out_dir: Path, today: str) -> tuple[str, dict[str, Any] | None, str | None]:
     """The D7 selection rule (SKILL.md's Diff-vs-Previous-Run section), scoped to --check
     (AMENDMENTS A48): among harness-map-YYYY-MM-DD.json sidecars in `out_dir` strictly
     before `today`, walk NEWEST FIRST. D-2: a structurally malformed candidate is FATAL --
-    returns ("malformed", ...) with NO fallback to an older file. A well-formed CRASH
-    ENVELOPE is not malformed -- it is SKIPPED, continuing to the next-older candidate.
+    returns ("malformed", ...) with NO fallback to an older file. A well-formed UNMEASURED
+    ENVELOPE (crash or profile rejection) is not malformed -- it is SKIPPED, continuing to
+    the next-older candidate.
 
     Returns (status, doc, detail):
       ("found", doc, date_str)     -- doc is the measured baseline, detail is its date
       ("no_prior", None, None)     -- no sidecar at all strictly before `today`
-      ("all_crashed", None, None)  -- sidecars exist, every one is a crash envelope
+      ("all_crashed", None, None)  -- sidecars exist, every one is an unmeasured envelope
+                                       (crash or profile rejection)
       ("malformed", None, msg)     -- the D7-selected candidate failed structural validation
       ("unreadable", None, msg)    -- `out_dir` itself could not be listed
     """
@@ -6501,6 +6553,13 @@ def _check_select_prior_sidecar(out_dir: Path, today: str) -> tuple[str, dict[st
             return "malformed", None, f"malformed prior sidecar {path.name}: {exc}"
         if not isinstance(candidate_doc, dict) or "schema_version" not in candidate_doc:
             return "malformed", None, f"malformed prior sidecar {path.name}: not a valid sidecar document"
+        # Comparability is structural validation too (A48 D-2), and it runs BEFORE the
+        # unmeasured-envelope skip below: an unmeasured envelope's headline is all-zero
+        # ints and always passes this, so the ordering is only load-bearing for a
+        # DOCTORED envelope -- where "malformed" is the more accurate verdict anyway.
+        headline_problem = _check_headline_is_comparable(candidate_doc.get("headline") or {})
+        if headline_problem is not None:
+            return "malformed", None, f"malformed prior sidecar {path.name}: {headline_problem}"
         if _check_is_crash_envelope(candidate_doc):
             continue
         return "found", candidate_doc, date_str
@@ -6543,7 +6602,18 @@ def _check_civc_cells(synth_doc: dict[str, Any]) -> dict[tuple[str, str], str]:
     grid. Coercing here would turn a synthesis typo into a manufactured
     covered->empty finding, so an unmatched cell is simply absent from the returned map."""
     cells: dict[tuple[str, str], str] = {}
-    for c in synth_doc.get("civc", []) or []:
+    raw = synth_doc.get("civc")
+    # A non-list `civc` (an int, a bare dict) is not iterable into cells -- pre-TRK-051
+    # `for c in raw` raised a TypeError inside run_check, AFTER headline findings had been
+    # accumulated, so a real regression was lost to a traceback. Unusable means "no cells":
+    # the synthesis comparison is best-effort by design (SPEC_7 §1 gates it on ">= 2
+    # exist", and _check_select_synthesis_pair already returns None on unreadable input),
+    # unlike the collector-sidecar path above, which is mandatory and FATAL. Widening this
+    # into an exit-2 condition would be a different decision (Codex F5) and is deliberately
+    # NOT made here.
+    if not isinstance(raw, list):
+        return cells
+    for c in raw:
         if not isinstance(c, dict):
             continue
         verb, surface, verdict = c.get("verb"), c.get("surface"), c.get("verdict")
@@ -6553,23 +6623,86 @@ def _check_civc_cells(synth_doc: dict[str, Any]) -> dict[tuple[str, str], str]:
     return cells
 
 
-def _check_headline_regressions(current: dict[str, Any], prior: dict[str, Any]) -> list[str]:
+def _check_valid_definition_version(value: Any) -> bool:
+    """schema.md:167's stated contract for a metric definition version: a positive int and
+    NOT a bool. `True == 1` in Python, so a stray boolean would silently resolve as
+    version 1 and report a series comparable when it is not. Anything failing this is
+    UNKNOWN, never a default.
+
+    Mirrors render_html._valid_definition_version. NOT imported from it (A48 D-4:
+    collector.py does not import render_html, and must not start) -- instead the two are
+    pinned BEHAVIORALLY equal by test_definition_version_validator_matches_render_html.
+    Two independent implementations of one prose contract is the two-home shape, and A49's
+    lesson is that the unpinned half of a pinned pair is where the off-by-one ships."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _check_definition_skips(prior: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """(skipped_metric_names, notice_lines) for metrics whose DEFINITION VERSION differs
+    between the prior sidecar and this run (S6b §8.1 / AMENDMENTS A50).
+
+    METRIC_DEFINITIONS is the current run's version map by construction -- build_document
+    copies this same constant into doc["metric_definitions"], so reading the constant and
+    reading the current document give the same value for any real run. Reading the constant
+    keeps run_check callable with a hand-built current doc (the in-process boundary test).
+
+    ABSENT, EMPTY, non-dict, or INVALID prior versions mean COMPARE, never skip. Reading
+    "unknown" as "changed" would skip every metric and print a clean-looking verdict for a
+    run that compared nothing -- the identical silent-green failure as a --check whose
+    --root did not exist, relocated. `_empty_document` sets metric_definitions to {}
+    deliberately, and a legacy sidecar predating S6b carries no map at all; both of those
+    are ordinary inputs, not signals.
+
+    CIVC is deliberately untouched: METRIC_DEFINITIONS declares no CIVC metric, and the
+    synthesis comparison is not a headline metric. Do not wire one in without a spec change.
+
+    Fixed key order (CLAUDE.md rule 9: deterministic output across PYTHONHASHSEED)."""
+    declared = prior.get("metric_definitions")
+    if not isinstance(declared, dict):
+        return [], []
+    skipped: list[str] = []
+    notices: list[str] = []
+    for key in _CHECK_COMPARED_HEADLINE_KEYS:
+        prior_version = declared.get(key)
+        current_version = METRIC_DEFINITIONS.get(key)
+        if not _check_valid_definition_version(prior_version):
+            continue
+        if not _check_valid_definition_version(current_version):
+            continue
+        if prior_version == current_version:
+            continue
+        skipped.append(key)
+        notices.append(f"notice: {key} skipped (definition v{prior_version} -> v{current_version})")
+    return skipped, notices
+
+
+def _check_headline_regressions(current: dict[str, Any], prior: dict[str, Any],
+                                skip: tuple[str, ...] = ()) -> list[str]:
     """The three headline regression signals (SPEC_7 §1), checked and emitted in this
     FIXED order (deterministic, F4.4) so findings are stable across runs regardless of
-    dict iteration order."""
+    dict iteration order.
+
+    `skip` names metrics whose DEFINITION VERSION changed between the two runs (A50): the
+    numbers are no longer measuring the same thing, so comparing them would manufacture a
+    REGRESSION out of a detector bump. The default () preserves the pre-A50 behavior for
+    any caller that does not supply it."""
     findings = []
-    cur_tokens = current.get("always_loaded_tokens_est", 0)
-    prior_tokens = prior.get("always_loaded_tokens_est", 0)
-    cur_band, prior_band = _check_band(cur_tokens), _check_band(prior_tokens)
-    if _CHECK_BAND_ORDER.index(cur_band) > _CHECK_BAND_ORDER.index(prior_band):
-        findings.append(f"REGRESSION: always_loaded_tokens_est crossed {prior_band} -> {cur_band} "
-                         f"({prior_tokens} -> {cur_tokens} tokens)")
-    cur_over200 = current.get("instruction_files_over_200", 0)
-    prior_over200 = prior.get("instruction_files_over_200", 0)
-    if cur_over200 > prior_over200:
-        findings.append(f"REGRESSION: instruction_files_over_200 increased "
-                         f"({prior_over200} -> {cur_over200})")
+    if "always_loaded_tokens_est" not in skip:
+        cur_tokens = current.get("always_loaded_tokens_est", 0)
+        prior_tokens = prior.get("always_loaded_tokens_est", 0)
+        cur_band, prior_band = _check_band(cur_tokens), _check_band(prior_tokens)
+        if _CHECK_BAND_ORDER.index(cur_band) > _CHECK_BAND_ORDER.index(prior_band):
+            findings.append(f"REGRESSION: always_loaded_tokens_est crossed {prior_band} -> {cur_band} "
+                             f"({prior_tokens} -> {cur_tokens} tokens)")
+    if "instruction_files_over_200" not in skip:
+        cur_over200 = current.get("instruction_files_over_200", 0)
+        prior_over200 = prior.get("instruction_files_over_200", 0)
+        if cur_over200 > prior_over200:
+            findings.append(f"REGRESSION: instruction_files_over_200 increased "
+                             f"({prior_over200} -> {cur_over200})")
     for key in ("orphan_registration_count", "orphan_script_count"):
+        if key in skip:
+            continue
         cur_v, prior_v = current.get(key, 0), prior.get(key, 0)
         if cur_v > prior_v:
             findings.append(f"REGRESSION: {key} increased ({prior_v} -> {cur_v})")
@@ -6589,34 +6722,68 @@ def _check_civc_regressions(prior_synth: dict[str, Any], newest_synth: dict[str,
     return findings
 
 
-def run_check(doc: dict[str, Any], out_dir: str) -> tuple[int, str]:
+def check_load_baseline(out_dir: str) -> tuple[tuple[str, dict[str, Any] | None, str | None],
+                                               tuple[dict[str, Any], dict[str, Any]] | None]:
+    """Every disk read run_check needs, performed in one place so main() can do it BEFORE
+    build_document and therefore before BOTH --out blocks -- the validation block
+    (`if args.out is not None:`) and the write block (`if out_path is not None:`) (F1).
+    Pre-fix, the --out WRITE ran first and could overwrite the very sidecar the comparison
+    was about to select, so `--check DIR --out DIR/<the baseline>` compared the run against
+    itself and reported CLEAN. Reading first makes the comparison independent of what --out
+    later does to the directory; it does NOT narrow the --out-alongside---check combination,
+    which SPEC_7 §1 explicitly permits.
+
+    Returns (prior_selection, synthesis_pair) -- exactly the two values run_check consumes.
+    No write, no mutation: --check writes nothing (CLAUDE.md rule 4)."""
+    today = datetime.now(timezone.utc).date().isoformat()  # D-1: one clock frame per module
+    out_path = Path(out_dir)
+    return (_check_select_prior_sidecar(out_path, today),
+            _check_select_synthesis_pair(out_path, today))
+
+
+def run_check(doc: dict[str, Any], out_dir: str,
+              baseline: tuple[tuple[str, dict[str, Any] | None, str | None],
+                              tuple[dict[str, Any], dict[str, Any]] | None] | None = None,
+              ) -> tuple[int, str]:
     """SPEC_7 §1 / AMENDMENTS A48 entry point. `doc` is the CURRENT run's already-built
     document -- main() intercepts a current-run crash/profile-rejection BEFORE calling
     this (comparing a crash envelope would emit fabricated regressions, never done here).
+
+    `baseline` is the preloaded (prior_selection, synthesis_pair) pair from
+    check_load_baseline. main() always passes it, read before build_document and before
+    both --out blocks (F1); the default None re-reads here, which keeps this function
+    callable standalone with just (doc, out_dir) -- the shape
+    test_check_exit_one_on_band_crossing_at_the_5000_boundary drives.
+
     Returns (exit_code, text): text is what --check prints to stdout INSTEAD OF the JSON
     document (SPEC_7 §1's one carve-out to the always-emit-JSON invariant, which governs
     the default mode only)."""
-    today = datetime.now(timezone.utc).date().isoformat()  # D-1: one clock frame per module
-    out_path = Path(out_dir)
-    status, prior_doc, detail = _check_select_prior_sidecar(out_path, today)
+    if baseline is None:
+        baseline = check_load_baseline(out_dir)
+    (status, prior_doc, detail), synth_pair = baseline
     if status in ("malformed", "unreadable"):
         return 2, f"error: {detail}"
     findings: list[str] = []
+    notices: list[str] = []
     if status == "found":
         assert prior_doc is not None
+        skipped_metrics, notices = _check_definition_skips(prior_doc)
         findings.extend(_check_headline_regressions(
-            doc.get("headline") or {}, prior_doc.get("headline") or {}))
-    synth_pair = _check_select_synthesis_pair(out_path, today)
+            doc.get("headline") or {}, prior_doc.get("headline") or {},
+            skip=tuple(skipped_metrics)))
     if synth_pair is not None:
         prior_synth, newest_synth = synth_pair
         findings.extend(_check_civc_regressions(prior_synth, newest_synth))
+    # A50: notices precede findings and the verdict line, and never change the exit code --
+    # a skipped metric is neither a regression nor a clean result, it is a metric nobody
+    # compared, and the operator is told which one by name.
     if findings:
-        return 1, "\n".join(findings)
+        return 1, "\n".join(notices + findings)
     if status == "no_prior":
-        return 0, _CHECK_BASELINE_NO_PRIOR
+        return 0, "\n".join(notices + [_CHECK_BASELINE_NO_PRIOR])
     if status == "all_crashed":
-        return 0, _CHECK_BASELINE_ALL_CRASHED
-    return 0, f"No regression detected (baseline: harness-map-{detail}.json)."
+        return 0, "\n".join(notices + [_CHECK_BASELINE_ALL_CRASHED])
+    return 0, "\n".join(notices + [f"No regression detected (baseline: harness-map-{detail}.json)."])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -6641,7 +6808,9 @@ def main(argv: list[str] | None = None) -> int:
                           "run in OUT_DIR; PRINTS FINDINGS, NOT THE JSON DOCUMENT (the one "
                           "carve-out to the always-emit-JSON invariant, default mode "
                           "only). Exit 0 no regression (or no baseline yet), 1 a "
-                          "REGRESSION:-prefixed finding, 2 a collection/comparison error.")
+                          "REGRESSION:-prefixed finding, 2 a collection/comparison error. "
+                          "A metric whose definition version differs between the two runs "
+                          "is skipped, with a notice: line naming it.")
     args = ap.parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     out_path = None
@@ -6650,6 +6819,35 @@ def main(argv: list[str] | None = None) -> int:
                                         # on which --out branch happened to run
     out_roots = [root]                 # guarded roots for BOTH the upfront check and the
                                         # write-time TOCTOU recheck below (P1-6a)
+    # M10 / TRK-051 pre-flight (F2 + F1). --check has no JSON envelope to fall back on --
+    # it prints findings -- so an input it cannot measure must EXIT 2, never reach the
+    # comparison. Pre-fix, build_document() did not raise on a missing root, so the
+    # current document came back empty, every real prior value read as an improvement,
+    # and a typo'd --root printed "No regression detected" with exit 0. SPEC_7 §1 line 23:
+    # exit 2 is for collection errors; errors must not masquerade as clean.
+    #
+    # Deliberately --check ONLY. The default mode's contract is the opposite (always emit
+    # a valid JSON envelope, CLAUDE.md rule 5), and the --out VALIDATION block below keeps
+    # its own softer os.stat() warning unchanged.
+    #
+    # THREE probes, not one: os.stat() succeeds on a regular file, and is_dir() is True
+    # for a directory whose contents cannot be listed -- both of those measure nothing and
+    # would report CLEAN.
+    check_baseline = None
+    if args.check is not None:
+        try:
+            if not root.is_dir():
+                print(f"error: --check requires --root to be a directory: {root}", file=sys.stderr)
+                return 2
+            os.listdir(root)
+        except OSError as exc:
+            print(f"error: --check requires an accessible --root: {exc}", file=sys.stderr)
+            return 2
+        # F1: read the baseline BEFORE build_document and before the --out WRITE block
+        # (`if out_path is not None:`), which may target a path inside OUT_DIR (SPEC_7 §1
+        # line 24 permits --out alongside --check). Reading first is what stops the run
+        # from comparing against itself.
+        check_baseline = check_load_baseline(args.check)
     # M11: resolve the layout profile BEFORE anything reads the tree. On failure we do not
     # collect at all -- a half-applied profile would silently inventory the wrong surfaces.
     # The --out block below still runs, and the envelope is still emitted and written
@@ -6776,7 +6974,7 @@ def main(argv: list[str] | None = None) -> int:
         if current_run_crash_reason is not None:
             print(f"error: current run did not measure anything -- {current_run_crash_reason}")
             return 2
-        check_exit, check_text = run_check(doc, args.check)
+        check_exit, check_text = run_check(doc, args.check, baseline=check_baseline)
         print(check_text)
         return check_exit
     print(text)  # stdout is the primary contract — always emit the built document, write-or-not

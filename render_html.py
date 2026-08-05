@@ -287,12 +287,14 @@ def select_current(
     A corrupt sidecar among several is excluded + listed in `skipped[]`; an explicit
     `--date` naming a corrupt sidecar is fatal (never silently substitutes).
 
-    VALID here excludes a collector CRASH ENVELOPE (Codex gate finding 1). `_run_was_measured`
-    was applied to the trend series only, so a crash envelope that happened to be the
-    NEWEST file was still SELECTED — and `_empty_document`'s eight fabricated zeros then
-    rendered as LEAN / COMPLIANT / CLEAN with "No hygiene flags": a confident all-clear
-    for a run that measured nothing. That is the identical defect the trend fix closed,
-    left half-applied one function upstream.
+    VALID here excludes an UNMEASURED envelope -- a collector CRASH ENVELOPE (Codex gate
+    finding 1) or a profile-rejection envelope (TRK-051 F3), the two shapes
+    `_unmeasured_envelope_reason` distinguishes. `_run_was_measured` was applied to the
+    trend series only, so an unmeasured envelope that happened to be the NEWEST file was
+    still SELECTED — and `_empty_document`'s eight fabricated zeros then rendered as
+    LEAN / COMPLIANT / CLEAN with "No hygiene flags": a confident all-clear for a run that
+    measured nothing. That is the identical defect the trend fix closed, left
+    half-applied one function upstream.
 
     Neither branch degrades SILENTLY, because "inaccessible != clean" is this codebase's
     core invariant. The fallback branch skips to the next older MEASURED sidecar and
@@ -309,16 +311,18 @@ def select_current(
         if err is not None:
             return None, None, skipped, f"sidecar for {date} is corrupt: {err}"
         # load_sidecar's contract: err is None iff doc is populated.
-        if not _run_was_measured(cast(dict[str, Any], doc)):
-            return None, None, skipped, f"sidecar for {date} is a {CRASH_ENVELOPE_REASON}"
+        reason = _unmeasured_envelope_reason(cast(dict[str, Any], doc))
+        if reason is not None:
+            return None, None, skipped, f"sidecar for {date} is a {reason}"
         return date, doc, skipped, None
     for d, p in reversed(sidecars):
         doc, err = _load_sidecar_guarded(p)
         if err is not None:
             skipped.append({"date": d, "reason": err})
             continue
-        if not _run_was_measured(cast(dict[str, Any], doc)):
-            skipped.append({"date": d, "reason": CRASH_ENVELOPE_REASON})
+        reason = _unmeasured_envelope_reason(cast(dict[str, Any], doc))
+        if reason is not None:
+            skipped.append({"date": d, "reason": reason})
             continue
         return d, doc, skipped, None
     return None, None, skipped, _no_valid_sidecar_message(skipped)
@@ -878,9 +882,28 @@ CRASH_ENVELOPE_REASON = (
     "not a measurement"
 )
 
+# The collector's OTHER unmeasured-run marker, read at the other end of a cross-module
+# string contract (collector._PROFILE_ERROR_PREFIX is the writer; pinned equal by a test).
+# A rejected --profile means the collector inventoried NOTHING, so its all-zero headline is
+# not a measurement -- the identical situation as a crash envelope, arriving by a different
+# route.
+PROFILE_ERROR_PREFIX = "layout profile rejected: "
+
+# What `skipped[]` records for a sidecar whose run rejected its layout profile. A SECOND
+# constant rather than a reworded CRASH_ENVELOPE_REASON: that string is asserted verbatim
+# by existing tests, and "crash" would misdescribe this run to the operator reading the
+# provenance footer.
+PROFILE_ENVELOPE_REASON = (
+    "layout profile rejected — the run inventoried nothing, so its all-zero headline is "
+    "not a measurement"
+)
+
 
 def _run_was_measured(doc: dict[str, Any]) -> bool:
-    """False for a collector CRASH ENVELOPE — a run that measured nothing.
+    """False for any collector envelope that measured NOTHING -- a crash envelope
+    (CRASH_ERROR_PREFIX) or a profile-rejection envelope (PROFILE_ERROR_PREFIX). Both are
+    written to --out as ordinary dated sidecars by main(), both pass load_sidecar, and both
+    carry _empty_document's eight fabricated zeros.
 
     `_empty_document` sets all eight headline keys to 0 and `main()` writes that envelope
     to `--out` as an ordinary dated sidecar, so it passes `load_sidecar` (dict +
@@ -889,18 +912,31 @@ def _run_was_measured(doc: dict[str, Any]) -> bool:
     delta for every polarity=="up" metric — a fabricated verdict in the reassuring
     direction, which is the failure mode the A17 numeric guard exists to prevent.
 
-    CRASH MARKER ONLY, not "errors[] is non-empty". `errors[]` also carries benign
+    MARKER ONLY, not "errors[] is non-empty". `errors[]` also carries benign
     per-surface warnings (a failed glob, an unparseable settings.json) from runs that
     measured everything else correctly; disqualifying those would silently drop most real
-    runs from the series and quietly shrink the operator's history. The crash marker is
+    runs from the series and quietly shrink the operator's history. A marker is
     the one entry that means the document is an envelope rather than a measurement.
 
     Defensive on shape (the doc is untrusted sidecar JSON): a non-list `errors` is
     wrapped, and non-string entries are skipped rather than raising."""
+    return _unmeasured_envelope_reason(doc) is None
+
+
+def _unmeasured_envelope_reason(doc: dict[str, Any]) -> str | None:
+    """The skipped[]/fatal reason for an unmeasured envelope, or None when the run WAS a
+    measurement. One function so the predicate and the operator-facing reason can never
+    disagree about which envelope this is."""
     errors = doc.get("errors") or []
     entries = errors if isinstance(errors, list) else [errors]
-    return not any(isinstance(entry, str) and entry.startswith(CRASH_ERROR_PREFIX)
-                   for entry in entries)
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        if entry.startswith(CRASH_ERROR_PREFIX):
+            return CRASH_ENVELOPE_REASON
+        if entry.startswith(PROFILE_ERROR_PREFIX):
+            return PROFILE_ENVELOPE_REASON
+    return None
 
 
 def build_trend_model(dated_docs: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:

@@ -3127,6 +3127,45 @@ def test_crash_marker_prefix_matches_the_collector_producer():
     assert all(value == 0 for value in doc["headline"].values())
 
 
+def _profile_rejection_envelope_doc(root="/fake/root"):
+    """The EXACT artifact `collector.main()` writes to `--out` when the resolved
+    `--profile` fails validation: `_empty_document`'s all-zero headline plus the
+    profile-rejection marker in `errors[]`. Built by calling the collector's OWN
+    producer so the fixture cannot drift from it -- same shape as _crash_envelope_doc,
+    a different marker (F3)."""
+    from test_collector import _collector
+    doc = _collector._empty_document(Path(root))
+    doc["errors"].append(f"{_collector._PROFILE_ERROR_PREFIX}profiles/foo.json: bad key")
+    return doc
+
+
+def test_profile_rejection_envelope_is_not_a_measured_run():
+    # F3, renderer home. LIVE defect, not theoretical: main()'s --out write block runs
+    # regardless of profile_error, so a profile-rejection envelope reaches disk as an
+    # ordinary dated sidecar. Pre-fix _run_was_measured returned True for it, so
+    # _empty_document's eight fabricated zeros rendered as LEAN / CLEAN -- a confident
+    # all-clear for a run that inventoried nothing -- and joined the trend series as a
+    # GREEN "improving" latest point. Same defect select_current was repaired for on the
+    # crash-envelope path.
+    doc = _profile_rejection_envelope_doc()
+    assert rh._run_was_measured(doc) is False
+
+
+def test_profile_rejection_envelope_excluded_from_trend_series():
+    # Trend home, mirrors test_trend_excludes_a_crashed_collector_run with the OTHER
+    # unmeasured-run marker. Eight fabricated zeros as the latest point render a GREEN
+    # "improving" delta for every polarity=="up" metric -- inflation in the reassuring
+    # direction, which is the failure the A17 numeric guard exists to prevent.
+    good_first = _minimal_doc(tokens_a=100, tokens_b=50)     # 150
+    good_second = _minimal_doc(tokens_a=200, tokens_b=50)    # 250
+    model = rh.build_trend_model([("2026-07-13", good_first), ("2026-07-14", good_second),
+                                  ("2026-07-15", _profile_rejection_envelope_doc())])
+    assert model["dates"] == ["2026-07-13", "2026-07-14"]
+    tokens = next(s for s in model["series"] if s["key"] == "always_loaded_tokens_est")
+    assert tokens["values"] == [150, 250]
+    assert rh._trend_delta(model, "always_loaded_tokens_est") == ("▲ 100", "bad")
+
+
 def test_trend_excludes_a_crashed_collector_run(tmp_path):
     """A crash envelope carries eight headline ZEROS that were never measured. Joined to
     the series as the LATEST point they read as a collapse to zero, and for every
@@ -5916,6 +5955,28 @@ def test_explicit_date_naming_a_crash_envelope_is_fatal_not_a_clean_page(tmp_pat
     assert not (out_dir / "harness-map-2026-07-15.html").exists()
     # and NOT silently substituted with the good neighbour
     assert not (out_dir / "harness-map-2026-07-14.html").exists()
+
+
+def test_select_current_skips_a_profile_rejection_envelope(tmp_path):
+    # The selection surface, not just the predicate: a profile-rejection envelope that is
+    # the NEWEST file must be skipped with a published reason, and the next-older MEASURED
+    # sidecar selected -- never silently, because "inaccessible != clean". Mirrors
+    # test_crash_envelope_as_newest_sidecar_is_not_selected_as_the_current_run with the
+    # OTHER unmeasured-run marker.
+    out_dir = tmp_path / "profile_rejection_newest"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-14", _minimal_doc(tokens_a=200, tokens_b=50))
+    _write_sidecar(out_dir, "2026-07-15", _profile_rejection_envelope_doc())
+    proc = run_render(out_dir, "--no-friction")          # no --date: newest wins
+    assert proc.returncode == 0, proc.stderr
+    # the MEASURED run is the one rendered; the profile-rejection envelope never becomes a page
+    assert (out_dir / "harness-map-2026-07-14.html").is_file()
+    assert not (out_dir / "harness-map-2026-07-15.html").exists()
+    text = (out_dir / "harness-map-2026-07-14.html").read_text(encoding="utf-8")
+    # and the skip is DISCLOSED, never silent -- the operator must learn the newest run
+    # exists and why it was passed over
+    assert "2026-07-15" in text
+    assert "profile rejected" in text
 
 
 def test_missing_headline_key_is_unmeasured_in_the_gauge_not_zero(tmp_path):
