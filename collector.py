@@ -6483,6 +6483,41 @@ def _check_is_crash_envelope(doc: dict[str, Any]) -> bool:
     return any(isinstance(e, str) and e.startswith(markers) for e in entries)
 
 
+# The four headline keys --check actually compares. Fixed order, matching
+# _check_headline_regressions' emission order (deterministic output, CLAUDE.md rule 9).
+_CHECK_COMPARED_HEADLINE_KEYS = ("always_loaded_tokens_est", "instruction_files_over_200",
+                                 "orphan_registration_count", "orphan_script_count")
+
+
+def _check_headline_is_comparable(headline: Any) -> str | None:
+    """None when `headline` can be compared, else a reason string naming the offending
+    key. Structural validation, run at SELECTION time (A48 D-2: a D7-selected sidecar
+    failing structural validation is FATAL, exit 2, with no fallback to an older file).
+
+    Pre-TRK-051 the `>` comparisons in _check_headline_regressions had no guard at all --
+    only _check_band's `try: float(value)` did -- so a prior headline value of "bad"
+    raised an uncaught TypeError and --check exited 1, the code that means REGRESSION
+    FOUND, printing no REGRESSION: line at all. A hook branching on the exit code could
+    not tell a degraded harness from an unreadable file.
+
+    ABSENT keys are fine and must stay fine: partial headlines are normal (older schemas),
+    and _check_headline_regressions defaults them with .get(key, 0). Only a PRESENT
+    non-numeric value is malformed.
+
+    Bools are rejected explicitly. `True == 1` in Python, so a boolean count would compare
+    as a real measurement of 1 -- the same trap schema.md:167 documents for definition
+    versions."""
+    if not isinstance(headline, dict):
+        return f"headline is {type(headline).__name__}, not an object"
+    for key in _CHECK_COMPARED_HEADLINE_KEYS:
+        if key not in headline:
+            continue
+        value = headline[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return f"headline.{key} is not a number ({value!r})"
+    return None
+
+
 def _check_select_prior_sidecar(out_dir: Path, today: str) -> tuple[str, dict[str, Any] | None, str | None]:
     """The D7 selection rule (SKILL.md's Diff-vs-Previous-Run section), scoped to --check
     (AMENDMENTS A48): among harness-map-YYYY-MM-DD.json sidecars in `out_dir` strictly
@@ -6518,6 +6553,13 @@ def _check_select_prior_sidecar(out_dir: Path, today: str) -> tuple[str, dict[st
             return "malformed", None, f"malformed prior sidecar {path.name}: {exc}"
         if not isinstance(candidate_doc, dict) or "schema_version" not in candidate_doc:
             return "malformed", None, f"malformed prior sidecar {path.name}: not a valid sidecar document"
+        # Comparability is structural validation too (A48 D-2), and it runs BEFORE the
+        # unmeasured-envelope skip below: an unmeasured envelope's headline is all-zero
+        # ints and always passes this, so the ordering is only load-bearing for a
+        # DOCTORED envelope -- where "malformed" is the more accurate verdict anyway.
+        headline_problem = _check_headline_is_comparable(candidate_doc.get("headline") or {})
+        if headline_problem is not None:
+            return "malformed", None, f"malformed prior sidecar {path.name}: {headline_problem}"
         if _check_is_crash_envelope(candidate_doc):
             continue
         return "found", candidate_doc, date_str
@@ -6560,7 +6602,18 @@ def _check_civc_cells(synth_doc: dict[str, Any]) -> dict[tuple[str, str], str]:
     grid. Coercing here would turn a synthesis typo into a manufactured
     covered->empty finding, so an unmatched cell is simply absent from the returned map."""
     cells: dict[tuple[str, str], str] = {}
-    for c in synth_doc.get("civc", []) or []:
+    raw = synth_doc.get("civc")
+    # A non-list `civc` (an int, a bare dict) is not iterable into cells -- pre-TRK-051
+    # `for c in raw` raised a TypeError inside run_check, AFTER headline findings had been
+    # accumulated, so a real regression was lost to a traceback. Unusable means "no cells":
+    # the synthesis comparison is best-effort by design (SPEC_7 §1 gates it on ">= 2
+    # exist", and _check_select_synthesis_pair already returns None on unreadable input),
+    # unlike the collector-sidecar path above, which is mandatory and FATAL. Widening this
+    # into an exit-2 condition would be a different decision (Codex F5) and is deliberately
+    # NOT made here.
+    if not isinstance(raw, list):
+        return cells
+    for c in raw:
         if not isinstance(c, dict):
             continue
         verb, surface, verdict = c.get("verb"), c.get("surface"), c.get("verdict")

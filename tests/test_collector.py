@@ -7315,3 +7315,85 @@ def test_check_unreadable_out_dir_still_exits_two(tmp_path, fake_harness):
         os.chmod(out_dir, 0o700)
     assert rc == 2, (out, err)
     assert out.startswith("error:")
+
+def test_check_non_numeric_prior_headline_exits_two_not_one(fake_harness, tmp_path):
+    # F6 (P1-adjacent): pre-fix, a prior headline of {"instruction_files_over_200": "bad"}
+    # raised an UNCAUGHT TypeError in _check_headline_regressions -- exiting 1, the code
+    # that means "regression found", with NO "REGRESSION:" line on stdout. A hook
+    # branching on the exit code read a malformed file as a failing gate. SPEC_7 §1
+    # line 23: a malformed prior sidecar is exit 2.
+    # Changing this value requires a spec change (SPEC_7 §1).
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": "bad", "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert out.startswith("error:") and "malformed prior sidecar" in out
+    assert "REGRESSION" not in out
+    assert "Traceback" not in err
+
+def test_check_non_dict_prior_headline_exits_two(fake_harness, tmp_path):
+    # Same class: a headline that is a list/string/number is not comparable at all.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    doc = {"schema_version": 1, "generated_at": f"{_days_ago(1)}T00:00:00+00:00",
+           "root": "/fake", "headline": ["not", "a", "dict"], "errors": []}
+    (out_dir / f"harness-map-{_days_ago(1)}.json").write_text(json.dumps(doc))
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert "malformed prior sidecar" in out
+
+def test_check_boolean_prior_headline_count_exits_two(fake_harness, tmp_path):
+    # A bool is an int in Python (True > 0 is True), so a boolean count would compare as
+    # 1 and read as a real measurement. A count that is not a count is malformed, and the
+    # same reasoning schema.md:167 applies to definition versions applies here.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": True, "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert "malformed prior sidecar" in out
+
+def test_check_absent_prior_headline_keys_still_compare(fake_harness, tmp_path):
+    # Regression guard on the F6 fix's blast radius: only a PRESENT non-numeric value is
+    # malformed. An ABSENT key is normal (older schemas, partial headlines) and must keep
+    # taking the .get(key, 0) path -- turning absence into exit 2 would break every
+    # existing partial-headline fixture and disable the gate on legacy sidecars.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "No regression detected" in out
+
+def test_check_non_list_civc_does_not_discard_headline_findings(fake_harness, tmp_path):
+    # F6, second half: a non-list "civc" raised a TypeError inside _check_civc_cells --
+    # AFTER _check_headline_regressions had already accumulated findings, so a real
+    # regression was converted into a traceback and the findings were lost. The synthesis
+    # comparison is best-effort by design (SPEC_7 §1 gates it on ">= 2 exist", and
+    # _check_select_synthesis_pair already returns None on unreadable input), so an
+    # unusable civc means "no cells" -- it must NOT crash, and must NOT suppress the
+    # headline findings that were already collected.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_sidecar(out_dir, newer, {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    for date_str in (older, newer):
+        (out_dir / f"harness-synthesis-{date_str}.json").write_text(
+            json.dumps({"schema_version": 1, "civc": 7}))     # non-list, non-iterable
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")   # forces a real finding
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: orphan_script_count increased" in out
+    assert "Traceback" not in err
