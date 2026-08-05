@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import pytest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 COLLECTOR = Path(__file__).resolve().parents[1] / "collector.py"
@@ -68,6 +69,19 @@ def run_collector(root, *args, project_root=None, env=None):
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=run_env)
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
+
+def run_check(root, out_dir, *args, project_root=None, env=None):
+    # M10: like run_collector, but drives `--check OUT_DIR` and does NOT assert
+    # returncode == 0 or json-parse stdout -- shaped like test_profiles.py's
+    # run_collector_raw (the non-asserting variant), since --check deliberately prints
+    # findings/notices (never JSON) and exercising its non-zero exit codes IS the point.
+    cmd = [sys.executable, str(COLLECTOR), "--root", str(root), "--check", str(out_dir)]
+    if project_root is not None:
+        cmd += ["--project-root", str(project_root)]
+    cmd += list(args)
+    run_env = dict(os.environ, **env) if env else None
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=run_env)
+    return proc.returncode, proc.stdout, proc.stderr
 
 def _active_slug(fake_harness):
     proj = fake_harness.parent / "active-repo"
@@ -6862,3 +6876,207 @@ def test_safe_exists_keeps_two_probes_for_a_symlink_into_an_unreadable_tree(tmp_
         assert _collector._safe_exists(link) == (False, False)
     finally:
         os.chmod(hidden, 0o755)
+
+
+# ============================================================================
+# TRK-047 / M10 -- `--check` regression gate (SPEC_7 §1, AMENDMENTS A48)
+# ============================================================================
+# `run_check` (top of file, next to `run_collector`) is the non-asserting subprocess
+# driver these tests use. Every prior sidecar below is a REAL, hand-authored JSON file
+# written into a temp OUT_DIR -- not a mock of collector behavior, just fixture data in
+# the shape --check reads. `project_root` is always pinned to a freshly-created EMPTY
+# tmp_path subdir (never the real harness-map checkout `--project-root` would otherwise
+# default to via getcwd()) so `always_loaded_tokens_est` stays a small, predictable LOW-
+# band value regardless of what this repo's own CLAUDE.md happens to weigh.
+
+def _days_ago(n):
+    # D-1: --check's "today" is UTC; fixture dates are derived from the SAME clock.
+    return (datetime.now(timezone.utc).date() - timedelta(days=n)).isoformat()
+
+def _check_empty_project(tmp_path):
+    proj = tmp_path / "empty-project"
+    proj.mkdir()
+    return proj
+
+def _write_check_sidecar(out_dir, date_str, headline=None, crashed=False):
+    """A real harness-map-<date>.json fixture. `crashed=True` writes a well-formed CRASH
+    ENVELOPE -- all-zero headline plus the actual _CRASH_ERROR_PREFIX marker main() itself
+    writes on a build_document exception -- ignoring any `headline` passed alongside it."""
+    if crashed:
+        headline = {k: 0 for k in ("always_loaded_words", "always_loaded_tokens_est",
+            "always_loaded_file_count", "duplicate_pair_count", "unchecked_binary_count",
+            "instruction_files_over_200", "orphan_registration_count", "orphan_script_count")}
+        errors = [f"{_collector._CRASH_ERROR_PREFIX}RuntimeError('synthetic crash')"]
+    else:
+        errors = []
+    doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00",
+           "root": "/fake", "headline": headline or {}, "errors": errors}
+    (Path(out_dir) / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+    return doc
+
+def _write_check_synthesis(out_dir, date_str, cells):
+    """`cells`: list of (verb, surface, verdict) tuples."""
+    doc = {"schema_version": 1,
+           "civc": [{"verb": v, "surface": s, "verdict": vd} for v, s, vd in cells]}
+    (Path(out_dir) / f"harness-synthesis-{date_str}.json").write_text(json.dumps(doc))
+    return doc
+
+def test_check_exit_zero_when_no_regression(fake_harness, tmp_path):
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    assert "REGRESSION" not in out
+    assert "No regression detected" in out
+
+def test_check_exit_zero_baseline_when_no_prior_sidecar(fake_harness, tmp_path):
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    # SKILL.md:92's D7 notice, reproduced VERBATIM -- em-dash and trailing period included.
+    assert out.strip() == "First run — no prior map (baseline)."
+
+def test_check_exit_one_on_band_crossing_upward(fake_harness, tmp_path):
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    # Push the CURRENT run's always_loaded_tokens_est from LOW well past the 5,000 boundary
+    # (CLAUDE.md is not in the instruction_length_flags corpus, so this cannot also flip
+    # instruction_files_over_200 -- isolates the one signal under test).
+    (fake_harness / "CLAUDE.md").write_text("# Root\n" + "word " * 4000)
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, err
+    assert "REGRESSION: always_loaded_tokens_est crossed LOW ->" in out
+
+def test_check_no_alert_on_band_crossing_downward(fake_harness, tmp_path):
+    # Improvement is NOT a regression: prior MODERATE, current (default fixture) LOW.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 8000,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    assert "REGRESSION" not in out
+
+def test_check_exit_one_on_civc_cell_regression(fake_harness, tmp_path):
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    _write_check_synthesis(out_dir, newer, [("Afford", "context", "thin")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, err
+    assert "REGRESSION: CIVC Afford/context regressed covered -> thin" in out
+
+def test_check_exit_one_on_new_orphan(fake_harness, tmp_path):
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    # fake_harness's settings.json already registers zero hooks (conftest.py:49) -- any
+    # script dropped under hooks/ is orphaned by construction (test_headline_reflects_
+    # orphan_counts's fixture, reused here).
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, err
+    assert "REGRESSION: orphan_script_count increased" in out
+
+def test_check_exit_two_on_malformed_prior_sidecar(fake_harness, tmp_path):
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / f"harness-map-{_days_ago(1)}.json").write_text("{ not valid json")
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 2, err
+    assert out.startswith("error:") and "malformed prior sidecar" in out
+
+def test_check_never_writes_inside_root(fake_harness, tmp_path):
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+
+    def _snapshot(path):
+        return sorted((str(p.relative_to(path)), p.stat().st_mtime_ns)
+                      for p in path.rglob("*"))
+
+    before_root, before_out = _snapshot(fake_harness), _snapshot(out_dir)
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    assert _snapshot(fake_harness) == before_root
+    assert _snapshot(out_dir) == before_out
+
+def test_check_bands_match_report_template_table():
+    # Changing bands requires editing report-template.md and CHECK_BANDS together (SPEC_7 §1).
+    template = (Path(__file__).resolve().parents[1] / "report-template.md").read_text(encoding="utf-8")
+    # The band row's range separator is an EN DASH (U+2013), not a hyphen -- a hyphen-only
+    # pattern matches nothing here and this assert on `m` is what stops that from silently
+    # becoming a vacuous pass.
+    m = re.search(r"<([\d,]+)\s*LOW\s*/\s*[\d,]+–([\d,]+)\s*MODERATE\s*/\s*>([\d,]+)\s*HIGH", template)
+    assert m is not None, "band-table row not found in report-template.md -- drift check extracted nothing"
+    low = int(m.group(1).replace(",", ""))
+    moderate_upper = int(m.group(2).replace(",", ""))
+    high_lower = int(m.group(3).replace(",", ""))
+    assert moderate_upper == high_lower
+    assert (low, moderate_upper) == (_collector.CHECK_BANDS[0][0], _collector.CHECK_BANDS[1][0])
+
+def test_check_skips_crash_envelope_prior_and_uses_next_older(fake_harness, tmp_path):
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_sidecar(out_dir, older, {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    _write_check_sidecar(out_dir, newer, crashed=True)  # well-formed crash envelope, skipped
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    assert f"harness-map-{older}.json" in out
+    assert f"harness-map-{newer}.json" not in out
+
+def test_check_all_priors_crashed_emits_verbatim_notice(fake_harness, tmp_path):
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), crashed=True)
+    _write_check_sidecar(out_dir, _days_ago(2), crashed=True)
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    assert out.strip() == "No comparison baseline available — every prior run crashed."
+
+def test_check_civc_unallowlisted_verdict_is_ignored_not_coerced(fake_harness, tmp_path):
+    # D-3: an unallowlisted verdict makes the CURRENT-side cell absent, not 'empty' -- if
+    # it were coerced (render_html.build_civc_model's rendering behavior) this would read
+    # as a fabricated covered->empty regression instead of no finding at all.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    _write_check_synthesis(out_dir, newer, [("Afford", "context", "amazing")])  # unallowlisted
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    assert "REGRESSION" not in out
+    assert out.strip() == "First run — no prior map (baseline)."
+
+def test_check_enums_match_render_html():
+    # D-4 drift pin: collector.py must not import render_html.py, so these three tuples
+    # are re-declared locally in collector.py and must stay byte-for-byte equal to
+    # render_html's copies.
+    render_html_path = Path(__file__).resolve().parents[1] / "render_html.py"
+    spec = importlib.util.spec_from_file_location("harness_map_render_html_for_check_drift", render_html_path)
+    render_html_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(render_html_mod)
+    assert _collector._CHECK_VERBS == render_html_mod.VERBS
+    assert _collector._CHECK_SURFACES == render_html_mod.SURFACES
+    assert _collector._CHECK_VERDICTS == render_html_mod.VERDICTS
