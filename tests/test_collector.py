@@ -7111,3 +7111,40 @@ def test_check_enums_match_render_html():
     assert _collector._CHECK_VERBS == render_html_mod.VERBS
     assert _collector._CHECK_SURFACES == render_html_mod.SURFACES
     assert _collector._CHECK_VERDICTS == render_html_mod.VERDICTS
+
+def test_check_sidecar_regex_matches_render_html():
+    # D-4 drift pin, same cure as test_check_enums_match_render_html above: collector.py
+    # must not import render_html.py (AMENDMENTS A48 D-4), so _CHECK_SIDECAR_RE is
+    # re-declared locally and must stay pattern-identical to render_html.SIDECAR_RE --
+    # otherwise --check's D7 selection and the renderer's select_current could silently
+    # walk different file sets with no test failing.
+    render_html_path = Path(__file__).resolve().parents[1] / "render_html.py"
+    spec = importlib.util.spec_from_file_location("harness_map_render_html_for_check_drift", render_html_path)
+    render_html_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(render_html_mod)
+    assert _collector._CHECK_SIDECAR_RE.pattern == render_html_mod.SIDECAR_RE.pattern
+
+def test_check_synthesis_regex_matches_render_html_naming(tmp_path):
+    # D-4 drift pin, behavioral not textual: render_html.load_synthesis builds the
+    # synthesis filename with an f-string (f"harness-synthesis-{date}.json") rather than
+    # a regex, so there is no render_html constant to compare _CHECK_SYNTHESIS_RE's
+    # pattern text against. A name the TEST hardcodes and only matches against the
+    # collector regex is vacuous -- it can't catch a naming-convention drift on
+    # render_html's side. So: write a sidecar named the way the collector's regex
+    # expects, then ask render_html's OWN load_synthesis to find it for real. A
+    # convention change on EITHER side (the collector's regex or render_html's
+    # f-string) breaks this.
+    sample_date = "2026-07-15"
+    built_name = f"harness-synthesis-{sample_date}.json"
+    m = _collector._CHECK_SYNTHESIS_RE.match(built_name)
+    assert m is not None
+    assert m.group(1) == sample_date
+    sidecar_doc = {"schema_version": 1}
+    (tmp_path / built_name).write_text(json.dumps(sidecar_doc), encoding="utf-8")
+    render_html_path = Path(__file__).resolve().parents[1] / "render_html.py"
+    spec = importlib.util.spec_from_file_location("harness_map_render_html_for_check_drift", render_html_path)
+    render_html_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(render_html_mod)
+    found_doc, err = render_html_mod.load_synthesis(tmp_path, sample_date)
+    assert err is None
+    assert found_doc == sidecar_doc
