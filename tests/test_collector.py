@@ -7031,6 +7031,37 @@ def test_check_bands_match_report_template_table():
     assert moderate_upper == high_lower
     assert (low, moderate_upper) == (_collector.CHECK_BANDS[0][0], _collector.CHECK_BANDS[1][0])
 
+def test_check_band_boundaries_match_template():
+    # The sibling test above pins the band NUMBERS (5,000 / 12,000); this one pins the
+    # band EDGES -- which side of each boundary value falls. Neither alone is sufficient:
+    # report-template.md:23 puts BOTH boundary values in MODERATE (the LOW cut is
+    # EXCLUSIVE, the MODERATE cut is INCLUSIVE), an asymmetry a uniform `<=` walk over
+    # CHECK_BANDS cannot express -- this is the exact off-by-one _check_band's docstring
+    # warns against re-introducing.
+    assert _collector._check_band(4999) == "LOW"
+    assert _collector._check_band(5000) == "MODERATE"
+    assert _collector._check_band(12000) == "MODERATE"
+    assert _collector._check_band(12001) == "HIGH"
+
+def test_check_exit_one_on_band_crossing_at_the_5000_boundary(tmp_path):
+    # Pins the fix at --check's own gate surface (collector.run_check, not just the
+    # _check_band helper): a prior of EXACTLY 4,999 (LOW) vs a current run of EXACTLY
+    # 5,000 (MODERATE) must still be reported as a REGRESSION and exit 1. Driven
+    # in-process against the real run_check function (a real prior sidecar written to a
+    # real temp OUT_DIR, a real current `doc` -- no mock of the comparison itself) rather
+    # than via subprocess, because the fixture-content route to an EXACT current-run
+    # token count is not practically controllable; test_check_exit_one_on_band_crossing_
+    # upward above already covers the subprocess/real-collector path for a coarser cross.
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 4999,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    current_doc = {"headline": {"always_loaded_tokens_est": 5000,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0}}
+    exit_code, text = _collector.run_check(current_doc, str(out_dir))
+    assert exit_code == 1, text
+    assert "REGRESSION: always_loaded_tokens_est crossed LOW -> MODERATE (4999 -> 5000 tokens)" in text
+
 def test_check_skips_crash_envelope_prior_and_uses_next_older(fake_harness, tmp_path):
     proj = _check_empty_project(tmp_path)
     out_dir = tmp_path / "out"

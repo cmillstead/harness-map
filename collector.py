@@ -6403,7 +6403,11 @@ def _default_operator_root():
 # CHECK_BANDS encodes report-template.md's "Fixed band thresholds" row for
 # always_loaded_tokens_est (5,000 / 12,000) -- deliberately its OWN constant, not
 # render_html.GAUGE_BANDS (6,000/15,000): the template/gauge divergence is a known,
-# out-of-scope inconsistency (AMENDMENTS A3). Ascending (upper_inclusive|None, label).
+# out-of-scope inconsistency (AMENDMENTS A3). NOT a uniform upper_inclusive ladder: per
+# report-template.md:23 (`<5,000 LOW / 5,000-12,000 MODERATE / >12,000 HIGH`) the LOW cut
+# is EXCLUSIVE (5,000 itself is MODERATE) while the MODERATE cut is INCLUSIVE (12,000
+# itself is MODERATE, not HIGH) -- see _check_band, which reads these two numbers with
+# that asymmetry made explicit rather than folding them into one `<=` walk.
 # Changing bands requires editing report-template.md and CHECK_BANDS together (SPEC_7 §1).
 CHECK_BANDS = ((5000, "LOW"), (12000, "MODERATE"), (None, "HIGH"))
 _CHECK_BAND_ORDER = tuple(label for _, label in CHECK_BANDS)
@@ -6426,19 +6430,30 @@ _CHECK_BASELINE_ALL_CRASHED = "No comparison baseline available — every prior 
 
 
 def _check_band(value: Any) -> str:
-    """Which CHECK_BANDS label `value` falls in. Mirrors render_html._gauge_band's
-    first-match-wins walk but stays local (D-4) -- a non-numeric value sorts into the
-    LAST band rather than raising, matching this module's crash-safe posture elsewhere;
+    """Which CHECK_BANDS label `value` falls in. A non-numeric value sorts into the LAST
+    band rather than raising, matching this module's crash-safe posture elsewhere;
     --check has no unit for that case anyway since it only compares like-typed headline
-    ints written by build_headline/`_empty_document`."""
+    ints written by build_headline/`_empty_document`.
+
+    Deliberately three explicit branches, NOT a uniform `num <= upper` walk (that shape
+    is what render_html._gauge_band uses, and it is WRONG here): report-template.md:23
+    puts BOTH boundary values in MODERATE -- 5,000 tokens is MODERATE, not LOW, and
+    12,000 tokens is MODERATE, not HIGH. A single ascending `<=` ladder cannot express an
+    exclusive-then-inclusive pair of cuts without silently mis-banding the 5,000 edge (a
+    harness moving 4,999 -> 5,000 tokens would read LOW->LOW and the gate would stay
+    silent at exactly the threshold it exists to watch). Do not "simplify" this back to
+    a `for upper, label in CHECK_BANDS: if num <= upper` loop."""
     try:
         num = float(value)
     except (TypeError, ValueError):
         num = float("inf")
-    for upper, label in CHECK_BANDS:
-        if upper is None or num <= upper:
-            return label
-    return CHECK_BANDS[-1][1]
+    low_upper = CHECK_BANDS[0][0]       # 5,000 -- EXCLUSIVE upper bound for LOW
+    moderate_upper = CHECK_BANDS[1][0]  # 12,000 -- INCLUSIVE upper bound for MODERATE
+    if num < low_upper:
+        return CHECK_BANDS[0][1]
+    if num <= moderate_upper:
+        return CHECK_BANDS[1][1]
+    return CHECK_BANDS[2][1]
 
 
 def _check_is_crash_envelope(doc: dict[str, Any]) -> bool:
