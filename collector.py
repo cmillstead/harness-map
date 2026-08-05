@@ -6395,6 +6395,230 @@ def _default_operator_root():
     return Path(cfg) if cfg else (Path.home() / ".claude")
 
 
+# ------------------------------------------------------------- TRK-047 / M10: --check (SPEC_7 §1)
+# A regression GATE, not a report: --check compares this run's signals against the prior
+# MEASURED run in an OUT_DIR and prints findings/exit codes only -- never the JSON document
+# (Envelope rule §5 governs the DEFAULT mode; this is the one documented carve-out).
+
+# CHECK_BANDS encodes report-template.md's "Fixed band thresholds" row for
+# always_loaded_tokens_est (5,000 / 12,000) -- deliberately its OWN constant, not
+# render_html.GAUGE_BANDS (6,000/15,000): the template/gauge divergence is a known,
+# out-of-scope inconsistency (AMENDMENTS A3). NOT a uniform upper_inclusive ladder: per
+# report-template.md:23 (`<5,000 LOW / 5,000-12,000 MODERATE / >12,000 HIGH`) the LOW cut
+# is EXCLUSIVE (5,000 itself is MODERATE) while the MODERATE cut is INCLUSIVE (12,000
+# itself is MODERATE, not HIGH) -- see _check_band, which reads these two numbers with
+# that asymmetry made explicit rather than folding them into one `<=` walk.
+# Changing bands requires editing report-template.md and CHECK_BANDS together (SPEC_7 §1).
+CHECK_BANDS = ((5000, "LOW"), (12000, "MODERATE"), (None, "HIGH"))
+_CHECK_BAND_ORDER = tuple(label for _, label in CHECK_BANDS)
+
+# D-4 (AMENDMENTS A48): collector.py does not import render_html.py (and must not start).
+# These three tuples are the CIVC allowlists render_html.py declares at module scope
+# (VERBS/SURFACES/VERDICTS) -- re-declared locally here and pinned equal to render_html's
+# by test_check_enums_match_render_html (drift test, the same cure CHECK_BANDS uses above).
+_CHECK_VERBS = ("Afford", "Inform", "Constrain", "Verify", "Correct", "Evolve")
+_CHECK_SURFACES = ("context", "tools", "memory", "permissions", "orchestration", "observability")
+_CHECK_VERDICTS = ("covered", "thin", "empty")
+# A cell whose verdict pair matches one of these is a CIVC coverage regression.
+_CHECK_CIVC_REGRESSIONS = {("covered", "thin"), ("covered", "empty"), ("thin", "empty")}
+
+_CHECK_SIDECAR_RE = re.compile(r"^harness-map-(\d{4}-\d{2}-\d{2})\.json$")
+_CHECK_SYNTHESIS_RE = re.compile(r"^harness-synthesis-(\d{4}-\d{2}-\d{2})\.json$")
+
+_CHECK_BASELINE_NO_PRIOR = "First run — no prior map (baseline)."
+_CHECK_BASELINE_ALL_CRASHED = "No comparison baseline available — every prior run crashed."
+
+
+def _check_band(value: Any) -> str:
+    """Which CHECK_BANDS label `value` falls in. A non-numeric value sorts into the LAST
+    band rather than raising, matching this module's crash-safe posture elsewhere;
+    --check has no unit for that case anyway since it only compares like-typed headline
+    ints written by build_headline/`_empty_document`.
+
+    Deliberately three explicit branches, NOT a uniform `num <= upper` walk (that shape
+    is what render_html._gauge_band uses, and it is WRONG here): report-template.md:23
+    puts BOTH boundary values in MODERATE -- 5,000 tokens is MODERATE, not LOW, and
+    12,000 tokens is MODERATE, not HIGH. A single ascending `<=` ladder cannot express an
+    exclusive-then-inclusive pair of cuts without silently mis-banding the 5,000 edge (a
+    harness moving 4,999 -> 5,000 tokens would read LOW->LOW and the gate would stay
+    silent at exactly the threshold it exists to watch). Do not "simplify" this back to
+    a `for upper, label in CHECK_BANDS: if num <= upper` loop."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        num = float("inf")
+    low_upper = CHECK_BANDS[0][0]       # 5,000 -- EXCLUSIVE upper bound for LOW
+    moderate_upper = CHECK_BANDS[1][0]  # 12,000 -- INCLUSIVE upper bound for MODERATE
+    if num < low_upper:
+        return CHECK_BANDS[0][1]
+    if num <= moderate_upper:
+        return CHECK_BANDS[1][1]
+    return CHECK_BANDS[2][1]
+
+
+def _check_is_crash_envelope(doc: dict[str, Any]) -> bool:
+    """True when `doc["errors"]` carries the _CRASH_ERROR_PREFIX marker _empty_document
+    writes on a build_document crash -- mirrors render_html._run_was_measured's detector
+    (D-4: reuses this module's OWN _CRASH_ERROR_PREFIX rather than importing the renderer's
+    copy of the same string; the two are pinned equal by
+    test_crash_marker_prefix_matches_the_collector_producer). Defensive on shape: a
+    non-list `errors` is wrapped, non-string entries are skipped rather than raising."""
+    errors = doc.get("errors") or []
+    entries = errors if isinstance(errors, list) else [errors]
+    return any(isinstance(e, str) and e.startswith(_CRASH_ERROR_PREFIX) for e in entries)
+
+
+def _check_select_prior_sidecar(out_dir: Path, today: str) -> tuple[str, dict[str, Any] | None, str | None]:
+    """The D7 selection rule (SKILL.md's Diff-vs-Previous-Run section), scoped to --check
+    (AMENDMENTS A48): among harness-map-YYYY-MM-DD.json sidecars in `out_dir` strictly
+    before `today`, walk NEWEST FIRST. D-2: a structurally malformed candidate is FATAL --
+    returns ("malformed", ...) with NO fallback to an older file. A well-formed CRASH
+    ENVELOPE is not malformed -- it is SKIPPED, continuing to the next-older candidate.
+
+    Returns (status, doc, detail):
+      ("found", doc, date_str)     -- doc is the measured baseline, detail is its date
+      ("no_prior", None, None)     -- no sidecar at all strictly before `today`
+      ("all_crashed", None, None)  -- sidecars exist, every one is a crash envelope
+      ("malformed", None, msg)     -- the D7-selected candidate failed structural validation
+      ("unreadable", None, msg)    -- `out_dir` itself could not be listed
+    """
+    try:
+        entries = list(out_dir.iterdir())
+    except OSError as exc:
+        return "unreadable", None, f"could not read --check out-dir {out_dir}: {exc}"
+    candidates = []
+    for p in entries:
+        m = _CHECK_SIDECAR_RE.match(p.name)
+        if m and m.group(1) < today:
+            candidates.append((m.group(1), p))
+    candidates.sort(key=lambda t: t[0], reverse=True)  # newest first (fixed order, F4.4)
+    if not candidates:
+        return "no_prior", None, None
+    for date_str, path in candidates:
+        try:
+            candidate_doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return "malformed", None, f"malformed prior sidecar {path.name}: {exc}"
+        if not isinstance(candidate_doc, dict) or "schema_version" not in candidate_doc:
+            return "malformed", None, f"malformed prior sidecar {path.name}: not a valid sidecar document"
+        if _check_is_crash_envelope(candidate_doc):
+            continue
+        return "found", candidate_doc, date_str
+    return "all_crashed", None, None
+
+
+def _check_select_synthesis_pair(out_dir: Path, today: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """The two most recent harness-synthesis-YYYY-MM-DD.json sidecars strictly before
+    `today`, oldest-then-newest, or None when fewer than two exist or either is unreadable
+    (the CIVC comparison is best-effort/optional -- SPEC_7 §1 gates it on "if >= 2 exist",
+    unlike the collector-sidecar D7 selection above, which is mandatory and FATAL on
+    malformed input)."""
+    try:
+        entries = list(out_dir.iterdir())
+    except OSError:
+        return None
+    candidates = []
+    for p in entries:
+        m = _CHECK_SYNTHESIS_RE.match(p.name)
+        if m and m.group(1) < today:
+            candidates.append((m.group(1), p))
+    candidates.sort(key=lambda t: t[0], reverse=True)  # newest first
+    if len(candidates) < 2:
+        return None
+    (_newest_date, newest_path), (_prior_date, prior_path) = candidates[0], candidates[1]
+    try:
+        newest_doc = json.loads(newest_path.read_text(encoding="utf-8"))
+        prior_doc = json.loads(prior_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(newest_doc, dict) or not isinstance(prior_doc, dict):
+        return None
+    return prior_doc, newest_doc
+
+
+def _check_civc_cells(synth_doc: dict[str, Any]) -> dict[tuple[str, str], str]:
+    """D-3 (AMENDMENTS A48): a cell whose verb/surface/verdict falls outside the
+    allowlists is IGNORED, never coerced -- unlike render_html.build_civc_model, which
+    coerces an unallowlisted verdict to 'empty' because it is filling a fixed 6x6 render
+    grid. Coercing here would turn a synthesis typo into a manufactured
+    covered->empty finding, so an unmatched cell is simply absent from the returned map."""
+    cells: dict[tuple[str, str], str] = {}
+    for c in synth_doc.get("civc", []) or []:
+        if not isinstance(c, dict):
+            continue
+        verb, surface, verdict = c.get("verb"), c.get("surface"), c.get("verdict")
+        if verb not in _CHECK_VERBS or surface not in _CHECK_SURFACES or verdict not in _CHECK_VERDICTS:
+            continue
+        cells[(verb, surface)] = verdict
+    return cells
+
+
+def _check_headline_regressions(current: dict[str, Any], prior: dict[str, Any]) -> list[str]:
+    """The three headline regression signals (SPEC_7 §1), checked and emitted in this
+    FIXED order (deterministic, F4.4) so findings are stable across runs regardless of
+    dict iteration order."""
+    findings = []
+    cur_tokens = current.get("always_loaded_tokens_est", 0)
+    prior_tokens = prior.get("always_loaded_tokens_est", 0)
+    cur_band, prior_band = _check_band(cur_tokens), _check_band(prior_tokens)
+    if _CHECK_BAND_ORDER.index(cur_band) > _CHECK_BAND_ORDER.index(prior_band):
+        findings.append(f"REGRESSION: always_loaded_tokens_est crossed {prior_band} -> {cur_band} "
+                         f"({prior_tokens} -> {cur_tokens} tokens)")
+    cur_over200 = current.get("instruction_files_over_200", 0)
+    prior_over200 = prior.get("instruction_files_over_200", 0)
+    if cur_over200 > prior_over200:
+        findings.append(f"REGRESSION: instruction_files_over_200 increased "
+                         f"({prior_over200} -> {cur_over200})")
+    for key in ("orphan_registration_count", "orphan_script_count"):
+        cur_v, prior_v = current.get(key, 0), prior.get(key, 0)
+        if cur_v > prior_v:
+            findings.append(f"REGRESSION: {key} increased ({prior_v} -> {cur_v})")
+    return findings
+
+
+def _check_civc_regressions(prior_synth: dict[str, Any], newest_synth: dict[str, Any]) -> list[str]:
+    """CIVC cell regressions between the two most recent synthesis sidecars, iterated in
+    the FIXED _CHECK_VERBS x _CHECK_SURFACES order (never a sorted(set(...)), F4.4)."""
+    prior_cells, newest_cells = _check_civc_cells(prior_synth), _check_civc_cells(newest_synth)
+    findings = []
+    for verb in _CHECK_VERBS:
+        for surface in _CHECK_SURFACES:
+            old, new = prior_cells.get((verb, surface)), newest_cells.get((verb, surface))
+            if old is not None and new is not None and (old, new) in _CHECK_CIVC_REGRESSIONS:
+                findings.append(f"REGRESSION: CIVC {verb}/{surface} regressed {old} -> {new}")
+    return findings
+
+
+def run_check(doc: dict[str, Any], out_dir: str) -> tuple[int, str]:
+    """SPEC_7 §1 / AMENDMENTS A48 entry point. `doc` is the CURRENT run's already-built
+    document -- main() intercepts a current-run crash/profile-rejection BEFORE calling
+    this (comparing a crash envelope would emit fabricated regressions, never done here).
+    Returns (exit_code, text): text is what --check prints to stdout INSTEAD OF the JSON
+    document (SPEC_7 §1's one carve-out to the always-emit-JSON invariant, which governs
+    the default mode only)."""
+    today = datetime.now(timezone.utc).date().isoformat()  # D-1: one clock frame per module
+    out_path = Path(out_dir)
+    status, prior_doc, detail = _check_select_prior_sidecar(out_path, today)
+    if status in ("malformed", "unreadable"):
+        return 2, f"error: {detail}"
+    findings: list[str] = []
+    if status == "found":
+        assert prior_doc is not None
+        findings.extend(_check_headline_regressions(
+            doc.get("headline") or {}, prior_doc.get("headline") or {}))
+    synth_pair = _check_select_synthesis_pair(out_path, today)
+    if synth_pair is not None:
+        prior_synth, newest_synth = synth_pair
+        findings.extend(_check_civc_regressions(prior_synth, newest_synth))
+    if findings:
+        return 1, "\n".join(findings)
+    if status == "no_prior":
+        return 0, _CHECK_BASELINE_NO_PRIOR
+    if status == "all_crashed":
+        return 0, _CHECK_BASELINE_ALL_CRASHED
+    return 0, f"No regression detected (baseline: harness-map-{detail}.json)."
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Read-only harness map collector.")
     ap.add_argument("--root", default=str(_default_operator_root()))
@@ -6411,6 +6635,13 @@ def main(argv: list[str] | None = None) -> int:
                           "profiles/claude-code.json). Omitted: the embedded Claude Code "
                           "default. A malformed profile exits 2.")
     ap.add_argument("--indent", type=int, default=2)
+    ap.add_argument("--check", default=None, metavar="OUT_DIR",
+                     help="Regression gate (SPEC_7 §1): compare this run's headline + "
+                          "latest CIVC synthesis against the most recent prior MEASURED "
+                          "run in OUT_DIR; PRINTS FINDINGS, NOT THE JSON DOCUMENT (the one "
+                          "carve-out to the always-emit-JSON invariant, default mode "
+                          "only). Exit 0 no regression (or no baseline yet), 1 a "
+                          "REGRESSION:-prefixed finding, 2 a collection/comparison error.")
     args = ap.parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     out_path = None
@@ -6474,15 +6705,22 @@ def main(argv: list[str] | None = None) -> int:
                           "collector reads, including --profile if given (read-only "
                           "invariant)")
             out_path = resolved                                # write through the validated resolved path
+    # M10 (SPEC_7 §1 / AMENDMENTS A48): tracked unconditionally so the --check branch below
+    # can tell "current run measured nothing" from a real document without re-parsing
+    # errors[] for a marker string -- comparing a crash/profile-rejection envelope would
+    # emit fabricated regressions (every real headline number reads as "new").
+    current_run_crash_reason: str | None = None
     if profile_error is not None:
         doc = _empty_document(root)
         doc["errors"].append(f"{_PROFILE_ERROR_PREFIX}{profile_error}")
+        current_run_crash_reason = f"layout profile rejected: {profile_error}"
     else:
         try:
             doc = build_document(root, args.project_root, compose=args.compose, profile=profile)
         except Exception as exc:  # noqa: BLE001 — collector must always emit a FULL-key valid envelope
             doc = _empty_document(root)
             doc["errors"].append(f"{_CRASH_ERROR_PREFIX}{exc!r}")
+            current_run_crash_reason = f"collector crashed: {exc!r}"
     # Serialize defensively: a lone UTF-16 surrogate (e.g. surviving json.loads out of a
     # crafted settings.json — Python allows lone surrogates in str) is unencodable as
     # UTF-8 under ensure_ascii=False. Force-detect it HERE (encode, discard the bytes) so
@@ -6531,6 +6769,16 @@ def main(argv: list[str] | None = None) -> int:
                                  input_paths=input_paths)
         except OSError as exc:
             print(f"warning: could not write --out: {exc}", file=sys.stderr)
+    if args.check is not None:
+        # M10 (SPEC_7 §1): the one carve-out to "stdout is the primary contract" below --
+        # --check prints findings, never the JSON document. --out (if also given) already
+        # wrote above, unaffected; this branch only changes what goes to stdout/exit code.
+        if current_run_crash_reason is not None:
+            print(f"error: current run did not measure anything -- {current_run_crash_reason}")
+            return 2
+        check_exit, check_text = run_check(doc, args.check)
+        print(check_text)
+        return check_exit
     print(text)  # stdout is the primary contract — always emit the built document, write-or-not
     return 2 if profile_error is not None else 0
 

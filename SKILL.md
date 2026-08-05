@@ -93,6 +93,10 @@ Glob `$OUT_DIR/harness-map-*.json` (the same report directory `OUT_DIR` used in 
 
 The Trend tab also grows a per-metric sparkline (last 10 points) once that metric's series has 3+ MEASURED points — a crashed collector run contributes none, and a sidecar missing that headline key contributes none to THAT metric, so sidecar count alone is no longer the gate — another reason to keep reusing that one stable `OUT_DIR` across runs.
 
+## `--check` — Regression Gate (M10)
+
+`python3 collector.py --check OUT_DIR` (same D7 skip-crash-envelope selection above) compares this run's headline + latest CIVC synthesis against the most recent prior MEASURED run in `OUT_DIR` and prints findings instead of the JSON document. Exit **0** no regression (or no baseline yet — first run / every prior crashed), **1** a `REGRESSION:`-prefixed finding, **2** a collection/comparison error. Useful as a SessionStart hook gate (wiring the hook itself is out of scope here).
+
 ## Promotion Honors Hooks-As-Last-Resort
 
 `promotion_candidates` propose extending an EXISTING hook before proposing a new one. Prose-check trigger patterns are advisory only (NEVER/ALWAYS clauses, "must"/"must not", numeric caps like "≤N lines" / ">N lines", required-file assertions) — the collector surfaces the signal; synthesis decides whether extension or a new check is warranted.
