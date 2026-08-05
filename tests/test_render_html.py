@@ -665,6 +665,24 @@ def test_join_decisions_date_provenance_counters_on_own_return():
     assert extra["records_dated_as_of"] == 1
 
 
+def test_new_date_counters_ordered_key_set_is_pinned():
+    """TRK-027 — `_new_date_counters`'s docstring declares the insertion ORDER
+    load-bearing ("so the rendered raw counters are byte-deterministic across
+    PYTHONHASHSEED"), and `_accumulate_date` separately declares the five NAMES
+    load-bearing. A bare set-equality assertion (`set(...) == {...}`) would let a silent
+    reordering through and pins neither contract — this asserts the ORDERED LIST, which
+    covers both in one assertion: a renamed key changes the list's contents, and a
+    reordered key changes the list's sequence, either of which fails this test.
+    # Changing this value requires a spec change (S6 §4.3, finding #12)."""
+    assert list(rh._new_date_counters().keys()) == [
+        "records_dated_as_of",
+        "records_undated",
+        "records_invalid_date",
+        "records_conflicting_date",
+        "records_skipped_future",
+    ]
+
+
 def test_join_decisions_undated_invalid_and_conflicting_counters():
     """QA P3 — mirrors `test_interventions_counts_undated_invalid_and_conflicting`
     (T2.2/T2.3/T2.4) for the decisions join, whose date-provenance counters had no

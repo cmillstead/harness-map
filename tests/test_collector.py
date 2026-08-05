@@ -3022,6 +3022,114 @@ def test_walk_contained_dirs_closes_aba_symlink_race_on_realpath_check(tmp_path,
     assert any(r["name"].endswith("victim-dir") for r in out_of_root_refs)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_contained_dirs_open_failure_is_inaccessible_not_out_of_root(tmp_path):
+    # TRK-044 (AMENDMENTS A46), category 1, site 1: an `os.open` failure on a directory
+    # has not yet computed a realpath, so it is never a containment fact. The OLD code
+    # recorded it via `_record_out_of_root_ref`, mislabeling a real permission failure as
+    # "resolved outside the root". A chmod-000 subdirectory (real EACCES, not simulated)
+    # must land in `inaccessible[]` and must NOT appear in `out_of_root_refs` at all --
+    # the test fails if the two channels are conflated.
+    root = tmp_path / "root"
+    root.mkdir()
+    locked = root / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0)
+    try:
+        out_of_root_refs = []
+        inaccessible = []
+        blind_spots: list = []
+        root_stat = os.stat(root)
+        list(_collector._walk_contained_dirs(root, root, root_stat, out_of_root_refs, set(),
+                                              inaccessible=inaccessible, blind_spots=blind_spots))
+    finally:
+        os.chmod(locked, 0o755)
+    assert any(e["path"].endswith("locked") for e in inaccessible), inaccessible
+    assert not any("locked" in r["name"] for r in out_of_root_refs), out_of_root_refs
+
+
+def test_walk_contained_dirs_scandir_failure_is_reported_not_silent(tmp_path, monkeypatch):  # mock-ok: interposes on the real os.scandir call for one real fd, not a faked dependency
+    # TRK-044 (AMENDMENTS A46), category 1, site 2: an `os.scandir(fd)` failure used to
+    # be a bare `continue` with ZERO disclosure -- the yielded directory's subtree
+    # silently vanished from the walk with no record anywhere. Measured directly on this
+    # machine: chmod(0) on a directory AFTER this walk's own `os.open` already succeeded
+    # does NOT make the subsequent `os.scandir(fd)` fail here -- permission is checked at
+    # open() time, not re-checked per `scandir(fd)` call. That is NOT a test-fixture
+    # limitation -- it is the fd-pinned design (S7, AMENDMENTS A36) working exactly as
+    # intended: the descriptor keeps its authority precisely so a later chmod/rename
+    # cannot change what gets listed, the same TOCTOU class this walk closes elsewhere.
+    # So no real chmod/rmdir sequencing can portably reproduce this branch -- the branch
+    # is defensive against causes with no permission-bit trigger: real-world hits look
+    # like disk I/O failure (EIO) mid-read, ENOMEM on a huge directory, or a network
+    # mount vanishing out from under an already-open fd, none of which a test can dial up
+    # on demand. This interposes on the real `os.scandir` call for the ONE real fd this
+    # walk itself opens for `unlistable`; every other fd (including root's own) goes
+    # through the unmodified real function -- a blanket `os.scandir` failure would also
+    # break unrelated collector paths and prove less than this test appears to. The
+    # directory must still be YIELDED (its own CLAUDE.md is still checked), but the
+    # listing failure must be disclosed in blind_spots[].
+    root = tmp_path / "root"
+    root.mkdir()
+    unlistable = root / "unlistable"
+    unlistable.mkdir()
+    (unlistable / "child.md").write_text("should never be reached")
+
+    real_open = os.open
+    trapped_fd = {}
+
+    def _tracking_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if Path(path) == unlistable:
+            trapped_fd["fd"] = fd
+        return fd
+
+    real_scandir = os.scandir
+
+    def _failing_scandir(fd):
+        if fd == trapped_fd.get("fd"):
+            raise OSError("simulated listing failure on the real unlistable fd")
+        return real_scandir(fd)
+
+    monkeypatch.setattr(os, "open", _tracking_open)  # mock-ok: see function comment
+    monkeypatch.setattr(os, "scandir", _failing_scandir)  # mock-ok: see function comment
+
+    out_of_root_refs = []
+    inaccessible: list = []
+    blind_spots: list = []
+    root_stat = os.stat(root)
+    yielded = list(_collector._walk_contained_dirs(
+        root, root, root_stat, out_of_root_refs, set(),
+        inaccessible=inaccessible, blind_spots=blind_spots))
+    assert unlistable in yielded
+    assert any("unlistable" in b for b in blind_spots), blind_spots
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_walk_contained_dirs_entry_is_dir_failure_is_reported_not_dropped(tmp_path):
+    # TRK-044 (AMENDMENTS A46), category 1, site 3: a per-entry `entry.is_dir()` failure
+    # used to fall back to `is_dir = False` silently -- an entry that IS a directory (or
+    # resolves to one) simply vanishes from the walk with no record. A self-referential
+    # symlink (`loop -> loop`, in the SAME directory) makes the real `stat()` inside
+    # `is_dir()` raise ELOOP ("too many levels of symbolic links"), which CPython does
+    # NOT swallow (only ENOENT is swallowed internally -- confirmed by team-lead
+    # measurement: a merely-DANGLING symlink's `is_dir()` returns False with no raise at
+    # all, so that shape can't reach this branch; a LOOP is required). This is a
+    # reachable defect, not a theoretical one: the walk already treats symlink loops as a
+    # known input shape (its own cycle-safety), so a loop anywhere in a scanned tree
+    # silently dropping its (non-)subtree with no record is a real gap.
+    root = tmp_path / "root"
+    root.mkdir()
+    loop = root / "loop"
+    os.symlink(loop, loop)
+    out_of_root_refs = []
+    inaccessible: list = []
+    blind_spots: list = []
+    root_stat = os.stat(root)
+    list(_collector._walk_contained_dirs(root, root, root_stat, out_of_root_refs, set(),
+                                          inaccessible=inaccessible, blind_spots=blind_spots))
+    assert any("loop" in b for b in blind_spots), blind_spots
+
+
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
 def test_compose_project_tier_symlink_loop_does_not_hang(fake_harness, tmp_path):
     # A project-internal (contained) symlink loop must not hang the CLAUDE.md walk —

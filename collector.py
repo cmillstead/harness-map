@@ -1213,7 +1213,8 @@ def _project_file_entry(rel_root, path, category, containment_root_stat, inacces
     }
 
 
-def _walk_contained_dirs(start, containment_root, containment_root_stat, out_of_root_refs, seen_refs):
+def _walk_contained_dirs(start, containment_root, containment_root_stat, out_of_root_refs, seen_refs,
+                          inaccessible=None, blind_spots=None):
     """Manual, cycle-safe directory walk under `start` (H2) — yields each directory
     (including `start`) whose realpath lies inside `containment_root`. Deliberately NOT
     `Path.rglob`, which follows symlinks unconditionally: a directory entry that is a
@@ -1232,7 +1233,26 @@ def _walk_contained_dirs(start, containment_root, containment_root_stat, out_of_
     `containment_root` AND that a FRESH `os.stat()` of that realpath `samestat()`s the
     OPENED fd — closing the ABA window exactly like `_read_project_file` — and enumerate
     children via `os.scandir(fd)` (an int fd, not the pathname again) so the listing is
-    of the PROVEN inode, never a re-resolved path."""
+    of the PROVEN inode, never a re-resolved path.
+
+    TRK-044 (AMENDMENTS A46), category 1 of 5 — three swallows fixed, all "inaccessible
+    is NOT clean" cases: (1) an `os.open` failure has NOT yet computed a realpath, so it
+    is never a containment fact — it used to be recorded via `_record_out_of_root_ref`,
+    mislabeling a real permission failure (EACCES) as "out of root"; it is now recorded
+    to `inaccessible[]`, the correct channel for "could not open this path" regardless of
+    cause. (2) an `os.scandir(fd)` failure used to be a bare `continue` with zero
+    disclosure anywhere — the yielded directory's subtree silently vanished from the walk
+    with no record. (3) a per-entry `is_dir()` failure used to silently treat the entry as
+    a non-directory, dropping its subtree without a record. Both (2) and (3) are now
+    disclosed to `blind_spots[]` as a structural gap (a listing the walk could not
+    complete), distinct from `inaccessible[]`'s per-path read failures. `inaccessible`/
+    `blind_spots` default to `None` (internally treated as throwaway local lists) so a
+    caller with no report to disclose into — the compose-mode watch-surface scratch walk
+    — can omit them exactly as it already omits real out_of_root_refs/seen bookkeeping."""
+    if inaccessible is None:
+        inaccessible = []
+    if blind_spots is None:
+        blind_spots = []
     visited = set()
     stack = [Path(start)]
     while stack:
@@ -1244,7 +1264,10 @@ def _walk_contained_dirs(start, containment_root, containment_root_stat, out_of_
         try:
             fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK)
         except OSError:
-            _record_out_of_root_ref(out_of_root_refs, seen_refs, containment_root, d)
+            # Not yet a containment fact (no realpath has been derived) — an open
+            # failure (EACCES, ENOENT on a dangling symlink, etc.) means "could not
+            # open," never "resolved outside the root."
+            _append_inaccessible_once(inaccessible, _rel_safe(containment_root, d))
             continue
         try:
             post_stat = os.fstat(fd)
@@ -1264,11 +1287,20 @@ def _walk_contained_dirs(start, containment_root, containment_root_stat, out_of_
             try:
                 entries = sorted(os.scandir(fd), key=lambda e: e.name)
             except OSError:
+                msg = (f"directory listing failed for {_rel_safe(containment_root, d)} "
+                       f"— its subtree was not scanned")
+                if msg not in blind_spots:
+                    blind_spots.append(msg)
                 continue
             for entry in entries:
                 try:
                     is_dir = entry.is_dir()
                 except OSError:
+                    msg = (f"entry type undetermined for "
+                           f"{_rel_safe(containment_root, d / entry.name)} — a possible "
+                           f"subtree was not scanned")
+                    if msg not in blind_spots:
+                        blind_spots.append(msg)
                     is_dir = False
                 if is_dir:
                     stack.append(d / entry.name)
@@ -1527,7 +1559,7 @@ def _file_entry(root, path, category, inaccessible, rel_root=None):
     }
 
 
-def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
+def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs, blind_spots=None):
     """Compose-mode project-tier walk (P1-1): project CLAUDE files under the
     project-containment-root (`<repo>/CLAUDE.md`, `<repo>/CLAUDE.local.md`, and nested
     `<repo>/**/CLAUDE.md` — including `<repo>/.claude/CLAUDE.md`, a valid load form per
@@ -1541,7 +1573,12 @@ def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
     instead of `_file_entry`/`_read_text`. A directory (the `<repo>/**` walk that finds
     nested CLAUDE.md, or `.claude/rules` itself) whose realpath escapes the project
     containment root is NOT descended into; a file whose realpath escapes is NOT read.
-    Both are recorded as `out_of_root_refs` (name + target, untrusted) instead."""
+    Both are recorded as `out_of_root_refs` (name + target, untrusted) instead.
+
+    TRK-044 (AMENDMENTS A46): `inaccessible` (already a param) and the new optional
+    `blind_spots` are threaded into `_walk_contained_dirs` so a permission failure or a
+    listing gap encountered during the walk itself is disclosed rather than silently
+    dropped or mislabeled as an out-of-root escape."""
     files: list[dict[str, Any]] = []
     seen: set[Any] = set()
     seen_refs: set[str] = set()
@@ -1557,7 +1594,8 @@ def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs):
     claude_files = []
     try:
         for d in _walk_contained_dirs(project_root, project_root, containment_stat,
-                                       out_of_root_refs, seen_refs):
+                                       out_of_root_refs, seen_refs,
+                                       inaccessible=inaccessible, blind_spots=blind_spots):
             for fname in ("CLAUDE.md", "CLAUDE.local.md"):
                 f = d / fname
                 present, ok = _safe_exists(f)
@@ -1928,6 +1966,7 @@ def walk_always_loaded(
     out_of_root_refs: list[Any] | None = None,
     *,
     profile: dict[str, Any] | None = None,
+    blind_spots: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Collect always-loaded surfaces: harness CLAUDE.md, the active project's memory
     index only (other projects' indexes go to conditional_variants), the active
@@ -1943,7 +1982,13 @@ def walk_always_loaded(
 
     M11 (SPEC_7 §2): every fixed path below is sourced from `profile` (defaulting to
     PROFILE_CLAUDE_CODE); a None role means this layout has no such surface, and the
-    corresponding block is skipped — never `root / None`."""
+    corresponding block is skipped — never `root / None`.
+
+    TRK-044 (AMENDMENTS A46): `blind_spots`, optional and defaulting to `None`, is passed
+    through to `_walk_project_tier`'s own `_walk_contained_dirs` walk (compose mode only)
+    so a listing gap encountered during that walk is disclosed; omitted by every existing
+    caller that has no `blind_spots` list of its own, matching this function's existing
+    `out_of_root_refs: list[Any] | None = None` convention."""
     profile = PROFILE_CLAUDE_CODE if profile is None else profile
     top_level_files = profile["top_level_files"]
     container_dirs = profile["container_dirs"]
@@ -2179,7 +2224,8 @@ def walk_always_loaded(
 
     if compose and project_root is not None:
         files.extend(_walk_project_tier(project_root, inaccessible, errors,
-                                         out_of_root_refs if out_of_root_refs is not None else []))
+                                         out_of_root_refs if out_of_root_refs is not None else [],
+                                         blind_spots=blind_spots))
 
     return files, conditional_variants
 
@@ -5999,7 +6045,8 @@ def build_document(
     files, conditional_variants = walk_always_loaded(root, project_root, inaccessible, errors,
                                                       compose=compose,
                                                       out_of_root_refs=out_of_root_refs,
-                                                      profile=profile)
+                                                      profile=profile,
+                                                      blind_spots=blind_spots)
     weight_excluded_count = ((len(out_of_root_refs) - _weight_out_of_root_before)
                               + (len(inaccessible) - _weight_inaccessible_before))
     skill_descriptions, agent_descriptions = collect_descriptions(root, inaccessible, profile=profile)
