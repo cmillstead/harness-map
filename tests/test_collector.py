@@ -6898,15 +6898,25 @@ def _check_empty_project(tmp_path):
     proj.mkdir()
     return proj
 
-def _write_check_sidecar(out_dir, date_str, headline=None, crashed=False):
+def _write_check_sidecar(out_dir, date_str, headline=None, crashed=False, profile_rejected=False):
     """A real harness-map-<date>.json fixture. `crashed=True` writes a well-formed CRASH
     ENVELOPE -- all-zero headline plus the actual _CRASH_ERROR_PREFIX marker main() itself
-    writes on a build_document exception -- ignoring any `headline` passed alongside it."""
+    writes on a build_document exception -- ignoring any `headline` passed alongside it.
+    `profile_rejected=True` writes the OTHER unmeasured-run envelope shape (F3): the same
+    all-zero headline, tagged with _PROFILE_ERROR_PREFIX instead -- the marker main()
+    writes when the resolved --profile fails validation. Both flags produce a well-formed,
+    all-zero, UNMEASURED envelope; they differ only in which marker main() would actually
+    have written."""
     if crashed:
         headline = {k: 0 for k in ("always_loaded_words", "always_loaded_tokens_est",
             "always_loaded_file_count", "duplicate_pair_count", "unchecked_binary_count",
             "instruction_files_over_200", "orphan_registration_count", "orphan_script_count")}
         errors = [f"{_collector._CRASH_ERROR_PREFIX}RuntimeError('synthetic crash')"]
+    elif profile_rejected:
+        headline = {k: 0 for k in ("always_loaded_words", "always_loaded_tokens_est",
+            "always_loaded_file_count", "duplicate_pair_count", "unchecked_binary_count",
+            "instruction_files_over_200", "orphan_registration_count", "orphan_script_count")}
+        errors = [f"{_collector._PROFILE_ERROR_PREFIX}profiles/foo.json: bad key"]
     else:
         errors = []
     doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00",
@@ -7084,6 +7094,57 @@ def test_check_all_priors_crashed_emits_verbatim_notice(fake_harness, tmp_path):
     rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
     assert rc == 0, err
     assert out.strip() == "No comparison baseline available — every prior run crashed."
+
+def test_check_skips_profile_rejection_envelope_prior(fake_harness, tmp_path):
+    # F3 (P1): pre-fix, _check_is_crash_envelope matched only _CRASH_ERROR_PREFIX, so a
+    # PROFILE-REJECTION envelope -- all-zero headline, errors[] tagged
+    # "layout profile rejected: " -- was accepted as a MEASURED baseline. Its fabricated
+    # zeros made every real current number read as an increase:
+    # "REGRESSION: instruction_files_over_200 increased (0 -> 8)" against a harness where
+    # nothing had changed. A run that rejected its profile measured nothing, exactly as a
+    # crashed run measured nothing, and D7 says skip an unmeasured prior and continue to
+    # the next-older candidate.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_sidecar(out_dir, older, {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    _write_check_sidecar(out_dir, newer, profile_rejected=True)
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    assert "REGRESSION" not in out
+    assert f"harness-map-{older}.json" in out
+    assert f"harness-map-{newer}.json" not in out
+
+def test_check_all_priors_unmeasured_mixed_markers(fake_harness, tmp_path):
+    # A crash envelope and a profile-rejection envelope are both unmeasured, so with only
+    # those two present there is no baseline at all. The notice text is SKILL.md:92's
+    # verbatim D7 wording and is deliberately NOT reworded here -- changing it would need
+    # a spec change (SPEC_7 §1). Its "every prior run crashed" phrasing is the umbrella
+    # term for "measured nothing".
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), profile_rejected=True)
+    _write_check_sidecar(out_dir, _days_ago(2), crashed=True)
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, err
+    # Build the expected string from the CONSTANT, never by retyping the literal: it
+    # contains an em-dash (U+2014), and a retyped hyphen would fail this assert for a
+    # reason that has nothing to do with the behavior under test.
+    assert out.strip() == _collector._CHECK_BASELINE_ALL_CRASHED
+
+def test_profile_marker_prefix_matches_the_renderer_reader():
+    # Two-home pin, collector side. Mirrors
+    # test_crash_marker_prefix_matches_the_collector_producer for the OTHER unmeasured-run
+    # marker. Pre-fix render_html had no mirror at all, so a profile-rejection envelope
+    # written to --out was rendered as a real measurement.
+    render_html_path = Path(__file__).resolve().parents[1] / "render_html.py"
+    spec = importlib.util.spec_from_file_location("harness_map_render_html_for_check_drift", render_html_path)
+    render_html_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(render_html_mod)
+    assert _collector._PROFILE_ERROR_PREFIX == render_html_mod.PROFILE_ERROR_PREFIX
 
 def test_check_civc_unallowlisted_verdict_is_ignored_not_coerced(fake_harness, tmp_path):
     # D-3: an unallowlisted verdict makes the CURRENT-side cell absent, not 'empty' -- if

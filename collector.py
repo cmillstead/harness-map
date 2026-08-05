@@ -6342,8 +6342,11 @@ _CRASH_ERROR_PREFIX = "collector crashed: "
 
 # M11 (SPEC_7 §2): companion to _CRASH_ERROR_PREFIX above -- tags an errors[] entry so a
 # rejected --profile is distinguishable from a build_document crash by anyone reading the
-# document. Unlike _CRASH_ERROR_PREFIX there is deliberately no render_html mirror: the
-# renderer is out of scope for M11 (no renderer change).
+# document. render_html.PROFILE_ERROR_PREFIX is the reading end, pinned equal to this one
+# by test_profile_marker_prefix_matches_the_renderer_reader. (Through M11 there was no
+# renderer mirror -- an M11 SCOPING decision, not a design property. It was a live defect:
+# main()'s --out block writes this envelope to disk as an ordinary dated sidecar, and the
+# renderer read its eight fabricated zeros as a measurement. Fixed in TRK-051.)
 _PROFILE_ERROR_PREFIX = "layout profile rejected: "
 
 
@@ -6426,6 +6429,10 @@ _CHECK_SIDECAR_RE = re.compile(r"^harness-map-(\d{4}-\d{2}-\d{2})\.json$")
 _CHECK_SYNTHESIS_RE = re.compile(r"^harness-synthesis-(\d{4}-\d{2}-\d{2})\.json$")
 
 _CHECK_BASELINE_NO_PRIOR = "First run — no prior map (baseline)."
+# SKILL.md D7's mandated wording, unchanged by TRK-051 (Rule 7: never edit an existing
+# assertion's subject). "every prior run crashed" is the UMBRELLA term here for "every
+# prior run was unmeasured" -- it now also covers a profile-rejection envelope, which
+# measured nothing for a different reason than a crash but is skipped identically.
 _CHECK_BASELINE_ALL_CRASHED = "No comparison baseline available — every prior run crashed."
 
 
@@ -6457,28 +6464,38 @@ def _check_band(value: Any) -> str:
 
 
 def _check_is_crash_envelope(doc: dict[str, Any]) -> bool:
-    """True when `doc["errors"]` carries the _CRASH_ERROR_PREFIX marker _empty_document
-    writes on a build_document crash -- mirrors render_html._run_was_measured's detector
-    (D-4: reuses this module's OWN _CRASH_ERROR_PREFIX rather than importing the renderer's
-    copy of the same string; the two are pinned equal by
-    test_crash_marker_prefix_matches_the_collector_producer). Defensive on shape: a
+    """True when `doc["errors"]` carries EITHER unmeasured-run marker _empty_document
+    ships with: _CRASH_ERROR_PREFIX (build_document raised) or _PROFILE_ERROR_PREFIX (the
+    --profile was rejected, so nothing was inventoried). Both produce the SAME all-zero
+    headline, and both mean "this run measured nothing" -- so both must be skipped as
+    baselines. Matching only the crash marker (the pre-TRK-051 behavior) let a
+    profile-rejection envelope's fabricated zeros turn every real current number into a
+    manufactured increase.
+
+    Mirrors render_html._run_was_measured's detector (D-4: reuses this module's OWN
+    prefixes rather than importing the renderer's copies; the two are pinned equal by
+    test_crash_marker_prefix_matches_the_collector_producer and
+    test_profile_marker_prefix_matches_the_renderer_reader). Defensive on shape: a
     non-list `errors` is wrapped, non-string entries are skipped rather than raising."""
     errors = doc.get("errors") or []
     entries = errors if isinstance(errors, list) else [errors]
-    return any(isinstance(e, str) and e.startswith(_CRASH_ERROR_PREFIX) for e in entries)
+    markers = (_CRASH_ERROR_PREFIX, _PROFILE_ERROR_PREFIX)
+    return any(isinstance(e, str) and e.startswith(markers) for e in entries)
 
 
 def _check_select_prior_sidecar(out_dir: Path, today: str) -> tuple[str, dict[str, Any] | None, str | None]:
     """The D7 selection rule (SKILL.md's Diff-vs-Previous-Run section), scoped to --check
     (AMENDMENTS A48): among harness-map-YYYY-MM-DD.json sidecars in `out_dir` strictly
     before `today`, walk NEWEST FIRST. D-2: a structurally malformed candidate is FATAL --
-    returns ("malformed", ...) with NO fallback to an older file. A well-formed CRASH
-    ENVELOPE is not malformed -- it is SKIPPED, continuing to the next-older candidate.
+    returns ("malformed", ...) with NO fallback to an older file. A well-formed UNMEASURED
+    ENVELOPE (crash or profile rejection) is not malformed -- it is SKIPPED, continuing to
+    the next-older candidate.
 
     Returns (status, doc, detail):
       ("found", doc, date_str)     -- doc is the measured baseline, detail is its date
       ("no_prior", None, None)     -- no sidecar at all strictly before `today`
-      ("all_crashed", None, None)  -- sidecars exist, every one is a crash envelope
+      ("all_crashed", None, None)  -- sidecars exist, every one is an unmeasured envelope
+                                       (crash or profile rejection)
       ("malformed", None, msg)     -- the D7-selected candidate failed structural validation
       ("unreadable", None, msg)    -- `out_dir` itself could not be listed
     """
