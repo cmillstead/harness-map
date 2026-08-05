@@ -241,6 +241,132 @@ def test_direct_registration_resolved(fake_harness):
     scripts = {s["name"]: s for s in doc["enforcement"]["hooks"]["scripts_on_disk"]}
     assert scripts["direct.py"]["registered_via"] == "direct"
 
+def _hooks_settings(commands):
+    """Minimal settings.json body registering exactly `commands` on one PostToolUse
+    entry (TRK-025) -- reused by the coverage-classification tests below."""
+    return {"hooks": {"PostToolUse": [{"hooks": [
+        {"type": "command", "command": c} for c in commands]}]}}
+
+
+def test_inline_shell_hook_command_is_no_script_and_not_a_blind_spot(fake_harness):
+    # TRK-025 T1/T4#1: a genuinely inline-shell command (unambiguous shell control
+    # syntax -- here `&&` and a redirection -- with no script-shaped token anywhere)
+    # tokenizes fine and is fully examined -- it must land in commands_no_script and
+    # never in blind_spots. A bare `prog arg arg` invocation with NO shell syntax does
+    # NOT qualify here -- see test_bare_opaque_invocation_stays_unparsed below, which
+    # pins that boundary deliberately.
+    (fake_harness / "settings.json").write_text(
+        json.dumps(_hooks_settings(["[ \"$X\" = \"1\" ] && printf 'hi' 2>/dev/null"])))
+    doc = run_collector(fake_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == 1
+    assert hooks["commands_unparsed"] == 0
+    assert not any("printf" in bs for bs in doc["blind_spots"])
+
+
+def test_bare_opaque_invocation_stays_unparsed(fake_harness):
+    # TRK-025 T1 step 3, pinned deliberately (per team-lead review): a bare `prog arg arg`
+    # invocation with NO shell control syntax and no script-shaped token -- an opaque
+    # program we have no positive evidence about (the exact shape of the pre-existing
+    # test_unsupported_command_form_surfaced_not_dropped's "rtk hook claude") -- must NOT
+    # be waved through as no_script just because it superficially resembles inline shell.
+    # It stays "unparsed", a real, disclosed blind spot.
+    (fake_harness / "settings.json").write_text(
+        json.dumps(_hooks_settings(["mytool subcommand argument"])))
+    doc = run_collector(fake_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_unparsed"] == 1
+    assert hooks["commands_no_script"] == 0
+    assert any("unsupported hook command form" in bs for bs in doc["blind_spots"])
+
+
+def test_oversized_inline_token_is_no_script_and_does_not_crash_the_run(fake_harness):
+    # TRK-025 P1 regression (the exact real-harness shape): an unrecognized `[`-leading
+    # compound command carrying a ~1500-character inline awk program as a SINGLE shlex
+    # token (plus a /dev/null-style redirection), the actual measured form of 8 real
+    # hook commands. Path.is_file() re-raises OSError(ENAMETOOLONG) on a token this long
+    # (unguarded, this crashed the whole run into an all-zero envelope) -- this must
+    # produce a REAL document (errors empty), classify the command no_script, and never
+    # add it to blind_spots.
+    huge_awk_program = "BEGIN{" + "x" * 1490 + "}"
+    command = f'[ "$CLAUDE_HOOK_EVENT" = "PreToolUse" ] && awk \'{huge_awk_program}\' 2>/dev/null'
+    (fake_harness / "settings.json").write_text(json.dumps(_hooks_settings([command])))
+    doc = run_collector(fake_harness)
+    assert doc["errors"] == []
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == 1
+    assert hooks["commands_unparsed"] == 0
+    assert not any("unsupported hook command form" in bs for bs in doc["blind_spots"])
+
+
+def test_unrecognized_form_referencing_script_stays_unparsed_and_blind_spot(fake_harness):
+    # TRK-025 T1/T4#2 (Trap 2 regression guard, the most important test): an unrecognized
+    # command form that DOES appear to reference a script (a .py-suffixed token) must NOT
+    # be waved through as no_script -- it is a real coverage gap and must stay a blind spot.
+    (fake_harness / "settings.json").write_text(
+        json.dumps(_hooks_settings(["caffeinate -i hooks/mystery.py"])))
+    doc = run_collector(fake_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_unparsed"] == 1
+    assert hooks["commands_no_script"] == 0
+    assert any("caffeinate" in bs for bs in doc["blind_spots"])
+
+
+def test_shlex_unparseable_hook_command_is_unparsed(fake_harness):
+    # TRK-025 T1 row 1314: shlex.split raising ValueError is a real coverage gap.
+    (fake_harness / "settings.json").write_text(
+        json.dumps(_hooks_settings(['python3 hooks/x.py "unterminated'])))
+    doc = run_collector(fake_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_unparsed"] == 1
+    assert any("unparseable hook command" in bs for bs in doc["blind_spots"])
+
+
+def test_empty_hook_command_resolution_emits_a_note_directly():
+    # TRK-025 T1 row 1316: _script_from_command used to return (None, None) SILENTLY for
+    # an empty token list. Exercised directly (same pattern as the _rel/_empty_document
+    # direct-call tests elsewhere in this file) since a no_script note is deliberately
+    # never surfaced to blind_spots by the caller (see the no_script test above) -- this
+    # is the only place the closed silent path is actually observable.
+    resolution = _collector._script_from_command("", Path("/fake/root"))
+    assert resolution.script_path is None
+    assert resolution.note is not None
+    assert resolution.kind == "no_script"
+
+
+def test_hook_command_coverage_totals_and_headline_denominator(fake_harness):
+    # TRK-025 T4#5 + T3: every registered command lands in EXACTLY one bucket, so
+    # commands_total always equals the other three summed, and the headline denominator
+    # mirrors the same split.
+    _build_hooks_harness(fake_harness)  # 3 "resolved" commands: dispatcher, direct.py, absent.py
+    settings = json.loads((fake_harness / "settings.json").read_text())
+    settings["hooks"]["PostToolUse"] = [{"hooks": [
+        {"type": "command", "command": "[ \"$X\" = \"1\" ] && printf 'hi' 2>/dev/null"},
+        {"type": "command", "command": "caffeinate -i hooks/mystery.py"},
+    ]}]
+    (fake_harness / "settings.json").write_text(json.dumps(settings))
+    doc = run_collector(fake_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert (hooks["commands_total"]
+            == hooks["commands_resolved"] + hooks["commands_no_script"] + hooks["commands_unparsed"])
+    assert hooks["commands_total"] == 5
+    assert hooks["commands_resolved"] == 3
+    assert hooks["commands_no_script"] == 1
+    assert hooks["commands_unparsed"] == 1
+    assert doc["headline"]["hook_commands_total"] == 5
+    assert doc["headline"]["hook_commands_examined"] == 4  # resolved + no_script
+
+
+def test_empty_document_hook_coverage_keys_zeroed(tmp_path):
+    # TRK-025 envelope rule: every new field exists, zeroed, on the crash path.
+    doc = _collector._empty_document(tmp_path)
+    hooks = doc["enforcement"]["hooks"]
+    for key in ("commands_total", "commands_resolved", "commands_no_script", "commands_unparsed"):
+        assert hooks[key] == 0
+    assert doc["headline"]["hook_commands_examined"] == 0
+    assert doc["headline"]["hook_commands_total"] == 0
+
+
 def test_permissions_counted(fake_harness):
     _build_hooks_harness(fake_harness)
     doc = run_collector(fake_harness)
@@ -1723,6 +1849,9 @@ def test_headline_snapshot_matches_fixture(fake_harness):
     # only by the separate live-harness regression diff (which is flaky as the real
     # harness evolves).
     doc = run_collector(fake_harness)
+    # TRK-025: regenerated to add the two new headline keys (hook_commands_examined,
+    # hook_commands_total) -- fake_harness registers no hooks (conftest's settings.json
+    # has "hooks": {}), so both are 0. Every other value is untouched.
     assert doc["headline"] == {
         "always_loaded_words": 134,
         "always_loaded_tokens_est": 175,
@@ -1732,6 +1861,8 @@ def test_headline_snapshot_matches_fixture(fake_harness):
         "instruction_files_over_200": 0,
         "orphan_registration_count": 0,
         "orphan_script_count": 0,
+        "hook_commands_examined": 0,
+        "hook_commands_total": 0,
     }
     assert not any("skills/coding-team/rules/*.md reflects" in b for b in doc["blind_spots"])
 
@@ -2330,7 +2461,13 @@ def test_description_extraction_is_read_only(fake_harness):
 # ADDED is exactly `.blind_spots[6]` and `.blind_spots[7]`, and the ONLY CHANGED paths are
 # `.metric_definitions.phantom_confirmed_count` and `.metric_definitions.phantom_ref_count`
 # -- no existing blind_spot index moved. `blob == _GOLDEN_...` is unchanged.
-_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan.", "Line-range citations (`path.md:12-19`) are checked for the FILE only \\u2014 the line range itself is never validated, so a stale range in an otherwise-valid citation is invisible to this scan.", "Placeholder and glob tokens are recognized only when they are PATH-SHAPED \\u2014 a backticked `<slug>.md`, `{session}.md` or `*.md` with no directory separator is not detected as a reference at all, so it is neither resolved nor reported."], "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "metric_definitions": {"always_loaded_file_count": 1, "always_loaded_tokens_est": 1, "always_loaded_words": 1, "duplicate_pair_count": 1, "hooks_with_test_ratio": 1, "instruction_files_over_200": 1, "memory_body_count": 1, "orphan_registration_count": 1, "orphan_script_count": 1, "phantom_confirmed_count": 4, "phantom_ref_count": 4, "promotion_candidate_count": 1, "skills_with_test_ratio": 1, "unchecked_binary_count": 1}, "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "staleness_null_reasons": {"agents/demo-agent.md": "no_repo", "commands/demo-cmd.md": "no_repo", "rules/a.md": "no_repo", "rules/b.md": "no_repo", "skills/coding-team/rules/c.md": "no_repo", "skills/demo/SKILL.md": "no_repo", "skills/demo/phases/p1.md": "no_repo"}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
+# TRK-025: regenerated again, same rule and same reason, for six new additive fields --
+# `enforcement.hooks.commands_total`/`.commands_resolved`/`.commands_no_script`/
+# `.commands_unparsed` and `headline.hook_commands_examined`/`.hook_commands_total`
+# (fake_harness registers no hooks, so all six are 0). Verified mechanically: comparing
+# the two literals path-by-path, REMOVED is empty and ADDED is exactly those six paths --
+# no existing value changed.
+_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan.", "Line-range citations (`path.md:12-19`) are checked for the FILE only \\u2014 the line range itself is never validated, so a stale range in an otherwise-valid citation is invisible to this scan.", "Placeholder and glob tokens are recognized only when they are PATH-SHAPED \\u2014 a backticked `<slug>.md`, `{session}.md` or `*.md` with no directory separator is not detected as a reference at all, so it is neither resolved nor reported."], "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"commands_no_script": 0, "commands_resolved": 0, "commands_total": 0, "commands_unparsed": 0, "orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "hook_commands_examined": 0, "hook_commands_total": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "metric_definitions": {"always_loaded_file_count": 1, "always_loaded_tokens_est": 1, "always_loaded_words": 1, "duplicate_pair_count": 1, "hooks_with_test_ratio": 1, "instruction_files_over_200": 1, "memory_body_count": 1, "orphan_registration_count": 1, "orphan_script_count": 1, "phantom_confirmed_count": 4, "phantom_ref_count": 4, "promotion_candidate_count": 1, "skills_with_test_ratio": 1, "unchecked_binary_count": 1}, "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "staleness_null_reasons": {"agents/demo-agent.md": "no_repo", "commands/demo-cmd.md": "no_repo", "rules/a.md": "no_repo", "rules/b.md": "no_repo", "skills/coding-team/rules/c.md": "no_repo", "skills/demo/SKILL.md": "no_repo", "skills/demo/phases/p1.md": "no_repo"}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
 
 
 def test_non_compose_output_byte_identical_to_pre_change(fake_harness):
