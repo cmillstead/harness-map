@@ -95,7 +95,7 @@ The Trend tab also grows a per-metric sparkline (last 10 points) once that metri
 
 ## `--check` — Regression Gate (M10)
 
-`python3 collector.py --check OUT_DIR` (same D7 skip-crash-envelope selection above) compares this run's headline + latest CIVC synthesis against the most recent prior MEASURED run in `OUT_DIR` and prints findings instead of the JSON document. Exit **0** no regression (or no baseline yet — first run / every prior crashed), **1** a `REGRESSION:`-prefixed finding, **2** a collection/comparison error. Useful as a SessionStart hook gate (wiring the hook itself is out of scope here).
+`python3 collector.py --check OUT_DIR` (same D7 skip-crash-envelope selection above) compares this run's headline + latest CIVC synthesis against the most recent prior MEASURED run in `OUT_DIR` and prints findings instead of the JSON document. Exit **0** no regression (or no baseline yet — first run / every prior crashed), **1** a `REGRESSION:`-prefixed finding, **2** a collection/comparison error. Useful as a SessionStart hook gate (wiring the hook itself is out of scope here). A metric whose `metric_definitions` version differs between the two runs is skipped and named on a `notice:` line — a detector change is not a regression.
 
 ## Promotion Honors Hooks-As-Last-Resort
 

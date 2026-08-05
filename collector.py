@@ -6623,23 +6623,86 @@ def _check_civc_cells(synth_doc: dict[str, Any]) -> dict[tuple[str, str], str]:
     return cells
 
 
-def _check_headline_regressions(current: dict[str, Any], prior: dict[str, Any]) -> list[str]:
+def _check_valid_definition_version(value: Any) -> bool:
+    """schema.md:167's stated contract for a metric definition version: a positive int and
+    NOT a bool. `True == 1` in Python, so a stray boolean would silently resolve as
+    version 1 and report a series comparable when it is not. Anything failing this is
+    UNKNOWN, never a default.
+
+    Mirrors render_html._valid_definition_version. NOT imported from it (A48 D-4:
+    collector.py does not import render_html, and must not start) -- instead the two are
+    pinned BEHAVIORALLY equal by test_definition_version_validator_matches_render_html.
+    Two independent implementations of one prose contract is the two-home shape, and A49's
+    lesson is that the unpinned half of a pinned pair is where the off-by-one ships."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _check_definition_skips(prior: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """(skipped_metric_names, notice_lines) for metrics whose DEFINITION VERSION differs
+    between the prior sidecar and this run (S6b §8.1 / AMENDMENTS A50).
+
+    METRIC_DEFINITIONS is the current run's version map by construction -- build_document
+    copies this same constant into doc["metric_definitions"], so reading the constant and
+    reading the current document give the same value for any real run. Reading the constant
+    keeps run_check callable with a hand-built current doc (the in-process boundary test).
+
+    ABSENT, EMPTY, non-dict, or INVALID prior versions mean COMPARE, never skip. Reading
+    "unknown" as "changed" would skip every metric and print a clean-looking verdict for a
+    run that compared nothing -- the identical silent-green failure as a --check whose
+    --root did not exist, relocated. `_empty_document` sets metric_definitions to {}
+    deliberately, and a legacy sidecar predating S6b carries no map at all; both of those
+    are ordinary inputs, not signals.
+
+    CIVC is deliberately untouched: METRIC_DEFINITIONS declares no CIVC metric, and the
+    synthesis comparison is not a headline metric. Do not wire one in without a spec change.
+
+    Fixed key order (CLAUDE.md rule 9: deterministic output across PYTHONHASHSEED)."""
+    declared = prior.get("metric_definitions")
+    if not isinstance(declared, dict):
+        return [], []
+    skipped: list[str] = []
+    notices: list[str] = []
+    for key in _CHECK_COMPARED_HEADLINE_KEYS:
+        prior_version = declared.get(key)
+        current_version = METRIC_DEFINITIONS.get(key)
+        if not _check_valid_definition_version(prior_version):
+            continue
+        if not _check_valid_definition_version(current_version):
+            continue
+        if prior_version == current_version:
+            continue
+        skipped.append(key)
+        notices.append(f"notice: {key} skipped (definition v{prior_version} -> v{current_version})")
+    return skipped, notices
+
+
+def _check_headline_regressions(current: dict[str, Any], prior: dict[str, Any],
+                                skip: tuple[str, ...] = ()) -> list[str]:
     """The three headline regression signals (SPEC_7 §1), checked and emitted in this
     FIXED order (deterministic, F4.4) so findings are stable across runs regardless of
-    dict iteration order."""
+    dict iteration order.
+
+    `skip` names metrics whose DEFINITION VERSION changed between the two runs (A50): the
+    numbers are no longer measuring the same thing, so comparing them would manufacture a
+    REGRESSION out of a detector bump. The default () preserves the pre-A50 behavior for
+    any caller that does not supply it."""
     findings = []
-    cur_tokens = current.get("always_loaded_tokens_est", 0)
-    prior_tokens = prior.get("always_loaded_tokens_est", 0)
-    cur_band, prior_band = _check_band(cur_tokens), _check_band(prior_tokens)
-    if _CHECK_BAND_ORDER.index(cur_band) > _CHECK_BAND_ORDER.index(prior_band):
-        findings.append(f"REGRESSION: always_loaded_tokens_est crossed {prior_band} -> {cur_band} "
-                         f"({prior_tokens} -> {cur_tokens} tokens)")
-    cur_over200 = current.get("instruction_files_over_200", 0)
-    prior_over200 = prior.get("instruction_files_over_200", 0)
-    if cur_over200 > prior_over200:
-        findings.append(f"REGRESSION: instruction_files_over_200 increased "
-                         f"({prior_over200} -> {cur_over200})")
+    if "always_loaded_tokens_est" not in skip:
+        cur_tokens = current.get("always_loaded_tokens_est", 0)
+        prior_tokens = prior.get("always_loaded_tokens_est", 0)
+        cur_band, prior_band = _check_band(cur_tokens), _check_band(prior_tokens)
+        if _CHECK_BAND_ORDER.index(cur_band) > _CHECK_BAND_ORDER.index(prior_band):
+            findings.append(f"REGRESSION: always_loaded_tokens_est crossed {prior_band} -> {cur_band} "
+                             f"({prior_tokens} -> {cur_tokens} tokens)")
+    if "instruction_files_over_200" not in skip:
+        cur_over200 = current.get("instruction_files_over_200", 0)
+        prior_over200 = prior.get("instruction_files_over_200", 0)
+        if cur_over200 > prior_over200:
+            findings.append(f"REGRESSION: instruction_files_over_200 increased "
+                             f"({prior_over200} -> {cur_over200})")
     for key in ("orphan_registration_count", "orphan_script_count"):
+        if key in skip:
+            continue
         cur_v, prior_v = current.get(key, 0), prior.get(key, 0)
         if cur_v > prior_v:
             findings.append(f"REGRESSION: {key} increased ({prior_v} -> {cur_v})")
@@ -6701,20 +6764,26 @@ def run_check(doc: dict[str, Any], out_dir: str,
     if status in ("malformed", "unreadable"):
         return 2, f"error: {detail}"
     findings: list[str] = []
+    notices: list[str] = []
     if status == "found":
         assert prior_doc is not None
+        skipped_metrics, notices = _check_definition_skips(prior_doc)
         findings.extend(_check_headline_regressions(
-            doc.get("headline") or {}, prior_doc.get("headline") or {}))
+            doc.get("headline") or {}, prior_doc.get("headline") or {},
+            skip=tuple(skipped_metrics)))
     if synth_pair is not None:
         prior_synth, newest_synth = synth_pair
         findings.extend(_check_civc_regressions(prior_synth, newest_synth))
+    # A50: notices precede findings and the verdict line, and never change the exit code --
+    # a skipped metric is neither a regression nor a clean result, it is a metric nobody
+    # compared, and the operator is told which one by name.
     if findings:
-        return 1, "\n".join(findings)
+        return 1, "\n".join(notices + findings)
     if status == "no_prior":
-        return 0, _CHECK_BASELINE_NO_PRIOR
+        return 0, "\n".join(notices + [_CHECK_BASELINE_NO_PRIOR])
     if status == "all_crashed":
-        return 0, _CHECK_BASELINE_ALL_CRASHED
-    return 0, f"No regression detected (baseline: harness-map-{detail}.json)."
+        return 0, "\n".join(notices + [_CHECK_BASELINE_ALL_CRASHED])
+    return 0, "\n".join(notices + [f"No regression detected (baseline: harness-map-{detail}.json)."])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -6739,7 +6808,9 @@ def main(argv: list[str] | None = None) -> int:
                           "run in OUT_DIR; PRINTS FINDINGS, NOT THE JSON DOCUMENT (the one "
                           "carve-out to the always-emit-JSON invariant, default mode "
                           "only). Exit 0 no regression (or no baseline yet), 1 a "
-                          "REGRESSION:-prefixed finding, 2 a collection/comparison error.")
+                          "REGRESSION:-prefixed finding, 2 a collection/comparison error. "
+                          "A metric whose definition version differs between the two runs "
+                          "is skipped, with a notice: line naming it.")
     args = ap.parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     out_path = None

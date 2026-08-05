@@ -7397,3 +7397,152 @@ def test_check_non_list_civc_does_not_discard_headline_findings(fake_harness, tm
     assert rc == 1, (out, err)
     assert "REGRESSION: orphan_script_count increased" in out
     assert "Traceback" not in err
+
+def test_check_skips_a_metric_whose_definition_version_changed(fake_harness, tmp_path):
+    # F7: --check ignored METRIC_DEFINITIONS entirely, so the next detector bump would
+    # read as a REGRESSION against every prior sidecar -- a false positive in exactly the
+    # direction the RISK_REGISTER kill signal watches. A prior declaring a DIFFERENT
+    # version for a metric means that metric is incomparable: omit it and SAY SO.
+    # Changing this value requires a spec change (SPEC_7 §1).
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    date_str = _days_ago(1)
+    doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+           "headline": {"always_loaded_tokens_est": 200, "instruction_files_over_200": 0,
+                        "orphan_registration_count": 0, "orphan_script_count": 0},
+           "metric_definitions": {"orphan_script_count": 99}, "errors": []}
+    (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+    current_version = _collector.METRIC_DEFINITIONS["orphan_script_count"]
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")   # would fire, if compared
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert f"notice: orphan_script_count skipped (definition v99 -> v{current_version})" in out
+    assert "REGRESSION: orphan_script_count" not in out
+    assert "No regression detected" in out
+
+def test_check_definition_skip_does_not_suppress_other_metrics(fake_harness, tmp_path):
+    # The skip is PER-METRIC. One bumped detector must not blind the gate to the metrics
+    # that are still comparable -- a whole-run abort would be the silent-green shape again.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    date_str = _days_ago(1)
+    doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+           "headline": {"always_loaded_tokens_est": 200, "instruction_files_over_200": 0,
+                        "orphan_registration_count": 0, "orphan_script_count": 0},
+           "metric_definitions": {"always_loaded_tokens_est": 99}, "errors": []}
+    (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "notice: always_loaded_tokens_est skipped" in out
+    assert "REGRESSION: orphan_script_count increased" in out
+
+def test_check_missing_definitions_map_compares_rather_than_skipping(fake_harness, tmp_path):
+    # THE F2 SHAPE IN A NEW PLACE, and the reason this test exists. _empty_document sets
+    # metric_definitions to {} deliberately ("measured nothing, so defines nothing"), and a
+    # LEGACY sidecar predating S6b carries no map at all. Reading absence as "every metric
+    # changed definition" would skip every comparison and print a clean-looking verdict for
+    # a run that compared nothing -- the gate silently green again. Absent MUST compare.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # _write_check_sidecar writes no metric_definitions key at all -- the legacy shape.
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0,
+        "orphan_script_count": 0})
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "notice:" not in out
+    assert "REGRESSION: orphan_script_count increased" in out
+
+def test_check_empty_definitions_map_compares_rather_than_skipping(fake_harness, tmp_path):
+    # Sibling of the above for an EXPLICIT {} -- the crash-envelope shape. After TRK-051's
+    # F3 fix both envelope kinds are excluded as baselines, so this is defense in depth,
+    # but the semantics must be identical to "absent": compare, do not skip.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    date_str = _days_ago(1)
+    doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+           "headline": {"always_loaded_tokens_est": 200, "instruction_files_over_200": 0,
+                        "orphan_registration_count": 0, "orphan_script_count": 0},
+           "metric_definitions": {}, "errors": []}
+    (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "notice:" not in out
+    assert "REGRESSION: orphan_script_count increased" in out
+
+def test_check_invalid_definition_version_compares_rather_than_skipping(fake_harness, tmp_path):
+    # schema.md:167: a version must be `isinstance(v, int) and not isinstance(v, bool) and
+    # v > 0`; anything else is UNKNOWN, never a default. UNKNOWN takes the same branch as
+    # absent -- COMPARE -- because the safe direction for a gate is to keep watching, not
+    # to fall silent on garbage input. A non-dict map takes the same branch.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    for bad in (True, 0, -1, "1", 1.0, None):
+        date_str = _days_ago(1)
+        doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+               "headline": {"always_loaded_tokens_est": 200, "instruction_files_over_200": 0,
+                            "orphan_registration_count": 0, "orphan_script_count": 0},
+               "metric_definitions": {"orphan_script_count": bad}, "errors": []}
+        (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+        rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+        assert rc == 0, (bad, out, err)
+        assert "notice:" not in out, bad
+    doc["metric_definitions"] = ["not", "a", "dict"]
+    (out_dir / f"harness-map-{_days_ago(1)}.json").write_text(json.dumps(doc))
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "notice:" not in out
+
+def test_check_all_metrics_skipped_still_names_every_skip(fake_harness, tmp_path):
+    # If every compared metric is skipped, exit 0 with only "No regression detected" would
+    # be a NEW silent green -- a clean-looking verdict for a run that compared nothing.
+    # Four notices must precede the verdict line, in the FIXED metric order
+    # _check_headline_regressions emits in (deterministic across PYTHONHASHSEED).
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    date_str = _days_ago(1)
+    keys = ("always_loaded_tokens_est", "instruction_files_over_200",
+            "orphan_registration_count", "orphan_script_count")
+    doc = {"schema_version": 1, "generated_at": f"{date_str}T00:00:00+00:00", "root": "/fake",
+           "headline": {k: 0 for k in keys},
+           "metric_definitions": {k: 99 for k in keys}, "errors": []}
+    (out_dir / f"harness-map-{date_str}.json").write_text(json.dumps(doc))
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    lines = [ln for ln in out.strip().splitlines() if ln]
+    assert [ln.split()[1] for ln in lines if ln.startswith("notice:")] == list(keys)
+    assert lines[-1].startswith("No regression detected")
+
+def test_definition_version_validator_matches_render_html():
+    # BEHAVIORAL two-home pin. collector._check_valid_definition_version and
+    # render_html._valid_definition_version are two INDEPENDENT implementations of one
+    # prose contract (schema.md:167). That is the two-home shape even though no constant
+    # is shared, and A49's lesson is that the unpinned half of a pinned pair is where the
+    # off-by-one ships -- so pin the BEHAVIOR across the battery rather than the text.
+    # The battery's teeth: True must be False in BOTH (a bool is excluded despite
+    # True == 1), and 1.0 must be False in BOTH (isinstance(1.0, int) is False). If
+    # schema.md's prose ever changes, both implementations fail this together -- which is
+    # the point.
+    # Changing this contract requires a spec change (SPEC_7 §1).
+    render_html_path = Path(__file__).resolve().parents[1] / "render_html.py"
+    spec = importlib.util.spec_from_file_location("harness_map_render_html_for_check_drift", render_html_path)
+    render_html_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(render_html_mod)
+    battery = (True, False, 0, -1, 1, 2, "1", 1.0, None)
+    for value in battery:
+        assert (_collector._check_valid_definition_version(value)
+                is render_html_mod._valid_definition_version(value)), value
+    # And pin the shape itself, so "both agree" cannot be satisfied by both being broken.
+    assert _collector._check_valid_definition_version(1) is True
+    assert _collector._check_valid_definition_version(True) is False
+    assert _collector._check_valid_definition_version(1.0) is False
+    assert _collector._check_valid_definition_version(0) is False
