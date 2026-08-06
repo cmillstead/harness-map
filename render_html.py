@@ -2214,7 +2214,7 @@ main{padding:16px 20px}
 .view-heading{display:none}
 body.expand-all-on .view-heading{display:block;font-size:0.95rem;margin:18px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
 body.expand-all-on .view-heading:first-of-type{margin-top:0;padding-top:0;border-top:none}
-#expand-all[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600}
+#expand-all[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent);color:var(--ink);font-weight:600}
 @media print{.view[hidden]{display:block}.view-heading{display:block}}
 .card{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;margin-bottom:14px}
 .digest{color:var(--muted);font-size:0.85rem;margin:0 0 10px 0}

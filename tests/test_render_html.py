@@ -4762,6 +4762,44 @@ def test_svg_fill_fallbacks_use_the_accent_token(tmp_path):
     assert src.count('c.get("fill", "var(--accent)")') == 2
 
 
+def _wcag_contrast(hex_a, hex_b):
+    def lum(h):
+        h = h.lstrip("#")
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        c = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        c = [(x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4) for x in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    la, lb = lum(hex_a), lum(hex_b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_expand_all_pressed_state_meets_wcag_contrast_in_both_themes():
+    """Rejects the exact defect Codex found in the first TRK-021 review round: the pressed
+    expand-all rule composed var(--accent) text on var(--accent-soft) background, which in
+    the light theme is #6366f1 on #e5e7fb -- about 3.65:1, under the 4.5:1 WCAG AA floor
+    for the control's 0.85rem text. Every literal-scan audit missed it because the rule
+    contains no hex literal at all; this test therefore resolves the rule's var() references
+    against BOTH parsed theme palettes and computes the actual ratio. Changing this value
+    requires a spec change (WCAG 2.1 AA 1.4.3: 4.5:1 for normal-size text)."""
+    css = rh.STATIC_STYLE
+    rule = _css_decls(css, '#expand-all[aria-pressed="true"]')
+    assert rule != "", "pressed-state rule missing"
+    m = re.search(r"(?:^|;)color:var\((--[a-z-]+)\)", rule)
+    assert m, "pressed-state rule must set color via a theme token"
+    fg_token = m.group(1)
+    mb = re.search(r"background:var\((--[a-z-]+)\)", rule)
+    assert mb, "pressed-state rule must set background via a theme token"
+    bg_token = mb.group(1)
+    light = _theme_tokens(_theme_block(css, ":root{"))
+    dark = _theme_tokens(_theme_block(css, ':root[data-theme="dark"]{'))
+    for theme_name, tokens in (("light", light), ("dark", dark)):
+        ratio = _wcag_contrast(tokens[fg_token], tokens[bg_token])
+        assert ratio >= 4.5, (
+            f"{theme_name}: {fg_token} on {bg_token} = {ratio:.2f}:1, below WCAG AA 4.5:1")
+
+
 def test_one_executable_script_and_csp_hash_reconciles_with_tier_composition(tmp_path):
     doc = _minimal_doc()
     doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
