@@ -3739,7 +3739,9 @@ def _checked_git_reason(reason: str) -> str:
 # UNBOUNDED 230-260s worst case.
 # 4.5x the measured 2.24s typical; a backstop for a degenerate case (huge-history
 # submodule, network-mounted .git, hung git), not a perf target. DELIBERATELY not tied
-# to --check's <=5s: that budget covers a different, intentionally-thin path.
+# to --check's <=5s: --check runs the SAME build_document() path as default mode --
+# there is no separate thin path -- and was measured at 3.17s against that budget
+# (TRK-051 F4).
 _GIT_TOTAL_BUDGET = 10.0
 
 # Harden-audit fix (T9 round 2, HIGH): command-line -c OUTRANKS repo config, so these
