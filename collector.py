@@ -6714,9 +6714,14 @@ def _check_select_synthesis_pair(
         prior_doc = json.loads(prior_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return None, [f"notice: CIVC comparison skipped, unreadable synthesis sidecar {prior_path.name}: {exc}"]
-    if not isinstance(newest_doc, dict):
+    # Codex P2 (TRK-051 T5): a dict lacking "schema_version" is not a valid synthesis
+    # document either -- load_sidecar's D7 selection and schema.md's synthesis contract
+    # both require the marker, and a bare {} previously slipped through this check. Reuses
+    # the SAME "is not a valid document" notice text as the isinstance failure above: one
+    # notice vocabulary, not two.
+    if not isinstance(newest_doc, dict) or "schema_version" not in newest_doc:
         return None, [f"notice: CIVC comparison skipped, synthesis sidecar {newest_path.name} is not a valid document"]
-    if not isinstance(prior_doc, dict):
+    if not isinstance(prior_doc, dict) or "schema_version" not in prior_doc:
         return None, [f"notice: CIVC comparison skipped, synthesis sidecar {prior_path.name} is not a valid document"]
     return (prior_doc, newest_doc), []
 
@@ -6906,7 +6911,21 @@ def run_check(doc: dict[str, Any], out_dir: str,
         baseline = check_load_baseline(out_dir)
     (status, prior_doc, detail), (synth_pair, synth_notices) = baseline
     if status in ("malformed", "unreadable"):
-        return 2, f"error: {detail}"
+        # Codex P2 (TRK-051 T5): synth_notices was computed by check_load_baseline
+        # unconditionally (it runs the synthesis selection independently of the headline
+        # selection's own status), so a FATAL headline status must not throw it away --
+        # doing so silently violated SKILL.md's documented guarantee that an unreadable
+        # out-dir names itself on a notice: line. The exit code is unaffected: it is
+        # already 2 for the headline reason, and notices still never change it.
+        #
+        # Ordering: "error: {detail}" stays FIRST, not the usual notices-precede-everything
+        # shape (A50) -- test_check_unreadable_out_dir_still_exits_two pins
+        # `out.startswith("error:")` and is a shipped assertion (never edited). An
+        # unreadable OUT_DIR fails BOTH selectors identically (same directory, same
+        # OSError), so that exact test now also carries a non-empty synth_notices; putting
+        # the error line first keeps it green while still surfacing the notice, appended
+        # after, rather than discarding it as before.
+        return 2, "\n".join([f"error: {detail}"] + synth_notices)
     findings: list[str] = []
     notices: list[str] = []
     if status == "found":

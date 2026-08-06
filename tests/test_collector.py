@@ -7712,6 +7712,28 @@ def test_check_unreadable_out_dir_still_exits_two(tmp_path, fake_harness):
     assert rc == 2, (out, err)
     assert out.startswith("error:")
 
+def test_check_unreadable_out_dir_still_emits_synthesis_notice(tmp_path, fake_harness):
+    # Codex P2 (TRK-051 T5, Finding A): check_load_baseline runs the synthesis selection
+    # UNCONDITIONALLY, independent of the headline selection's own status -- an unlistable
+    # OUT_DIR fails BOTH selectors identically (same directory, same OSError), so
+    # _check_select_synthesis_pair's own notice was already being computed here even
+    # though run_check's fatal branch used to discard it. The exit code stays 2; the error
+    # line stays first (test_check_unreadable_out_dir_still_exits_two pins that), and the
+    # notice is appended after rather than thrown away.
+    if os.geteuid() == 0:
+        pytest.skip("mode bits do not restrict uid 0")
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    os.chmod(out_dir, 0o000)
+    try:
+        rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    finally:
+        os.chmod(out_dir, 0o700)
+    assert rc == 2, (out, err)
+    assert out.startswith("error:")
+    assert "notice: CIVC comparison skipped, could not read --check out-dir" in out
+
 def test_check_non_numeric_prior_headline_exits_two_not_one(fake_harness, tmp_path):
     # F6 (P1-adjacent): pre-fix, a prior headline of {"instruction_files_over_200": "bad"}
     # raised an UNCAUGHT TypeError in _check_headline_regressions -- exiting 1, the code
@@ -8012,6 +8034,39 @@ def test_check_single_synthesis_file_emits_no_notice(fake_harness, tmp_path):
     assert rc == 0, (out, err)
     assert "notice:" not in out
     assert out.strip() == "First run — no prior map (baseline)."
+
+def test_check_synthesis_sidecar_without_schema_version_is_not_a_valid_document(fake_harness, tmp_path):
+    # Codex P2 (TRK-051 T5, Finding B): a dict lacking "schema_version" is not a valid
+    # synthesis document -- load_sidecar's D7 selection and schema.md's synthesis contract
+    # both require the marker, but the isinstance(doc, dict) check alone let a bare {}
+    # through. Reuses the SAME "is not a valid document" notice text as a non-dict doc:
+    # one notice vocabulary, not two.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    (out_dir / f"harness-synthesis-{newer}.json").write_text(json.dumps({}))   # no schema_version
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert (f"notice: CIVC comparison skipped, synthesis sidecar "
+            f"harness-synthesis-{newer}.json is not a valid document") in out
+    assert "REGRESSION" not in out
+    assert "First run — no prior map (baseline)." in out
+
+def test_check_synthesis_sidecar_with_schema_version_still_compares(fake_harness, tmp_path):
+    # Guard against over-rejecting: a well-formed synthesis document (schema_version
+    # present, exactly what _write_check_synthesis always writes) must still compare
+    # normally after the Finding B tightening.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    _write_check_synthesis(out_dir, newer, [("Afford", "context", "thin")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: CIVC Afford/context regressed covered -> thin" in out
 
 def test_definition_version_validator_matches_render_html():
     # BEHAVIORAL two-home pin. collector._check_valid_definition_version and
