@@ -2303,6 +2303,9 @@ details > summary{cursor:pointer;color:var(--accent)}
 .inspector-panel .surface-tag{color:var(--muted);font-size:0.72rem;text-transform:uppercase;margin:0}
 .inspector-panel .verb-tag{font-weight:600;margin:2px 0 6px 0}
 .inspector-panel .evidence{margin:6px 0}
+.inspector-panel .cell-note{margin:6px 0 0;color:var(--ink);font-size:0.85rem}
+.inspector-panel .cell-note > summary{color:var(--muted);font-size:0.72rem;text-transform:uppercase;letter-spacing:.03em}
+.inspector-panel .cell-note[open] > summary{margin-bottom:4px}
 .seg .seg-btn{border:none}
 .treemap-panel{display:block}
 .ladder-panel{display:none}
@@ -3767,7 +3770,7 @@ def _render_coverage_matrix_body(civc, date):
         '<span class="badge verdict-empty">empty</span> → '
         '<span class="badge verdict-thin">thin</span> → '
         '<span class="badge verdict-covered">covered</span>. '
-        'Cells with a "note" expose it via a details toggle.</p>'
+        'A cell "note" is shown with the cell detail; use its toggle to collapse it.</p>'
     )
     by_key = {(c["verb"], c["surface"]): c for c in civc["cells"]}
     grid_cells = ['<div class="mhead"></div>']
@@ -3798,8 +3801,13 @@ def _render_coverage_matrix_body(civc, date):
             note = c.get("note") or ""
             evidence_html = (f'<p class="evidence">{esc_html(evidence)}</p>' if evidence
                               else '<p class="evidence empty-state">no evidence recorded</p>')
-            note_html = (f'<details><summary>note</summary>{esc_html(note)}</details>' if note
-                         else '<p class="empty-state">no note</p>')
+            # TRK-021 finding 4: `open` so the note is legible at first paint instead of
+            # costing a second click per cell. The asserted substring starts at `<summary>`,
+            # so everything added here precedes it and the pinned bytes are unchanged.
+            note_html = (
+                f'<details class="cell-note" open><summary>note</summary>'
+                f'{esc_html(note)}</details>' if note
+                else '<p class="empty-state">no note</p>')
             if verdict == "empty":
                 brief_html = _render_brief_control("gap", gap_index, build_gap_stub_brief(verb, surface))
                 gap_index += 1

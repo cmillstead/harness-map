@@ -1916,6 +1916,44 @@ def test_civc_notes_and_legend_render(tmp_path):
     assert "<summary>note</summary>context note here</details>" in text
 
 
+def test_coverage_cell_note_is_open_at_first_paint(tmp_path):
+    """Rejects the pre-TRK-021 behavior where a cell note rendered inside a CLOSED <details>:
+    the operator had to click the cell and then click again to read the one sentence the
+    synthesis wrote about it. `open` makes it visible at first paint. Deliberately keeps the
+    <details> wrapper -- tests/test_render_html.py:1855 pins the closing bytes and removing
+    the wrapper would edit an existing assertion (CLAUDE.md rule 7)."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "cell_note_open"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered", "note": "context note here"},
+    ], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert '<details class="cell-note" open><summary>note</summary>context note here</details>' in text
+    # The legend must not still claim the note is hidden behind a toggle.
+    assert "expose it via a details toggle" not in text
+
+
+def test_copy_brief_disclosure_stays_collapsed(tmp_path):
+    """Rejects a blanket `open` sweep: the copy-brief disclosure (_render_copy_disclosure /
+    .copy-preview) must stay CLOSED. Its body is a full markdown brief, and opening every one
+    of them would bury the inspector's actual content under raw payload text."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "brief_closed"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert '<details class="copy-preview">' in text
+    assert '<details class="copy-preview" open' not in text
+    assert '<details open class="copy-preview"' not in text
+
+
 def test_civc_renamed_to_coverage_matrix_in_display_text(tmp_path):
     """The stale 4-letter acronym must not appear anywhere a human reads the page —
     only the JSON schema key (`civc`) and internal identifiers (build_civc_model,
