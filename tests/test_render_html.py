@@ -9905,3 +9905,97 @@ def test_four_views_and_copy_payloads_are_untouched(tmp_path):
     for vid in ("overview", "weight", "friction", "hygiene"):
         assert f'<script type="application/json" id="copy-{vid}">' in text
     assert 'id="copy-coverage"' not in text
+
+
+# ==================================== S6c Task 10: the sparkline on the stat tile
+# The third sparkline surface (Ambiguity B): the gauge card that already shows this
+# series' delta now also carries its own namespaced sparkline, `sparkline-tile`,
+# distinct from the legacy per-date table's `sparkline` and the derived trend table's
+# `sparkline-derived`. Only the 5 headline-kind GAUGE_SPECS keys get a tile sparkline —
+# `GAUGE_SPECS` wires 5 of the 8 HEADLINE_KEYS to a gauge card; the other 3
+# (`orphan_registration_count`, `orphan_script_count`, `unchecked_binary_count`) have no
+# gauge card to carry one.
+_TILE_GAUGE_KEYS = [key for kind, key, _ in rh.GAUGE_SPECS if kind == "headline"]
+
+
+def test_existing_gauge_call_sites_render_byte_identical():
+    """Default "" is LOAD-BEARING. This is the exact pattern `band_value=None` already
+    established in this function, whose docstring says so in terms: 'Default None ->
+    band follows the displayed value, so every existing call site and its rendered
+    bytes are unchanged.' Follow that precedent rather than inventing a new one."""
+    import inspect
+    params = inspect.signature(rh._render_gauge).parameters
+    assert params["sparkline_html"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert params["sparkline_html"].default == ""
+    assert rh._render_gauge("always_loaded_words", "Always-loaded words", 60) == (
+        '<div class="gauge gauge-good" data-gauge="always_loaded_words">'
+        '<div class="v">60</div><div class="l">Always-loaded words</div>'
+        '<div class="band">LEAN</div></div>')
+    assert rh._render_gauge("always_loaded_words", "Always-loaded words", 60,
+                            delta=("▲ 10", "bad"), has_drill=True) == (
+        '<button class="gauge gauge-good" data-gauge="always_loaded_words" '
+        'aria-expanded="false" aria-controls="gdrawer-always_loaded_words">'
+        '<div class="v">60</div><div class="l">Always-loaded words</div>'
+        '<div class="band">LEAN</div><div class="delta delta-bad">▲ 10</div>'
+        '<span class="gauge-chev" aria-hidden="true">▾</span></button>')
+
+
+def test_weight_tiles_carry_a_sparkline_at_or_above_the_floor(tmp_path):
+    """>=3 dated sidecars: every headline-kind gauge card gets its own `sparkline-tile`
+    mark, namespaced by DOM id so it cannot collide with the legacy or derived marks
+    for the same key."""
+    text = _render_corpus(tmp_path, "tilefloor", _moving_corpus())
+    assert text.count('class="sparkline sparkline-tile"') == len(_TILE_GAUGE_KEYS)
+    for key in _TILE_GAUGE_KEYS:
+        assert f'id="spark-tile-{key}"' in text
+        gauge = re.search(rf'data-gauge="{key}"[^>]*>(.*?)<span class="gauge-chev"',
+                          text, re.S)
+        assert gauge is not None, key
+        assert f'id="spark-tile-{key}"' in gauge.group(1)
+
+
+def test_weight_tiles_carry_no_sparkline_below_the_floor(tmp_path):
+    """Sub-floor series stay byte-identical to today."""
+    text = _render_corpus(tmp_path, "tilenofloor", _dated_trend_docs(
+        [dict(memory_bodies=5), dict(memory_bodies=9)]))
+    assert 'class="sparkline"' not in text
+    assert 'class="sparkline sparkline-tile"' not in text
+    for key in _TILE_GAUGE_KEYS:
+        assert f'id="spark-tile-{key}"' not in text
+        assert f'data-gauge="{key}"' in text          # the tile itself still renders
+
+
+def test_tile_sparkline_is_namespaced_and_follows_the_delta(tmp_path):
+    """Ambiguity B: the tile needs its OWN class AND its own DOM id, or
+    `id="spark-always_loaded_words"` appears twice in one document (invalid HTML, broken
+    aria-labelledby) and the three shipped count assertions go 8 -> 10.
+    Emitted order: value (.v) -> label (.l) -> band -> delta -> sparkline. Fork (1)'s
+    phrase 'third field' is the diagnostic's CONCEPTUAL wording, not a positional
+    index: `_render_gauge` has no positional field slots, it concatenates named
+    fragments. Do not reorder or reindex the existing fragments."""
+    docs = []
+    for i, words in enumerate((50, 55, 60)):
+        doc = _minimal_doc()
+        doc["headline"]["always_loaded_words"] = words
+        docs.append((f"2026-07-{13 + i:02d}", doc))
+    out_dir = tmp_path / "tilenamespace"
+    out_dir.mkdir()
+    for date, doc in docs:
+        _write_sidecar(out_dir, date, doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="spark-tile-always_loaded_words"' in text
+    assert text.count('class="sparkline"') == len(rh.HEADLINE_KEYS)
+    # the legacy namespace for the same key is untouched, and the two ids coexist
+    assert 'id="spark-always_loaded_words"' in text
+    gauge = re.search(r'data-gauge="always_loaded_words"[^>]*>(.*?)<span class="gauge-chev"',
+                      text, re.S)
+    assert gauge is not None
+    inner = gauge.group(1)
+    v_idx = inner.index('class="v"')
+    l_idx = inner.index('class="l"')
+    band_idx = inner.index('class="band"')
+    delta_idx = inner.index('class="delta')
+    spark_idx = inner.index('id="spark-tile-always_loaded_words"')
+    assert v_idx < l_idx < band_idx < delta_idx < spark_idx

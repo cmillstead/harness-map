@@ -3262,14 +3262,19 @@ GAUGE_SPECS = (  # (source_kind, key, label) — source_kind selects where the v
 )
 
 
-def _render_gauge(key, label, value, delta=None, has_drill=False, band_value=None):
+def _render_gauge(key, label, value, delta=None, has_drill=False, band_value=None,
+                  sparkline_html=""):
     """A header gauge. `has_drill=True` renders a `<button>` (item 1 accordion trigger,
     `aria-expanded`/`aria-controls` wired to the shared drawer panel) instead of an inert
     `<div>` — `class="gauge gauge-{semantic}"` and `data-gauge` are preserved in both forms
     so existing regression assertions hold either way.
     R4-2: `band_value`, when given, drives `_gauge_band`; `value` stays the DISPLAYED
     text. Default None -> band follows the displayed value, so every existing call
-    site and its rendered bytes are unchanged."""
+    site and its rendered bytes are unchanged.
+    S6c Task 10: `sparkline_html`, when given, is already-built markup (a
+    `_tile_sparkline_cell` result) appended after the delta — same precedent as
+    `band_value`: default "" -> every existing call site and its rendered bytes are
+    unchanged."""
     band, semantic = _gauge_band(key, band_value if band_value is not None else value)
     band_html = f'<div class="band">{esc_html(band)}</div>' if band else ""
     delta_html = ""
@@ -3278,7 +3283,7 @@ def _render_gauge(key, label, value, delta=None, has_drill=False, band_value=Non
         delta_html = (f'<div class="delta delta-{esc_html(delta_semantic)}">'
                       f'{esc_html(delta_text)}</div>')
     inner = (f'<div class="v">{esc_html(value)}</div><div class="l">{esc_html(label)}</div>'
-             f'{band_html}{delta_html}')
+             f'{band_html}{delta_html}{sparkline_html}')
     if has_drill:
         return (f'<button class="gauge gauge-{esc_html(semantic)}" data-gauge="{esc_html(key)}" '
                 f'aria-expanded="false" aria-controls="gdrawer-{esc_html(key)}">'
@@ -3492,9 +3497,15 @@ def _render_instrument_readout(headline, phantom_ref_count, phantom_confirmed_co
             if phantom_confirmed_count != phantom_ref_count:
                 value = f"{phantom_ref_count} ({phantom_confirmed_count} confirmed)"
         delta = _trend_delta(trend_model, key) if kind == "headline" else None
+        sparkline_html = ""
+        if kind == "headline":
+            series = next((s for s in trend_model.get("series", []) if s.get("key") == key),
+                          None)
+            if series is not None:
+                sparkline_html = _tile_sparkline_cell(series, label)
         drill = _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate)
         cards.append(_render_gauge(key, label, value, delta, has_drill=bool(drill),
-                                    band_value=band_value))
+                                    band_value=band_value, sparkline_html=sparkline_html))
         if drill:
             panels.append(f'<div class="gauge-drill-panel" id="gdrawer-{esc_html(key)}" '
                           f'role="region" aria-label="{esc_html(label)} detail" hidden>'
@@ -5255,6 +5266,32 @@ def _derived_sparkline_cell(series: dict[str, Any], title: str) -> str:
         return ""
     return _sparkline_svg(f"spark-derived-{series.get('key')}", floats,
                           css_class="sparkline sparkline-derived", title=title)
+
+
+def _tile_sparkline_cell(series: dict[str, Any], title: str) -> str:
+    """The stat TILE's sparkline cell (S6c Task 10) — the third surface, sitting on the
+    gauge card that already shows this series' delta. Same shape as
+    `_derived_sparkline_cell`: its own class/DOM-id namespace, no min/max/cur span
+    (the gauge's `.v` already shows the current value), geometry through
+    `_trend_point_value` (the ONE normalizer) since a legacy headline series is a bare
+    number but the same accessor also has to tolerate a ratio-shaped point without a
+    second normalizer ever being written.
+
+    `_sparkline_cell` (legacy per-date table, byte-frozen) and `_derived_sparkline_cell`
+    (derived trend table) are the other two — three disjoint namespaces on one page:
+
+      legacy headline table   `sparkline`                      `spark-{key}`
+      derived trend table     `sparkline sparkline-derived`    `spark-derived-{key}`
+      stat tile (gauge card)  `sparkline sparkline-tile`        `spark-tile-{key}`"""
+    window = _series_points(series)[-SPARKLINE_WINDOW:]
+    if len(window) < SPARKLINE_MIN_POINTS:
+        return ""
+    floats = [value for value in (_trend_point_value(point) for point in window)
+              if value is not None]
+    if len(floats) != len(window):
+        return ""
+    return _sparkline_svg(f"spark-tile-{series.get('key')}", floats,
+                          css_class="sparkline sparkline-tile", title=title)
 
 
 def _fmt_trend_value(value: Any) -> str:
