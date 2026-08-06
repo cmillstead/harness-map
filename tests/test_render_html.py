@@ -1954,6 +1954,69 @@ def test_copy_brief_disclosure_stays_collapsed(tmp_path):
     assert '<details open class="copy-preview"' not in text
 
 
+def test_expand_all_is_a_toggle_with_visible_pressed_state(tmp_path):
+    """Rejects the pre-TRK-021 handler, which was wired but gave zero feedback: it set
+    `v.hidden = false` on every view and stopped. Nothing scrolled, the button state never
+    changed, the tab bar still advertised one aria-selected tab while four panels were open,
+    and there was no second click to undo it. The control must carry aria-pressed, the
+    handler must branch on it, and activate() must clear both the pressed state and the
+    body class so choosing a tab exits the mode instead of leaving it stale."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "expand_toggle"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="expand-all" type="button" aria-pressed="false"' in text
+    js = rh.STATIC_SCRIPT
+    assert "expand.getAttribute('aria-pressed') === 'true'" in js
+    assert "expand.setAttribute('aria-pressed', 'true')" in js
+    assert "classList.add('expand-all-on')" in js
+    assert "classList.remove('expand-all-on')" in js
+    # activate() owns the cleanup, so a tab click cannot leave a stale pressed state.
+    activate_src = js[js.index("function activate(id){"):js.index("vbtns.forEach(function(b){ b.addEventListener")]
+    assert "aria-pressed', 'false'" in activate_src
+    assert "classList.remove('expand-all-on')" in activate_src
+    # The lookup must precede activate(), not depend on `var` hoisting.
+    assert js.index("var expand = document.getElementById('expand-all')") < js.index("function activate(id){")
+
+
+def test_each_view_gets_a_heading_before_its_section(tmp_path):
+    """Rejects expanding into an undifferentiated wall: with the tab bar deselected, four
+    stacked panels carried no visible label at all, so the user could not see that anything
+    had happened. Each heading must sit OUTSIDE its <section>, immediately before it, so the
+    existing `<section id="view-...">.*?</section>` regression regexes are unaffected."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "view_headings"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    for vid, label in rh.VIEWS:
+        heading = f'<h2 class="view-heading" data-for="{vid}">{label}</h2>'
+        assert heading in text
+        assert text.index(heading) < text.index(f'<section id="{vid}"')
+
+
+def test_view_headings_are_hidden_until_expanded(tmp_path):
+    """Rejects the inverse defect of the test above: four always-visible headings would
+    duplicate the tab label on every ordinary single-view page. They appear only under
+    `body.expand-all-on` -- and under @media print, so the control's own name stays true
+    for a reader who prints without clicking it."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "heading_hidden"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    css = rh.STATIC_STYLE
+    assert "display:none" in _css_decls(css, ".view-heading")
+    assert "display:block" in _css_decls(css, "body.expand-all-on .view-heading")
+    assert "@media print{" in css and ".view[hidden]{display:block}" in css
+
+
 def test_civc_renamed_to_coverage_matrix_in_display_text(tmp_path):
     """The stale 4-letter acronym must not appear anywhere a human reads the page —
     only the JSON schema key (`civc`) and internal identifiers (build_civc_model,

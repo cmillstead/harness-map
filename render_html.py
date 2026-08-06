@@ -2211,6 +2211,11 @@ main{padding:16px 20px}
 @media (prefers-reduced-motion: no-preference){.view:not([hidden]){animation:fade .18s ease-out}}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 .view-toolbar{display:flex;justify-content:flex-end;margin-bottom:8px}
+.view-heading{display:none}
+body.expand-all-on .view-heading{display:block;font-size:0.95rem;margin:18px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+body.expand-all-on .view-heading:first-of-type{margin-top:0;padding-top:0;border-top:none}
+#expand-all[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600}
+@media print{.view[hidden]{display:block}.view-heading{display:block}}
 .card{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;margin-bottom:14px}
 .digest{color:var(--muted);font-size:0.85rem;margin:0 0 10px 0}
 .hero-friction{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;margin-bottom:14px}
@@ -2412,9 +2417,15 @@ STATIC_SCRIPT = """
 (function(){
   var views = document.querySelectorAll('.view');
   var vbtns = document.querySelectorAll('.view-btn');
+  var expand = document.getElementById('expand-all');
   function activate(id){
     views.forEach(function(v){ v.hidden = (v.id !== id); });
     vbtns.forEach(function(b){ b.setAttribute('aria-selected', b.dataset.target === id ? 'true':'false'); });
+    // TRK-021 finding 2: picking one view IS leaving expand-all. Without this, clicking a
+    // tab while expanded left the button reading "pressed" and the headings shouting over a
+    // single-view page.
+    if (expand){ expand.setAttribute('aria-pressed', 'false'); }
+    document.body.classList.remove('expand-all-on');
   }
   vbtns.forEach(function(b){ b.addEventListener('click', function(){ activate(b.dataset.target); }); });
 
@@ -2617,10 +2628,30 @@ STATIC_SCRIPT = """
     el.addEventListener('keydown', keyActivate);
   });
 
-  // expand-all (print view) preserved
-  var expand = document.getElementById('expand-all');
-  if (expand){ expand.addEventListener('click', function(){
-    views.forEach(function(v){ v.hidden = false; }); }); }
+  // Expand-all / print view (TRK-021 finding 2): a real toggle, not a one-way reveal. The
+  // old handler unhid every view and changed nothing else -- no button state, no way back,
+  // and a tablist still claiming exactly one selected tab while four panels were open.
+  // Pressing now: remembers the active view, deselects every tab, reveals all views, sets
+  // aria-pressed and `body.expand-all-on` (which turns on the per-view headings). Pressing
+  // again restores the remembered view via activate(), which owns the cleanup.
+  if (expand){
+    var restoreTo = null;
+    expand.addEventListener('click', function(){
+      if (expand.getAttribute('aria-pressed') === 'true'){
+        activate(restoreTo || 'view-overview');
+        restoreTo = null;
+        return;
+      }
+      restoreTo = null;
+      vbtns.forEach(function(b){
+        if (b.getAttribute('aria-selected') === 'true'){ restoreTo = b.dataset.target; }
+        b.setAttribute('aria-selected', 'false');
+      });
+      views.forEach(function(v){ v.hidden = false; });
+      document.body.classList.add('expand-all-on');
+      expand.setAttribute('aria-pressed', 'true');
+    });
+  }
 
   if (views.length){ activate('view-overview'); }
 
@@ -4717,6 +4748,19 @@ def _render_friction_view(joined, footer, codex_aggregate, drag, friction_total_
 VIEWS = (("view-overview", "Overview"),
          ("view-weight", "Weight"), ("view-friction", "Friction"), ("view-hygiene", "Hygiene"))
 
+_VIEW_LABELS = dict(VIEWS)
+
+
+def _view_block(vid, html):
+    """TRK-021 finding 2: a per-view heading, `display:none` while a single view is shown
+    (the tab bar already names it) and revealed by `body.expand-all-on` / `@media print`, so
+    an expanded page reads as four labelled sections instead of one undifferentiated wall.
+    Emitted OUTSIDE `<section class="view">` on purpose -- every existing
+    `<section id="view-...">.*?</section>` regression regex must stay unaffected."""
+    label = _VIEW_LABELS[vid]
+    return (f'<h2 class="view-heading" data-for="{esc_html(vid)}">{esc_html(label)}</h2>'
+            f'{html}')
+
 
 def render_html(
     date: str,
@@ -4814,17 +4858,24 @@ def render_html(
         '<nav class="view-switch" role="tablist">',
         view_buttons,
         '</nav>',
-        '<button class="action-btn" id="expand-all">Expand all / print view</button>',
+        '<button class="action-btn" id="expand-all" type="button" '
+        'aria-pressed="false">Expand all / print view</button>',
         '<button class="action-btn" id="theme-toggle" type="button" '
         'aria-pressed="false" aria-label="Toggle color theme">◐</button>',
         tier_filter_html,
         "</div>",
         "<main>",
-        _render_overview_view(overview_model, models["civc"], date, copy_payloads["overview"], doc),
-        _render_weight_view(models["context_weight"], heat, friction_enabled, doc, copy_payloads["weight"]),
-        _render_friction_view(joined, footer, codex_aggregate, models["drag"], friction_total_shown, date,
-                              copy_payloads["friction"]),
-        _render_hygiene_view(doc, models, copy_payloads["hygiene"]),
+        _view_block("view-overview",
+                    _render_overview_view(overview_model, models["civc"], date,
+                                          copy_payloads["overview"], doc)),
+        _view_block("view-weight",
+                    _render_weight_view(models["context_weight"], heat, friction_enabled, doc,
+                                        copy_payloads["weight"])),
+        _view_block("view-friction",
+                    _render_friction_view(joined, footer, codex_aggregate, models["drag"],
+                                          friction_total_shown, date, copy_payloads["friction"])),
+        _view_block("view-hygiene",
+                    _render_hygiene_view(doc, models, copy_payloads["hygiene"])),
         "</main>",
         _render_copy_island("overview", copy_payloads["overview"]),
         _render_copy_island("weight", copy_payloads["weight"]),
