@@ -184,6 +184,35 @@ def _write_sidecar(out_dir, date, doc):
     (Path(out_dir) / f"harness-map-{date}.json").write_text(json.dumps(doc))
 
 
+def test_find_sidecars_ignores_impossible_calendar_dates(tmp_path):
+    # F8 (TRK-051): SIDECAR_RE is structural only (\d{4}-\d{2}-\d{2}), so each of these
+    # filenames matches it despite naming no real calendar date -- including a Feb 29 in
+    # 2026, which is NOT a leap year. None may be returned.
+    for bad_date in ("2026-02-31", "2026-13-01", "2026-00-10", "2026-02-29"):
+        _write_sidecar(tmp_path, bad_date, {"schema_version": 1})
+    assert rh.find_sidecars(tmp_path) == []
+
+def test_find_sidecars_keeps_real_dates_alongside_impossible_ones(tmp_path):
+    # A real prior sidecar's discovery is unaffected by an impossible sibling sitting
+    # right next to it -- including a Feb 29 in 2024, which IS a leap year and real.
+    _write_sidecar(tmp_path, "2026-02-10", {"schema_version": 1})
+    _write_sidecar(tmp_path, "2026-02-31", {"schema_version": 1})    # impossible, adjacent
+    _write_sidecar(tmp_path, "2024-02-29", {"schema_version": 1})    # real leap day
+    found = rh.find_sidecars(tmp_path)
+    assert [d for d, _ in found] == ["2024-02-29", "2026-02-10"]     # ascending; bogus excluded
+
+def test_find_sidecars_impossible_newest_sort_does_not_win(tmp_path):
+    # The ordering case: find_sidecars' own contract is "sorted ascending by date", so its
+    # LAST entry is whatever a caller relying on "the latest sidecar" would pick.
+    # "2026-02-31" sorts lexically newer than every real February date and must not win
+    # that slot.
+    _write_sidecar(tmp_path, "2026-02-10", {"schema_version": 1})
+    _write_sidecar(tmp_path, "2026-02-20", {"schema_version": 1})
+    _write_sidecar(tmp_path, "2026-02-31", {"schema_version": 1})    # sorts newest, impossible
+    found = rh.find_sidecars(tmp_path)
+    assert found[-1][0] == "2026-02-20"    # the true newest REAL date, not the bogus one
+
+
 # S6c Task 3: the sentinel a caller passes to DROP a comparability marker from a
 # `_trend_doc`. `None` cannot serve — `definitions=None` already means "the standard
 # comparable marker set", and `project_root=None` is a REAL scope value the collector

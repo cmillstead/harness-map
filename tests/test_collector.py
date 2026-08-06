@@ -7519,6 +7519,93 @@ def test_check_synthesis_regex_matches_render_html_naming(tmp_path):
     assert err is None
     assert found_doc == sidecar_doc
 
+def test_check_impossible_prior_sidecar_dates_are_ignored(fake_harness, tmp_path):
+    # F8 (TRK-051): _CHECK_SIDECAR_RE is STRUCTURAL only (\d{4}-\d{2}-\d{2}), so each of
+    # these filenames matches it despite naming no real calendar date. None may become a
+    # D7 candidate -- with all three excluded, out_dir holds no prior sidecar at all.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    for bad_date in ("2026-02-31", "2026-13-01", "2026-00-10"):
+        _write_check_sidecar(out_dir, bad_date, {"always_loaded_tokens_est": 200,
+            "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert out.strip() == "First run — no prior map (baseline)."
+
+def test_check_impossible_date_sorting_newest_does_not_become_baseline(fake_harness, tmp_path):
+    # The ordering case (this is what makes F8 a defect rather than a curiosity): D7 walks
+    # candidates NEWEST FIRST by the captured date STRING. "2026-02-31" > "2026-02-15"
+    # lexically despite naming no real February date, so pre-fix it is D7-selected FIRST --
+    # the real prior sidecar is never even reached, let alone compared.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, "2026-02-15", {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    _write_check_sidecar(out_dir, "2026-02-31", {"always_loaded_tokens_est": 99999,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "harness-map-2026-02-31.json" not in out
+    assert "No regression detected (baseline: harness-map-2026-02-15.json)." in out
+
+def test_check_real_prior_alongside_adjacent_impossible_date_still_compares(fake_harness, tmp_path):
+    # A real prior sidecar's normal D7 selection and comparison must be UNAFFECTED by an
+    # impossible sibling sitting right next to it in the same out_dir.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    _write_check_sidecar(out_dir, "2026-02-31", {"always_loaded_tokens_est": 0,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")   # forces a real finding
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: orphan_script_count increased" in out
+
+def test_check_leap_year_prior_sidecar_date_is_selectable(fake_harness, tmp_path):
+    # Leap year, valid direction: 2024 IS a leap year, so Feb 29 is a real calendar date
+    # and must be selectable exactly like any other.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, "2024-02-29", {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "No regression detected (baseline: harness-map-2024-02-29.json)." in out
+
+def test_check_non_leap_year_february_29_prior_sidecar_is_ignored(fake_harness, tmp_path):
+    # Leap year, invalid direction: 2026 is NOT a leap year, so Feb 29 is structurally
+    # sidecar-shaped but not a real calendar date and must be ignored.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, "2026-02-29", {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert out.strip() == "First run — no prior map (baseline)."
+
+def test_check_synthesis_impossible_date_sorting_newest_does_not_become_pair_member(fake_harness, tmp_path):
+    # Same ordering trap as test_check_impossible_date_sorting_newest_does_not_become_
+    # baseline above, at _check_select_synthesis_pair instead: pre-fix, "2026-02-31" sorts
+    # newest and enters the compared PAIR, producing a REGRESSION finding from a bogus cell
+    # (thin -> empty) while the real historical regression between the two genuine
+    # sidecars (covered -> thin) is never reached.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_synthesis(out_dir, "2026-02-10", [("Afford", "context", "covered")])
+    _write_check_synthesis(out_dir, "2026-02-20", [("Afford", "context", "thin")])
+    _write_check_synthesis(out_dir, "2026-02-31", [("Afford", "context", "empty")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: CIVC Afford/context regressed covered -> thin" in out
+    assert "thin -> empty" not in out
+
 def test_check_nonexistent_root_exits_two_not_clean(tmp_path):
     # F2 (P1): pre-fix, a nonexistent --root produced an empty current document, every
     # real prior value read as an improvement, and --check printed
@@ -7624,6 +7711,55 @@ def test_check_unreadable_out_dir_still_exits_two(tmp_path, fake_harness):
         os.chmod(out_dir, 0o700)
     assert rc == 2, (out, err)
     assert out.startswith("error:")
+
+def test_check_unreadable_out_dir_still_emits_synthesis_notice(tmp_path, fake_harness):
+    # Codex P2 (TRK-051 T5, Finding A): check_load_baseline runs the synthesis selection
+    # UNCONDITIONALLY, independent of the headline selection's own status -- an unlistable
+    # OUT_DIR fails BOTH selectors identically (same directory, same OSError), so
+    # _check_select_synthesis_pair's own notice was already being computed here even
+    # though run_check's fatal branch used to discard it. The exit code stays 2; the error
+    # line stays first (test_check_unreadable_out_dir_still_exits_two pins that), and the
+    # notice is appended after rather than thrown away.
+    if os.geteuid() == 0:
+        pytest.skip("mode bits do not restrict uid 0")
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    os.chmod(out_dir, 0o000)
+    try:
+        rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    finally:
+        os.chmod(out_dir, 0o700)
+    assert rc == 2, (out, err)
+    assert out.startswith("error:")
+    assert "notice: CIVC comparison skipped, could not read --check out-dir" in out
+
+def test_check_malformed_prior_headline_still_emits_civc_shape_notice(fake_harness, tmp_path):
+    # Codex P2 round 2 (TRK-051 T6): the exact reproduction. A malformed HEADLINE sidecar
+    # makes run_check exit 2 via the headline selector's OWN "malformed" status, entirely
+    # independent of the synthesis pair -- synth_notices (the SELECTION-failure notices T5
+    # restored) is EMPTY here, because both synthesis sidecars parse and select fine. The
+    # SHAPE notice (a present-but-non-list "civc") is only discoverable once a pair IS
+    # selected -- via _check_civc_cells, called from _check_civc_regressions -- which used
+    # to run only AFTER the fatal early return. It must now survive that return too.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / f"harness-map-{_days_ago(1)}.json").write_text("{ not valid json")
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    (out_dir / f"harness-synthesis-{newer}.json").write_text(
+        json.dumps({"schema_version": 1, "civc": 7}))    # present, non-list
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert out.startswith("error:") and "malformed prior sidecar" in out
+    assert "notice: CIVC comparison skipped, current synthesis civc is not a list" in out
+    # No duplication: this notice can only be produced by ONE call to
+    # _check_civc_regressions (T6 computes it exactly once, before `status` is inspected).
+    assert out.count("notice:") == 1
+    # A fatal run performed no comparison -- no CIVC finding may leak through even though
+    # a real comparison result existed for the "prior" side's cell.
+    assert "REGRESSION" not in out
 
 def test_check_non_numeric_prior_headline_exits_two_not_one(fake_harness, tmp_path):
     # F6 (P1-adjacent): pre-fix, a prior headline of {"instruction_files_over_200": "bad"}
@@ -7830,6 +7966,134 @@ def test_check_all_metrics_skipped_still_names_every_skip(fake_harness, tmp_path
     lines = [ln for ln in out.strip().splitlines() if ln]
     assert [ln.split()[1] for ln in lines if ln.startswith("notice:")] == list(keys)
     assert lines[-1].startswith("No regression detected")
+
+def test_check_notices_unreadable_synthesis_out_dir(tmp_path):
+    # F5 (TRK-051), row 1: _check_select_synthesis_pair's own OSError-on-iterdir is masked
+    # at the full CLI layer -- _check_select_prior_sidecar hits the SAME os.iterdir() on the
+    # SAME out_dir FIRST and already exits 2 for an unlistable OUT_DIR
+    # (test_check_unreadable_out_dir_still_exits_two), so this row can never be observed
+    # through subprocess run_check. Exercised in two steps instead: the real unreadable-
+    # directory fixture proves the helper's own notice text, then that exact result is
+    # threaded through collector.run_check in-process with a hand-built baseline (the same
+    # standalone-callable shape test_check_exit_one_on_band_crossing_at_the_5000_boundary
+    # drives) to prove the notice reaches stdout without moving the exit code off 0.
+    if os.geteuid() == 0:
+        pytest.skip("mode bits do not restrict uid 0")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    os.chmod(out_dir, 0o000)
+    try:
+        pair, notices = _collector._check_select_synthesis_pair(out_dir, _days_ago(0))
+    finally:
+        os.chmod(out_dir, 0o700)
+    assert pair is None
+    assert len(notices) == 1
+    assert notices[0].startswith("notice: CIVC comparison skipped, could not read --check out-dir")
+    assert str(out_dir) in notices[0]
+    baseline = (("no_prior", None, None), (pair, notices))
+    exit_code, text = _collector.run_check({"headline": {}}, str(out_dir), baseline=baseline)
+    assert exit_code == 0, text
+    assert notices[0] in text
+    assert "First run — no prior map (baseline)." in text
+
+def test_check_notices_unreadable_synthesis_sidecar(fake_harness, tmp_path):
+    # F5, row 3: a candidate synthesis sidecar that fails to parse as JSON must not vanish
+    # silently -- it is reported by name, but the comparison still stays best-effort (exit
+    # 0, no headline sidecar written so status is "no_prior").
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    (out_dir / f"harness-synthesis-{newer}.json").write_text("{ not valid json")
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert (f"notice: CIVC comparison skipped, unreadable synthesis sidecar "
+            f"harness-synthesis-{newer}.json") in out
+    assert "REGRESSION" not in out
+    assert "First run — no prior map (baseline)." in out
+
+def test_check_notices_synthesis_sidecar_that_is_not_a_document(fake_harness, tmp_path):
+    # F5, row 4: valid JSON that is not a dict (e.g. a bare number) parses cleanly but is
+    # not a usable synthesis document -- named by file, exit code unaffected.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    (out_dir / f"harness-synthesis-{newer}.json").write_text("42")
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert (f"notice: CIVC comparison skipped, synthesis sidecar "
+            f"harness-synthesis-{newer}.json is not a valid document") in out
+    assert "REGRESSION" not in out
+    assert "First run — no prior map (baseline)." in out
+
+def test_check_notices_non_list_civc_in_synthesis(fake_harness, tmp_path):
+    # F5, row 5 (_check_civc_cells): a present-but-non-list "civc" is the YES half of this
+    # site -- contrast test_check_civc_unallowlisted_verdict_is_ignored_not_coerced, which
+    # pins the NO half (a merely unallowlisted cell inside an otherwise-valid list stays
+    # silent). Both sidecars are malformed here, so both "prior" and "current" labels fire.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    for date_str in (older, newer):
+        (out_dir / f"harness-synthesis-{date_str}.json").write_text(
+            json.dumps({"schema_version": 1, "civc": 7}))    # present, non-list
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "notice: CIVC comparison skipped, prior synthesis civc is not a list" in out
+    assert "notice: CIVC comparison skipped, current synthesis civc is not a list" in out
+    assert "REGRESSION" not in out
+    assert "First run — no prior map (baseline)." in out
+
+def test_check_single_synthesis_file_emits_no_notice(fake_harness, tmp_path):
+    # F5 negative: the load-bearing NO half of the selector's own gate. Fewer than two
+    # synthesis sidecars is the ORDINARY early-life state of any fresh OUT_DIR (it fires on
+    # every single run until a second synthesis exists) -- a notice here would fire
+    # constantly and teach the reader to ignore the channel, so this stays silent by design.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_synthesis(out_dir, _days_ago(1), [("Afford", "context", "covered")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "notice:" not in out
+    assert out.strip() == "First run — no prior map (baseline)."
+
+def test_check_synthesis_sidecar_without_schema_version_is_not_a_valid_document(fake_harness, tmp_path):
+    # Codex P2 (TRK-051 T5, Finding B): a dict lacking "schema_version" is not a valid
+    # synthesis document -- load_sidecar's D7 selection and schema.md's synthesis contract
+    # both require the marker, but the isinstance(doc, dict) check alone let a bare {}
+    # through. Reuses the SAME "is not a valid document" notice text as a non-dict doc:
+    # one notice vocabulary, not two.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    (out_dir / f"harness-synthesis-{newer}.json").write_text(json.dumps({}))   # no schema_version
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert (f"notice: CIVC comparison skipped, synthesis sidecar "
+            f"harness-synthesis-{newer}.json is not a valid document") in out
+    assert "REGRESSION" not in out
+    assert "First run — no prior map (baseline)." in out
+
+def test_check_synthesis_sidecar_with_schema_version_still_compares(fake_harness, tmp_path):
+    # Guard against over-rejecting: a well-formed synthesis document (schema_version
+    # present, exactly what _write_check_synthesis always writes) must still compare
+    # normally after the Finding B tightening.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    _write_check_synthesis(out_dir, newer, [("Afford", "context", "thin")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: CIVC Afford/context regressed covered -> thin" in out
 
 def test_definition_version_validator_matches_render_html():
     # BEHAVIORAL two-home pin. collector._check_valid_definition_version and

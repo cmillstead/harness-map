@@ -224,8 +224,18 @@ def find_sidecars(out_dir: Path) -> list[tuple[str, Path]]:
         return []
     for name in names:
         m = SIDECAR_RE.match(name)
-        if m:
-            out.append((m.group(1), Path(out_dir) / name))
+        if not m:
+            continue
+        # F8 (TRK-051): SIDECAR_RE is STRUCTURAL only, so harness-map-2026-02-31.json
+        # matches -- and since callers sort/compare on the captured STRING, an impossible
+        # date can sort as newer than every real one. datetime.date.fromisoformat is the
+        # calendar gate, the same shape _date_prefix's fix took (AMENDMENTS A27); a match
+        # that fails it is treated as not-a-sidecar, never returned.
+        try:
+            datetime.date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        out.append((m.group(1), Path(out_dir) / name))
     return out
 
 
