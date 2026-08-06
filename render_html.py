@@ -2167,10 +2167,10 @@ def write_html_safely(
 
 # ---------------------------------------------------------------------------------- CSS/JS
 STATIC_STYLE = """
-:root{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05);--r:10px;--mono:ui-monospace,"SF Mono","JetBrains Mono","Menlo",monospace;--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#0e7490;--tier-project-bg:#cffafe;--tier-project-line:#67e8f9}
-@media (prefers-color-scheme: dark){:root{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#22d3ee;--tier-project-bg:#083344;--tier-project-line:#155e75}}
-:root[data-theme="dark"]{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#22d3ee;--tier-project-bg:#083344;--tier-project-line:#155e75}
-:root[data-theme="light"]{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05);--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#0e7490;--tier-project-bg:#cffafe;--tier-project-line:#67e8f9}
+:root{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--on-crit:#000000;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05);--r:10px;--mono:ui-monospace,"SF Mono","JetBrains Mono","Menlo",monospace;--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#0e7490;--tier-project-bg:#cffafe;--tier-project-line:#67e8f9}
+@media (prefers-color-scheme: dark){:root{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--on-crit:#2a0c0f;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#22d3ee;--tier-project-bg:#083344;--tier-project-line:#155e75}}
+:root[data-theme="dark"]{--paper:#0e1117;--surface:#161b25;--surface-2:#1d2431;--line:#2b3342;--ink:#e8ecf4;--muted:#9aa4b8;--faint:#6b7484;--accent:#818cf8;--accent-2:#a78bfa;--accent-soft:#262b45;--good:#2dd4a7;--good-bg:#123a30;--good-line:#1f6f57;--warn:#f0b13c;--warn-bg:#3a2c10;--warn-line:#7a5a1c;--crit:#f2666d;--crit-bg:#3a1418;--crit-line:#7a2830;--on-crit:#2a0c0f;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#22d3ee;--tier-project-bg:#083344;--tier-project-line:#155e75}
+:root[data-theme="light"]{--paper:#f5f7fb;--surface:#ffffff;--surface-2:#eef1f7;--line:#d9dfea;--ink:#161a23;--muted:#5a6376;--faint:#8b93a5;--accent:#6366f1;--accent-2:#8b5cf6;--accent-soft:#e5e7fb;--good:#12a37e;--good-bg:#d8f3ea;--good-line:#7fd9c2;--warn:#c9820a;--warn-bg:#fbeecd;--warn-line:#e6c878;--crit:#d83f47;--crit-bg:#fbdedf;--crit-line:#eaa0a4;--on-crit:#000000;--shadow:0 1px 2px rgba(22,26,35,.06),0 6px 20px rgba(22,26,35,.05);--tier-operator:var(--muted);--tier-operator-bg:var(--surface-2);--tier-operator-line:var(--line);--tier-project:#0e7490;--tier-project-bg:#cffafe;--tier-project-line:#67e8f9}
 *{box-sizing:border-box}
 body{background:var(--paper);color:var(--ink);font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:0;padding:0}
 header{padding:16px 20px;border-bottom:1px solid var(--line)}
@@ -2193,7 +2193,7 @@ h1{font-size:1.25rem;margin:0 0 4px 0}
 .gauge .delta-good{color:var(--good)}
 .gauge .delta-bad{color:var(--crit)}
 .gauge .delta-neutral{color:var(--muted)}
-.warn-badge{background:var(--crit);color:#fff;border-radius:6px;padding:2px 8px;font-size:0.75rem;text-decoration:none}
+.warn-badge{background:var(--crit);color:var(--on-crit);border-radius:6px;padding:2px 8px;font-size:0.75rem;text-decoration:none}
 .controls{position:sticky;top:0;background:var(--paper);border-bottom:1px solid var(--line);padding:8px 20px;display:flex;gap:8px;flex-wrap:wrap;z-index:5}
 .seg{display:inline-flex;gap:6px;flex-wrap:wrap;border:1px solid var(--line);border-radius:6px;padding:2px}
 .view-switch{display:inline-flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid var(--line)}
@@ -2211,12 +2211,20 @@ main{padding:16px 20px}
 @media (prefers-reduced-motion: no-preference){.view:not([hidden]){animation:fade .18s ease-out}}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 .view-toolbar{display:flex;justify-content:flex-end;margin-bottom:8px}
+.view-heading{display:none}
+body.expand-all-on .view-heading{display:block;font-size:0.95rem;margin:18px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+body.expand-all-on .view-heading:first-of-type{margin-top:0;padding-top:0;border-top:none}
+#expand-all[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent);color:var(--ink);font-weight:600}
+@media print{.view[hidden]{display:block}.view-heading{display:block}}
 .card{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;margin-bottom:14px}
 .digest{color:var(--muted);font-size:0.85rem;margin:0 0 10px 0}
 .hero-friction{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;margin-bottom:14px}
 .inspector{position:sticky;top:52px;background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;max-height:70vh;overflow-y:auto}
 .empty-state{color:var(--muted);font-style:italic}
 .script-desc{display:block;color:var(--muted);font-size:0.78rem;margin-top:2px}
+.hook-list{margin:6px 0 0;padding-left:20px}
+.hook-list li{margin:8px 0;line-height:1.5}
+.hook-list .script-desc{margin-top:4px}
 table{border-collapse:collapse;width:100%;font-size:0.85rem}
 th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;font-family:var(--mono);font-variant-numeric:tabular-nums}
 th{color:var(--muted);font-weight:600}
@@ -2266,7 +2274,7 @@ body.friction-on .friction-badge{display:inline}
 .length-crit-ring{fill:none;stroke:var(--warn);stroke-width:2.5;pointer-events:none}
 .length-crit-marker{fill:var(--warn);stroke:var(--paper);stroke-width:1.5;pointer-events:none}
 .legend-swatch.length-crit-swatch{background:transparent;border:2px solid var(--warn)}
-#friction-toggle[aria-pressed="true"]{background:var(--crit);border-color:var(--crit);color:#fff;font-weight:600}
+#friction-toggle[aria-pressed="true"]{background:var(--crit);border-color:var(--crit);color:var(--on-crit);font-weight:600}
 .friction-legend{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:0.75rem;padding:4px 20px 0}
 .legend-entry{display:inline-flex;align-items:center;gap:4px}
 .legend-swatch.fh0{background:var(--surface);border:1px solid var(--line)}
@@ -2300,6 +2308,9 @@ details > summary{cursor:pointer;color:var(--accent)}
 .inspector-panel .surface-tag{color:var(--muted);font-size:0.72rem;text-transform:uppercase;margin:0}
 .inspector-panel .verb-tag{font-weight:600;margin:2px 0 6px 0}
 .inspector-panel .evidence{margin:6px 0}
+.inspector-panel .cell-note{margin:6px 0 0;color:var(--ink);font-size:0.85rem}
+.inspector-panel .cell-note > summary{color:var(--muted);font-size:0.72rem;text-transform:uppercase;letter-spacing:.03em}
+.inspector-panel .cell-note[open] > summary{margin-bottom:4px}
 .seg .seg-btn{border:none}
 .treemap-panel{display:block}
 .ladder-panel{display:none}
@@ -2308,7 +2319,7 @@ details > summary{cursor:pointer;color:var(--accent)}
 .copy-btn{font-size:0.78rem;padding:4px 10px}
 .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .pill{display:inline-block;border-radius:5px;padding:1px 6px;font-size:0.72rem;border:1px solid var(--warn);color:var(--warn)}
-.pill-critical{background:var(--crit);border-color:var(--crit);color:#fff;font-weight:700;padding:2px 9px;box-shadow:var(--shadow)}
+.pill-critical{background:var(--crit);border-color:var(--crit);color:var(--on-crit);font-weight:700;padding:2px 9px;box-shadow:var(--shadow)}
 tr:has(.pill-critical){background:var(--crit-bg)}
 tr:has(.pill-critical) td{border-color:var(--crit-line);font-weight:600}
 .hygiene-unchecked{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600}
@@ -2317,8 +2328,8 @@ table.sortable thead th{padding:0}
 button.th-sort{width:100%;background:transparent;border:none;color:var(--muted);font:inherit;font-weight:600;text-align:left;cursor:pointer;padding:6px 8px}
 button.th-sort:hover{color:var(--accent)}
 thead th[aria-sort="ascending"] button.th-sort,thead th[aria-sort="descending"] button.th-sort{color:var(--accent);text-decoration:underline}
-button.gauge{font:inherit;text-align:left;cursor:pointer;border:1px solid var(--line);border-left-width:3px}
-.gauge-chev{float:right;color:var(--muted);font-size:0.7rem;margin-left:8px}
+button.gauge{font:inherit;text-align:left;cursor:pointer;border:1px solid var(--line);border-left-width:3px;display:flex;flex-direction:column;justify-content:flex-start}
+.gauge-chev{align-self:flex-end;color:var(--muted);font-size:0.7rem;margin-left:8px}
 button.gauge[aria-expanded="true"]{border-color:var(--accent)}
 .gauge-drawer{padding:0 20px 8px}
 .gauge-drill-panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:10px 14px;margin-top:6px;font-size:0.82rem}
@@ -2406,9 +2417,15 @@ STATIC_SCRIPT = """
 (function(){
   var views = document.querySelectorAll('.view');
   var vbtns = document.querySelectorAll('.view-btn');
+  var expand = document.getElementById('expand-all');
   function activate(id){
     views.forEach(function(v){ v.hidden = (v.id !== id); });
     vbtns.forEach(function(b){ b.setAttribute('aria-selected', b.dataset.target === id ? 'true':'false'); });
+    // TRK-021 finding 2: picking one view IS leaving expand-all. Without this, clicking a
+    // tab while expanded left the button reading "pressed" and the headings shouting over a
+    // single-view page.
+    if (expand){ expand.setAttribute('aria-pressed', 'false'); }
+    document.body.classList.remove('expand-all-on');
   }
   vbtns.forEach(function(b){ b.addEventListener('click', function(){ activate(b.dataset.target); }); });
 
@@ -2611,10 +2628,30 @@ STATIC_SCRIPT = """
     el.addEventListener('keydown', keyActivate);
   });
 
-  // expand-all (print view) preserved
-  var expand = document.getElementById('expand-all');
-  if (expand){ expand.addEventListener('click', function(){
-    views.forEach(function(v){ v.hidden = false; }); }); }
+  // Expand-all / print view (TRK-021 finding 2): a real toggle, not a one-way reveal. The
+  // old handler unhid every view and changed nothing else -- no button state, no way back,
+  // and a tablist still claiming exactly one selected tab while four panels were open.
+  // Pressing now: remembers the active view, deselects every tab, reveals all views, sets
+  // aria-pressed and `body.expand-all-on` (which turns on the per-view headings). Pressing
+  // again restores the remembered view via activate(), which owns the cleanup.
+  if (expand){
+    var restoreTo = null;
+    expand.addEventListener('click', function(){
+      if (expand.getAttribute('aria-pressed') === 'true'){
+        activate(restoreTo || 'view-overview');
+        restoreTo = null;
+        return;
+      }
+      restoreTo = null;
+      vbtns.forEach(function(b){
+        if (b.getAttribute('aria-selected') === 'true'){ restoreTo = b.dataset.target; }
+        b.setAttribute('aria-selected', 'false');
+      });
+      views.forEach(function(v){ v.hidden = false; });
+      document.body.classList.add('expand-all-on');
+      expand.setAttribute('aria-pressed', 'true');
+    });
+  }
 
   if (views.length){ activate('view-overview'); }
 
@@ -2834,7 +2871,7 @@ def _render_treemap_svg(tree, heat, dom_id, bucket_map=None, length_crit_keys=No
         parts.append(
             f'<rect x="{_fmt_float(gx)}" y="{_fmt_float(gy)}" width="{_fmt_float(gw)}" '
             f'height="{_fmt_float(gh)}" rx="{TREEMAP_CELL_RX}" '
-            f'fill="{esc_html(c.get("fill", "#56b4e9"))}" fill-opacity="{opacity}" '
+            f'fill="{esc_html(c.get("fill", "var(--accent)"))}" fill-opacity="{opacity}" '
             f'class="{rect_cls}" data-node-key="{esc_html(c["node_key"])}">'
             f'<title>{esc_html(title)}</title></rect>')
         tx, ty = _fmt_float(gx + 4), _fmt_float(gy + 14)
@@ -2934,7 +2971,7 @@ def _render_ladder_svg(tree, heat, dom_id, bucket_map=None, length_crit_keys=Non
             f'rx="4" class="ladder-track"/>'
             f'<rect x="{_fmt_float(_LADDER_LABEL_W)}" y="{track_y}" '
             f'width="{_fmt_float(width)}" height="{track_h}" rx="4" '
-            f'fill="{esc_html(c.get("fill", "#56b4e9"))}" class="{bar_cls}" '
+            f'fill="{esc_html(c.get("fill", "var(--accent)"))}" class="{bar_cls}" '
             f'data-node-key="{esc_html(c["node_key"])}">'
             f'<title>{esc_html(title)}</title></rect>'
             f'<text x="{value_x}" y="{text_y}" text-anchor="end" '
@@ -3764,7 +3801,7 @@ def _render_coverage_matrix_body(civc, date):
         '<span class="badge verdict-empty">empty</span> → '
         '<span class="badge verdict-thin">thin</span> → '
         '<span class="badge verdict-covered">covered</span>. '
-        'Cells with a "note" expose it via a details toggle.</p>'
+        'A cell "note" is shown with the cell detail; use its toggle to collapse it.</p>'
     )
     by_key = {(c["verb"], c["surface"]): c for c in civc["cells"]}
     grid_cells = ['<div class="mhead"></div>']
@@ -3795,8 +3832,13 @@ def _render_coverage_matrix_body(civc, date):
             note = c.get("note") or ""
             evidence_html = (f'<p class="evidence">{esc_html(evidence)}</p>' if evidence
                               else '<p class="evidence empty-state">no evidence recorded</p>')
-            note_html = (f'<details><summary>note</summary>{esc_html(note)}</details>' if note
-                         else '<p class="empty-state">no note</p>')
+            # TRK-021 finding 4: `open` so the note is legible at first paint instead of
+            # costing a second click per cell. The asserted substring starts at `<summary>`,
+            # so everything added here precedes it and the pinned bytes are unchanged.
+            note_html = (
+                f'<details class="cell-note" open><summary>note</summary>'
+                f'{esc_html(note)}</details>' if note
+                else '<p class="empty-state">no note</p>')
             if verdict == "empty":
                 brief_html = _render_brief_control("gap", gap_index, build_gap_stub_brief(verb, surface))
                 gap_index += 1
@@ -4021,11 +4063,17 @@ def _render_bipartite_body(model):
         f'<li class="badge orphan">{esc_html(n["script"])} ({esc_html(n["target_status"])})</li>'
         for n in model["left_orphans"]) or '<li class="empty-state">none</li>'
     right_html = "".join(_row(n, "right") for n in model["right"]) or '<li class="empty-state">none</li>'
+    # TRK-021 finding 3: all three cards are one visual family and share one class, so the
+    # spacing rules cannot drift apart. A class (not `.card ul`) so the rules cannot reach
+    # `.digest-group ul` / `.tier-dark-callout ul` / `.gauge-drill`, which tie on specificity
+    # and today win only by source order.
     return (
-        '<div class="card"><h2>Registered hooks (settings.json)</h2><ul>' + left_html + '</ul></div>'
-        '<div class="card"><h2>Orphan registrations</h2><ul>' + orphan_html + '</ul></div>'
-        '<div class="card"><h2>Scripts on disk (registration/reachability status)</h2><ul>'
-        + right_html + '</ul></div>'
+        '<div class="card"><h2>Registered hooks (settings.json)</h2>'
+        '<ul class="hook-list">' + left_html + '</ul></div>'
+        '<div class="card"><h2>Orphan registrations</h2>'
+        '<ul class="hook-list">' + orphan_html + '</ul></div>'
+        '<div class="card"><h2>Scripts on disk (registration/reachability status)</h2>'
+        '<ul class="hook-list">' + right_html + '</ul></div>'
     )
 
 
@@ -4700,6 +4748,19 @@ def _render_friction_view(joined, footer, codex_aggregate, drag, friction_total_
 VIEWS = (("view-overview", "Overview"),
          ("view-weight", "Weight"), ("view-friction", "Friction"), ("view-hygiene", "Hygiene"))
 
+_VIEW_LABELS = dict(VIEWS)
+
+
+def _view_block(vid, html):
+    """TRK-021 finding 2: a per-view heading, `display:none` while a single view is shown
+    (the tab bar already names it) and revealed by `body.expand-all-on` / `@media print`, so
+    an expanded page reads as four labelled sections instead of one undifferentiated wall.
+    Emitted OUTSIDE `<section class="view">` on purpose -- every existing
+    `<section id="view-...">.*?</section>` regression regex must stay unaffected."""
+    label = _VIEW_LABELS[vid]
+    return (f'<h2 class="view-heading" data-for="{esc_html(vid)}">{esc_html(label)}</h2>'
+            f'{html}')
+
 
 def render_html(
     date: str,
@@ -4797,17 +4858,24 @@ def render_html(
         '<nav class="view-switch" role="tablist">',
         view_buttons,
         '</nav>',
-        '<button class="action-btn" id="expand-all">Expand all / print view</button>',
+        '<button class="action-btn" id="expand-all" type="button" '
+        'aria-pressed="false">Expand all / print view</button>',
         '<button class="action-btn" id="theme-toggle" type="button" '
         'aria-pressed="false" aria-label="Toggle color theme">◐</button>',
         tier_filter_html,
         "</div>",
         "<main>",
-        _render_overview_view(overview_model, models["civc"], date, copy_payloads["overview"], doc),
-        _render_weight_view(models["context_weight"], heat, friction_enabled, doc, copy_payloads["weight"]),
-        _render_friction_view(joined, footer, codex_aggregate, models["drag"], friction_total_shown, date,
-                              copy_payloads["friction"]),
-        _render_hygiene_view(doc, models, copy_payloads["hygiene"]),
+        _view_block("view-overview",
+                    _render_overview_view(overview_model, models["civc"], date,
+                                          copy_payloads["overview"], doc)),
+        _view_block("view-weight",
+                    _render_weight_view(models["context_weight"], heat, friction_enabled, doc,
+                                        copy_payloads["weight"])),
+        _view_block("view-friction",
+                    _render_friction_view(joined, footer, codex_aggregate, models["drag"],
+                                          friction_total_shown, date, copy_payloads["friction"])),
+        _view_block("view-hygiene",
+                    _render_hygiene_view(doc, models, copy_payloads["hygiene"])),
         "</main>",
         _render_copy_island("overview", copy_payloads["overview"]),
         _render_copy_island("weight", copy_payloads["weight"]),

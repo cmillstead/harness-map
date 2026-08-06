@@ -1024,6 +1024,67 @@ def test_ladder_bars_get_cursor_pointer_affordance():
                       rh.STATIC_STYLE) is not None
 
 
+def _css_decls(stylesheet, selector):
+    """Return the declaration block for an exact `selector` from a CSS string, or ''."""
+    marker = selector + "{"
+    i = stylesheet.find(marker)
+    if i == -1:
+        return ""
+    return stylesheet[i + len(marker):stylesheet.index("}", i)]
+
+
+def test_gauge_button_content_is_top_anchored(tmp_path):
+    """Rejects the pre-TRK-021 behavior: a drill-enabled gauge renders as a bare <button>,
+    and a <button> inherits the UA stylesheet's vertically CENTERED anonymous content box.
+    `.gauges` is display:flex with the default align-items:stretch, so every card is as tall
+    as the tallest -- which made a short drill button float its value and label at the
+    vertical middle while its taller siblings started at the top. `text-align:left` on
+    button.gauge fixed the horizontal axis only. The button must therefore declare its own
+    column flex box anchored with justify-content:flex-start, and `.gauge-chev` must use
+    align-self -- `float` is inert on a flex item and would drop the chevron to the left."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "gauge_align"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    # Guard: the fixture must actually produce a <button> gauge, or the rule is untested.
+    assert '<button class="gauge' in text
+    decls = _css_decls(rh.STATIC_STYLE, "button.gauge")
+    assert "display:flex" in decls
+    assert "flex-direction:column" in decls
+    assert "justify-content:flex-start" in decls
+    chev = _css_decls(rh.STATIC_STYLE, ".gauge-chev")
+    assert "align-self:flex-end" in chev
+    assert "float" not in chev
+
+
+def test_hook_cards_share_one_spaced_list_style(tmp_path):
+    """Rejects two pre-TRK-021 behaviors. (1) The three bipartite hook cards emitted bare
+    unclassed <ul>s, so every entry inherited UA defaults and the "Scripts on disk" card --
+    where each <li> stacks a name, a badge and a description -- rendered as an unreadable
+    wall. (2) The naive fix, `.card ul`, would also hit `.digest-group ul` and
+    `.tier-dark-callout ul`, which tie on specificity and win only by source order.
+    Also pins that `.hook-list li` sets no padding: it out-ranks `.badge`, and a padding
+    declaration here would silently flatten every orphan-registration pill."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "hook_lists"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    for heading in ("Registered hooks (settings.json)",
+                    "Orphan registrations",
+                    "Scripts on disk (registration/reachability status)"):
+        assert f"<h2>{heading}</h2><ul class=\"hook-list\">" in text
+    li = _css_decls(rh.STATIC_STYLE, ".hook-list li")
+    assert "margin:" in li and "line-height:" in li
+    assert "padding" not in li
+    assert _css_decls(rh.STATIC_STYLE, ".hook-list") != ""
+
+
 def test_csp_hashes_match_recomputed_static_blocks(tmp_path):
     doc = _minimal_doc()
     out_dir = tmp_path / "csp_hash"
@@ -1853,6 +1914,107 @@ def test_civc_notes_and_legend_render(tmp_path):
     text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
     assert "Coverage scale" in text
     assert "<summary>note</summary>context note here</details>" in text
+
+
+def test_coverage_cell_note_is_open_at_first_paint(tmp_path):
+    """Rejects the pre-TRK-021 behavior where a cell note rendered inside a CLOSED <details>:
+    the operator had to click the cell and then click again to read the one sentence the
+    synthesis wrote about it. `open` makes it visible at first paint. Deliberately keeps the
+    <details> wrapper -- tests/test_render_html.py:1855 pins the closing bytes and removing
+    the wrapper would edit an existing assertion (CLAUDE.md rule 7)."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "cell_note_open"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    synth = {"schema_version": 1, "civc": [
+        {"verb": "Afford", "surface": "context", "verdict": "covered", "note": "context note here"},
+    ], "drag_candidates": []}
+    (out_dir / "harness-synthesis-2026-07-15.json").write_text(json.dumps(synth))
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert '<details class="cell-note" open><summary>note</summary>context note here</details>' in text
+    # The legend must not still claim the note is hidden behind a toggle.
+    assert "expose it via a details toggle" not in text
+
+
+def test_copy_brief_disclosure_stays_collapsed(tmp_path):
+    """Rejects a blanket `open` sweep: the copy-brief disclosure (_render_copy_disclosure /
+    .copy-preview) must stay CLOSED. Its body is a full markdown brief, and opening every one
+    of them would bury the inspector's actual content under raw payload text."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "brief_closed"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert '<details class="copy-preview">' in text
+    assert '<details class="copy-preview" open' not in text
+    assert '<details open class="copy-preview"' not in text
+
+
+def test_expand_all_is_a_toggle_with_visible_pressed_state(tmp_path):
+    """Rejects the pre-TRK-021 handler, which was wired but gave zero feedback: it set
+    `v.hidden = false` on every view and stopped. Nothing scrolled, the button state never
+    changed, the tab bar still advertised one aria-selected tab while four panels were open,
+    and there was no second click to undo it. The control must carry aria-pressed, the
+    handler must branch on it, and activate() must clear both the pressed state and the
+    body class so choosing a tab exits the mode instead of leaving it stale."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "expand_toggle"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert 'id="expand-all" type="button" aria-pressed="false"' in text
+    js = rh.STATIC_SCRIPT
+    assert "expand.getAttribute('aria-pressed') === 'true'" in js
+    assert "expand.setAttribute('aria-pressed', 'true')" in js
+    assert "classList.add('expand-all-on')" in js
+    assert "classList.remove('expand-all-on')" in js
+    # activate() owns the cleanup, so a tab click cannot leave a stale pressed state.
+    activate_src = js[js.index("function activate(id){"):js.index("vbtns.forEach(function(b){ b.addEventListener")]
+    assert "aria-pressed', 'false'" in activate_src
+    assert "classList.remove('expand-all-on')" in activate_src
+    # The lookup must precede activate(), not depend on `var` hoisting.
+    assert js.index("var expand = document.getElementById('expand-all')") < js.index("function activate(id){")
+
+
+def test_each_view_gets_a_heading_before_its_section(tmp_path):
+    """Rejects expanding into an undifferentiated wall: with the tab bar deselected, four
+    stacked panels carried no visible label at all, so the user could not see that anything
+    had happened. Each heading must sit OUTSIDE its <section>, immediately before it, so the
+    existing `<section id="view-...">.*?</section>` regression regexes are unaffected."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "view_headings"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    for vid, label in rh.VIEWS:
+        heading = f'<h2 class="view-heading" data-for="{vid}">{label}</h2>'
+        assert heading in text
+        assert text.index(heading) < text.index(f'<section id="{vid}"')
+
+
+def test_view_headings_are_hidden_until_expanded(tmp_path):
+    """Rejects the inverse defect of the test above: four always-visible headings would
+    duplicate the tab label on every ordinary single-view page. They appear only under
+    `body.expand-all-on` -- and under @media print, so the control's own name stays true
+    for a reader who prints without clicking it."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "heading_hidden"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    css = rh.STATIC_STYLE
+    assert "display:none" in _css_decls(css, ".view-heading")
+    assert "display:block" in _css_decls(css, "body.expand-all-on .view-heading")
+    assert "@media print{" in css and ".view[hidden]{display:block}" in css
 
 
 def test_civc_renamed_to_coverage_matrix_in_display_text(tmp_path):
@@ -4525,6 +4687,117 @@ def test_tier_tokens_present_in_light_and_dark_static_style():
     assert style.count("--tier-operator:var(--muted)") == 4
     assert style.count("--tier-project:#0e7490") == 2   # light theme (base :root + [data-theme=light])
     assert style.count("--tier-project:#22d3ee") == 2   # dark theme (media dark + [data-theme=dark])
+
+
+def _theme_block(css, opener):
+    """Return the declaration text of a theme variable block, given its exact opener."""
+    i = css.index(opener)
+    return css[i + len(opener):css.index("}", i)]
+
+
+def _theme_tokens(block):
+    return dict(d.split(":", 1) for d in block.split(";") if d.startswith("--"))
+
+
+def test_light_and_dark_theme_blocks_each_stay_in_sync():
+    """Rejects the single most likely dark-mode regression in this file: the dark theme is
+    declared TWICE (@media prefers-color-scheme, and :root[data-theme="dark"]) and the light
+    theme TWICE (:root, and :root[data-theme="light"]). Editing or adding a token in only one
+    member of a pair makes the manual theme toggle render differently from the same theme
+    picked up from the OS -- a divergence nothing else in the suite would catch."""
+    css = rh.STATIC_STYLE
+    # --r and --mono are declared once, only in the base :root{} block, on purpose: they are
+    # theme-invariant (same border-radius and font stack in both themes), and every
+    # [data-theme=...] selector still resolves them from :root{} via normal CSS custom
+    # property inheritance. They are excluded from the pairwise sync check below because
+    # they are the one deliberate exception to "every token appears in all four blocks".
+    invariant_tokens = {"--r", "--mono"}
+    light_a = {k: v for k, v in _theme_tokens(_theme_block(css, ":root{")).items()
+               if k not in invariant_tokens}
+    light_b = _theme_tokens(_theme_block(css, ':root[data-theme="light"]{'))
+    dark_a = {k: v for k, v in _theme_tokens(
+        _theme_block(css, "@media (prefers-color-scheme: dark){:root{")).items()
+        if k not in invariant_tokens}
+    dark_b = _theme_tokens(_theme_block(css, ':root[data-theme="dark"]{'))
+    assert light_a == light_b, "light :root and [data-theme=light] diverged"
+    assert dark_a == dark_b, "dark @media and [data-theme=dark] diverged"
+    assert set(light_a) == set(dark_a), "a token exists in one theme but not the other"
+
+
+def test_no_unthemed_color_literal_in_the_stylesheet():
+    """Rejects a hardcoded hex/rgb() creeping into a rule outside the four theme-variable
+    blocks -- exactly the class of defect that makes a control legible in light mode and
+    invisible in dark. Every remaining literal must be on this allowlist with a stated
+    reason; a new one fails the test until it is either mapped to a variable or added here
+    deliberately."""
+    css = rh.STATIC_STYLE
+    for opener in (":root{", ':root[data-theme="light"]{',
+                   "@media (prefers-color-scheme: dark){:root{", ':root[data-theme="dark"]{'):
+        block = _theme_block(css, opener)
+        css = css.replace(block, "", 1)
+    found = set(re.findall(r"#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)", css))
+    allowed = {
+        # .friction-badge: paint-order:stroke halo. White fill over a black outline must read
+        # over ANY cell fill in EITHER theme -- these two are load-bearing BECAUSE they do
+        # not theme.
+        "#fff", "#000",
+        # HEAT_RAMP (render_html.py:89), appended via _HEAT_CSS. A sequential magnitude ramp
+        # emitted identically into the cell stroke and the legend swatch; theming it would
+        # desynchronize the legend from the data it explains.
+        "#FCAE91", "#FB6A4A", "#DE2D26", "#A50F15",
+    }
+    assert found <= allowed, f"unthemed color literal(s) in the stylesheet: {sorted(found - allowed)}"
+
+
+def test_svg_fill_fallbacks_use_the_accent_token(tmp_path):
+    """Rejects a regression the stylesheet scan structurally cannot see: the defensive
+    `c.get("fill", ...)` fallbacks in _render_treemap_svg and _render_ladder_svg live in
+    Python f-strings OUTSIDE STATIC_STYLE, so test_no_unthemed_color_literal_in_the_stylesheet
+    never reads them. Pre-TRK-021 they were the hardcoded hex #56b4e9 -- legible in light
+    mode, unthemed in dark. Both builders always set "fill" today, so the fallback is
+    unreachable dead code; this pins it to the themed accent token anyway, because a future
+    builder change could make it live without any test noticing."""
+    src = Path(rh.__file__).with_suffix(".py").read_text(encoding="utf-8")
+    assert '"#56b4e9"' not in src
+    assert src.count('c.get("fill", "var(--accent)")') == 2
+
+
+def _wcag_contrast(hex_a, hex_b):
+    def lum(h):
+        h = h.lstrip("#")
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        c = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        c = [(x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4) for x in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    la, lb = lum(hex_a), lum(hex_b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_expand_all_pressed_state_meets_wcag_contrast_in_both_themes():
+    """Rejects the exact defect Codex found in the first TRK-021 review round: the pressed
+    expand-all rule composed var(--accent) text on var(--accent-soft) background, which in
+    the light theme is #6366f1 on #e5e7fb -- about 3.65:1, under the 4.5:1 WCAG AA floor
+    for the control's 0.85rem text. Every literal-scan audit missed it because the rule
+    contains no hex literal at all; this test therefore resolves the rule's var() references
+    against BOTH parsed theme palettes and computes the actual ratio. Changing this value
+    requires a spec change (WCAG 2.1 AA 1.4.3: 4.5:1 for normal-size text)."""
+    css = rh.STATIC_STYLE
+    rule = _css_decls(css, '#expand-all[aria-pressed="true"]')
+    assert rule != "", "pressed-state rule missing"
+    m = re.search(r"(?:^|;)color:var\((--[a-z-]+)\)", rule)
+    assert m, "pressed-state rule must set color via a theme token"
+    fg_token = m.group(1)
+    mb = re.search(r"background:var\((--[a-z-]+)\)", rule)
+    assert mb, "pressed-state rule must set background via a theme token"
+    bg_token = mb.group(1)
+    light = _theme_tokens(_theme_block(css, ":root{"))
+    dark = _theme_tokens(_theme_block(css, ':root[data-theme="dark"]{'))
+    for theme_name, tokens in (("light", light), ("dark", dark)):
+        ratio = _wcag_contrast(tokens[fg_token], tokens[bg_token])
+        assert ratio >= 4.5, (
+            f"{theme_name}: {fg_token} on {bg_token} = {ratio:.2f}:1, below WCAG AA 4.5:1")
 
 
 def test_one_executable_script_and_csp_hash_reconciles_with_tier_composition(tmp_path):
