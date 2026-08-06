@@ -7734,6 +7734,33 @@ def test_check_unreadable_out_dir_still_emits_synthesis_notice(tmp_path, fake_ha
     assert out.startswith("error:")
     assert "notice: CIVC comparison skipped, could not read --check out-dir" in out
 
+def test_check_malformed_prior_headline_still_emits_civc_shape_notice(fake_harness, tmp_path):
+    # Codex P2 round 2 (TRK-051 T6): the exact reproduction. A malformed HEADLINE sidecar
+    # makes run_check exit 2 via the headline selector's OWN "malformed" status, entirely
+    # independent of the synthesis pair -- synth_notices (the SELECTION-failure notices T5
+    # restored) is EMPTY here, because both synthesis sidecars parse and select fine. The
+    # SHAPE notice (a present-but-non-list "civc") is only discoverable once a pair IS
+    # selected -- via _check_civc_cells, called from _check_civc_regressions -- which used
+    # to run only AFTER the fatal early return. It must now survive that return too.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / f"harness-map-{_days_ago(1)}.json").write_text("{ not valid json")
+    older, newer = _days_ago(2), _days_ago(1)
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    (out_dir / f"harness-synthesis-{newer}.json").write_text(
+        json.dumps({"schema_version": 1, "civc": 7}))    # present, non-list
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 2, (out, err)
+    assert out.startswith("error:") and "malformed prior sidecar" in out
+    assert "notice: CIVC comparison skipped, current synthesis civc is not a list" in out
+    # No duplication: this notice can only be produced by ONE call to
+    # _check_civc_regressions (T6 computes it exactly once, before `status` is inspected).
+    assert out.count("notice:") == 1
+    # A fatal run performed no comparison -- no CIVC finding may leak through even though
+    # a real comparison result existed for the "prior" side's cell.
+    assert "REGRESSION" not in out
+
 def test_check_non_numeric_prior_headline_exits_two_not_one(fake_harness, tmp_path):
     # F6 (P1-adjacent): pre-fix, a prior headline of {"instruction_files_over_200": "bad"}
     # raised an UNCAUGHT TypeError in _check_headline_regressions -- exiting 1, the code

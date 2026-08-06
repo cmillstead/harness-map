@@ -6910,22 +6910,40 @@ def run_check(doc: dict[str, Any], out_dir: str,
     if baseline is None:
         baseline = check_load_baseline(out_dir)
     (status, prior_doc, detail), (synth_pair, synth_notices) = baseline
+    # Codex P2 round 2 (TRK-051 T6): computed EXACTLY ONCE here, before `status` is even
+    # inspected, so the fatal early return below and the normal path downstream read the
+    # SAME `all_synth_notices` -- one gather step, not two hand-synced call sites. T5
+    # closed the ONE instance it found (a fatal headline run discarding `synth_notices`,
+    # the SELECTION-failure notices from check_load_baseline); it left a second instance
+    # of the identical class standing -- the SHAPE notices _check_civc_cells can raise once
+    # a pair IS selected (e.g. a present-but-non-list `civc`) were still only folded in
+    # further down, past the fatal return. Gathering both notice sources up front, before
+    # the branch, closes the CLASS: a third notice source added later is included by
+    # construction, not by whoever adds it remembering to patch the fatal branch too.
+    # `_check_civc_regressions` is called EXACTLY ONCE per run_check invocation (here) --
+    # never a second time downstream -- so `civc_notices` cannot appear twice in the text.
+    civc_findings: list[str] = []
+    civc_notices: list[str] = []
+    if synth_pair is not None:
+        prior_synth, newest_synth = synth_pair
+        civc_findings, civc_notices = _check_civc_regressions(prior_synth, newest_synth)
+    all_synth_notices = synth_notices + civc_notices
     if status in ("malformed", "unreadable"):
-        # Codex P2 (TRK-051 T5): synth_notices was computed by check_load_baseline
-        # unconditionally (it runs the synthesis selection independently of the headline
-        # selection's own status), so a FATAL headline status must not throw it away --
-        # doing so silently violated SKILL.md's documented guarantee that an unreadable
-        # out-dir names itself on a notice: line. The exit code is unaffected: it is
-        # already 2 for the headline reason, and notices still never change it.
+        # Exit 2 means the gate could NOT run: civc_findings are deliberately DISCARDED on
+        # this path (never returned to the caller) -- a notice is unconditional disclosure
+        # ("here is why this run does not carry the usual signal"), a finding is a
+        # comparison RESULT, and a fatal run performed no comparison. Surfacing a finding
+        # here would be the F6 shape again (a real comparison outcome reached the operator
+        # from a run that officially compared nothing) -- not reopened.
         #
         # Ordering: "error: {detail}" stays FIRST, not the usual notices-precede-everything
         # shape (A50) -- test_check_unreadable_out_dir_still_exits_two pins
-        # `out.startswith("error:")` and is a shipped assertion (never edited). An
+        # `out.startswith("error:")` and is a shipped assertion (never edited, T5). An
         # unreadable OUT_DIR fails BOTH selectors identically (same directory, same
         # OSError), so that exact test now also carries a non-empty synth_notices; putting
-        # the error line first keeps it green while still surfacing the notice, appended
-        # after, rather than discarding it as before.
-        return 2, "\n".join([f"error: {detail}"] + synth_notices)
+        # the error line first keeps it green while still surfacing every notice, appended
+        # after, rather than discarding any of them as before.
+        return 2, "\n".join([f"error: {detail}"] + all_synth_notices)
     findings: list[str] = []
     notices: list[str] = []
     if status == "found":
@@ -6936,15 +6954,11 @@ def run_check(doc: dict[str, Any], out_dir: str,
             skip=tuple(skipped_metrics)))
     # F5 (TRK-051): synth_notices covers selection failures (an unreadable out-dir or an
     # unreadable/malformed candidate sidecar -- synth_pair is None in both cases); the
-    # civc-shape notices below cover a selected PAIR whose civc field is unusable. The two
-    # are mutually exclusive per run (civc notices only fire once a pair was found), so
+    # civc-shape notices cover a selected PAIR whose civc field is unusable. The two are
+    # mutually exclusive per run (civc notices only fire once a pair was found), so
     # simply concatenating preserves the fixed selection-then-comparison order (F4.4).
-    notices = notices + synth_notices
-    if synth_pair is not None:
-        prior_synth, newest_synth = synth_pair
-        civc_findings, civc_notices = _check_civc_regressions(prior_synth, newest_synth)
-        findings.extend(civc_findings)
-        notices = notices + civc_notices
+    notices = notices + all_synth_notices
+    findings.extend(civc_findings)
     # A50: notices precede findings and the verdict line, and never change the exit code --
     # a skipped metric is neither a regression nor a clean result, it is a metric nobody
     # compared, and the operator is told which one by name.
