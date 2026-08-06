@@ -6655,16 +6655,27 @@ def _check_select_prior_sidecar(out_dir: Path, today: str) -> tuple[str, dict[st
     return "all_crashed", None, None
 
 
-def _check_select_synthesis_pair(out_dir: Path, today: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """The two most recent harness-synthesis-YYYY-MM-DD.json sidecars strictly before
-    `today`, oldest-then-newest, or None when fewer than two exist or either is unreadable
-    (the CIVC comparison is best-effort/optional -- SPEC_7 §1 gates it on "if >= 2 exist",
-    unlike the collector-sidecar D7 selection above, which is mandatory and FATAL on
-    malformed input)."""
+def _check_select_synthesis_pair(
+    out_dir: Path, today: str,
+) -> tuple[tuple[dict[str, Any], dict[str, Any]] | None, list[str]]:
+    """(pair, notices). `pair` is the two most recent harness-synthesis-YYYY-MM-DD.json
+    sidecars strictly before `today`, oldest-then-newest, or None when the CIVC comparison
+    could not be made (the comparison is best-effort/optional -- SPEC_7 §1 gates it on "if
+    >= 2 exist", unlike the collector-sidecar D7 selection above, which is mandatory and
+    FATAL on malformed input -- so a `pair is None` return is NEVER by itself grounds for
+    exit 2).
+
+    F5 (TRK-051): a None `pair` used to be silent regardless of WHY -- indistinguishable
+    from the ordinary "fewer than two sidecars exist yet" case that fires on every run
+    against a fresh OUT_DIR. That ordinary case still gets no notice (a notice there would
+    fire constantly and teach the reader to ignore the channel); an out-dir that could not
+    be listed, or a candidate sidecar that could not be read or parsed as a document, is
+    reported by name so "CIVC compared and found nothing" is never confused with "CIVC
+    never ran"."""
     try:
         entries = list(out_dir.iterdir())
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, [f"notice: CIVC comparison skipped, could not read --check out-dir {out_dir}: {exc}"]
     candidates = []
     for p in entries:
         m = _CHECK_SYNTHESIS_RE.match(p.name)
@@ -6672,36 +6683,54 @@ def _check_select_synthesis_pair(out_dir: Path, today: str) -> tuple[dict[str, A
             candidates.append((m.group(1), p))
     candidates.sort(key=lambda t: t[0], reverse=True)  # newest first
     if len(candidates) < 2:
-        return None
+        return None, []
     (_newest_date, newest_path), (_prior_date, prior_path) = candidates[0], candidates[1]
     try:
         newest_doc = json.loads(newest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, [f"notice: CIVC comparison skipped, unreadable synthesis sidecar {newest_path.name}: {exc}"]
+    try:
         prior_doc = json.loads(prior_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(newest_doc, dict) or not isinstance(prior_doc, dict):
-        return None
-    return prior_doc, newest_doc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, [f"notice: CIVC comparison skipped, unreadable synthesis sidecar {prior_path.name}: {exc}"]
+    if not isinstance(newest_doc, dict):
+        return None, [f"notice: CIVC comparison skipped, synthesis sidecar {newest_path.name} is not a valid document"]
+    if not isinstance(prior_doc, dict):
+        return None, [f"notice: CIVC comparison skipped, synthesis sidecar {prior_path.name} is not a valid document"]
+    return (prior_doc, newest_doc), []
 
 
-def _check_civc_cells(synth_doc: dict[str, Any]) -> dict[tuple[str, str], str]:
-    """D-3 (AMENDMENTS A48): a cell whose verb/surface/verdict falls outside the
-    allowlists is IGNORED, never coerced -- unlike render_html.build_civc_model, which
-    coerces an unallowlisted verdict to 'empty' because it is filling a fixed 6x6 render
-    grid. Coercing here would turn a synthesis typo into a manufactured
-    covered->empty finding, so an unmatched cell is simply absent from the returned map."""
+def _check_civc_cells(synth_doc: dict[str, Any], label: str) -> tuple[dict[tuple[str, str], str], list[str]]:
+    """(cells, notices). D-3 (AMENDMENTS A48): a cell whose verb/surface/verdict falls
+    outside the allowlists is IGNORED, never coerced, and never notice-worthy -- unlike
+    render_html.build_civc_model, which coerces an unallowlisted verdict to 'empty'
+    because it is filling a fixed 6x6 render grid. Coercing here would turn a synthesis
+    typo into a manufactured covered->empty finding, so an unmatched cell is simply
+    absent from the returned map; per-cell noise across a 36-cell grid would drown any
+    real signal, so that case stays silent (this is the load-bearing NO half of F5 at
+    this call site).
+
+    `label` (e.g. "prior"/"current") names WHICH of the two compared sidecars an
+    unusable `civc` came from, since this function only sees the already-parsed dict,
+    never the file it came from."""
     cells: dict[tuple[str, str], str] = {}
     raw = synth_doc.get("civc")
     # A non-list `civc` (an int, a bare dict) is not iterable into cells -- pre-TRK-051
     # `for c in raw` raised a TypeError inside run_check, AFTER headline findings had been
     # accumulated, so a real regression was lost to a traceback. Unusable means "no cells":
     # the synthesis comparison is best-effort by design (SPEC_7 §1 gates it on ">= 2
-    # exist", and _check_select_synthesis_pair already returns None on unreadable input),
-    # unlike the collector-sidecar path above, which is mandatory and FATAL. Widening this
-    # into an exit-2 condition would be a different decision (Codex F5) and is deliberately
-    # NOT made here.
+    # exist", and _check_select_synthesis_pair already returns (None, ...) on unreadable
+    # input), unlike the collector-sidecar path above, which is mandatory and FATAL.
+    # F5 (TRK-051): silently returning "no cells" here used to be indistinguishable from a
+    # clean CIVC comparison that genuinely found nothing -- fixed by reporting a notice
+    # (never an exit-2; that widening was considered and declined, see Codex F5 above)
+    # whenever `civc` is PRESENT but the wrong shape. An ABSENT key is the ordinary case
+    # (a synthesis document predating the civc field) and stays silent for the same
+    # every-run-fires-a-notice reason as the fewer-than-two-sidecars case above.
+    if "civc" in synth_doc and not isinstance(raw, list):
+        return cells, [f"notice: CIVC comparison skipped, {label} synthesis civc is not a list"]
     if not isinstance(raw, list):
-        return cells
+        return cells, []
     for c in raw:
         if not isinstance(c, dict):
             continue
@@ -6709,7 +6738,7 @@ def _check_civc_cells(synth_doc: dict[str, Any]) -> dict[tuple[str, str], str]:
         if verb not in _CHECK_VERBS or surface not in _CHECK_SURFACES or verdict not in _CHECK_VERDICTS:
             continue
         cells[(verb, surface)] = verdict
-    return cells
+    return cells, []
 
 
 def _check_valid_definition_version(value: Any) -> bool:
@@ -6798,21 +6827,24 @@ def _check_headline_regressions(current: dict[str, Any], prior: dict[str, Any],
     return findings
 
 
-def _check_civc_regressions(prior_synth: dict[str, Any], newest_synth: dict[str, Any]) -> list[str]:
-    """CIVC cell regressions between the two most recent synthesis sidecars, iterated in
-    the FIXED _CHECK_VERBS x _CHECK_SURFACES order (never a sorted(set(...)), F4.4)."""
-    prior_cells, newest_cells = _check_civc_cells(prior_synth), _check_civc_cells(newest_synth)
+def _check_civc_regressions(prior_synth: dict[str, Any], newest_synth: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """(findings, notices). CIVC cell regressions between the two most recent synthesis
+    sidecars, iterated in the FIXED _CHECK_VERBS x _CHECK_SURFACES order (never a
+    sorted(set(...)), F4.4)."""
+    prior_cells, prior_notices = _check_civc_cells(prior_synth, "prior")
+    newest_cells, newest_notices = _check_civc_cells(newest_synth, "current")
     findings = []
     for verb in _CHECK_VERBS:
         for surface in _CHECK_SURFACES:
             old, new = prior_cells.get((verb, surface)), newest_cells.get((verb, surface))
             if old is not None and new is not None and (old, new) in _CHECK_CIVC_REGRESSIONS:
                 findings.append(f"REGRESSION: CIVC {verb}/{surface} regressed {old} -> {new}")
-    return findings
+    return findings, prior_notices + newest_notices
 
 
 def check_load_baseline(out_dir: str) -> tuple[tuple[str, dict[str, Any] | None, str | None],
-                                               tuple[dict[str, Any], dict[str, Any]] | None]:
+                                               tuple[tuple[dict[str, Any], dict[str, Any]] | None,
+                                                     list[str]]]:
     """Every disk read run_check needs, performed in one place so main() can do it BEFORE
     build_document and therefore before BOTH --out blocks -- the validation block
     (`if args.out is not None:`) and the write block (`if out_path is not None:`) (F1).
@@ -6822,8 +6854,9 @@ def check_load_baseline(out_dir: str) -> tuple[tuple[str, dict[str, Any] | None,
     later does to the directory; it does NOT narrow the --out-alongside---check combination,
     which SPEC_7 §1 explicitly permits.
 
-    Returns (prior_selection, synthesis_pair) -- exactly the two values run_check consumes.
-    No write, no mutation: --check writes nothing (CLAUDE.md rule 4)."""
+    Returns (prior_selection, (synthesis_pair, synthesis_notices)) -- exactly the two
+    top-level values run_check consumes. No write, no mutation: --check writes nothing
+    (CLAUDE.md rule 4)."""
     today = datetime.now(timezone.utc).date().isoformat()  # D-1: one clock frame per module
     out_path = Path(out_dir)
     return (_check_select_prior_sidecar(out_path, today),
@@ -6832,16 +6865,17 @@ def check_load_baseline(out_dir: str) -> tuple[tuple[str, dict[str, Any] | None,
 
 def run_check(doc: dict[str, Any], out_dir: str,
               baseline: tuple[tuple[str, dict[str, Any] | None, str | None],
-                              tuple[dict[str, Any], dict[str, Any]] | None] | None = None,
+                              tuple[tuple[dict[str, Any], dict[str, Any]] | None,
+                                    list[str]]] | None = None,
               ) -> tuple[int, str]:
     """SPEC_7 §1 / AMENDMENTS A48 entry point. `doc` is the CURRENT run's already-built
     document -- main() intercepts a current-run crash/profile-rejection BEFORE calling
     this (comparing a crash envelope would emit fabricated regressions, never done here).
 
-    `baseline` is the preloaded (prior_selection, synthesis_pair) pair from
-    check_load_baseline. main() always passes it, read before build_document and before
-    both --out blocks (F1); the default None re-reads here, which keeps this function
-    callable standalone with just (doc, out_dir) -- the shape
+    `baseline` is the preloaded (prior_selection, (synthesis_pair, synthesis_notices))
+    pair from check_load_baseline. main() always passes it, read before build_document and
+    before both --out blocks (F1); the default None re-reads here, which keeps this
+    function callable standalone with just (doc, out_dir) -- the shape
     test_check_exit_one_on_band_crossing_at_the_5000_boundary drives.
 
     Returns (exit_code, text): text is what --check prints to stdout INSTEAD OF the JSON
@@ -6849,7 +6883,7 @@ def run_check(doc: dict[str, Any], out_dir: str,
     the default mode only)."""
     if baseline is None:
         baseline = check_load_baseline(out_dir)
-    (status, prior_doc, detail), synth_pair = baseline
+    (status, prior_doc, detail), (synth_pair, synth_notices) = baseline
     if status in ("malformed", "unreadable"):
         return 2, f"error: {detail}"
     findings: list[str] = []
@@ -6860,9 +6894,17 @@ def run_check(doc: dict[str, Any], out_dir: str,
         findings.extend(_check_headline_regressions(
             doc.get("headline") or {}, prior_doc.get("headline") or {},
             skip=tuple(skipped_metrics)))
+    # F5 (TRK-051): synth_notices covers selection failures (an unreadable out-dir or an
+    # unreadable/malformed candidate sidecar -- synth_pair is None in both cases); the
+    # civc-shape notices below cover a selected PAIR whose civc field is unusable. The two
+    # are mutually exclusive per run (civc notices only fire once a pair was found), so
+    # simply concatenating preserves the fixed selection-then-comparison order (F4.4).
+    notices = notices + synth_notices
     if synth_pair is not None:
         prior_synth, newest_synth = synth_pair
-        findings.extend(_check_civc_regressions(prior_synth, newest_synth))
+        civc_findings, civc_notices = _check_civc_regressions(prior_synth, newest_synth)
+        findings.extend(civc_findings)
+        notices = notices + civc_notices
     # A50: notices precede findings and the verdict line, and never change the exit code --
     # a skipped metric is neither a regression nor a clean result, it is a metric nobody
     # compared, and the operator is told which one by name.

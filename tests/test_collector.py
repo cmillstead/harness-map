@@ -7831,6 +7831,101 @@ def test_check_all_metrics_skipped_still_names_every_skip(fake_harness, tmp_path
     assert [ln.split()[1] for ln in lines if ln.startswith("notice:")] == list(keys)
     assert lines[-1].startswith("No regression detected")
 
+def test_check_notices_unreadable_synthesis_out_dir(tmp_path):
+    # F5 (TRK-051), row 1: _check_select_synthesis_pair's own OSError-on-iterdir is masked
+    # at the full CLI layer -- _check_select_prior_sidecar hits the SAME os.iterdir() on the
+    # SAME out_dir FIRST and already exits 2 for an unlistable OUT_DIR
+    # (test_check_unreadable_out_dir_still_exits_two), so this row can never be observed
+    # through subprocess run_check. Exercised in two steps instead: the real unreadable-
+    # directory fixture proves the helper's own notice text, then that exact result is
+    # threaded through collector.run_check in-process with a hand-built baseline (the same
+    # standalone-callable shape test_check_exit_one_on_band_crossing_at_the_5000_boundary
+    # drives) to prove the notice reaches stdout without moving the exit code off 0.
+    if os.geteuid() == 0:
+        pytest.skip("mode bits do not restrict uid 0")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    os.chmod(out_dir, 0o000)
+    try:
+        pair, notices = _collector._check_select_synthesis_pair(out_dir, _days_ago(0))
+    finally:
+        os.chmod(out_dir, 0o700)
+    assert pair is None
+    assert len(notices) == 1
+    assert notices[0].startswith("notice: CIVC comparison skipped, could not read --check out-dir")
+    assert str(out_dir) in notices[0]
+    baseline = (("no_prior", None, None), (pair, notices))
+    exit_code, text = _collector.run_check({"headline": {}}, str(out_dir), baseline=baseline)
+    assert exit_code == 0, text
+    assert notices[0] in text
+    assert "First run — no prior map (baseline)." in text
+
+def test_check_notices_unreadable_synthesis_sidecar(fake_harness, tmp_path):
+    # F5, row 3: a candidate synthesis sidecar that fails to parse as JSON must not vanish
+    # silently -- it is reported by name, but the comparison still stays best-effort (exit
+    # 0, no headline sidecar written so status is "no_prior").
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    (out_dir / f"harness-synthesis-{newer}.json").write_text("{ not valid json")
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert (f"notice: CIVC comparison skipped, unreadable synthesis sidecar "
+            f"harness-synthesis-{newer}.json") in out
+    assert "REGRESSION" not in out
+    assert "First run — no prior map (baseline)." in out
+
+def test_check_notices_synthesis_sidecar_that_is_not_a_document(fake_harness, tmp_path):
+    # F5, row 4: valid JSON that is not a dict (e.g. a bare number) parses cleanly but is
+    # not a usable synthesis document -- named by file, exit code unaffected.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    (out_dir / f"harness-synthesis-{newer}.json").write_text("42")
+    _write_check_synthesis(out_dir, older, [("Afford", "context", "covered")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert (f"notice: CIVC comparison skipped, synthesis sidecar "
+            f"harness-synthesis-{newer}.json is not a valid document") in out
+    assert "REGRESSION" not in out
+    assert "First run — no prior map (baseline)." in out
+
+def test_check_notices_non_list_civc_in_synthesis(fake_harness, tmp_path):
+    # F5, row 5 (_check_civc_cells): a present-but-non-list "civc" is the YES half of this
+    # site -- contrast test_check_civc_unallowlisted_verdict_is_ignored_not_coerced, which
+    # pins the NO half (a merely unallowlisted cell inside an otherwise-valid list stays
+    # silent). Both sidecars are malformed here, so both "prior" and "current" labels fire.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    older, newer = _days_ago(2), _days_ago(1)
+    for date_str in (older, newer):
+        (out_dir / f"harness-synthesis-{date_str}.json").write_text(
+            json.dumps({"schema_version": 1, "civc": 7}))    # present, non-list
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "notice: CIVC comparison skipped, prior synthesis civc is not a list" in out
+    assert "notice: CIVC comparison skipped, current synthesis civc is not a list" in out
+    assert "REGRESSION" not in out
+    assert "First run — no prior map (baseline)." in out
+
+def test_check_single_synthesis_file_emits_no_notice(fake_harness, tmp_path):
+    # F5 negative: the load-bearing NO half of the selector's own gate. Fewer than two
+    # synthesis sidecars is the ORDINARY early-life state of any fresh OUT_DIR (it fires on
+    # every single run until a second synthesis exists) -- a notice here would fire
+    # constantly and teach the reader to ignore the channel, so this stays silent by design.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_synthesis(out_dir, _days_ago(1), [("Afford", "context", "covered")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "notice:" not in out
+    assert out.strip() == "First run — no prior map (baseline)."
+
 def test_definition_version_validator_matches_render_html():
     # BEHAVIORAL two-home pin. collector._check_valid_definition_version and
     # render_html._valid_definition_version are two INDEPENDENT implementations of one
