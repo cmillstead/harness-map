@@ -23,6 +23,16 @@ _collector = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_collector)
 _rel = _collector._rel
 
+# Optional real-root acceptance fixture (TRK-049 T3). Set HARNESS_MAP_REAL_ROOT to a real
+# harness ROOT DIRECTORY (not a sidecar file) to enable the real-root acceptance test. Unlike
+# HARNESS_MAP_REAL_SAMPLE (test_render_html.py:26), unset and invalid are NOT the same outcome
+# here: unset (or empty) skips quietly, as before, but a value that IS set and does not resolve
+# to a directory FAILS loudly instead of skipping -- a typo'd path must never silently report
+# "the acceptance check ran" when the collector never executed (TRK-049 P2 fix). No absolute
+# literal here on purpose -- this repo is public (see test_no_absolute_home_literal_in_runtime_modules).
+_real_root_env = os.environ.get("HARNESS_MAP_REAL_ROOT", "")
+REAL_ROOT = Path(_real_root_env) if _real_root_env else Path("/nonexistent/harness-map-real-root")
+
 _GIT_IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                  "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 
@@ -379,6 +389,103 @@ def test_empty_document_hook_coverage_keys_zeroed(tmp_path):
         assert hooks[key] == 0
     assert doc["headline"]["hook_commands_examined"] == 0
     assert doc["headline"]["hook_commands_total"] == 0
+
+
+# TRK-049 T2: pathological input family (see conftest.py::pathological_harness for the
+# full rationale). All six tests below run against the SAME combined fixture -- one
+# settings.json registering 11 hook commands (1 crash-shape token + 8 real-shape bracket
+# compounds + 1 nested-quote command + 1 deliberately unparseable command), one
+# non-UTF8 rules file, one oversized env scalar -- so the aggregate hook-coverage math is
+# identical and deterministic across all of them (verified directly against
+# _script_from_command before these were written): commands_total=11, commands_resolved=0,
+# commands_no_script=10, commands_unparsed=1. Each test below centers its assertions on
+# the ONE row it exists to pin, per TRK-049's row table.
+
+def test_pathological_2000_char_hook_token_does_not_crash_the_document(pathological_harness):
+    # Row 1: instance 1's exact crash shape (a single shlex token whose name exceeds
+    # _MAX_SCRIPT_TOKEN_LEN), scaled to 2000 chars (past the measured live 1948-char
+    # command). Pre-TRK-025-P1, Path.is_file() on a token this long re-raises
+    # OSError(ENAMETOOLONG) uncaught, which used to escape reconcile_hooks entirely and
+    # turn the WHOLE document into an all-zero crash envelope via main()'s catch-all --
+    # so the document-level (not just hook-level) assertions below are the point. What
+    # this test actually pins is the COMBINED defense in _looks_like_existing_hook_script
+    # -- the _MAX_SCRIPT_TOKEN_LEN length guard AND the wrapping `except OSError` -- not
+    # the length guard in isolation: deleting either defense alone still returns False
+    # before any crash reaches this document, so this test stays green either way; only a
+    # full revert of BOTH (an unguarded, unwrapped is_file() call) reddens it.
+    doc = run_collector(pathological_harness)
+    assert doc["errors"] == []
+    assert doc["headline"]["always_loaded_file_count"] > 0
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == 10
+    assert hooks["commands_unparsed"] == 1
+
+
+def test_pathological_bracket_prefixed_hook_commands_classify_as_no_script(pathological_harness):
+    # Row 2: instance 2's exact live shape -- 8 `[ ... ] && ...` compounds, the real
+    # measured first-token the shipped name-allowlist fix was completely inert against
+    # (every real hook command on the live harness begins with `[`, which was never in
+    # the allowlist). All 8 must land in commands_no_script, never commands_unparsed, and
+    # none may surface as a blind spot (a "flag<N>" token would appear in an unparsed
+    # note's command[:80] slice if any of the 8 were misclassified).
+    doc = run_collector(pathological_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == 10
+    assert hooks["commands_unparsed"] == 1
+    assert not any("flag" in bs for bs in doc["blind_spots"])
+
+
+def test_pathological_nested_quoting_hook_command_tokenizes_and_classifies(pathological_harness):
+    # Row 3: deeply nested single/double quoting in the first operand, with the `&&`
+    # control operator OUTSIDE the quotes -- shlex must round-trip the nested quoting
+    # without raising, and this command genuinely IS shell-interpreted (a real shell
+    # would run it as two commands), so `no_script` is the correct classification here
+    # regardless of whether _has_shell_control_syntax matches on the raw string or on
+    # exact tokens. (The embedded-INSIDE-quotes shape -- where a raw-string scan flags
+    # `&&` that no shell would actually treat as a control operator -- is a genuine
+    # collector false positive, filed as TRK-056 and deliberately not pinned by this
+    # fixture; see conftest.py::pathological_harness.)
+    doc = run_collector(pathological_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == 10
+    assert hooks["commands_unparsed"] == 1
+    assert not any("rtk" in bs for bs in doc["blind_spots"])
+
+
+def test_pathological_unbalanced_quote_hook_command_is_the_only_unparsed_one(pathological_harness):
+    # Row 4: an unbalanced quote makes shlex.split raise ValueError -- a genuine,
+    # disclosed coverage gap. This is the ONLY command among the 11 in the fixture that
+    # is deliberately unparseable, so it must be the ONLY commands_unparsed contributor:
+    # the headline denominator (hook_commands_total) must exceed the examined count
+    # (hook_commands_examined) by exactly this one command.
+    doc = run_collector(pathological_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_total"] == 11
+    assert hooks["commands_unparsed"] == 1
+    assert any("unterminated" in bs for bs in doc["blind_spots"])
+    assert doc["headline"]["hook_commands_total"] == 11
+    assert doc["headline"]["hook_commands_examined"] == 10
+
+
+def test_pathological_non_utf8_rules_file_is_counted_not_crashed(pathological_harness):
+    # Row 5: a rules/*.md file (part of the always-loaded corpus) containing bytes that
+    # are not valid UTF-8. _read_text reads with errors="replace", so the file must be
+    # counted (not dropped, not an inaccessible/error entry) and the run must not crash.
+    doc = run_collector(pathological_harness)
+    assert doc["errors"] == []
+    paths = {f["path"] for f in doc["always_loaded"]["files"]}
+    assert "rules/nonutf8.md" in paths
+    assert not any(i["path"] == "rules/nonutf8.md" for i in doc["inaccessible"])
+
+
+def test_pathological_huge_env_value_does_not_leak_or_crash(pathological_harness):
+    # Row 6: an oversized single settings scalar (a 200,000-char env value) must not
+    # crash the run, and -- per CLAUDE.md binding rule 11 -- must never serialize: only
+    # its KEY belongs in config.env_keys, never its value.
+    doc = run_collector(pathological_harness)
+    assert doc["errors"] == []
+    assert "PATHOLOGICAL_HUGE_VALUE" in doc["config"]["env_keys"]
+    assert ("v" * 1000) not in json.dumps(doc)
 
 
 def test_permissions_counted(fake_harness):
@@ -8119,3 +8226,47 @@ def test_definition_version_validator_matches_render_html():
     assert _collector._check_valid_definition_version(True) is False
     assert _collector._check_valid_definition_version(1.0) is False
     assert _collector._check_valid_definition_version(0) is False
+
+
+# ============================================================================
+# TRK-049 T3 -- real-root acceptance test
+# ============================================================================
+# Complements the pathological_harness battery above (conftest.py:61): that corpus is
+# real failure-mode SHAPES layered onto a fixture, but both of TRK-049's actual escapes
+# were only visible against a real harness, never against fake_harness --
+#   1. a ~1500-char single shlex token made Path.is_file() re-raise ENAMETOOLONG, which
+#      escaped to main()'s catch-all and turned the WHOLE report into an all-zero crash
+#      envelope. Suite green throughout.
+#   2. the fix that followed gated hook classification on a name allowlist omitting `[`
+#      -- which is how every real hook command in this harness begins -- so on the live
+#      harness classification was completely INERT (zero classified, all real hooks
+#      still a coverage gap). Suite green throughout.
+# HARNESS_MAP_REAL_ROOT (module top, next to run_collector) points at a real harness
+# ROOT DIRECTORY -- not a sidecar. Unset (or empty) skips, the ordinary state, same shape
+# test_render_html.py's REAL_SAMPLE smoke tests use for a missing file. But a value that IS
+# set and does not resolve to a real directory -- e.g. a typo'd path -- must FAIL rather
+# than skip: a skip-shaped green run in that case would look identical to "the acceptance
+# check ran and passed" while the collector never executed at all, defeating the whole
+# point of this test (TRK-049 P2 fix).
+
+def test_real_root_acceptance_no_crash_envelope_and_hooks_classified():
+    if not _real_root_env:
+        pytest.skip("real harness root not present on this machine")
+    if not REAL_ROOT.is_dir():
+        pytest.fail(
+            f"HARNESS_MAP_REAL_ROOT={_real_root_env!r} does not resolve to a directory -- "
+            "the real-root acceptance check did NOT run"
+        )
+    doc = run_collector(REAL_ROOT, project_root=REAL_ROOT)
+
+    # Anti-crash-envelope: would have caught escape 1 above.
+    assert doc["errors"] == []
+    assert doc["headline"]["always_loaded_file_count"] > 0
+
+    # Anti-inertness: would have caught escape 2 above. This is the load-bearing
+    # assertion -- a skip-when-unset test that ALSO passes on a hookless root is
+    # indistinguishable from a test that never ran, so it must fail loudly here
+    # rather than pass empty.
+    assert doc["headline"]["hook_commands_total"] > 0
+    assert doc["headline"]["hook_commands_examined"] == doc["headline"]["hook_commands_total"]
+    assert doc["enforcement"]["hooks"]["commands_unparsed"] == 0

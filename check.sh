@@ -8,4 +8,7 @@ cd "$(dirname "$0")"
 echo "== ruff ==" && ruff check .
 echo "== mypy ==" && python3 -m mypy --config-file mypy.ini collector.py render_html.py serve.py
 echo "== pytest ==" && python3 -m pytest -q
+if [ -z "$HARNESS_MAP_REAL_ROOT" ]; then
+  echo "notice: HARNESS_MAP_REAL_ROOT is unset -- the real-input acceptance check did not run"
+fi
 echo "CHECK GREEN"
