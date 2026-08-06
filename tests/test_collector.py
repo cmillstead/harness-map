@@ -381,6 +381,100 @@ def test_empty_document_hook_coverage_keys_zeroed(tmp_path):
     assert doc["headline"]["hook_commands_total"] == 0
 
 
+# TRK-049 T2: pathological input family (see conftest.py::pathological_harness for the
+# full rationale). All six tests below run against the SAME combined fixture -- one
+# settings.json registering 11 hook commands (1 crash-shape token + 8 real-shape bracket
+# compounds + 1 nested-quote command + 1 deliberately unparseable command), one
+# non-UTF8 rules file, one oversized env scalar -- so the aggregate hook-coverage math is
+# identical and deterministic across all of them (verified directly against
+# _script_from_command before these were written): commands_total=11, commands_resolved=0,
+# commands_no_script=10, commands_unparsed=1. Each test below centers its assertions on
+# the ONE row it exists to pin, per TRK-049's row table.
+
+def test_pathological_2000_char_hook_token_does_not_crash_the_document(pathological_harness):
+    # Row 1: instance 1's exact crash shape (a single shlex token whose name exceeds
+    # _MAX_SCRIPT_TOKEN_LEN), scaled to 2000 chars (past the measured live 1948-char
+    # command). Pre-TRK-025-P1, Path.is_file() on a token this long re-raises
+    # OSError(ENAMETOOLONG) uncaught, which used to escape reconcile_hooks entirely and
+    # turn the WHOLE document into an all-zero crash envelope via main()'s catch-all --
+    # so the document-level (not just hook-level) assertions below are the point.
+    doc = run_collector(pathological_harness)
+    assert doc["errors"] == []
+    assert doc["headline"]["always_loaded_file_count"] > 0
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == 10
+    assert hooks["commands_unparsed"] == 1
+
+
+def test_pathological_bracket_prefixed_hook_commands_classify_as_no_script(pathological_harness):
+    # Row 2: instance 2's exact live shape -- 8 `[ ... ] && ...` compounds, the real
+    # measured first-token the shipped name-allowlist fix was completely inert against
+    # (every real hook command on the live harness begins with `[`, which was never in
+    # the allowlist). All 8 must land in commands_no_script, never commands_unparsed, and
+    # none may surface as a blind spot (a "flag<N>" token would appear in an unparsed
+    # note's command[:80] slice if any of the 8 were misclassified).
+    doc = run_collector(pathological_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == 10
+    assert hooks["commands_unparsed"] == 1
+    assert not any("flag" in bs for bs in doc["blind_spots"])
+
+
+def test_pathological_nested_quoting_hook_command_tokenizes_and_classifies(pathological_harness):
+    # Row 3: deeply nested single/double quoting with `&&` embedded INSIDE the quoted
+    # argument -- shlex must round-trip it without raising, and _has_shell_control_syntax
+    # must still catch the embedded `&&` (a raw-string substring scan does; matching
+    # against EXACT shlex tokens instead would not, since shlex folds the whole quoted
+    # argument -- including its embedded `&&` -- into ONE token that no longer equals the
+    # standalone "&&" member of _SHELL_CONTROL_SYNTAX). Verified load-bearing directly:
+    # switching the real function to an exact-token match reddens this assertion
+    # (this row's nested-quote command AND row 1's brace-delimited token both fold their
+    # control chars into a single non-standalone token, so both flip to "unparsed" and
+    # commands_no_script drops from 10 to 8 -- every test in this block shares the one
+    # combined fixture, so that drop is visible here too).
+    doc = run_collector(pathological_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == 10
+    assert hooks["commands_unparsed"] == 1
+    assert not any("rtk" in bs for bs in doc["blind_spots"])
+
+
+def test_pathological_unbalanced_quote_hook_command_is_the_only_unparsed_one(pathological_harness):
+    # Row 4: an unbalanced quote makes shlex.split raise ValueError -- a genuine,
+    # disclosed coverage gap. This is the ONLY command among the 11 in the fixture that
+    # is deliberately unparseable, so it must be the ONLY commands_unparsed contributor:
+    # the headline denominator (hook_commands_total) must exceed the examined count
+    # (hook_commands_examined) by exactly this one command.
+    doc = run_collector(pathological_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_total"] == 11
+    assert hooks["commands_unparsed"] == 1
+    assert any("unterminated" in bs for bs in doc["blind_spots"])
+    assert doc["headline"]["hook_commands_total"] == 11
+    assert doc["headline"]["hook_commands_examined"] == 10
+
+
+def test_pathological_non_utf8_rules_file_is_counted_not_crashed(pathological_harness):
+    # Row 5: a rules/*.md file (part of the always-loaded corpus) containing bytes that
+    # are not valid UTF-8. _read_text reads with errors="replace", so the file must be
+    # counted (not dropped, not an inaccessible/error entry) and the run must not crash.
+    doc = run_collector(pathological_harness)
+    assert doc["errors"] == []
+    paths = {f["path"] for f in doc["always_loaded"]["files"]}
+    assert "rules/nonutf8.md" in paths
+    assert not any(i["path"] == "rules/nonutf8.md" for i in doc["inaccessible"])
+
+
+def test_pathological_huge_env_value_does_not_leak_or_crash(pathological_harness):
+    # Row 6: an oversized single settings scalar (a 200,000-char env value) must not
+    # crash the run, and -- per CLAUDE.md binding rule 11 -- must never serialize: only
+    # its KEY belongs in config.env_keys, never its value.
+    doc = run_collector(pathological_harness)
+    assert doc["errors"] == []
+    assert "PATHOLOGICAL_HUGE_VALUE" in doc["config"]["env_keys"]
+    assert ("v" * 1000) not in json.dumps(doc)
+
+
 def test_permissions_counted(fake_harness):
     _build_hooks_harness(fake_harness)
     doc = run_collector(fake_harness)
