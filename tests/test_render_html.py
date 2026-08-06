@@ -9671,3 +9671,136 @@ def test_both_trend_tables_render_inside_one_card(tmp_path):
     assert len(_TREND_ROW_RE.findall(card.group(0))) == _RENDERED_TREND_ROWS
     assert card.group(0).count('class="sparkline sparkline-derived"') == \
         len(rh.DERIVED_TREND_KEYS)
+
+
+# ============================= S6c Task 8 (A52, deliverable 22): disclose the refusal
+# A52 measured the LIVE corpus on 2026-08-06: every series was `not comparable`, for two
+# independent causes -- no sidecar carries `metric_definitions` matching a legacy digest,
+# and none carries `collection_scope` at all. That is the CORRECT verdict. The risk is
+# not the refusal -- it is a page of fourteen identical `not comparable` cells with
+# nothing explaining them, which reads as a broken feature and invites a later "fix"
+# that weakens the refusal into a guess. Task 7 already renders the per-row reason (the
+# built axis string rides inside `trend_verdict`'s `not comparable` text); this section
+# pins that as a CONTRACT with its own extractors and adds the one thing that was
+# missing: a section-level sentence disclosing the blackout, present only while it lasts.
+
+def _all_rendered_metric_labels(text):
+    """One label per rendered trend row, across BOTH tables, in document order -- the
+    same row set `_trend_rows` walks."""
+    return [row.split("<td>", 1)[1].split("</td>", 1)[0] for row in _trend_rows(text)]
+
+
+def _value_cell(text, label):
+    """The per-date VALUE columns of one trend row -- everything after the Direction
+    cell, concatenated. Never the verdict text: suppression is direction-only, and this
+    is the half of the row that must survive every refusal."""
+    row = _trend_row(text, label)
+    match = _VERDICT_CELL_RE.search(row)
+    assert match is not None, row
+    return row[match.end():row.rindex("</tr>")]
+
+
+# The boundary between the built axis reason and `trend_verdict`'s own `N pts · Md`
+# companion -- the SAME " · " separator `trend_verdict` joins them with, so this reads
+# the format rather than re-deciding it.
+_REFUSAL_DETAIL_RE = re.compile(r"not comparable — (.*?) · \d+ pts", re.S)
+
+
+def _reason_cell(text, label):
+    """The factual axis reason for one row, or `""` when the row does not refuse.
+    Extracts the SAME string `series_comparability` already built and `trend_verdict`
+    already rendered -- no second reason vocabulary."""
+    word, cell = _verdict_of(_trend_row(text, label))
+    if word != "not comparable":
+        return ""
+    match = _REFUSAL_DETAIL_RE.search(cell)
+    assert match is not None, cell
+    return match.group(1)
+
+
+def _all_reason_cells(text):
+    """One reason string per rendered row (possibly `""`), in document order -- the same
+    row set `_all_rendered_metric_labels` walks."""
+    return [_reason_cell(text, label) for label in _all_rendered_metric_labels(text)]
+
+
+def test_every_refusing_row_states_its_reason(tmp_path):
+    """A52. A `not comparable` with no stated reason reads as a broken feature. Every
+    refusing row carries a factual one-liner naming the dates, the versions or scopes
+    observed, and WHICH AXIS refused."""
+    scope_docs = _dated_trend_docs([dict(memory_bodies=n) for n in (5, 9, 12)])
+    scope_docs[2][1]["collection_scope"] = {"root": "/other/root", "project_root": None,
+                                            "compose": False}
+    scope_text = _render_corpus(tmp_path, "reasondiscscope", scope_docs)
+    labels = _all_rendered_metric_labels(scope_text)
+    assert len(labels) == _RENDERED_TREND_ROWS, "metric-label extraction missing or incomplete"
+    # scope is a property of the RUN, not the metric -- the refusal poisons every row
+    reasons = {label: _reason_cell(scope_text, label) for label in labels}
+    assert all(reasons.values()), reasons
+    assert all("collection scope" in reason for reason in reasons.values())
+    assert all("root=/other/root" in reason for reason in reasons.values())
+
+    quality_docs = _dated_trend_docs([dict(memory_bodies=n) for n in (5, 9, 12)])
+    quality_docs[1][1]["metric_quality"]["memory_body_count"] = "partial"
+    quality_text = _render_corpus(tmp_path, "reasondiscquality", quality_docs)
+    memory_reason = _reason_cell(quality_text, "Memory bodies")
+    sibling_reason = _reason_cell(quality_text, "Phantom refs (total)")
+    assert memory_reason != "" and "quality partial" in memory_reason
+    # ...and ONLY that metric: quality is recorded per (run, metric), not per run
+    assert sibling_reason == ""
+
+
+def test_the_full_blackout_corpus_shape_renders_values_and_reasons(tmp_path):
+    """THE LIVE CORPUS SHAPE, pinned as contract rather than left as an accident.
+    Fixture mirrors A52's measurement: markerless sidecars whose digests match no
+    legacy entry. Every metric refuses a direction -- AND every metric still shows its
+    value, its series and its point count, each beside a reason."""
+    docs = _dated_trend_docs([
+        dict(scope_root=_NO_MARKERS, definitions=_NO_MARKERS, memory_bodies=n)
+        for n in (5, 9, 12)])
+    text = _render_corpus(tmp_path, "blackoutshape", docs)
+    labels = _all_rendered_metric_labels(text)
+    assert len(labels) == _RENDERED_TREND_ROWS, "metric-label extraction missing or incomplete"
+    for label in labels:
+        word = _verdict_of(_trend_row(text, label))[0]
+        assert word == "not comparable", (label, word)
+        assert _value_cell(text, label) != ""      # the VALUE always survives
+        assert _reason_cell(text, label) != ""     # and never refuses silently
+
+
+def test_reason_strings_carry_no_verdict_word(tmp_path):
+    """Binding rule 6, and the shipped precedent is `_CONFOUND_REASON_FORBIDDEN` --
+    reuse that tuple rather than writing a second list."""
+    docs = _dated_trend_docs([
+        dict(scope_root=_NO_MARKERS, definitions=_NO_MARKERS, memory_bodies=n)
+        for n in (5, 9, 12)])
+    text = _render_corpus(tmp_path, "reasonnoverdict", docs)
+    reasons = _all_reason_cells(text)
+    assert len(reasons) == _RENDERED_TREND_ROWS, "reason extraction missing or incomplete"
+    assert all(reasons), "every row in this corpus refuses -- an empty reason is a miss"
+    for reason in reasons:
+        assert not any(w in reason.lower() for w in rh._CONFOUND_REASON_FORBIDDEN)
+
+
+def test_section_level_disclosure_appears_exactly_once(tmp_path):
+    """One section-level sentence explaining the blackout, not one per row -- N
+    identical sentences is noise that trains the operator to skip the column. The
+    per-row reasons carry the specifics."""
+    docs = _dated_trend_docs([
+        dict(scope_root=_NO_MARKERS, definitions=_NO_MARKERS, memory_bodies=n)
+        for n in (5, 9, 12)])
+    text = _render_corpus(tmp_path, "blackoutonce", docs)
+    assert text.count(rh.TREND_COMPARABILITY_BLACKOUT_NOTE) == 1
+
+
+def test_disclosure_is_absent_once_the_corpus_is_comparable(tmp_path):
+    """The blackout is a STATE, not a permanent banner. Two adjacent sidecars carrying
+    both markers get a verdict and no blackout disclosure -- which is what every run
+    from this stage forward produces. Without this test the disclosure becomes
+    unconditional chrome nobody notices is stale."""
+    text = _render_corpus(tmp_path, "blackoutlifted", _moving_corpus())
+    assert rh.TREND_COMPARABILITY_BLACKOUT_NOTE not in text
+    # anti-vacuity: the comparable corpus really does verdict every row, not just
+    # happen to omit the note for an unrelated reason (e.g. an empty card)
+    for label in _all_rendered_metric_labels(text):
+        assert _verdict_of(_trend_row(text, label))[0] != "not comparable", label

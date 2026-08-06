@@ -5327,6 +5327,37 @@ def _render_trend_table(model: Any, provenance: Any, trend_basis: Any, *,
             f'<th>Direction</th>{header}</tr>{"".join(rows)}</table></div>')
 
 
+# ------------------------------------------ S6c Task 8 (A52, deliverable 22): disclose
+# the refusal. Per-row reasons already ride inside `trend_verdict`'s `not comparable`
+# text (Task 7 wired that; this section adds nothing to it). What A52 found missing is
+# SECTION-level: the live corpus measured 2026-08-06 has EVERY series `not comparable`
+# (no sidecar carries `collection_scope`; none carries `metric_definitions` matching a
+# legacy digest), and a page of identical refusals with no explanation reads as a broken
+# feature -- inviting a later "fix" that weakens the refusal into a guess. This ONE
+# sentence is the disclosure: rendered once per card (N identical sentences trains the
+# operator to skip the column, the per-row reasons already carry the specifics), and
+# ABSENT the moment even one row carries a direction, because the blackout is a STATE the
+# corpus grows out of on its own, not permanent chrome.
+TREND_COMPARABILITY_BLACKOUT_NOTE = (
+    "Every row below refuses a direction: the measured history predates the "
+    "comparability markers (collection scope, definition version) this table checks. "
+    "Verdicts resume once two adjacent runs both carry them."
+)
+
+
+def _series_not_comparable(series: dict[str, Any], owner: Any, provenance: Any,
+                           trend_basis: Any) -> bool:
+    """True iff one series' verdict is `not comparable` -- the single word this
+    disclosure describes. `not measured` and `no direction` are different, already
+    self-explanatory refusals and are not this note's subject.
+
+    `owner` is the model THIS series belongs to (raw or derived) -- `_trend_row_state`
+    needs it to find the series' own points for `_trend_latest_direction`, the same
+    pairing `_render_trend_table` already keeps by construction."""
+    verdict, _, _ = _trend_row_state(series, owner, provenance, trend_basis)
+    return verdict.word == "not comparable"
+
+
 def _render_trend_body(model, derived_model=None, provenance=None, trend_basis=None):
     """The Trend card: the legacy 8-headline table and the 6-metric derived table, in ONE
     `<div class="card">`.
@@ -5343,7 +5374,15 @@ def _render_trend_body(model, derived_model=None, provenance=None, trend_basis=N
     if model["first_run"]:
         body = '<p class="empty-state">first run — no baseline</p>'
     else:
-        body = _render_trend_table(model, provenance, trend_basis, derived=False)
+        series_owners = [(series, model) for series in (model.get("series") or [])]
+        if isinstance(derived_model, dict) and not derived_model.get("first_run"):
+            series_owners += [(series, derived_model)
+                              for series in (derived_model.get("series") or [])]
+        blackout = any(_series_not_comparable(series, owner, provenance, trend_basis)
+                       for series, owner in series_owners)
+        note = (f'<p class="digest" id="trend-comparability-note">'
+               f'{esc_html(TREND_COMPARABILITY_BLACKOUT_NOTE)}</p>' if blackout else '')
+        body = note + _render_trend_table(model, provenance, trend_basis, derived=False)
         if isinstance(derived_model, dict) and not derived_model.get("first_run"):
             body += ('<h3 class="trend-subhead">Derived metrics</h3>'
                      + _render_trend_table(derived_model, provenance, trend_basis,
