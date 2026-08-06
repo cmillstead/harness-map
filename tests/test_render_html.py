@@ -7925,6 +7925,53 @@ _TOTALITY_TARGETS = (
     (rh._trend_point_value, lambda v: (v,)),
     (rh.trend_verdict, lambda v: ([v, v, v], [v, v, v], v, v, v)),
     (rh.trend_verdict, lambda v: (v, v, "up", "good", rh.COMPARABLE)),
+    # S6c Task 4: the three-axis comparability engine. `collection_scope`,
+    # `metric_quality` and a ratio's `total` are all sidecar leaves read straight out of
+    # parsed JSON -- exactly this guard's subject, and each one reaches an operation the
+    # block comment above names: `dict.get` on a possibly-unhashable metric key, a
+    # whole-dict `==` scan, and a `sorted(..., key=...)` over mixed-typed rows. Every
+    # axis gets the hostile value BOTH as a leaf inside a well-shaped list (the
+    # comparison position) AND as the whole argument (the window-slice position), the
+    # same two jobs Task 3's entries split.
+    (rh.metric_quality_state,
+     lambda v: ({"metric_quality": {"memory_body_count": v}}, "memory_body_count")),
+    (rh.metric_quality_state, lambda v: ({"metric_quality": v}, "memory_body_count")),
+    # the METRIC position: an unhashable key would raise inside `dict.get` itself
+    (rh.metric_quality_state,
+     lambda v: ({"metric_quality": {"memory_body_count": "complete"}}, v)),
+    (rh.metric_quality_state, lambda v: (v, "memory_body_count")),
+    (rh._scope_readable, lambda v: (v,)),
+    (rh.scope_comparable,
+     lambda v: ([v, {"root": "/r", "project_root": None, "compose": False}],)),
+    (rh.scope_comparable, lambda v: (v,)),
+    # the hostile value as each scope FIELD, which is where the type guards live
+    (rh.scope_comparable,
+     lambda v: ([{"root": v, "project_root": v, "compose": v},
+                 {"root": "/r", "project_root": None, "compose": False}],)),
+    (rh._scope_display, lambda v: (v,)),
+    # A second, DIFFERENTLY-TYPED row forces the sort key to actually COMPARE, the same
+    # reason `build_confounded_reason`'s entry above carries a second tuple.
+    (rh.build_scope_reason,
+     lambda v: ([(v, v),
+                 ("2026-01-02", {"root": "/r", "project_root": None, "compose": False})],)),
+    (rh.build_scope_reason, lambda v: (v,)),
+    (rh.quality_comparable, lambda v: ([v, "complete"],)),
+    (rh.quality_comparable, lambda v: (v,)),
+    (rh.build_quality_reason, lambda v: (v, [(v, v), ("2026-01-02", "complete")])),
+    (rh.build_quality_reason, lambda v: ("memory_body_count", v)),
+    (rh._trend_point_denominator, lambda v: (v,)),
+    (rh._trend_point_denominator, lambda v: ({"total": v},)),
+    (rh._observed_denominators, lambda v: ([v, v, 20],)),
+    (rh._observed_denominators, lambda v: (v,)),
+    (rh.denominators_comparable, lambda v: ([v, 20],)),
+    (rh.denominators_comparable, lambda v: (v,)),
+    (rh.build_denominator_reason, lambda v: (v, [(v, v), ("2026-01-02", 20)])),
+    (rh.build_denominator_reason, lambda v: ("hooks_with_test_ratio", v)),
+    (rh._dated_axis, lambda v: (v, v)),
+    (rh._dated_axis, lambda v: ([v], [v])),
+    (rh.series_comparability, lambda v: (v, v, v, v, v, v)),
+    (rh.series_comparability,
+     lambda v: ("memory_body_count", ["2026-01-01"], [v], [v], [v], [v])),
 )
 
 
@@ -8303,3 +8350,456 @@ def test_trend_doc_derived_values_actually_vary_across_a_window():
     verdict = rh.trend_verdict(points=bodies["points"], dates=model["dates"], polarity="up")
     assert verdict.word == "worsening"
     assert "3 pts · 2d" in verdict.reason
+
+
+# ============================== S6c Task 4: the three-axis comparability engine (§6.5a)
+# EVERY assertion below calls a comparability function DIRECTLY. Nothing here renders --
+# Task 7 owns the rendered half, exactly as the shipped S6b precedent
+# (`test_marker_first_appearance_is_not_a_transition`,
+# `test_no_value_shape_heuristic_is_possible_by_signature`) calls its functions with no
+# render in the loop.
+#
+# ONE DEVIATION from the task brief, measured against live source rather than assumed.
+# The brief's `test_markerless_but_audited_...` sketch asserts `"scope" in
+# verdict.reason.lower()`. The SHIPPED `trend_verdict` (Task 3, commit 1ec0d2c) splits
+# the two fields deliberately: `.reason` is always the `N pts · Md` companion pair, and
+# the comparability detail rides in `.text`
+# (`f"not comparable — {detail} · {reason}"`). `trend_verdict` is frozen and the branch
+# holds zero deletions, so the axis assertions below target `.text` -- the field that
+# actually carries the detail -- plus the `series_comparability` record itself. The
+# INTENT (a refusal names WHICH axis refused, and a broken digest lookup cannot hide
+# behind a same-word-different-cause row) is asserted in full.
+_SCOPE_MAIN = {"root": "/fake/root", "project_root": None, "compose": False}
+_SCOPE_COMPOSED = {"root": "/fake/root", "project_root": "/fake/project", "compose": True}
+# A markerless historical sidecar carries NO `collection_scope` key, so the renderer's
+# extraction yields None. A52 rejected a legacy scope table, so None stays UNKNOWN.
+_SCOPE_ABSENT = None
+
+
+def _comparable_window(metric, dates, versions=None, scopes=None, quality=None,
+                       denominators=None):
+    """`series_comparability` over a window that is comparable on all four axes unless
+    the caller opts one out -- the same "refusals are explicit" contract `_trend_doc`
+    established in Task 3. Returns the comparability record (`rh.COMPARABLE` or a
+    factual reason)."""
+    count = len(dates)
+    return rh.series_comparability(
+        metric, dates,
+        [_SCOPE_MAIN] * count if scopes is None else scopes,
+        [rh.QUALITY_COMPLETE] * count if quality is None else quality,
+        [None] * count if denominators is None else denominators,
+        [1] * count if versions is None else versions)
+
+
+def test_scope_transition_compose_to_non_compose_is_not_comparable():
+    """§6.5a axis 2. `compose` is a FIELD of the run's identity: the composed run walks
+    a project tier the non-composed run never reads, so the two numbers are not the same
+    measurement even when the root matches."""
+    scopes = [_SCOPE_COMPOSED, _SCOPE_COMPOSED, _SCOPE_MAIN]
+    assert rh.scope_comparable(scopes) is False
+    # anti-vacuity: the same window WITHOUT the transition is comparable, so the refusal
+    # above is caused by the transition and not by the fixture's shape
+    assert rh.scope_comparable(scopes[:2]) is True
+    reason = rh.build_scope_reason(list(zip(_dates_for(scopes), scopes)))
+    assert "compose=true" in reason and "compose=false" in reason
+
+
+def test_differing_project_root_under_one_root_is_not_comparable():
+    """One operator root, two different project roots -- the composed corpus differs, so
+    the points are not comparable. The second half pins the collector's own rule: a null
+    `project_root` is a DISTINCT scope, never 'same as whatever ran last'."""
+    two_projects = [{"root": "/fake/root", "project_root": "/fake/one", "compose": True},
+                    {"root": "/fake/root", "project_root": "/fake/two", "compose": True}]
+    assert rh.scope_comparable(two_projects) is False
+    null_versus_set = [{"root": "/fake/root", "project_root": None, "compose": True},
+                       {"root": "/fake/root", "project_root": "/fake/one", "compose": True}]
+    assert rh.scope_comparable(null_versus_set) is False
+    # anti-vacuity: identical project roots ARE comparable
+    assert rh.scope_comparable([two_projects[0], dict(two_projects[0])]) is True
+
+
+def test_markerless_scope_is_unknown_and_not_comparable():
+    """UNKNOWN adjacent to ANYTHING -- including another UNKNOWN -- is not comparable.
+    Do NOT default a missing scope to 'same as current'; that assumption is the whole
+    finding (§6.5a). Same fail-toward-doubt direction as §8.1's markerless rule."""
+    assert rh.scope_comparable([_SCOPE_ABSENT, _SCOPE_ABSENT]) is False
+    assert rh.scope_comparable([_SCOPE_ABSENT, _SCOPE_MAIN]) is False
+    assert rh.scope_comparable([_SCOPE_MAIN, _SCOPE_ABSENT]) is False
+    assert rh.scope_comparable([_SCOPE_ABSENT]) is False
+    # anti-vacuity: two readable, identical scopes ARE comparable
+    assert rh.scope_comparable([_SCOPE_MAIN, dict(_SCOPE_MAIN)]) is True
+    # and a markerless point states its own fact in the reason, never a blank
+    reason = rh.build_scope_reason([("2026-07-13", _SCOPE_ABSENT),
+                                    ("2026-07-14", _SCOPE_MAIN)])
+    assert "2026-07-13: scope unknown" in reason
+
+
+def test_malformed_collection_scope_is_unknown_never_raises():
+    """Failure-modes row. A hand-crafted or corrupt sidecar can put anything here. A
+    non-dict scope, or a dict whose fields are non-string, degrades to UNKNOWN -- the
+    same degrade-don't-raise posture `series_confounded`'s T5.1 totality fix already
+    established for unhashable version elements."""
+    malformed = ([], "x", 0, None, {"root": 1, "project_root": [], "compose": "yes"},
+                 {"root": "/fake/root"},                                   # fields missing
+                 {"root": "/fake/root", "project_root": None, "compose": 1})  # 1 is not a bool
+    for bad in malformed:
+        assert rh.scope_comparable([bad, _SCOPE_MAIN]) is False, bad
+        assert rh.scope_comparable([_SCOPE_MAIN, bad]) is False, bad
+        # the reason builder degrades the same way rather than raising
+        assert "scope unknown" in rh.build_scope_reason([("2026-07-13", bad),
+                                                         ("2026-07-14", _SCOPE_MAIN)]), bad
+
+
+def test_absent_metric_quality_is_treated_as_unmeasured_never_complete():
+    """Failure-modes row, and it fires on EVERY legacy sidecar -- A52 measured all 7
+    live sidecars and none carries `metric_quality`. Absent is not a measurement:
+    reading it as `complete` would let every pre-S6c point claim a quality it never
+    reported. Direction suppressed, value shown."""
+    legacy = _minimal_doc()
+    assert "metric_quality" not in legacy          # the live legacy shape, asserted
+    state = rh.metric_quality_state(legacy, "memory_body_count")
+    assert state == rh.QUALITY_UNMEASURED
+    assert state != rh.QUALITY_COMPLETE
+    assert rh.quality_comparable([state, state, state]) is False
+    # a non-dict `metric_quality`, and a metric absent from a present dict, take the
+    # same path -- absent is absent however it got that way
+    assert rh.metric_quality_state({"metric_quality": "x"}, "memory_body_count") == \
+        rh.QUALITY_UNMEASURED
+    assert rh.metric_quality_state({"metric_quality": {}}, "memory_body_count") == \
+        rh.QUALITY_UNMEASURED
+    # anti-vacuity: Task 1's collector output DOES report complete
+    assert rh.metric_quality_state(_trend_doc(), "memory_body_count") == rh.QUALITY_COMPLETE
+    # direction suppressed, VALUE SHOWN: the verdict refuses while the measured points
+    # and their span still render
+    points = [92, 96, 98]
+    dates = _dates_for(points)
+    comparability = _comparable_window("memory_body_count", dates, quality=[state] * 3)
+    verdict = rh.trend_verdict(points=points, dates=dates, polarity="up",
+                               comparability=comparability)
+    assert verdict.word == "not comparable"
+    assert "quality unmeasured" in verdict.text
+    assert verdict.reason == "3 pts · 2d"
+
+
+def test_partial_quality_suppresses_direction_but_keeps_the_value():
+    """Suppression is DIRECTION-ONLY. The value survives and the reason is produced --
+    'add doubt, never remove it'."""
+    states = [rh.QUALITY_COMPLETE, "partial", rh.QUALITY_COMPLETE]
+    assert rh.quality_comparable(states) is False
+    assert rh.quality_comparable([rh.QUALITY_COMPLETE] * 3) is True   # anti-vacuity
+    points = [7685, 7961, 7944]
+    dates = _dates_for(points)
+    comparability = _comparable_window("always_loaded_words", dates, quality=states)
+    assert comparability != rh.COMPARABLE
+    assert "quality partial" in comparability
+    assert "2026-07-02" in comparability          # the reason names WHEN
+    verdict = rh.trend_verdict(points=points, dates=dates, polarity="up",
+                               comparability=comparability)
+    assert verdict.word == "not comparable"
+    # the value half survives: point count and span still stated, no direction word
+    assert verdict.reason == "3 pts · 2d"
+    for direction in ("improving", "worsening", "unchanged"):
+        assert direction not in verdict.text, direction
+
+
+def test_saturated_quality_suppresses_direction():
+    """`saturated` is a STRUCTURAL ceiling (`duplicate_pair_count` pinned at MAX_PAIRS),
+    not an accessibility caveat -- but it suppresses direction by the same rule, because
+    a capped series that stops moving is not a series that stopped changing."""
+    states = [rh.QUALITY_COMPLETE, "saturated", "saturated"]
+    assert rh.quality_comparable(states) is False
+    points = [40, 50, 50]
+    dates = _dates_for(points)
+    comparability = _comparable_window("duplicate_pair_count", dates, quality=states)
+    assert "quality saturated" in comparability
+    verdict = rh.trend_verdict(points=points, dates=dates, polarity="up",
+                               comparability=comparability)
+    assert verdict.word == "not comparable"
+    # specifically NOT `unchanged across N` / `net unchanged`, the words a pinned-at-cap
+    # series would otherwise earn
+    assert "unchanged" not in verdict.text
+
+
+def test_denominator_change_anywhere_in_the_window_forces_confounded():
+    """The fixture is 21 -> 20 -> 21, NOT an endpoint-only change. A fixture that moves
+    only first vs last passes under the retired first/last rule and therefore proves
+    nothing about the all-pairs rule that replaced it.
+    # Changing this rule requires a spec change (S6 §6.5 / finding #9 sub-fix 5)."""
+    window = [{"value": 16, "total": 21, "ratio": 16 / 21},
+              {"value": 16, "total": 20, "ratio": 16 / 20},
+              {"value": 17, "total": 21, "ratio": 17 / 21}]
+    denominators = [rh._trend_point_denominator(point) for point in window]
+    assert denominators == [21, 20, 21]
+    # the load-bearing property of the fixture: the ENDPOINTS agree, so a first-vs-last
+    # check would return comparable and this test would prove nothing
+    assert denominators[0] == denominators[-1]
+    assert rh.denominators_comparable(denominators) is False
+    # anti-vacuity: one stable denominator IS comparable, and a bare-number series
+    # (no denominator at all) never refuses on this axis
+    assert rh.denominators_comparable([21, 21, 21]) is True
+    assert rh.denominators_comparable([None, None, None]) is True
+    dates = _dates_for(window)
+    comparability = _comparable_window("hooks_with_test_ratio", dates,
+                                       denominators=denominators)
+    reason = comparability
+    assert "21" in reason and "20" in reason   # the reason names the OBSERVED set
+    assert "denominators observed: 20, 21" in reason
+    verdict = rh.trend_verdict(points=window, dates=dates, polarity="down",
+                               comparability=comparability)
+    assert verdict.word == "not comparable"
+
+
+def test_definition_change_mid_series_is_flagged_and_yields_no_direction_word():
+    """A verdict beside the flag IS the failure. `confounded` pre-empts the direction
+    words rather than sitting next to one."""
+    points = [92, 96, 98]
+    dates = _dates_for(points)
+    versions = [1, 2, 2]
+    assert rh.series_confounded(versions) is True
+    comparability = _comparable_window("memory_body_count", dates, versions=versions)
+    assert "definition v1" in comparability and "definition v2" in comparability
+    verdict = rh.trend_verdict(points=points, dates=dates, polarity="up",
+                               latest_direction="bad", comparability=comparability)
+    assert verdict.word == "not comparable"
+    for direction in ("improving", "worsening", "unchanged", "no direction"):
+        assert direction not in verdict.text, direction
+    # anti-vacuity: the SAME points under one stable version do earn a direction word
+    stable = _comparable_window("memory_body_count", dates, versions=[1, 1, 1])
+    assert stable == rh.COMPARABLE
+    assert rh.trend_verdict(points=points, dates=dates, polarity="up",
+                            comparability=stable).word == "worsening"
+
+
+def test_markerless_but_audited_sidecar_resolves_its_version_but_scope_still_refuses():
+    """SUPERSEDES design §9.5 item 2, which said "verdict still given". That was written
+    when the definition axis was the ONLY axis; A52 added scope, and a sidecar markerless
+    for `metric_definitions` is markerless for `collection_scope` too -- both fields are
+    absent from the same historical artifacts. So the scope axis refuses this point
+    INDEPENDENTLY, and the original claim asserts an outcome that cannot occur.
+
+    What survives, and is still worth testing, is the ORIGINAL PURPOSE: the digest lookup
+    resolves the version, so the DEFINITION axis does not falsely flag it.
+
+    The third assertion is the load-bearing one. Both axes produce `not comparable`, so
+    without it a regression that BROKE the digest lookup would be invisible here -- the
+    row would still read `not comparable`, for the other reason.
+
+    Pairs with the shipped `test_marker_first_appearance_is_not_a_transition`, which
+    proves the same digest-resolution property for the definition axis alone."""
+    legacy_raws = [b'{"n": 1}', b'{"n": 2}', b'{"n": 3}']
+    legacy = {hashlib.sha256(raw).hexdigest(): {"memory_body_count": 1}
+              for raw in legacy_raws}
+    audited_window = [({}, raw) for raw in legacy_raws]
+    versions = [rh.resolve_metric_definition_version(doc, raw, "memory_body_count", legacy)
+                for doc, raw in audited_window]
+    assert None not in versions                      # the digest path RESOLVED
+    assert rh.series_confounded(versions) is False   # definition axis does NOT flag
+    # the SAME markerless artifacts carry no collection_scope either
+    scopes = [doc.get("collection_scope") for doc, _ in audited_window]
+    assert scopes == [_SCOPE_ABSENT] * 3
+    points = [92, 96, 98]
+    dates = _dates_for(points)
+    comparability = _comparable_window("memory_body_count", dates, versions=versions,
+                                       scopes=scopes)
+    verdict = rh.trend_verdict(points=points, dates=dates, polarity="up",
+                               comparability=comparability)
+    assert verdict.word == "not comparable"          # ...but scope refuses anyway
+    detail = verdict.text.lower()
+    assert "scope" in detail                         # and the reason names WHICH axis
+    assert "definition" not in detail
+    assert "scope" in comparability.lower() and "definition" not in comparability.lower()
+
+
+def test_markerless_and_unaudited_sidecar_is_not_comparable():
+    """A digest matching none of the frozen entries resolves UNKNOWN. An unrecognised
+    markerless artifact must never receive an INFERRED version. THIS IS THE LIVE CORPUS
+    SHAPE (A52): the 08-01 and 08-02 sidecars match no legacy digest and carry no
+    marker, so this is the path every real render takes today."""
+    legacy = {hashlib.sha256(b'{"n": 1}').hexdigest(): {"memory_body_count": 1}}
+    audited = rh.resolve_metric_definition_version({}, b'{"n": 1}', "memory_body_count",
+                                                    legacy)
+    unaudited = rh.resolve_metric_definition_version({}, b'{"n": 99}', "memory_body_count",
+                                                      legacy)
+    assert audited == 1                # anti-vacuity: the table itself works
+    assert unaudited is None           # ...and an unrecognised artifact stays UNKNOWN
+    assert rh.series_confounded([1, 1, unaudited]) is True
+    points = [92, 96, 98]
+    dates = _dates_for(points)
+    # scope carried (so the definition axis is the one under test), version unknown
+    comparability = _comparable_window("memory_body_count", dates,
+                                       versions=[1, 1, unaudited])
+    assert comparability != rh.COMPARABLE
+    assert "definition unknown" in comparability
+    assert rh.trend_verdict(points=points, dates=dates, polarity="up",
+                            comparability=comparability).word == "not comparable"
+
+
+def test_unaudited_markerless_window_yields_not_comparable_WITH_ITS_REASON():
+    """A52, and the blackout is CONTRACT now, not an accident. A window holding an
+    unaudited markerless sidecar must produce `not comparable` AND a factual reason
+    naming the dates and the axis. A refusal with no reason reads as a broken feature,
+    which is how a correct refusal gets 'fixed' by weakening it a milestone later.
+    Task 8 asserts the reason RENDERS; this pins that one is produced."""
+    # the live corpus shape: no `metric_definitions`, no `collection_scope`, no
+    # `metric_quality`, and a digest matching no frozen entry
+    markerless = _trend_doc(scope_root=_NO_MARKERS, definitions=_NO_MARKERS)
+    markerless.pop("metric_quality")
+    dates = ["2026-08-01", "2026-08-02", "2026-08-03"]
+    scopes = [markerless.get("collection_scope")] * 3
+    versions = [rh.resolve_metric_definition_version(
+        markerless, json.dumps(markerless).encode(), "memory_body_count",
+        rh.LEGACY_METRIC_DEFINITIONS)] * 3
+    quality = [rh.metric_quality_state(markerless, "memory_body_count")] * 3
+    assert scopes == [None] * 3 and versions == [None] * 3
+    assert quality == [rh.QUALITY_UNMEASURED] * 3
+    comparability = rh.series_comparability("memory_body_count", dates, scopes, quality,
+                                            [None] * 3, versions)
+    assert comparability != rh.COMPARABLE
+    assert comparability.strip() != ""
+    for date in dates:
+        assert date in comparability, date            # the reason names the DATES
+    assert "scope" in comparability.lower()           # ...and the AXIS
+    verdict = rh.trend_verdict(points=[92, 96, 98], dates=dates, polarity="up",
+                               comparability=comparability)
+    assert verdict.word == "not comparable"
+    assert comparability in verdict.text              # available to render (Task 8)
+
+
+def test_scope_axis_has_NO_first_appearance_exemption():
+    """The SECOND instance of the CODEX-1 contradiction class, found by this plan's own
+    sweep. An earlier draft of this test extended the shipped
+    `test_marker_first_appearance_is_not_a_transition`'s `absent -> N is not a
+    transition` rule from the definition axis to the scope axis. THAT RULE CANNOT HOLD
+    FOR SCOPE, and the difference is A52's doing:
+
+      - DEFINITION axis: a markerless sidecar resolves through the frozen legacy DIGEST
+        table to a real version, so `series_confounded` never sees None and the
+        introduction step genuinely is not a transition.
+      - SCOPE axis: A52 REJECTED a legacy scope table (it would have to invent
+        `project_root`), so there is NOTHING to resolve a markerless scope through. It
+        is UNKNOWN, and UNKNOWN adjacent to anything is `not comparable` (§6.5a).
+
+    So an `absent -> present` scope step IS a refusal, and asserting otherwise would
+    have required defaulting a missing scope to "same as current" -- the single
+    assumption §6.5a exists to forbid.
+
+    THIS IS WHY THE BLACKOUT EXISTS, and why it lifts only when two ADJACENT points both
+    carry scope, never on the first run that ships the field."""
+    assert rh.scope_comparable([_SCOPE_ABSENT, {"root": "/r", "project_root": None,
+                                                "compose": False}]) is False
+    # the definition axis' exemption is UNTOUCHED by this rule -- the two axes differ
+    assert rh.series_confounded([1, 1]) is False
+    # and the blackout lifts on TWO ADJACENT carriers, with no code change
+    carried = {"root": "/r", "project_root": None, "compose": False}
+    assert rh.scope_comparable([carried, dict(carried)]) is True
+    assert rh.scope_comparable([_SCOPE_ABSENT, carried, dict(carried)]) is False
+
+
+def test_real_drift_under_stable_markers_is_worsening_never_confounded():
+    """THE NEGATIVE TEST -- do not drop it for time. memory_body_count 92/96/98/117
+    under versions 1,1,1,1 AND one identical scope must read `worsening`. If a
+    jump-magnitude heuristic ever creeps in, it eats this series: the ONE real finding
+    in the operator's data becomes a false negative (§8.4).
+
+    Driven through the real builder, not a hand-typed point list, so a regression in
+    `build_derived_trend_model` cannot hide behind a synthetic window."""
+    counts = (92, 96, 98, 117)
+    dated_docs = [(_DAILY_DATES[i], _trend_doc(memory_bodies=n))
+                  for i, n in enumerate(counts)]
+    model = rh.build_derived_trend_model(dated_docs)
+    bodies = next(s for s in model["series"] if s["key"] == "memory_body_count")
+    assert bodies["points"] == list(counts)
+    assert counts[-1] - counts[-2] > counts[1] - counts[0]   # the big jump is present
+    scopes = [doc["collection_scope"] for _, doc in dated_docs]
+    quality = [rh.metric_quality_state(doc, "memory_body_count") for _, doc in dated_docs]
+    versions = [doc["metric_definitions"]["memory_body_count"] for _, doc in dated_docs]
+    assert rh.series_confounded(versions) is False
+    comparability = rh.series_comparability("memory_body_count", model["dates"], scopes,
+                                            quality, [None] * 4, versions)
+    assert comparability == rh.COMPARABLE
+    verdict = rh.trend_verdict(points=bodies["points"], dates=model["dates"],
+                               polarity="up", comparability=comparability)
+    assert verdict.word == "worsening"
+    assert "4 pts" in verdict.reason
+
+
+def test_no_value_shape_heuristic_is_possible_on_the_new_axes_by_signature():
+    """EXTENDS the shipped test_no_value_shape_heuristic_is_possible_by_signature to the
+    scope, quality and denominator functions. Each takes scopes/quality states/
+    denominators ONLY and cannot see metric values, so the heuristic §8.4 forbids is
+    unwritable without changing a signature this test pins.
+
+    Changing this contract requires a spec change (S6 §8.4)."""
+    import inspect
+    for fn, expected in ((rh.scope_comparable, ["scopes"]),
+                         (rh.quality_comparable, ["states"]),
+                         (rh.denominators_comparable, ["denominators"])):
+        assert list(inspect.signature(fn).parameters) == expected, fn.__name__
+    assert "points" not in inspect.signature(rh.scope_comparable).parameters
+    assert "values" not in inspect.signature(rh.scope_comparable).parameters
+    # the composer is value-blind too, which is what makes the axis functions' blindness
+    # more than a formality -- nothing upstream of them holds a value to leak downward
+    composer = list(inspect.signature(rh.series_comparability).parameters)
+    assert composer == ["metric", "dates", "scopes", "quality_states", "denominators",
+                        "definition_versions"]
+    for forbidden in ("points", "values", "doc", "model"):
+        assert forbidden not in composer, forbidden
+    # anti-vacuity: one identical scope stays comparable no matter how far the implied
+    # values moved, because the function never saw them
+    assert rh.scope_comparable([_SCOPE_MAIN, dict(_SCOPE_MAIN), dict(_SCOPE_MAIN)]) is True
+
+
+@pytest.mark.parametrize("bad", [True, 0, -1, "1", 1.0, None])
+def test_invalid_definition_version_resolves_unknown(bad):
+    """`True == 1` in Python -- a stray boolean would silently read as version 1 and
+    report a series comparable when it is not. That is the whole point.
+
+    The shipped `test_definition_version_rejects_bool_true_which_equals_one_in_python`
+    pins the RESOLVER; this extends the property through the comparability engine, so a
+    rejected version is proved to actually refuse the window rather than merely resolve
+    to None somewhere upstream."""
+    doc = {"metric_definitions": {"memory_body_count": bad}}
+    version = rh.resolve_metric_definition_version(doc, b"unaudited", "memory_body_count", {})
+    assert version is None, bad
+    dates = _dates_for([0, 0, 0])
+    comparability = _comparable_window("memory_body_count", dates,
+                                       versions=[1, 1, version])
+    assert comparability != rh.COMPARABLE, bad
+    assert "definition unknown" in comparability, bad
+    assert rh.trend_verdict(points=[92, 96, 98], dates=dates, polarity="up",
+                            comparability=comparability).word == "not comparable", bad
+
+
+def test_every_comparability_reason_is_factual_only_and_carries_no_verdict_word():
+    """Binding rule 6, applied to the three reasons this task adds. The renderer states
+    FACTS -- dates, scope fields, quality states, denominators -- and the judgment stays
+    the model's. `_CONFOUND_REASON_FORBIDDEN` is the shared ban the shipped
+    `build_confounded_reason` test already applies to the definition axis."""
+    reasons = [
+        rh.build_scope_reason([("2026-07-13", _SCOPE_ABSENT), ("2026-07-14", _SCOPE_MAIN)]),
+        rh.build_quality_reason("memory_body_count",
+                                [("2026-07-13", "partial"), ("2026-07-14", "complete")]),
+        rh.build_denominator_reason("hooks_with_test_ratio",
+                                    [("2026-07-13", 21), ("2026-07-14", 20)]),
+    ]
+    for reason in reasons:
+        assert reason.strip() != ""
+        low = reason.lower()
+        for word in rh._CONFOUND_REASON_FORBIDDEN:
+            assert word not in low, (word, reason)
+
+
+def test_comparability_reasons_are_deterministic_regardless_of_input_order():
+    """Binding rule 9: fixed orderings, no bare `set()` iteration into output. Each
+    reason is sorted by its own display text, so two windows holding the same dated
+    readings in different orders produce byte-identical strings."""
+    scope_rows = [("2026-07-14", _SCOPE_MAIN), ("2026-07-13", _SCOPE_ABSENT)]
+    assert rh.build_scope_reason(scope_rows) == rh.build_scope_reason(scope_rows[::-1])
+    quality_rows = [("2026-07-14", "complete"), ("2026-07-13", "partial")]
+    assert rh.build_quality_reason("m", quality_rows) == \
+        rh.build_quality_reason("m", quality_rows[::-1])
+    denominator_rows = [("2026-07-14", 20), ("2026-07-13", 21)]
+    assert rh.build_denominator_reason("m", denominator_rows) == \
+        rh.build_denominator_reason("m", denominator_rows[::-1])
+    # and the observed set itself is order-independent
+    assert rh._observed_denominators([21, 20, 21]) == rh._observed_denominators([20, 21])

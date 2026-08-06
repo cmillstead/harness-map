@@ -4409,6 +4409,295 @@ def trend_verdict(points: Any, dates: Any, polarity: Any,
     return TrendVerdict(word, f"{phrase} · {reason}", reason)
 
 
+# ------------------------------------- S6c §6.5a: the three-axis comparability engine
+#
+# FOUR axes decide whether a window may carry a direction word: SCOPE (the run's
+# identity), DEFINITION (how the metric was computed -- shipped in S6b and CONSUMED
+# here, never reimplemented), QUALITY (how completely the run measured that metric) and
+# DENOMINATOR (a ratio's base).
+#
+# Every decision function below takes only the axis' own states, BY SIGNATURE -- no
+# `points`, no `values`, no `doc`. That is the same discipline `series_confounded`
+# documents and `test_no_value_shape_heuristic_is_possible_by_signature` pins: a
+# jump-magnitude or sign-flip heuristic is UNWRITABLE without changing a signature a
+# test asserts on, and such a heuristic eats memory_body_count 92/96/98/117, the single
+# real drift finding in the operator's dataset (S6 §8.4).
+#
+# Every axis also has a REASON builder beside it. A refusal with no stated reason reads
+# as a broken feature, and that is how a correct refusal gets "fixed" by weakening it a
+# milestone later (A52, deliverable 22). The reasons state FACTS ONLY -- dates, scope
+# fields, quality states, versions, denominators -- never a verdict word (binding rule
+# 6); `_CONFOUND_REASON_FORBIDDEN` is the shared vocabulary ban.
+#
+# Doubt is ADDED, never removed: an axis may force a refusal, none may clear one.
+
+# The one non-refusing quality state. `partial`, `saturated` and `unmeasured` all
+# suppress the DIRECTION only -- the value still renders (S6 §6.5a axis 3).
+# Changing this value requires a spec change (S6 §6.5a).
+QUALITY_COMPLETE = "complete"
+
+# A point whose `metric_quality` is absent or mis-shaped. NEVER `complete`: absent is
+# not a measurement, and reading it as complete would let every pre-S6c sidecar claim a
+# quality it never reported (A52 measured all 7 live sidecars; none carries the field).
+QUALITY_UNMEASURED = "unmeasured"
+
+# The three fields `collection_scope` carries and the type each must have for the scope
+# to be READABLE. A scope failing this is UNKNOWN -- never partially compared.
+# Changing these keys requires a spec change (S6 §6.5a).
+_SCOPE_FIELDS = ("root", "project_root", "compose")
+
+
+def metric_quality_state(doc: Any, metric: Any) -> str:
+    """The recorded quality state of one metric on one sidecar, or `unmeasured`.
+
+    An EXTRACTOR, deliberately separate from the decision function `quality_comparable`:
+    this one reads the whole document (which holds metric values), that one sees only
+    states. Splitting them is what keeps §8.4's structural guarantee true of the
+    decision half.
+
+    Absent key, non-dict `metric_quality`, absent metric, or a non-string state all give
+    `unmeasured`. There is no default of `complete` anywhere in this function."""
+    quality = doc.get("metric_quality") if isinstance(doc, dict) else None
+    if not isinstance(quality, dict):
+        return QUALITY_UNMEASURED
+    try:
+        state = quality.get(metric)
+    except TypeError:
+        # `metric` arrived unhashable out of untrusted JSON -- unknowable, not complete.
+        return QUALITY_UNMEASURED
+    return state if isinstance(state, str) else QUALITY_UNMEASURED
+
+
+def _scope_readable(scope: Any) -> bool:
+    """True iff `scope` is a `collection_scope` this module can compare field-by-field:
+    a dict carrying all three fields at their emitted types (`root` a str,
+    `project_root` a str or null -- a null scope is a DISTINCT scope, never "unset" --
+    and `compose` a bool). Anything else is UNKNOWN."""
+    if not isinstance(scope, dict):
+        return False
+    if not all(field in scope for field in _SCOPE_FIELDS):
+        return False
+    project_root = scope["project_root"]
+    return (isinstance(scope["root"], str)
+            and (project_root is None or isinstance(project_root, str))
+            and isinstance(scope["compose"], bool))
+
+
+def scope_comparable(scopes: Any) -> bool:
+    """S6 §6.5a axis 2. A window is scope-comparable iff EVERY point's
+    `collection_scope` is readable AND all of them are equal in every field.
+
+    Takes SCOPES ONLY, by signature -- it can see no metric values at all (§8.4).
+
+    THERE IS NO FIRST-APPEARANCE EXEMPTION HERE, and that is a deliberate difference
+    from the DEFINITION axis, not an oversight. `series_confounded` may treat an
+    `absent -> N` step as the marker's introduction because a markerless sidecar
+    resolves through the frozen `LEGACY_METRIC_DEFINITIONS` digest table to a REAL
+    version. A52 REJECTED the equivalent scope table -- it would have to invent
+    `project_root`, which §6.5a forbids in terms -- so a markerless scope has nothing to
+    resolve through. It is UNKNOWN, and UNKNOWN adjacent to ANYTHING, including another
+    UNKNOWN, is not comparable. Writing the exemption here would require defaulting a
+    missing scope to "same as whatever ran last", the single assumption §6.5a exists to
+    forbid.
+
+    Consequence, and it is CONTRACT rather than a bug: the live corpus is in a verdict
+    blackout on this axis (A52 -- no sidecar carries `collection_scope`). It lifts on
+    its own, with no code change, once two ADJACENT points both carry the field.
+
+    Equality is by `==` on the whole dict, never `set(...)`: a scope is a dict, dicts
+    are unhashable, and "differing in ANY field" includes a field this module does not
+    yet name. An empty window is vacuously comparable -- there is no pair to disagree,
+    and `trend_verdict`'s point floor refuses it first anyway.
+
+    TOTAL by construction (registered in `_TOTALITY_TARGETS`)."""
+    values = list(scopes) if isinstance(scopes, (list, tuple)) else [scopes]
+    if not values:
+        return True
+    if not all(_scope_readable(scope) for scope in values):
+        return False
+    first = values[0]
+    return all(scope == first for scope in values[1:])
+
+
+def _scope_field_display(value: Any) -> str:
+    """One scope field as a factual token. `None` renders `none` and a bool renders
+    lowercase, so the reason reads like the JSON it came from rather than like Python."""
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _scope_display(scope: Any) -> str:
+    """One scope as a factual token list, or `unknown`. Keys are emitted in sorted order
+    (JSON object keys are always strings) so the text is byte-stable across
+    `PYTHONHASHSEED`; every key present is shown, including one this module does not
+    name, because `scope_comparable` compares them all."""
+    if not _scope_readable(scope):
+        return "unknown"
+    return " ".join(f"{key}={_scope_field_display(scope[key])}"
+                    for key in sorted(scope, key=str))
+
+
+def build_scope_reason(dated_scopes: Any) -> str:
+    """Factual reason for a scope-refused series: dates and scope fields, no verdict
+    word. `dated_scopes` is an ordered list of (date_str, collection_scope).
+
+    Carries NO metric name, unlike the definition/quality/denominator reasons: the
+    collection scope is a property of the RUN, identical for all fourteen metrics, and
+    prefixing it with one metric's name would imply the scope changed for that metric.
+
+    Sorted by date-as-string then display-as-string, the same cross-`PYTHONHASHSEED`
+    determinism `build_confounded_reason` already takes, and `str(...)`-coerced for the
+    same reason: a corrupt date must not raise inside the sort key."""
+    pairs = list(dated_scopes) if isinstance(dated_scopes, (list, tuple)) else []
+    parts = [f"{date}: scope {_scope_display(scope)}"
+             for date, scope in sorted(_as_dated_pairs(pairs),
+                                        key=lambda p: (str(p[0]), _scope_display(p[1])))]
+    return "collection scope — " + "; ".join(parts)
+
+
+def quality_comparable(states: Any) -> bool:
+    """S6 §6.5a axis 3. A window is quality-comparable iff EVERY point reports
+    `complete`. `partial`, `saturated`, `unmeasured` and anything unrecognized suppress
+    the DIRECTION -- the value itself still renders, which is the whole shape of "add
+    doubt, never remove it".
+
+    Takes STATES ONLY, by signature -- it can see no metric values at all (§8.4).
+    `metric_quality_state` is the one home for turning a document into a state, so an
+    absent key can never reach here as `complete`.
+
+    TOTAL by construction (registered in `_TOTALITY_TARGETS`)."""
+    values = list(states) if isinstance(states, (list, tuple)) else [states]
+    return all(state == QUALITY_COMPLETE for state in values)
+
+
+def build_quality_reason(metric: Any, dated_states: Any) -> str:
+    """Factual reason for a quality-refused series: dates and the recorded states, no
+    verdict word. `dated_states` is an ordered list of (date_str, state)."""
+    parts = [f"{date}: quality {state if isinstance(state, str) else QUALITY_UNMEASURED}"
+             for date, state in sorted(_as_dated_pairs(dated_states),
+                                        key=lambda p: (str(p[0]), str(p[1])))]
+    return f"{metric} — " + "; ".join(parts)
+
+
+def _trend_point_denominator(point: Any) -> Any:
+    """The denominator of a trend point, or None when the point has none. Sibling to
+    `_trend_point_value` and the ONE home for this extraction: `build_derived_trend_model`
+    emits `{value, total, ratio}` for the two ratio series and a bare number everywhere
+    else, and a bare number has no denominator to change."""
+    return point.get("total") if isinstance(point, dict) else None
+
+
+def _denominator_display(value: Any) -> str:
+    """One denominator as a factual token. `None` (a bare-number series has no
+    denominator) renders `none` rather than vanishing from the reason."""
+    return "none" if value is None else str(value)
+
+
+def _observed_denominators(denominators: Any) -> list[Any]:
+    """The DISTINCT denominators in a window, sorted by display text for
+    cross-`PYTHONHASHSEED` byte determinism. Built by an `is`/`==` scan rather than
+    `set(...)`: a denominator arrives straight out of untrusted sidecar JSON and may be
+    unhashable, the same defect `series_confounded`'s T5.1 fix closed."""
+    values = list(denominators) if isinstance(denominators, (list, tuple)) else [denominators]
+    unique: list[Any] = []
+    for value in values:
+        if not any(value is seen or value == seen for seen in unique):
+            unique.append(value)
+    return sorted(unique, key=_denominator_display)
+
+
+def denominators_comparable(denominators: Any) -> bool:
+    """S6 §6.5a / finding #9 sub-fix 5. A window is denominator-comparable iff every
+    point shares ONE denominator.
+
+    ALL PAIRS, never first-versus-last. `21 -> 20 -> 21` escapes an endpoint check
+    entirely while the middle point's ratio was computed against a different base, and a
+    shrinking denominator manufactures a fake improvement.
+
+    Takes DENOMINATORS ONLY, by signature -- it can see no metric values at all (§8.4).
+
+    TOTAL by construction (registered in `_TOTALITY_TARGETS`)."""
+    return len(_observed_denominators(denominators)) <= 1
+
+
+def build_denominator_reason(metric: Any, dated_denominators: Any) -> str:
+    """Factual reason for a denominator-refused series: the OBSERVED SET first (that set
+    is the finding), then the dated readings, no verdict word. Both halves are sorted by
+    display text for cross-`PYTHONHASHSEED` byte determinism."""
+    pairs = _as_dated_pairs(dated_denominators)
+    observed = ", ".join(_denominator_display(value)
+                         for value in _observed_denominators([v for _, v in pairs]))
+    parts = [f"{date}: denominator {_denominator_display(value)}"
+             for date, value in sorted(pairs, key=lambda p: (str(p[0]),
+                                                             _denominator_display(p[1])))]
+    return f"{metric} — denominators observed: {observed}; " + "; ".join(parts)
+
+
+def _as_dated_pairs(dated: Any) -> list[tuple[Any, Any]]:
+    """Normalize an ordered (date, value) list arriving from untrusted JSON. A row that
+    is not a 2-element sequence contributes `("undated", row)` rather than raising --
+    the same degrade-don't-raise posture every reader in this block takes."""
+    rows = list(dated) if isinstance(dated, (list, tuple)) else []
+    pairs: list[tuple[Any, Any]] = []
+    for row in rows:
+        if isinstance(row, (list, tuple)) and len(row) == 2:
+            pairs.append((row[0], row[1]))
+        else:
+            pairs.append(("undated", row))
+    return pairs
+
+
+def _dated_axis(dates: Any, values: Any) -> list[tuple[Any, Any]]:
+    """Pair one axis' per-point states with the dates that produced them. A window whose
+    dates are not 1:1 with its states cannot say WHEN anything changed, so every row
+    degrades to `undated` rather than silently pairing a state to the wrong date -- the
+    same alignment rule `trend_verdict` applies to its span."""
+    items = list(values) if isinstance(values, (list, tuple)) else []
+    labels = list(dates) if isinstance(dates, (list, tuple)) else []
+    if len(labels) != len(items):
+        labels = ["undated"] * len(items)
+    return list(zip(labels, items))
+
+
+def series_comparability(metric: Any, dates: Any, scopes: Any, quality_states: Any,
+                         denominators: Any, definition_versions: Any) -> str:
+    """The one value `trend_verdict`'s `comparability` parameter takes: `COMPARABLE`, or
+    the FACTUAL REASON of the first axis that refuses.
+
+    NO `points` and NO `values` parameter, by signature: the whole engine decides
+    comparability without ever seeing a measurement (§8.4).
+
+    Axis order is SCOPE, DEFINITION, QUALITY, DENOMINATOR, and the first two are ordered
+    against each other deliberately. A historical sidecar markerless for
+    `metric_definitions` is markerless for `collection_scope` too -- the same artifacts
+    lack both -- so both axes refuse it and only the reason distinguishes them. Scope
+    first means such a row names SCOPE, which is the honest attribution: the definition
+    axis resolved that point fine through the legacy digest table, and reporting a
+    definition change there would be a fact the run did not observe. (Design §9.5 item 2
+    is SUPERSEDED by A52 for the same reason.)
+
+    Only ONE reason is returned, never a concatenation: the operator needs the axis that
+    refused, and a row listing four is a row nobody reads.
+
+    TOTAL by construction (registered in `_TOTALITY_TARGETS`)."""
+    scope_pairs = _dated_axis(dates, scopes)
+    if not scope_comparable([scope for _, scope in scope_pairs]):
+        return build_scope_reason(scope_pairs)
+    version_pairs = _dated_axis(dates, definition_versions)
+    if series_confounded([version for _, version in version_pairs]):
+        return build_confounded_reason(str(metric), version_pairs)
+    quality_pairs = _dated_axis(dates, quality_states)
+    if not quality_comparable([state for _, state in quality_pairs]):
+        return build_quality_reason(metric, quality_pairs)
+    denominator_pairs = _dated_axis(dates, denominators)
+    if not denominators_comparable([value for _, value in denominator_pairs]):
+        return build_denominator_reason(metric, denominator_pairs)
+    return COMPARABLE
+
+
 def _sparkline_svg(dom_id: str, floats: list[float]) -> str:
     """One inline `<svg><polyline>` sparkline (no external assets, §9-R). `floats`
     is already-coerced, already-windowed (SPARKLINE_WINDOW) geometry data — every
