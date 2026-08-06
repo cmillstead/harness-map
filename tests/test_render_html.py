@@ -14,7 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from test_collector import _build_two_tier_maximal_fixture, _SECRET_SENTINELS, run_collector
+from test_collector import (_build_two_tier_maximal_fixture, _collector, _SECRET_SENTINELS,
+                            run_collector)
 
 RENDER = Path(__file__).resolve().parents[1] / "render_html.py"
 # Optional real-data smoke fixture. Set HARNESS_MAP_REAL_SAMPLE to a collector sidecar
@@ -7679,6 +7680,16 @@ _TOTALITY_TARGETS = (
     # COMPARE against `v` rather than merely compute it — a single-element list never
     # exercises the comparison that broke #4 above.
     (rh.build_confounded_reason, lambda v: ("m", [(v, 1), ("2026-01-02", 2)])),
+    # S6c Task 1: `_collector._metric_quality` is a new total function over
+    # collection-derived structures whose shapes vary with a hostile filesystem — not an
+    # S6b sidecar reader (both its arguments are built THIS SAME RUN, never parsed back
+    # out of a past run's JSON), but the guard is free and the property it checks
+    # (never raise on a malformed argument shape) is the same one every entry above
+    # earns its place by. Two entries: the hostile value as an `inaccessible[]` ENTRY
+    # (exercising the per-entry `.get("path", "")` guard), and the hostile value as the
+    # whole `duplication_section` (exercising the `.get("pairs", [])` guard).
+    (_collector._metric_quality, lambda v: ([v], {"pairs": []})),
+    (_collector._metric_quality, lambda v: ([], v)),
 )
 
 
