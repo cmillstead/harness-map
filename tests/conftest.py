@@ -55,3 +55,59 @@ def fake_harness(tmp_path):
     (root / "plugins" / "installed_plugins.json").write_text(json.dumps(
         {"installed": {"demo-plugin@official": {"version": "1.0"}}}))
     return root
+
+
+@pytest.fixture
+def pathological_harness(fake_harness):
+    """TRK-049: layers a family of pathological hook/settings/corpus shapes onto
+    `fake_harness`, each pinned to one of the two "suite green, collector broken"
+    instances TRK-025 shipped without catching (see collector.py's
+    `_script_from_command`, `_references_script_token`, `_has_shell_control_syntax`,
+    `_looks_like_existing_hook_script`). Takes `fake_harness` as a parameter and mutates
+    ONLY what it adds -- `fake_harness`'s own golden shape (settings.json's `"hooks": {}`
+    included) is otherwise untouched, so a test that requests plain `fake_harness` (e.g.
+    the A16 golden in test_collector.py) is unaffected: this fixture must be requested
+    explicitly to see any of it.
+
+    Six shapes, one settings.json, one corpus file:
+      1. `long_single_token` -- a 2000-char command with no whitespace/"/" (instance 1's
+         exact crash shape, scaled past the measured live 1948-char command): the WHOLE
+         command tokenizes as ONE shlex token whose `.name` exceeds
+         `_MAX_SCRIPT_TOKEN_LEN` (255), so `_looks_like_existing_hook_script` must
+         short-circuit before any `is_file()` syscall (a real ENAMETOOLONG risk on this
+         filesystem -- verified directly against a 2000-char path during T1).
+      2. `bracket_commands` -- 8 `[ ... ] && ...` compounds: instance 2's exact live
+         shape, the `[` first token the shipped name-allowlist fix was inert against.
+      3. `nested_quote_command` -- deeply nested single/double quoting with `&&`
+         embedded INSIDE the quoted argument, invisible to the shlex-tokenized form and
+         visible only on the RAW command string `_has_shell_control_syntax` scans (see
+         that function's docstring for why it checks raw text, not tokens).
+      4. `unbalanced_quote_command` -- `shlex.split` raises ValueError: a genuine,
+         disclosed coverage gap, kept singular so tests can assert it is the ONLY
+         `commands_unparsed` contributor here.
+      5. a rules/*.md file containing invalid UTF-8 bytes (read with errors="replace").
+      6. an oversized single settings scalar (an `env` value) -- must never serialize
+         (config.env_keys is names-only, CLAUDE.md binding rule 11).
+    """
+    root = fake_harness
+    long_single_token = "{" + ("a" * 1998) + "}"  # 2000 chars total; no whitespace, no
+                                                    # "/", not "env"/an interpreter name
+    bracket_commands = [f"[ -f flag{i} ] && echo {i}" for i in range(8)]
+    # The `&& z` sits INSIDE the double-quoted argument (shlex hands `_script_from_command`
+    # a single token for it) -- only the RAW-string scan sees it.
+    nested_quote_command = """rtk hook "a 'b \\"c\\" b' a && z\""""
+    unbalanced_quote_command = "echo 'unterminated"
+
+    settings = json.loads((root / "settings.json").read_text())
+    settings["hooks"] = {"PostToolUse": [{"hooks": [
+        {"type": "command", "command": c} for c in [
+            long_single_token, *bracket_commands, nested_quote_command, unbalanced_quote_command,
+        ]
+    ]}]}
+    settings["env"]["PATHOLOGICAL_HUGE_VALUE"] = "v" * 200_000
+    (root / "settings.json").write_text(json.dumps(settings))
+
+    (root / "rules" / "nonutf8.md").write_bytes(
+        b"# Rule\n" + bytes([0xff, 0xfe, 0x80, 0x81]) + b" not valid utf-8\n")
+
+    return root
