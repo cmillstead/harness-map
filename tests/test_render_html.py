@@ -3416,6 +3416,136 @@ def test_trend_table_renders_a_missing_point_as_not_measured(tmp_path):
     assert rh.TREND_NOT_MEASURED_TEXT in m.group(1)
 
 
+# --------------------------------------------------------- S6c Task 2: derived trend keys
+def test_derived_trend_keys_cover_the_six_and_exclude_unchecked_binaries():
+    """Fork (3), corrected: 14 declared / 14 RENDERED. `unchecked_binary_count` is
+    excluded from the DERIVED table only (S6 §6.8 item 1) -- it stays in HEADLINE_KEYS
+    and the legacy table still renders it, because three shipped assertions count
+    sparklines against len(HEADLINE_KEYS). Its polarity is `none`, so the legacy table
+    renders it `no direction` -- honest for a metric that is permanently 0 and
+    explicitly never inspected, where a DERIVED trend row would have manufactured a
+    false-clean reading.
+    # Changing this set requires a spec change (S6 §6.6)."""
+    assert [k for k, _, _ in rh.DERIVED_TREND_KEYS] == [
+        "promotion_candidate_count", "memory_body_count", "phantom_ref_count",
+        "phantom_confirmed_count", "hooks_with_test_ratio", "skills_with_test_ratio"]
+
+
+def test_headline_polarity_is_derived_from_headline_keys_never_retyped():
+    """One home, enforced (S6 §6.5). A second hand-written copy of the eight headline
+    polarities is the two-homes defect A3 already records."""
+    assert rh._HEADLINE_POLARITY == {k: p for k, _, p in rh.HEADLINE_KEYS}
+
+
+def test_phantom_confirmed_counts_only_strictly_false():
+    """`resolved is False`, an IDENTITY check -- never truthiness. `resolved: null` is
+    the INFERRED/unverifiable state; counting it as a confirmed miss is the exact
+    wrong-evidence-label defect D4 exists to fix."""
+    # rows: resolved False, False, None, True -> confirmed == 2
+    doc = {"phantom_refs": [
+        {"source": "a.md", "ref": "x", "kind": "path", "resolved": False, "evidence": "VERIFIED"},
+        {"source": "b.md", "ref": "y", "kind": "path", "resolved": False, "evidence": "VERIFIED"},
+        {"source": "c.md", "ref": "z", "kind": "path", "resolved": None, "evidence": "INFERRED"},
+        {"source": "d.md", "ref": "w", "kind": "path", "resolved": True, "evidence": "VERIFIED"},
+    ]}
+    assert rh._derived_phantom_ref_count(doc) == 4
+    assert rh._derived_phantom_confirmed_count(doc) == 2
+
+
+def test_ratio_series_carries_value_total_and_ratio_never_a_bare_float():
+    """A bare float loses the denominator, and a shrinking denominator manufactures a
+    fake improvement: delete a hook -> 16/20 -> coverage 'improves' with zero tests
+    written."""
+    doc = _minimal_doc()
+    doc["test_coverage"]["summary"] = {"hooks_with_test": 15, "hooks_total": 20,
+                                        "skills_with_test": 4, "skills_total": 5}
+    model = rh.build_derived_trend_model([("2026-07-15", doc)])
+    hooks = next(s for s in model["series"] if s["key"] == "hooks_with_test_ratio")
+    expected = {"value": 15, "total": 20, "ratio": 0.75}
+    assert hooks["values"] == [expected]
+    assert hooks["points"] == [expected]
+    skills = next(s for s in model["series"] if s["key"] == "skills_with_test_ratio")
+    assert skills["values"] == [{"value": 4, "total": 5, "ratio": 0.8}]
+
+
+def test_ratio_point_is_dropped_when_total_is_zero_or_absent():
+    """total 0/absent -> ratio None -> the point is DROPPED, never 0.0. A fabricated
+    0.0 is a measurement that did not happen."""
+    zero_total = _minimal_doc()
+    zero_total["test_coverage"]["summary"] = {"hooks_with_test": 0, "hooks_total": 0,
+                                                "skills_with_test": 0, "skills_total": 0}
+    absent_total = _minimal_doc()
+    absent_total["test_coverage"]["summary"] = {"hooks_with_test": 3,
+                                                  "skills_with_test": 0, "skills_total": 0}
+    model = rh.build_derived_trend_model([("2026-07-14", zero_total), ("2026-07-15", absent_total)])
+    hooks = next(s for s in model["series"] if s["key"] == "hooks_with_test_ratio")
+    assert hooks["points"] == []
+    assert hooks["values"] == [{"value": 0, "total": 0, "ratio": None},
+                                {"value": 3, "total": None, "ratio": None}]
+
+
+def test_derived_extractor_degrades_to_none_on_misshaped_sidecar():
+    """Every extractor is TOTAL: a missing key, a null, a string, and a non-list all
+    degrade to None (=> 'not measured'), never raise and never default to 0."""
+    # list-shaped: promotion_candidate_count
+    assert rh._derived_promotion_candidate_count({}) is None                    # missing key
+    assert rh._derived_promotion_candidate_count({"promotion_candidates": None}) is None
+    assert rh._derived_promotion_candidate_count({"promotion_candidates": "x"}) is None
+    assert rh._derived_promotion_candidate_count({"promotion_candidates": {"a": 1}}) is None
+
+    # nested list-shaped: memory_body_count
+    assert rh._derived_memory_body_count({}) is None
+    assert rh._derived_memory_body_count({"on_demand": None}) is None
+    assert rh._derived_memory_body_count({"on_demand": "x"}) is None
+    assert rh._derived_memory_body_count({"on_demand": {"memory_bodies": None}}) is None
+    assert rh._derived_memory_body_count({"on_demand": {"memory_bodies": "x"}}) is None
+
+    # list-shaped: phantom_ref_count / phantom_confirmed_count
+    for extractor in (rh._derived_phantom_ref_count, rh._derived_phantom_confirmed_count):
+        assert extractor({}) is None
+        assert extractor({"phantom_refs": None}) is None
+        assert extractor({"phantom_refs": "x"}) is None
+        assert extractor({"phantom_refs": 0}) is None
+
+    # dict-shaped container: the two ratio extractors
+    for extractor in (rh._derived_hooks_test_ratio, rh._derived_skills_test_ratio):
+        assert extractor({}) is None
+        assert extractor({"test_coverage": None}) is None
+        assert extractor({"test_coverage": "x"}) is None
+        assert extractor({"test_coverage": {"summary": None}}) is None
+        assert extractor({"test_coverage": {"summary": "x"}}) is None
+        assert extractor({"test_coverage": {"summary": []}}) is None
+
+
+def test_headline_trend_model_is_unchanged_by_the_derived_builder():
+    """build_trend_model and HEADLINE_KEYS are untouched contracts (S6 §6.6)."""
+    doc1 = _minimal_doc(tokens_a=100, tokens_b=50)
+    doc2 = _minimal_doc(tokens_a=200, tokens_b=50)
+    dated = [("2026-07-14", doc1), ("2026-07-15", doc2)]
+    headline_model = rh.build_trend_model(dated)
+    rh.build_derived_trend_model(dated)  # runs alongside; must not disturb the headline model
+    headline_model_again = rh.build_trend_model(dated)
+    assert headline_model == headline_model_again
+    assert len(headline_model["series"]) == len(rh.HEADLINE_KEYS)
+
+
+def test_trend_delta_serves_the_derived_model_unchanged():
+    """LOAD-BEARING for Task 3, not a nice-to-have. `_trend_delta` must work on BOTH
+    models so polarity->direction has ONE home; if the derived model's shape diverges,
+    the classifier is forced to re-derive good/bad and the mapping lands in two homes --
+    the A3 defect this plan cites against itself. Same `series` list, same
+    key/polarity/values/points fields, so `_series_points` and `_trend_delta` both work
+    on either model."""
+    body = {"path": "a.md", "project_slug": "x", "lines": 1, "words": 1, "evidence": "VERIFIED"}
+    doc1 = _minimal_doc()
+    doc1["on_demand"]["memory_bodies"] = [body] * 92
+    doc2 = _minimal_doc()
+    doc2["on_demand"]["memory_bodies"] = [body] * 117
+    dated_docs = [("2026-07-14", doc1), ("2026-07-15", doc2)]
+    model = rh.build_derived_trend_model(dated_docs)
+    assert rh._trend_delta(model, "memory_body_count") is not None
+
+
 def test_sparkline_gate_counts_measured_points_not_sidecar_count(tmp_path):
     """SPARKLINE_MIN_POINTS is a floor on REAL points. With three sidecars but only two
     measurements of one metric, that metric's sparkline must not render -- drawing a
@@ -7690,6 +7820,25 @@ _TOTALITY_TARGETS = (
     # whole `duplication_section` (exercising the `.get("pairs", [])` guard).
     (_collector._metric_quality, lambda v: ([v], {"pairs": []})),
     (_collector._metric_quality, lambda v: ([], v)),
+    # S6c Task 2: the six derived-trend extractors read untrusted sidecar JSON leaves the
+    # same way S6b's phantom/definition readers do. The two ratio extractors are the
+    # highest-value entries here -- `{value, total, ratio}` construction over a hostile
+    # `total` is exactly the "compare or divide an untrusted value without a shape guard"
+    # class this guard exists for.
+    (rh._derived_promotion_candidate_count, lambda v: ({"promotion_candidates": v},)),
+    (rh._derived_memory_body_count, lambda v: ({"on_demand": {"memory_bodies": v}},)),
+    (rh._derived_phantom_ref_count, lambda v: ({"phantom_refs": v},)),
+    (rh._derived_phantom_confirmed_count, lambda v: ({"phantom_refs": [{"resolved": v}]},)),
+    (rh._derived_hooks_test_ratio,
+     lambda v: ({"test_coverage": {"summary": {"hooks_with_test": v, "hooks_total": v}}},)),
+    (rh._derived_skills_test_ratio,
+     lambda v: ({"test_coverage": {"summary": {"skills_with_test": v, "skills_total": v}}},)),
+    (rh.build_derived_trend_model,
+     lambda v: ([("2026-01-01", {
+         "headline": {}, "errors": [], "promotion_candidates": v, "phantom_refs": v,
+         "on_demand": {"memory_bodies": v},
+         "test_coverage": {"summary": {"hooks_with_test": v, "hooks_total": v,
+                                        "skills_with_test": v, "skills_total": v}}})],)),
 )
 
 

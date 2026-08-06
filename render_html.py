@@ -975,6 +975,139 @@ def build_trend_model(dated_docs: list[tuple[str, dict[str, Any]]]) -> dict[str,
     return {"dates": dates, "series": series, "first_run": len(measured) <= 1}
 
 
+# S6c §6.6 -- a SIBLING table and a sibling builder. HEADLINE_KEYS and build_trend_model
+# are NOT extended: build_trend_model reads doc["headline"][key] and these keys are not in
+# `headline`, so extending the tuple alone yields six all-None columns. Making it work
+# means growing `headline` 8 -> 14, which contradicts SKILL.md and report-template.md,
+# forces a golden regeneration, and -- decisively -- leaves the historical sidecars
+# without the keys, discarding the operator's entire existing history for exactly these six
+# metrics. `memory_body_count` 92->117 is the sharpest signal in the dataset.
+#
+# Polarity names the BAD direction: "up" = rising is bad, "down" = falling is bad (higher
+# is better), "none" = no blessed direction. Changing any polarity here requires a spec
+# change (S6 §6.5). `unchecked_binary_count` is deliberately EXCLUDED from this table
+# (S6 §6.8 item 1) -- it stays in HEADLINE_KEYS and the legacy table alone, because it is
+# permanently 0 and explicitly never inspected, and a DERIVED trend row would have
+# manufactured a false-clean reading for it.
+DERIVED_TREND_KEYS = (
+    ("promotion_candidate_count", "Promotion candidates", "none"),
+    ("memory_body_count", "Memory bodies", "up"),
+    ("phantom_ref_count", "Phantom refs (total)", "up"),
+    ("phantom_confirmed_count", "Phantom refs (confirmed)", "up"),
+    ("hooks_with_test_ratio", "Hooks with test", "down"),
+    ("skills_with_test_ratio", "Skills with test", "down"),
+)
+
+# One home, enforced (S6 §6.5): the eight headline polarities are DERIVED here, never
+# retyped. A second hand-written copy of them would be the two-homes defect A3 already
+# records. Only the six derived rows above carry hand-written polarity.
+_HEADLINE_POLARITY = {k: p for k, _, p in HEADLINE_KEYS}
+
+
+def _derived_promotion_candidate_count(doc: dict[str, Any]) -> int | None:
+    """`len(doc["promotion_candidates"])` -- None (not measured) on a missing or
+    non-list value, never a raise, never a fabricated 0."""
+    candidates = doc.get("promotion_candidates")
+    if not isinstance(candidates, list):
+        return None
+    return len(candidates)
+
+
+def _derived_memory_body_count(doc: dict[str, Any]) -> int | None:
+    on_demand = doc.get("on_demand")
+    if not isinstance(on_demand, dict):
+        return None
+    bodies = on_demand.get("memory_bodies")
+    if not isinstance(bodies, list):
+        return None
+    return len(bodies)
+
+
+def _derived_phantom_ref_count(doc: dict[str, Any]) -> int | None:
+    refs = doc.get("phantom_refs")
+    if not isinstance(refs, list):
+        return None
+    return len(refs)
+
+
+def _derived_phantom_confirmed_count(doc: dict[str, Any]) -> int | None:
+    """Counts rows where `resolved IS False` -- an IDENTITY check, never truthiness.
+    `resolved: null` is the INFERRED/unverifiable state; counting it as a confirmed miss
+    would be the exact wrong-evidence-label defect D4 exists to fix."""
+    refs = doc.get("phantom_refs")
+    if not isinstance(refs, list):
+        return None
+    return sum(1 for row in refs if isinstance(row, dict) and row.get("resolved") is False)
+
+
+def _derived_ratio(doc: dict[str, Any], with_key: str, total_key: str) -> dict[str, Any] | None:
+    """`{value, total, ratio}` for one `test_coverage.summary` pair. `ratio` is the ONLY
+    field geometry ever reads; `value`/`total` stay for the `N / M (P%)` display (a later
+    task). `ratio` is None -- and `build_derived_trend_model` drops the point upstream --
+    when `total` is zero, absent, or non-numeric: a fabricated 0.0 would read as a real
+    measurement that never happened."""
+    coverage = doc.get("test_coverage")
+    if not isinstance(coverage, dict):
+        return None
+    summary = coverage.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    value, total = summary.get(with_key), summary.get(total_key)
+    value_f, total_f = nonneg_number(value), nonneg_number(total)
+    ratio = value_f / total_f if value_f is not None and total_f else None
+    return {"value": value, "total": total, "ratio": ratio}
+
+
+def _derived_hooks_test_ratio(doc: dict[str, Any]) -> dict[str, Any] | None:
+    return _derived_ratio(doc, "hooks_with_test", "hooks_total")
+
+
+def _derived_skills_test_ratio(doc: dict[str, Any]) -> dict[str, Any] | None:
+    return _derived_ratio(doc, "skills_with_test", "skills_total")
+
+
+# One extractor per DERIVED_TREND_KEYS entry, keyed the same way -- the only place the
+# two are wired together, so build_derived_trend_model never re-lists them by hand.
+_DERIVED_EXTRACTORS: dict[str, Any] = {
+    "promotion_candidate_count": _derived_promotion_candidate_count,
+    "memory_body_count": _derived_memory_body_count,
+    "phantom_ref_count": _derived_phantom_ref_count,
+    "phantom_confirmed_count": _derived_phantom_confirmed_count,
+    "hooks_with_test_ratio": _derived_hooks_test_ratio,
+    "skills_with_test_ratio": _derived_skills_test_ratio,
+}
+
+
+def build_derived_trend_model(dated_docs: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    """Sibling to `build_trend_model` for the six S6c derived metrics (S6c §6.6) -- same
+    two-list-per-series shape (`values` aligned 1:1 with `dates`, `points` measured-only)
+    so `_series_points`/`_trend_delta` work UNCHANGED on either model (S6 §6.6). `dates`
+    reuses the SAME `_run_was_measured` filter as `build_trend_model` so the two tables
+    can never disagree about which sidecars in the run counted as measurements.
+
+    A ratio point (`{value, total, ratio}`) is measured-but-undefined when `ratio` is
+    None -- kept in `values` (so the per-date table can still show the raw counts) but
+    dropped from `points` (so geometry/delta never see a fabricated 0.0)."""
+    measured = [(date, doc) for date, doc in dated_docs if _run_was_measured(doc)]
+    dates = [date for date, _ in measured]
+    series: list[dict[str, Any]] = []
+    for key, label, polarity in DERIVED_TREND_KEYS:
+        extractor = _DERIVED_EXTRACTORS[key]
+        values: list[Any] = []
+        points: list[Any] = []
+        for _date, doc in measured:
+            value = extractor(doc)
+            values.append(value)
+            if value is None:
+                continue
+            if isinstance(value, dict) and value.get("ratio") is None:
+                continue
+            points.append(value)
+        series.append({"key": key, "label": label, "polarity": polarity,
+                       "values": values, "points": points})
+    return {"dates": dates, "series": series, "first_run": len(measured) <= 1}
+
+
 def build_dupweb_model(doc: dict[str, Any]) -> dict[str, Any]:
     """(d) Duplication web: dedup node set (lex-sorted) + edges in pair order +
     phantom_refs table.
