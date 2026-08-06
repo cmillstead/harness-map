@@ -18,6 +18,7 @@ from test_collector import (_build_two_tier_maximal_fixture, _collector, _SECRET
                             run_collector)
 
 RENDER = Path(__file__).resolve().parents[1] / "render_html.py"
+TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "report-template.md"
 # Optional real-data smoke fixture. Set HARNESS_MAP_REAL_SAMPLE to a collector sidecar
 # JSON to enable the two real-data smoke tests; they skip when it is unset or missing.
 # No absolute literal here on purpose -- this repo is public (see
@@ -8937,3 +8938,62 @@ def test_digest_is_canonical_and_stable_across_pythonhashseed():
     assert proc2.returncode == 0, proc2.stderr
     assert proc1.stdout == proc2.stdout
     assert len(proc1.stdout) == 16
+
+
+# ------------------------------------------------------- S6c Task 6: template single-source
+def _parse_marker_block(path, marker):
+    """Extract the text between `<!-- {marker} -->` and `<!-- /{marker} -->` in `path`, or
+    "" if the markers are missing or the file cannot be parsed -- an empty return keeps the
+    non-vacuity assert in the test below honest: deleting the markers must FAIL the test,
+    never silently pass it."""
+    text = path.read_text(encoding="utf-8")
+    m = re.search(rf"<!--\s*{re.escape(marker)}\s*-->(.*?)<!--\s*/{re.escape(marker)}\s*-->",
+                  text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def _parse_verdict_rows(block):
+    """Parse a markdown pipe table's DATA rows out of `block`: strip each cell of
+    surrounding whitespace and the leading/trailing pipes, skip the header row and the
+    `|---|---|---|` separator row, and ignore blank lines. Case-sensitive on purpose -- the
+    rendered verdict words and the template's words must match byte-for-byte."""
+    rows = []
+    for line in block.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("|"):
+            continue
+        cells = tuple(c.strip() for c in line.strip("|").split("|"))
+        if all(re.fullmatch(r"-+", c) for c in cells):
+            continue  # the `|---|---|---|` separator row
+        if cells and cells[0] == "Verdict":
+            continue  # header row
+        rows.append(cells)
+    return rows
+
+
+def _verdict_rows(verdicts):
+    """Project `TREND_VERDICTS`' (word, gate, polarity) rows into the same three-column
+    row shape `_parse_verdict_rows` yields from the markdown table, so the two can be
+    compared for exact equality -- same words, same gate text, same polarity, same order."""
+    return [tuple(row) for row in verdicts]
+
+
+def test_trend_verdict_table_is_single_sourced_against_the_template():
+    """S6 §6.2-R item 4. A COMMENT is governance, and governance is exactly what
+    produced the A3 wart -- CHECK_BANDS and GAUGE_BANDS each had a human-readable
+    justification too, and they still drifted, because nothing failed when they did.
+    Declaring 'one set of constants' while shipping two literals in two files IS the
+    two-homes divergence restated. This test is the enforcing artifact: editing either
+    home without the other turns the suite red.
+
+    The parse lives HERE, not in render_html.py -- the renderer keeps its plain literal
+    (stdlib-only runtime, offline render unaffected, no file read at import time)."""
+    block = _parse_marker_block(TEMPLATE_PATH, "TREND_VERDICT_TABLE")
+    # A green test over a MISSING block is the false-green class this project has
+    # already been burned by. Assert the block exists and is non-empty FIRST, so
+    # deleting the markers cannot make the check vacuous.
+    assert block, "TREND_VERDICT_TABLE marker block missing or empty"
+    assert _parse_verdict_rows(block) == _verdict_rows(rh.TREND_VERDICTS)
+    # same words, same gate text, same polarity, same ORDER -- case-sensitive.
+    # (No "thresholds" here: that column belongs to the BANDS precedent, not to this
+    # table, whose three columns are Verdict | Gate | Polarity.)

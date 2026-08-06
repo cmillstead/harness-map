@@ -129,7 +129,33 @@ Runtime anomalies the collector itself hit (malformed/unreadable settings.json, 
 
 - {errors[]} (or "none")
 
-## 6. Diff vs Previous Run
+## 6.1 Direction over the measured history
+
+Apply the gate table below verbatim; never invent a verdict per-run — successive runs must stay comparable. Source: `TREND_VERDICTS` in `render_html.py`, single-sourced against the table below by `test_trend_verdict_table_is_single_sourced_against_the_template`. A metric needs at least 3 usable measured points in the window before any verdict beyond `not measured` applies.
+
+<!-- TREND_VERDICT_TABLE -->
+| Verdict | Gate (evaluated in this order) | Polarity |
+|---|---|---|
+| not measured | fewer than 3 usable measured points in the window | any |
+| not comparable | the window is not comparable on scope, definition version or quality state | any |
+| no direction | the metric declares no good direction | none |
+| unchanged across N | every measured point in the window equals the first | any |
+| net unchanged | the last measured point equals the first, having moved between | any |
+| improving | the net move over the window is in the metric's good direction | up or down |
+| worsening | the net move over the window is in the metric's bad direction | up or down |
+<!-- /TREND_VERDICT_TABLE -->
+
+Full-series table — one row per metric with 3+ measured points, in this severity-first order: `worsening` → `unchanged across N`[^frozen] → `not comparable`[^notcomparable] → `improving` → `net unchanged`[^frozen] → `no direction`. A metric reading `not measured` gets no row here (it has fewer than 3 points to show). Ratios stay ratios — render the collector's `{value}/{total}` pair exactly as reported, never a computed decimal.
+
+| Metric | Series (oldest → newest) | Pts | Verdict | Basis |
+|---|---|---|---|---|
+| {metric} | {series} | {pts} | {verdict}[^verdict] | {basis} |
+
+[^verdict]: The verdict word is drawn from the fixed table above (`TREND_VERDICTS`) — never invented per-run; read the table's Gate column for exactly how each word is reached.
+[^frozen]: `unchanged across N` and `net unchanged` both describe a series with no net movement, from different vantage points — `unchanged across N` means every measured point in the window equals the first (no movement anywhere); `net unchanged` means the window moved and came back (the last point equals the first, having moved between).
+[^notcomparable]: `not comparable` fires when the window mixes scope, definition version, or quality state — the Basis column names which axis blacked it out and the two dates it changed between.
+
+## 6.2 Diff vs Previous Run
 
 Selection rule: most recent `harness-map-*.json` in OUT_DIR strictly before today.
 
@@ -150,6 +176,10 @@ Compared against `harness-map-{prior-date}.json`:
 Or, if no prior sidecar exists, exactly:
 
 First run — no prior map (baseline).
+
+Or, if every prior sidecar is a crash envelope, exactly:
+
+No comparison baseline available — every prior run crashed.
 
 ## Sidecar Note
 
