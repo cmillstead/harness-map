@@ -1024,6 +1024,42 @@ def test_ladder_bars_get_cursor_pointer_affordance():
                       rh.STATIC_STYLE) is not None
 
 
+def _css_decls(stylesheet, selector):
+    """Return the declaration block for an exact `selector` from a CSS string, or ''."""
+    marker = selector + "{"
+    i = stylesheet.find(marker)
+    if i == -1:
+        return ""
+    return stylesheet[i + len(marker):stylesheet.index("}", i)]
+
+
+def test_gauge_button_content_is_top_anchored(tmp_path):
+    """Rejects the pre-TRK-021 behavior: a drill-enabled gauge renders as a bare <button>,
+    and a <button> inherits the UA stylesheet's vertically CENTERED anonymous content box.
+    `.gauges` is display:flex with the default align-items:stretch, so every card is as tall
+    as the tallest -- which made a short drill button float its value and label at the
+    vertical middle while its taller siblings started at the top. `text-align:left` on
+    button.gauge fixed the horizontal axis only. The button must therefore declare its own
+    column flex box anchored with justify-content:flex-start, and `.gauge-chev` must use
+    align-self -- `float` is inert on a flex item and would drop the chevron to the left."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "gauge_align"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    # Guard: the fixture must actually produce a <button> gauge, or the rule is untested.
+    assert '<button class="gauge' in text
+    decls = _css_decls(rh.STATIC_STYLE, "button.gauge")
+    assert "display:flex" in decls
+    assert "flex-direction:column" in decls
+    assert "justify-content:flex-start" in decls
+    chev = _css_decls(rh.STATIC_STYLE, ".gauge-chev")
+    assert "align-self:flex-end" in chev
+    assert "float" not in chev
+
+
 def test_csp_hashes_match_recomputed_static_blocks(tmp_path):
     doc = _minimal_doc()
     out_dir = tmp_path / "csp_hash"

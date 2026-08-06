@@ -2317,8 +2317,8 @@ table.sortable thead th{padding:0}
 button.th-sort{width:100%;background:transparent;border:none;color:var(--muted);font:inherit;font-weight:600;text-align:left;cursor:pointer;padding:6px 8px}
 button.th-sort:hover{color:var(--accent)}
 thead th[aria-sort="ascending"] button.th-sort,thead th[aria-sort="descending"] button.th-sort{color:var(--accent);text-decoration:underline}
-button.gauge{font:inherit;text-align:left;cursor:pointer;border:1px solid var(--line);border-left-width:3px}
-.gauge-chev{float:right;color:var(--muted);font-size:0.7rem;margin-left:8px}
+button.gauge{font:inherit;text-align:left;cursor:pointer;border:1px solid var(--line);border-left-width:3px;display:flex;flex-direction:column;justify-content:flex-start}
+.gauge-chev{align-self:flex-end;color:var(--muted);font-size:0.7rem;margin-left:8px}
 button.gauge[aria-expanded="true"]{border-color:var(--accent)}
 .gauge-drawer{padding:0 20px 8px}
 .gauge-drill-panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:10px 14px;margin-top:6px;font-size:0.82rem}
