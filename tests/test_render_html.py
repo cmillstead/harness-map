@@ -4749,6 +4749,19 @@ def test_no_unthemed_color_literal_in_the_stylesheet():
     assert found <= allowed, f"unthemed color literal(s) in the stylesheet: {sorted(found - allowed)}"
 
 
+def test_svg_fill_fallbacks_use_the_accent_token(tmp_path):
+    """Rejects a regression the stylesheet scan structurally cannot see: the defensive
+    `c.get("fill", ...)` fallbacks in _render_treemap_svg and _render_ladder_svg live in
+    Python f-strings OUTSIDE STATIC_STYLE, so test_no_unthemed_color_literal_in_the_stylesheet
+    never reads them. Pre-TRK-021 they were the hardcoded hex #56b4e9 -- legible in light
+    mode, unthemed in dark. Both builders always set "fill" today, so the fallback is
+    unreachable dead code; this pins it to the themed accent token anyway, because a future
+    builder change could make it live without any test noticing."""
+    src = Path(rh.__file__).with_suffix(".py").read_text(encoding="utf-8")
+    assert '"#56b4e9"' not in src
+    assert src.count('c.get("fill", "var(--accent)")') == 2
+
+
 def test_one_executable_script_and_csp_hash_reconciles_with_tier_composition(tmp_path):
     doc = _minimal_doc()
     doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
