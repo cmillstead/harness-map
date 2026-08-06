@@ -10011,3 +10011,125 @@ def test_synthesis_template_has_one_trend_basis_row_per_trended_metric():
     rows = json.loads(template_path.read_text(encoding="utf-8"))["trend_basis"]
     assert ({r["metric"] for r in rows}
             == {k for k, _, _ in rh.HEADLINE_KEYS} | {k for k, _, _ in rh.DERIVED_TREND_KEYS})
+
+
+# =========================================================== S6c Task 13: the residual
+# coverage audit. Every case below is CROSS-CUTTING -- it belongs to no single earlier
+# task and exists to close a gap the three-list audit in the task report names
+# explicitly. Nothing here changes production code; every assertion pins EXISTING,
+# already-correct behavior (see the report's Pre-fix RED evidence: BASELINE-GREEN).
+
+# One fixture per NON-DIRECTION `TREND_VERDICTS` word -- the five "no answer" states a
+# refusing or non-directional series can render. `improving`/`worsening` are excluded on
+# purpose: those two ARE answers, and this test is about the ones that are not.
+_NON_DIRECTION_FIXTURES = {
+    "not measured": dict(points=[10, 20], dates=_dates_for([10, 20]), polarity="up"),
+    "not comparable": dict(points=[10, 20, 30], dates=_dates_for([10, 20, 30]),
+                           polarity="up", comparability="scope changed on 2026-07-14"),
+    "no direction": dict(points=[10, 20, 30], dates=_dates_for([10, 20, 30]),
+                         polarity="none"),
+    "unchanged across N": dict(points=[10, 10, 10], dates=_dates_for([10, 10, 10]),
+                               polarity="up"),
+    "net unchanged": dict(points=[10, 20, 10], dates=_dates_for([10, 20, 10]),
+                          polarity="up"),
+}
+
+
+def test_no_answer_states_render_as_distinct_strings():
+    """The flavours of 'no answer' -- `unchanged across N`, `not comparable`,
+    `not measured`, `no direction` and `net unchanged` -- must be DISTINCT rendered
+    strings. Lookalike no-answers are the discoverability defect (A52) reappearing one
+    layer down: a page where two different refusals print the same text is as opaque as
+    a page with no reason at all. Cardinality is DERIVED FROM THE ENUM, never pinned at
+    a literal -- it is `len(TREND_VERDICTS)` minus the direction words, so a future
+    eighth verdict state fails this test's own sanity check rather than silently passing
+    a stale count."""
+    all_words = [row[0] for row in rh.TREND_VERDICTS]
+    non_direction_words = [w for w in all_words if w not in ("improving", "worsening")]
+    # sanity: the hand-built fixture map has not drifted from the enum it mirrors
+    assert set(non_direction_words) == set(_NON_DIRECTION_FIXTURES)
+    assert len(non_direction_words) == len(all_words) - 2
+
+    texts = []
+    for word in non_direction_words:
+        verdict = rh.trend_verdict(**_NON_DIRECTION_FIXTURES[word])
+        assert verdict.word == word, (word, verdict.word)
+        texts.append(verdict.text)
+    assert len(set(texts)) == len(non_direction_words), texts
+
+
+# The explicit, hand-maintained roster of every S6c function `_TOTALITY_TARGETS`
+# registers (Tasks 1-2, 3, 4, 5 and 7 -- the S6b comparability machinery Task 4 extends
+# stays out, since it is not S6c's to claim).
+_S6C_TOTAL_FUNCTIONS = (
+    "_metric_quality",
+    "_derived_promotion_candidate_count",
+    "_derived_memory_body_count",
+    "_derived_phantom_ref_count",
+    "_derived_phantom_confirmed_count",
+    "_derived_hooks_test_ratio",
+    "_derived_skills_test_ratio",
+    "build_derived_trend_model",
+    "_trend_point_value",
+    "trend_verdict",
+    "metric_quality_state",
+    "_scope_readable",
+    "scope_comparable",
+    "_scope_display",
+    "build_scope_reason",
+    "quality_comparable",
+    "build_quality_reason",
+    "_trend_point_denominator",
+    "_observed_denominators",
+    "denominators_comparable",
+    "build_denominator_reason",
+    "_dated_axis",
+    "series_comparability",
+    "trend_inputs_digest",
+    "trend_basis_for",
+    "_series_point_dates",
+    "_trend_window",
+    "_provenance_record",
+    "_provenance_metric",
+    "_series_axes",
+    "build_trend_provenance",
+    "_verdict_slug",
+    "_fmt_trend_value",
+    "_trend_latest_direction",
+)
+
+
+def test_the_enumerated_s6c_functions_are_registered_in_the_totality_guard():
+    """Asserts that every name in the EXPLICIT list above appears in
+    `_TOTALITY_TARGETS`. That is the whole claim -- deliberately narrower than the name
+    an earlier draft gave this test.
+
+    WHY IT CANNOT BE STRONGER: nothing distinguishes an "S6c function" by
+    introspection, and `_TOTALITY_TARGETS` holds bare callables with no metadata, so the
+    only comparison available is `__name__` against a hand-maintained list. It therefore
+    catches a registration someone REMOVED, or renamed on one side only -- and CANNOT
+    catch a new function nobody registered anywhere, which is exactly the case a
+    coverage-sounding name would have implied it covered.
+
+    THE REAL ANTI-ROT MECHANISM FOR THAT CASE IS THE TASK 13 WRITTEN AUDIT, done by a
+    human reading the diff against three lists. This test is a cheap regression pin
+    underneath it, never a substitute for it. Do not reword this docstring into a
+    completeness claim -- a test that appears to guarantee coverage it cannot deliver is
+    the false-green class this project has been burned by."""
+    registered = {fn.__name__ for fn, _ in _TOTALITY_TARGETS}
+    for name in _S6C_TOTAL_FUNCTIONS:      # explicit list, maintained by hand
+        assert name in registered, name
+
+
+def test_zero_one_and_two_measured_points_all_read_not_measured():
+    """Failure-modes row 12 names three counts explicitly -- 0, 1 or 2 -- and the shipped
+    suite pinned only the boundary (2, in `test_below_floor_two_points_gets_no_direction_word`).
+    The guard is `count < SPARKLINE_MIN_POINTS`, the SAME branch for all three, so this is
+    not a new code path -- it closes the letter of the row rather than leaving 0 and 1
+    to a reader's inference from the boundary case."""
+    for points in ([], [10]):
+        dates = _dates_for(points)
+        verdict = rh.trend_verdict(points=points, dates=dates, polarity="up")
+        assert verdict.word == "not measured", points
+        assert f"{len(points)} pts" in verdict.reason, points
+        assert f"needs {rh.SPARKLINE_MIN_POINTS}" in verdict.reason, points
