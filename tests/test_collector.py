@@ -407,7 +407,12 @@ def test_pathological_2000_char_hook_token_does_not_crash_the_document(pathologi
     # command). Pre-TRK-025-P1, Path.is_file() on a token this long re-raises
     # OSError(ENAMETOOLONG) uncaught, which used to escape reconcile_hooks entirely and
     # turn the WHOLE document into an all-zero crash envelope via main()'s catch-all --
-    # so the document-level (not just hook-level) assertions below are the point.
+    # so the document-level (not just hook-level) assertions below are the point. What
+    # this test actually pins is the COMBINED defense in _looks_like_existing_hook_script
+    # -- the _MAX_SCRIPT_TOKEN_LEN length guard AND the wrapping `except OSError` -- not
+    # the length guard in isolation: deleting either defense alone still returns False
+    # before any crash reaches this document, so this test stays green either way; only a
+    # full revert of BOTH (an unguarded, unwrapped is_file() call) reddens it.
     doc = run_collector(pathological_harness)
     assert doc["errors"] == []
     assert doc["headline"]["always_loaded_file_count"] > 0
