@@ -7972,6 +7972,17 @@ _TOTALITY_TARGETS = (
     (rh.series_comparability, lambda v: (v, v, v, v, v, v)),
     (rh.series_comparability,
      lambda v: ("memory_body_count", ["2026-01-01"], [v], [v], [v], [v])),
+    # S6c Task 5: the basis digest and its row resolver both read model-authored sidecar
+    # JSON, untrusted by the same argument the entries above already make -- a hostile
+    # `trend_basis` row, a hostile leaf inside a `points`/`definition_versions`/`scopes`
+    # window, and the whole argument in the window-slice position, the same two jobs
+    # Task 4's entries split.
+    (rh.trend_inputs_digest, lambda v: (v, v, v, v, v)),
+    (rh.trend_inputs_digest,
+     lambda v: ("memory_body_count", [v, (v, v, v)], [v], [v], v)),
+    (rh.trend_basis_for, lambda v: (v, v, v, v, v, v)),
+    (rh.trend_basis_for,
+     lambda v: ([{"metric": v, "inputs_digest": v, "prose": v}], v, [v], [v], [v], v)),
 )
 
 
@@ -8803,3 +8814,126 @@ def test_comparability_reasons_are_deterministic_regardless_of_input_order():
         rh.build_denominator_reason("m", denominator_rows[::-1])
     # and the observed set itself is order-independent
     assert rh._observed_denominators([21, 20, 21]) == rh._observed_denominators([20, 21])
+
+
+# ==================== S6c Task 5 (§6.8): inputs_digest recompute + basis suppression
+# EVERY assertion below calls `trend_inputs_digest`/`trend_basis_for` DIRECTLY. Nothing
+# here renders -- Task 7 owns the rendered `basis stale for this series` assertion, the
+# same function-level/rendered split Tasks 3 and 4 already took.
+
+_BASIS_DATES = _dates_for([92, 96, 98], start=13)
+_BASIS_POINTS = list(zip(_BASIS_DATES, [92, 96, 98], [None, None, None]))
+_BASIS_VERSIONS = [1, 1, 1]
+_BASIS_SCOPES = [_SCOPE_MAIN, _SCOPE_MAIN, _SCOPE_MAIN]
+_BASIS_WINDOW_LENGTH = 3
+
+
+def test_digest_matches_yield_the_stored_prose():
+    """S6 §6.8: a row whose stored digest matches the recomputed one is CURRENT -- its
+    prose renders and no stale note accompanies it."""
+    digest = rh.trend_inputs_digest("memory_body_count", _BASIS_POINTS, _BASIS_VERSIONS,
+                                    _BASIS_SCOPES, _BASIS_WINDOW_LENGTH)
+    trend_basis = [{"metric": "memory_body_count",
+                    "prose": "steadily growing across the window",
+                    "inputs_digest": digest}]
+    prose, stale = rh.trend_basis_for(trend_basis, "memory_body_count", _BASIS_POINTS,
+                                      _BASIS_VERSIONS, _BASIS_SCOPES, _BASIS_WINDOW_LENGTH)
+    assert prose == "steadily growing across the window"
+    assert stale is None
+
+
+def test_mutating_one_covered_input_invalidates_the_digest():
+    """THE mechanism. Build a trend_basis row, mutate ONE covered input, recompute. The
+    happy path alone does not discharge this finding -- the whole feature exists for the
+    mismatch branch (S6 §6.8 finding #8). Do this once per covered input: a point value,
+    a denominator, a definition version, a scope, the window length."""
+    digest = rh.trend_inputs_digest("memory_body_count", _BASIS_POINTS, _BASIS_VERSIONS,
+                                    _BASIS_SCOPES, _BASIS_WINDOW_LENGTH)
+    trend_basis = [{"metric": "memory_body_count", "prose": "cached basis",
+                    "inputs_digest": digest}]
+    # sanity: the unmutated window resolves current, so every mismatch below is caused by
+    # the mutation and not by some other defect in the fixture
+    assert rh.trend_basis_for(trend_basis, "memory_body_count", _BASIS_POINTS,
+                              _BASIS_VERSIONS, _BASIS_SCOPES,
+                              _BASIS_WINDOW_LENGTH) == ("cached basis", None)
+
+    mutated_value = [("2026-07-13", 999, None)] + _BASIS_POINTS[1:]
+    mutated_denominator = [("2026-07-13", 92, 20)] + _BASIS_POINTS[1:]
+    mutated_versions = [2] + _BASIS_VERSIONS[1:]
+    other_scope = {"root": "/other/root", "project_root": None, "compose": False}
+    mutated_scopes = [other_scope] + _BASIS_SCOPES[1:]
+    cases = (
+        (mutated_value, _BASIS_VERSIONS, _BASIS_SCOPES, _BASIS_WINDOW_LENGTH),
+        (mutated_denominator, _BASIS_VERSIONS, _BASIS_SCOPES, _BASIS_WINDOW_LENGTH),
+        (_BASIS_POINTS, mutated_versions, _BASIS_SCOPES, _BASIS_WINDOW_LENGTH),
+        (_BASIS_POINTS, _BASIS_VERSIONS, mutated_scopes, _BASIS_WINDOW_LENGTH),
+        (_BASIS_POINTS, _BASIS_VERSIONS, _BASIS_SCOPES, _BASIS_WINDOW_LENGTH + 1),
+    )
+    for points, versions, scopes, window_length in cases:
+        prose, stale = rh.trend_basis_for(trend_basis, "memory_body_count", points,
+                                          versions, scopes, window_length)
+        assert prose is None, (points, versions, scopes, window_length)
+        assert stale == "basis stale for this series", (points, versions, scopes,
+                                                         window_length)
+
+
+def test_absent_or_malformed_digest_resolves_to_stale_with_no_fallback():
+    """No fallback, ever. A renderer-authored default is a judgment wearing a default's
+    clothing (§6.8 item 7). Empty string, None, a non-string, and a wrong-length hex
+    string all resolve STALE."""
+    real_digest = rh.trend_inputs_digest("memory_body_count", _BASIS_POINTS,
+                                         _BASIS_VERSIONS, _BASIS_SCOPES,
+                                         _BASIS_WINDOW_LENGTH)
+    for bad_digest in ("", None, 12345, real_digest[:8], real_digest + "0000"):
+        trend_basis = [{"metric": "memory_body_count", "prose": "should never render",
+                        "inputs_digest": bad_digest}]
+        prose, stale = rh.trend_basis_for(trend_basis, "memory_body_count", _BASIS_POINTS,
+                                          _BASIS_VERSIONS, _BASIS_SCOPES,
+                                          _BASIS_WINDOW_LENGTH)
+        assert prose is None, bad_digest
+        assert stale == "basis stale for this series", bad_digest
+
+
+def test_absent_trend_basis_yields_no_prose_AND_NO_STALE_NOTE():
+    """Failure-modes row, and it is a DIFFERENT branch from a malformed digest -- which is
+    why the malformed-digest test does not cover it. A missing or non-list `trend_basis`
+    means the model never wrote a row at all; there was nothing to go stale, so emitting
+    'basis stale for this series' would invent a history. No prose, NO note, no crash."""
+    for absent in (None, {}, "x", 0, []):
+        assert rh.trend_basis_for(absent, "memory_body_count", _BASIS_POINTS,
+                                  _BASIS_VERSIONS, _BASIS_SCOPES,
+                                  _BASIS_WINDOW_LENGTH) == (None, None)
+    # a well-formed list holding no row for THIS metric is the same "never wrote one" case
+    other_row = [{"metric": "always_loaded_words", "prose": "x", "inputs_digest": "y"}]
+    assert rh.trend_basis_for(other_row, "memory_body_count", _BASIS_POINTS,
+                              _BASIS_VERSIONS, _BASIS_SCOPES,
+                              _BASIS_WINDOW_LENGTH) == (None, None)
+
+
+def test_digest_is_canonical_and_stable_across_pythonhashseed():
+    """Both producers must agree byte-for-byte or the prose never renders at all -- a
+    silent, TOTAL feature loss that looks like 'the model didn't write basis prose'.
+    Exercised as a REAL subprocess under two differing seeds: asserting the digest equals
+    itself inside one interpreter proves nothing, since the hazard is CROSS-PROCESS
+    instability, which only a subprocess under differing `PYTHONHASHSEED` values can
+    exercise."""
+    code = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('rh', sys.argv[1])\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "points = [('2026-07-13', 92, None), ('2026-07-14', 96, None),\n"
+        "          ('2026-07-15', 98, 20)]\n"
+        "scopes = [{'root': '/fake/root', 'project_root': None, 'compose': False}] * 3\n"
+        "digest = m.trend_inputs_digest('memory_body_count', points, [1, 1, 1], scopes, 3)\n"
+        "sys.stdout.write(digest)\n"
+    )
+    proc1 = subprocess.run([sys.executable, "-c", code, str(RENDER)],
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "PYTHONHASHSEED": "0"})
+    assert proc1.returncode == 0, proc1.stderr
+    proc2 = subprocess.run([sys.executable, "-c", code, str(RENDER)],
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "PYTHONHASHSEED": "12345"})
+    assert proc2.returncode == 0, proc2.stderr
+    assert proc1.stdout == proc2.stdout
+    assert len(proc1.stdout) == 16

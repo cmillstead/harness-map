@@ -4698,6 +4698,130 @@ def series_comparability(metric: Any, dates: Any, scopes: Any, quality_states: A
     return COMPARABLE
 
 
+# ------------------------------------------ S6c Task 5 (S6 §6.8): trend basis digest
+#
+# The model's basis prose must not outlive its inputs. The deterministic series
+# refreshes live (serve.py re-renders on append); the prose is a cached launch-time
+# judgment that does not. A same-date collector rerun, an added historical sidecar, a
+# changed definition marker, or a changed window all move the series while the prose
+# still reads "-1,290 last interval". `trend_inputs_digest` recomputes a fingerprint of
+# every input the prose could have been written against; `trend_basis_for` compares it to
+# the model-authored `trend_basis` row and suppresses the prose the moment they disagree.
+
+def _digest_safe(value: Any) -> Any:
+    """One leaf value made JSON-safe for `trend_inputs_digest`'s canonical payload.
+    JSON scalars and containers pass through untouched (nested dict key order is handled
+    by `sort_keys=True` at serialization, so a scope dict needs no special casing here).
+    A whole-valued float folds to `int` (`json.dumps(1.0)` and `json.dumps(1)` are
+    different bytes for the same measurement) -- `math.isfinite` guards NaN/inf first,
+    since `float("nan").is_integer()` is a well-defined `False` but the two must still be
+    told apart from an ordinary integral float. Anything JSON has no type for at all
+    (bytes, and anything else untrusted leaf content might hold) folds to `str()`. Never
+    raises, never guesses a JSON type for a type JSON does not have."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_digest_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _digest_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def _digest_point_row(point: Any) -> list[Any]:
+    """One `(date, value, denominator_or_null)` triplet made JSON-safe for the digest
+    payload, or a stable one-element degrade for a point that is not a 3-tuple/list --
+    this function may never raise (registered in `_TOTALITY_TARGETS`)."""
+    if isinstance(point, (list, tuple)) and len(point) == 3:
+        return [_digest_safe(field) for field in point]
+    return [_digest_safe(point)]
+
+
+def trend_inputs_digest(metric_key: Any, points: Any, definition_versions: Any,
+                        scopes: Any, window_length: Any) -> str:
+    """S6 §6.8 -- the model's basis prose must not outlive its inputs (see the block
+    comment above for the full rationale).
+
+    Covered inputs, IN THIS ORDER: `metric_key`; the ordered list of
+    `(date, value, denominator_or_null)` triplets for every point in the window (`points`
+    is ALREADY this pre-zipped triplet list -- there is no separate `dates` parameter);
+    the ordered list of resolved definition versions; the ordered list of collection
+    scopes; the window length.
+
+    This plan's Ambiguity D: §6.8 names `definition_version` and `collection_scope` in
+    the singular, but both can legitimately differ PER POINT inside one window -- that is
+    the entire subject of §6.5a, and a changed marker is §6.8's own named trigger.
+    Ordered per-point lists are a strict superset of the scalar reading.
+
+    Canonical serialization: `json.dumps(payload, sort_keys=True,
+    separators=(",", ":"), ensure_ascii=True)` over plain JSON scalars -- no floats where
+    an int will do, no locale-dependent formatting, no Python `repr`.
+    Algorithm: `hashlib.sha256(...).hexdigest()`, FIRST 16 CHARS. Stdlib, stable across
+    interpreter versions and `PYTHONHASHSEED` (unlike `hash()`, which is not).
+
+    TOTAL by construction (registered in `_TOTALITY_TARGETS`): every argument may arrive
+    straight out of untrusted, model- or sidecar-derived state, and no shape may raise."""
+    point_list = list(points) if isinstance(points, (list, tuple)) else []
+    version_list = (list(definition_versions)
+                    if isinstance(definition_versions, (list, tuple)) else [])
+    scope_list = list(scopes) if isinstance(scopes, (list, tuple)) else []
+    payload = {
+        "metric_key": _digest_safe(metric_key),
+        "points": [_digest_point_row(point) for point in point_list],
+        "definition_versions": [_digest_safe(version) for version in version_list],
+        "scopes": [_digest_safe(scope) for scope in scope_list],
+        "window_length": _digest_safe(window_length),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+# The literal Task 7 renders beside a row whose digest no longer matches. ONE HOME for
+# the sentence so the resolver and the renderer can never drift apart on its wording.
+TREND_BASIS_STALE_NOTE = "basis stale for this series"
+
+
+def trend_basis_for(trend_basis: Any, metric_key: Any, points: Any,
+                    definition_versions: Any, scopes: Any,
+                    window_length: Any) -> tuple[str | None, str | None]:
+    """S6 §6.8 -- resolve one metric's cached basis prose against its recomputed digest.
+
+    Returns `(prose, stale_note)`, and distinguishes the TWO no-prose outcomes:
+
+    * `trend_basis` absent, non-list, or holding no row for `metric_key` -> `(None,
+      None)`. The model never wrote a row at all, so there was nothing to go stale --
+      emitting the stale note here would invent a history that never existed.
+    * a row exists but its `inputs_digest` is absent, empty, non-string, or does not
+      match the recomputed digest -> `(None, TREND_BASIS_STALE_NOTE)`. NO FALLBACK
+      SENTENCE, ever (§6.8 item 7) -- a renderer-authored default is a judgment wearing a
+      default's clothing.
+    * a row exists and its digest matches -> `(prose, None)`.
+
+    TOTAL by construction (registered in `_TOTALITY_TARGETS`): every argument may arrive
+    straight out of untrusted, model- or sidecar-derived state, and no shape may raise."""
+    rows = trend_basis if isinstance(trend_basis, list) else []
+    row = None
+    for candidate in rows:
+        if isinstance(candidate, dict) and candidate.get("metric") == metric_key:
+            row = candidate
+            break
+    if row is None:
+        return None, None
+    stored_digest = row.get("inputs_digest")
+    recomputed = trend_inputs_digest(metric_key, points, definition_versions, scopes,
+                                     window_length)
+    if not isinstance(stored_digest, str) or stored_digest != recomputed:
+        return None, TREND_BASIS_STALE_NOTE
+    prose = row.get("prose")
+    return (prose if isinstance(prose, str) else None), None
+
+
 def _sparkline_svg(dom_id: str, floats: list[float]) -> str:
     """One inline `<svg><polyline>` sparkline (no external assets, §9-R). `floats`
     is already-coerced, already-windowed (SPARKLINE_WINDOW) geometry data — every
