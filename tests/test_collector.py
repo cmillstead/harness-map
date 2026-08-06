@@ -23,6 +23,14 @@ _collector = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_collector)
 _rel = _collector._rel
 
+# Optional real-root acceptance fixture (TRK-049 T3). Set HARNESS_MAP_REAL_ROOT to a real
+# harness ROOT DIRECTORY (not a sidecar file) to enable the real-root acceptance test; it
+# skips when unset or not a directory -- same shape as HARNESS_MAP_REAL_SAMPLE
+# (test_render_html.py:26), just directory- rather than file-gated. No absolute literal
+# here on purpose -- this repo is public (see test_no_absolute_home_literal_in_runtime_modules).
+_real_root_env = os.environ.get("HARNESS_MAP_REAL_ROOT", "")
+REAL_ROOT = Path(_real_root_env) if _real_root_env else Path("/nonexistent/harness-map-real-root")
+
 _GIT_IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                  "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 
@@ -8213,3 +8221,39 @@ def test_definition_version_validator_matches_render_html():
     assert _collector._check_valid_definition_version(True) is False
     assert _collector._check_valid_definition_version(1.0) is False
     assert _collector._check_valid_definition_version(0) is False
+
+
+# ============================================================================
+# TRK-049 T3 -- real-root acceptance test
+# ============================================================================
+# Complements the pathological_harness battery above (conftest.py:61): that corpus is
+# real failure-mode SHAPES layered onto a fixture, but both of TRK-049's actual escapes
+# were only visible against a real harness, never against fake_harness --
+#   1. a ~1500-char single shlex token made Path.is_file() re-raise ENAMETOOLONG, which
+#      escaped to main()'s catch-all and turned the WHOLE report into an all-zero crash
+#      envelope. Suite green throughout.
+#   2. the fix that followed gated hook classification on a name allowlist omitting `[`
+#      -- which is how every real hook command in this harness begins -- so on the live
+#      harness classification was completely INERT (zero classified, all real hooks
+#      still a coverage gap). Suite green throughout.
+# HARNESS_MAP_REAL_ROOT (module top, next to run_collector) points at a real harness
+# ROOT DIRECTORY -- not a sidecar -- and this test skips when it is unset or not a
+# directory, the same shape test_render_html.py's REAL_SAMPLE smoke tests use for a
+# missing file.
+
+def test_real_root_acceptance_no_crash_envelope_and_hooks_classified():
+    if not REAL_ROOT.is_dir():
+        pytest.skip("real harness root not present on this machine")
+    doc = run_collector(REAL_ROOT, project_root=REAL_ROOT)
+
+    # Anti-crash-envelope: would have caught escape 1 above.
+    assert doc["errors"] == []
+    assert doc["headline"]["always_loaded_file_count"] > 0
+
+    # Anti-inertness: would have caught escape 2 above. This is the load-bearing
+    # assertion -- a skip-when-unset test that ALSO passes on a hookless root is
+    # indistinguishable from a test that never ran, so it must fail loudly here
+    # rather than pass empty.
+    assert doc["headline"]["hook_commands_total"] > 0
+    assert doc["headline"]["hook_commands_examined"] == doc["headline"]["hook_commands_total"]
+    assert doc["enforcement"]["hooks"]["commands_unparsed"] == 0
