@@ -77,6 +77,8 @@ Top-level keys are ALL present on every run. When a category has no data, its ar
   "staleness": {"git_age_available": false, "last_commit_ts": {"<rel path>": 0 /* |null */}},
   "staleness_null_reasons": {"<rel path>": "git_unavailable|no_repo|outside_root|untracked|submodule_unavailable|timeout|budget_exhausted|git_error|unparseable|no_commits"},
   "metric_definitions": {"<metric name>": 1},
+  "collection_scope": {"root": "<abs path>", "project_root": "<abs path|null>", "compose": false},
+  "metric_quality": {"<metric name>": "complete|partial|saturated|unmeasured"},
   "inaccessible": [{"path": "rel", "reason": ""}],
   "blind_spots": ["<string>"],
   "errors": ["<string>"]
@@ -165,6 +167,8 @@ These compose-only additions live INSIDE existing (A) arrays rather than as new 
   - `unparseable` — git exited 0 with stdout that was not an integer.
   - `no_commits` — the path is tracked but has no commit yet (staged only): `git log` exits 0 with empty stdout. Distinct from `unparseable` on purpose, since "stdout was not an integer" would be a misleading description of an empty one.
 - **`metric_definitions`** (S6b, additive — no `schema_version` bump) — a map from metric name to an integer DEFINITION VERSION. It carries no values; it says *how a metric was computed on this run*, so a consumer comparing two sidecars can distinguish "the world changed" from "we changed how we measure". A metric's integer is bumped in the SAME change as the edit to the code that computes it. 14 metrics are declared: the eight `headline` keys plus the six renderer-derived ones (`promotion_candidate_count`, `memory_body_count`, `hooks_with_test_ratio`, `skills_with_test_ratio`, `phantom_ref_count`, `phantom_confirmed_count`). `phantom_confirmed_count` is derived by the RENDERER and has no collector value, but it shares `phantom_ref_count`'s detector and therefore its version — two views, one definition. Derived metrics inherit the collector definition version of their underlying data; there is deliberately no separate renderer-derivation version, because it would be identical across every sidecar in a window and so could never detect anything. A consumer reading a version MUST validate it as `isinstance(v, int) and not isinstance(v, bool) and v > 0` — `True == 1` in Python, and a stray boolean silently resolving as version 1 would report a series comparable when it is not. Anything failing that check is UNKNOWN, never a default. On the crash-envelope path this field is present and EMPTY (`{}`): a run that measured nothing defines nothing.
+- **`collection_scope`** (S6c, additive — no `schema_version` bump) — the run's IDENTITY: `root` (`--root`, absolute), `project_root` (`--project-root`, absolute, or `null` when the collector was never given one), and `compose` (whether `--compose` was set). Two adjacent trend points whose `collection_scope` differs in ANY field are NOT COMPARABLE — the field exists so a consumer can make that call rather than guess from `headline` alone. A `null` `project_root` is a DISTINCT scope from any path, never "same as whatever ran last." Absent on a legacy sidecar predating S6c means UNKNOWN, and UNKNOWN adjacent to anything — including another UNKNOWN — is not comparable either.
+- **`metric_quality`** (S6c, additive — no `schema_version` bump) — one measurement-state per key in `metric_definitions`: `complete` (every input this metric depends on was read), `partial` (at least one input was unreadable — see `inaccessible`), `saturated` (`duplicate_pair_count` only, at `len(duplication.pairs) >= 50`, the `MAX_PAIRS` cap: the count hit a structural ceiling rather than merely being large, so it is a DISTINCT state from `partial`), or `unmeasured` (the run measured nothing at all — the crash-envelope and layout-profile-rejection paths). **A `partial`, `saturated`, or `unmeasured` metric's VALUE still renders in `headline`; only its DIRECTION (improving/worsening) is withheld** — this field never hides a number, only the trend judgment built on top of it. Absent on a legacy sidecar predating S6c means UNKNOWN, with the same not-comparable-to-anything rule as `collection_scope` above.
 - **`inaccessible`** — every path anywhere in the run that the collector attempted to read and could not, with the OS-level `reason`.
 - **`blind_spots`** — free-text notes on categories of content the collector structurally cannot see (e.g., runtime-only MCP server instructions, plugin-marketplace content not vendored locally). In `--compose` mode one additional entry discloses that the per-file hygiene analyses (`instruction_length_flags`, staleness, `phantom_refs`, `promotion_candidates`, `test_coverage`, and the hooks-body duplication corpus) scan the **operator tier only** — project-tier files are NOT covered by them in v1, so a "0 project length flags" reading means "not scanned," not "clean." Full per-tier hygiene is deferred to v1.1.
 - **`errors`** — any collector-internal error encountered mid-run; a non-fatal error is recorded here and the run continues.
@@ -195,6 +199,10 @@ The synthesis pass (B) is not just a report — it also writes a machine-readabl
     {"n": 0, "surface": "<surface>", "evidence": "V|I|IA",
      "outcome": "keep|give it one home|load it later|turn it into a check|probation",
      "what_must_survive": "<prose>", "risk_if_wrong": "<prose>"}
+  ],
+  "trend_basis": [
+    {"metric": "<metric key>", "prose": "<one-sentence interpretive basis>",
+     "inputs_digest": "<first 16 chars of the sha256 described below>"}
   ]
 }
 ```
@@ -216,6 +224,18 @@ The synthesis pass (B) is not just a report — it also writes a machine-readabl
 ### D8 constraint
 
 Per Note (B) above, `retire safely` is disallowed in v1 (no-usage) runs — cap `outcome` at `probation` for any drag candidate that would otherwise warrant retirement.
+
+### `trend_basis` contract (S6 §6.8)
+
+`trend_basis` carries the model's one-sentence interpretive prose for each trended metric — the Trend tab's numeric series can refresh live (`serve.py` re-renders on every appended sidecar) while this prose is a launch-time judgment that does not, so each row is pinned to the exact inputs it was written against with a digest.
+
+`inputs_digest` is the first 16 hex characters of `hashlib.sha256(...).hexdigest()` over the canonical serialization `json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)` of a payload covering, **in this exact order**: `metric_key`; the ordered `(date, value, denominator_or_null)` triplet for every point in the trend window; the ordered list of resolved definition versions, one per point; the ordered list of collection scopes, one per point; the window length. `render_html.py`'s `trend_inputs_digest` is the sole implementation of this recompute, and `trend_basis_for` is the sole resolver that compares a row's stored digest against it.
+
+**CASING WARNING, this contract's equivalent:** a row whose `inputs_digest` does not exactly match the recomputed digest is not repaired, not partially trusted, and not shown alongside a disclaimer — `trend_basis_for` drops the prose entirely and substitutes the single fixed sentence `basis stale for this series` (`render_html.py`'s `TREND_BASIS_STALE_NOTE`). There is no fallback sentence and no partial credit: a mismatched or absent digest means **no prose renders at all** for that row, a silent TOTAL loss rather than a cosmetic slip. An absent row (the model never wrote one for that metric) is a different, quieter outcome — no prose and no stale note, since there is no history to call stale. Get the digest right at write time; recompute it fresh, never hand-copy or reuse a digest from another row or an earlier run.
+
+### `trend_basis` completeness
+
+`trend_basis` should carry exactly one row per trended metric — all 14 keys in `HEADLINE_KEYS` (8) union `DERIVED_TREND_KEYS` (6), the same two constants the Trend tab's series already iterate. This mirrors the CIVC skeleton doctrine above: a metric with no row degrades to no prose and no stale note, the same silent-looking outcome a genuinely-considered "nothing to say" row would produce, so the sidecar-writer must emit the full skeleton to make a gap *intentional* rather than *accidental*. `unchecked_binary_count` gets a row like every other headline metric even though it is excluded from `DERIVED_TREND_KEYS` (S6 §6.8 item 1, Note (B) above) — it still renders in the legacy headline table, and a row the operator can see is a row this contract covers. `synthesis-template.json` in this skill directory carries this full 14-row skeleton (`prose: ""`, `inputs_digest: ""` — an empty digest correctly reads as MISMATCH, so an unfilled row suppresses its own prose rather than fabricating one).
 
 ## (D) Friction telemetry streams
 

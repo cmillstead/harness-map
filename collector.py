@@ -89,6 +89,40 @@ METRIC_DEFINITIONS: dict[str, int] = {
     "phantom_confirmed_count": 4,   # same detector; two views, one version (§6.5 C18)
 }
 
+# S6c §6.5a axis 3. WITHOUT THIS TABLE `partial` IS UNDECIDABLE -- the collector records
+# inaccessible paths but not which scan recorded them, so nothing else in this module can
+# say which metric an unreadable file taints. Each entry is a prefix predicate over
+# `inaccessible[].path`; ANY match taints the metric.
+#
+# This is a MEASUREMENT-STATE fact, not a judgment (binding rule 6): it reports whether an
+# input was read, exactly as `evidence: "INACCESSIBLE"` already does per row. It renders no
+# verdict and no direction -- the renderer withholds the direction word, and the VALUE is
+# displayed either way.
+#
+# Deliberately conservative: over-tainting ADDS doubt, which is the safe direction and the
+# same asymmetry as `inaccessible != clean`. Changing this map requires a spec change
+# (S6 §6.5a).
+_METRIC_INPUT_PREFIXES: dict[str, tuple[str, ...]] = {
+    "always_loaded_words":        ("CLAUDE.md", "memory/", "rules/", "skills/"),
+    "always_loaded_tokens_est":   ("CLAUDE.md", "memory/", "rules/", "skills/"),
+    "always_loaded_file_count":   ("CLAUDE.md", "memory/", "rules/", "skills/"),
+    "duplicate_pair_count":       ("CLAUDE.md", "rules/", "skills/", "hooks/"),
+    "instruction_files_over_200": ("CLAUDE.md", "rules/", "skills/", "commands/",
+                                   "agents/", "hooks/"),
+    "orphan_registration_count":  ("settings.json", "hooks/"),
+    "orphan_script_count":        ("hooks/",),
+    "promotion_candidate_count":  ("CLAUDE.md", "rules/", "skills/", "commands/",
+                                   "agents/"),
+    "memory_body_count":          ("memory/", "projects/"),
+    "phantom_ref_count":          ("CLAUDE.md", "rules/", "skills/", "commands/",
+                                   "agents/"),
+    "phantom_confirmed_count":    ("CLAUDE.md", "rules/", "skills/", "commands/",
+                                   "agents/"),
+    "hooks_with_test_ratio":      ("hooks/", "tests/"),
+    "skills_with_test_ratio":     ("skills/", "tests/"),
+    "unchecked_binary_count":     (),
+}
+
 _NEVER_RE = re.compile(r"\bNEVER\b")
 _ALWAYS_RE = re.compile(r"\bALWAYS\b")
 _MUST_RE = re.compile(r"\bmust\b")
@@ -6013,6 +6047,43 @@ def iter_input_paths(
     return sorted(paths, key=str)
 
 
+def _metric_quality(inaccessible: list[dict[str, Any]],
+                     duplication_section: dict[str, Any]) -> dict[str, str]:
+    """Per-metric measurement-state (S6c §6.5a axis 3): `complete | partial | saturated`
+    for every key in METRIC_DEFINITIONS, iterating `sorted(METRIC_DEFINITIONS)` for
+    cross-`PYTHONHASHSEED` determinism (`unmeasured` is set only by `_empty_document`, on
+    the crash/profile-rejection envelope paths -- this function never emits it).
+
+    `saturated` wins over `partial` for `duplicate_pair_count` at `len(pairs) >= MAX_PAIRS`
+    -- the count is capped, not merely large, so a `partial` label there would hide a
+    STRUCTURAL ceiling behind an accessibility caveat. A metric with no entry in
+    `_METRIC_INPUT_PREFIXES` (or an empty prefix tuple, e.g. `unchecked_binary_count`) can
+    never be tainted -- it is always `complete`, never inspected means never partially
+    inspected.
+
+    Registered in the T5.1 totality guard (`_TOTALITY_TARGETS`,
+    tests/test_render_html.py): unlike its S6b neighbors, both arguments here are
+    structures THIS SAME RUN just built in-process, never values parsed back out of a
+    past run's sidecar -- but shape-guarded regardless (`isinstance` checks below) so a
+    future caller passing a malformed structure degrades to `complete` rather than
+    raising, the same total-function property every registered entry shares."""
+    paths = [entry.get("path", "") for entry in inaccessible if isinstance(entry, dict)]
+    pairs = duplication_section.get("pairs", []) if isinstance(duplication_section, dict) else []
+    pairs_len = len(pairs) if isinstance(pairs, (list, tuple)) else 0
+    quality: dict[str, str] = {}
+    for metric in sorted(METRIC_DEFINITIONS):
+        if metric == "duplicate_pair_count" and pairs_len >= MAX_PAIRS:
+            quality[metric] = "saturated"
+            continue
+        prefixes = _METRIC_INPUT_PREFIXES.get(metric, ())
+        if prefixes and any(isinstance(path, str) and path.startswith(prefix)
+                             for path in paths for prefix in prefixes):
+            quality[metric] = "partial"
+        else:
+            quality[metric] = "complete"
+    return quality
+
+
 def build_document(
     root: Path, project_root: Path | None, compose: bool = False, *,
     profile: dict[str, Any] | None = None,
@@ -6202,6 +6273,17 @@ def build_document(
         # module constant, so a consumer mutating the emitted doc cannot corrupt the next
         # run in the same process.
         "metric_definitions": dict(METRIC_DEFINITIONS),
+        # S6c §6.5a axis 2 (ADDITIVE, no schema_version bump per binding rule 10). The
+        # run's IDENTITY: two adjacent trend points differing in ANY field are not
+        # comparable. `project_root` is null (not omitted) when unset -- a null scope is a
+        # DISTINCT scope, never "same as whatever ran last".
+        "collection_scope": {
+            "root": str(root),
+            "project_root": str(Path(project_root).expanduser().resolve())
+                            if project_root is not None else None,
+            "compose": bool(compose),
+        },
+        "metric_quality": _metric_quality(inaccessible, duplication_section),
         "inaccessible": inaccessible,
         "blind_spots": blind_spots,
         "errors": errors,
@@ -6385,6 +6467,11 @@ def _empty_document(root: Path) -> dict[str, Any]:
         # nothing, so it defines nothing -- inheriting METRIC_DEFINITIONS here would let a
         # crash envelope claim a definition it never computed.
         "metric_definitions": {},
+        # Envelope rule. A crashed run measured nothing, so its scope is the bare root and
+        # every metric is `unmeasured` -- inheriting `complete` here would let a crash
+        # envelope claim a measurement it never made.
+        "collection_scope": {"root": str(root), "project_root": None, "compose": False},
+        "metric_quality": {k: "unmeasured" for k in sorted(METRIC_DEFINITIONS)},
         "inaccessible": [], "blind_spots": [], "errors": [],
     }
 

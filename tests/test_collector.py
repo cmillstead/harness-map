@@ -2481,7 +2481,19 @@ def test_description_extraction_is_read_only(fake_harness):
 # (fake_harness registers no hooks, so all six are 0). Verified mechanically: comparing
 # the two literals path-by-path, REMOVED is empty and ADDED is exactly those six paths --
 # no existing value changed.
-_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan.", "Line-range citations (`path.md:12-19`) are checked for the FILE only \\u2014 the line range itself is never validated, so a stale range in an otherwise-valid citation is invisible to this scan.", "Placeholder and glob tokens are recognized only when they are PATH-SHAPED \\u2014 a backticked `<slug>.md`, `{session}.md` or `*.md` with no directory separator is not detected as a reference at all, so it is neither resolved nor reported."], "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"commands_no_script": 0, "commands_resolved": 0, "commands_total": 0, "commands_unparsed": 0, "orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "hook_commands_examined": 0, "hook_commands_total": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "metric_definitions": {"always_loaded_file_count": 1, "always_loaded_tokens_est": 1, "always_loaded_words": 1, "duplicate_pair_count": 1, "hooks_with_test_ratio": 1, "instruction_files_over_200": 1, "memory_body_count": 1, "orphan_registration_count": 1, "orphan_script_count": 1, "phantom_confirmed_count": 4, "phantom_ref_count": 4, "promotion_candidate_count": 1, "skills_with_test_ratio": 1, "unchecked_binary_count": 1}, "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "staleness_null_reasons": {"agents/demo-agent.md": "no_repo", "commands/demo-cmd.md": "no_repo", "rules/a.md": "no_repo", "rules/b.md": "no_repo", "skills/coding-team/rules/c.md": "no_repo", "skills/demo/SKILL.md": "no_repo", "skills/demo/phases/p1.md": "no_repo"}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
+# S6c Task 1: regenerated again, same rule and same reason, for two new additive top-level
+# fields -- `collection_scope` (`.root`/`.project_root`/`.compose`) and `metric_quality`
+# (one `complete|partial|saturated|unmeasured` state per METRIC_DEFINITIONS key; every
+# metric reads `complete` here since fake_harness makes nothing unreadable). Unlike every
+# prior regeneration, `collection_scope.root`/`.project_root` carry ABSOLUTE `tmp_path`
+# strings with no stable literal (AMENDMENTS A54) -- NORMALIZED into `<ROOT>`/
+# `<PROJECT_ROOT>` by the same replacement chain that already normalizes `slug` into
+# `<SLUG>`, rather than popped, so both fields stay inside the golden's coverage. Verified
+# mechanically by the structural diff run against this task's regeneration: REMOVED is
+# empty, CHANGED is empty, and ADDED is exactly `.collection_scope.root`,
+# `.collection_scope.project_root`, `.collection_scope.compose`, and the fourteen
+# `.metric_quality.<metric>` paths -- no existing value changed.
+_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan.", "Line-range citations (`path.md:12-19`) are checked for the FILE only \\u2014 the line range itself is never validated, so a stale range in an otherwise-valid citation is invisible to this scan.", "Placeholder and glob tokens are recognized only when they are PATH-SHAPED \\u2014 a backticked `<slug>.md`, `{session}.md` or `*.md` with no directory separator is not detected as a reference at all, so it is neither resolved nor reported."], "collection_scope": {"compose": false, "project_root": "<PROJECT_ROOT>", "root": "<ROOT>"}, "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"commands_no_script": 0, "commands_resolved": 0, "commands_total": 0, "commands_unparsed": 0, "orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "hook_commands_examined": 0, "hook_commands_total": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "metric_definitions": {"always_loaded_file_count": 1, "always_loaded_tokens_est": 1, "always_loaded_words": 1, "duplicate_pair_count": 1, "hooks_with_test_ratio": 1, "instruction_files_over_200": 1, "memory_body_count": 1, "orphan_registration_count": 1, "orphan_script_count": 1, "phantom_confirmed_count": 4, "phantom_ref_count": 4, "promotion_candidate_count": 1, "skills_with_test_ratio": 1, "unchecked_binary_count": 1}, "metric_quality": {"always_loaded_file_count": "complete", "always_loaded_tokens_est": "complete", "always_loaded_words": "complete", "duplicate_pair_count": "complete", "hooks_with_test_ratio": "complete", "instruction_files_over_200": "complete", "memory_body_count": "complete", "orphan_registration_count": "complete", "orphan_script_count": "complete", "phantom_confirmed_count": "complete", "phantom_ref_count": "complete", "promotion_candidate_count": "complete", "skills_with_test_ratio": "complete", "unchecked_binary_count": "complete"}, "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "staleness_null_reasons": {"agents/demo-agent.md": "no_repo", "commands/demo-cmd.md": "no_repo", "rules/a.md": "no_repo", "rules/b.md": "no_repo", "skills/coding-team/rules/c.md": "no_repo", "skills/demo/SKILL.md": "no_repo", "skills/demo/phases/p1.md": "no_repo"}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
 
 
 def test_non_compose_output_byte_identical_to_pre_change(fake_harness):
@@ -2489,7 +2501,16 @@ def test_non_compose_output_byte_identical_to_pre_change(fake_harness):
     doc = run_collector(fake_harness, project_root=proj)
     doc.pop("generated_at")
     doc.pop("root")
-    blob = json.dumps(doc, sort_keys=True).replace(slug, "<SLUG>")
+    # S6c Task 1 (AMENDMENTS A54): collection_scope.root/.project_root are absolute
+    # tmp_path strings with no stable literal, unlike every other field here -- normalized
+    # the same way `slug` already is, rather than popped, so the golden keeps covering
+    # them. Longer string first (a standing rule): fake_harness and proj are siblings
+    # (tests/conftest.py:13-18) so ordering is not load-bearing today, but the rule keeps
+    # that true if a future fixture nests one path inside the other.
+    blob = (json.dumps(doc, sort_keys=True)
+            .replace(slug, "<SLUG>")
+            .replace(str(Path(fake_harness).resolve()), "<ROOT>")
+            .replace(str(Path(proj).resolve()), "<PROJECT_ROOT>"))
     assert blob == _GOLDEN_NON_COMPOSE_DOC_JSON
 
 
@@ -5715,6 +5736,294 @@ def test_empty_document_carries_metric_definitions(fake_harness):
     computed."""
     env = _collector._empty_document(fake_harness)
     assert env["metric_definitions"] == {}
+
+
+# ---------------------------------------------------------------------------
+# S6c Task 1 -- collection_scope + metric_quality (§6.5a)
+# ---------------------------------------------------------------------------
+
+def test_collection_scope_identifies_the_run(fake_harness):
+    """§6.5a axis 2. Two points whose collection_scope differs in ANY field are not
+    comparable, so the field must carry all three discriminators explicitly. Pinned here
+    rather than in the golden blob because root/project_root are absolute tmp_path
+    strings with no stable literal (AMENDMENTS A54).
+    # Changing these keys requires a spec change (S6 §6.5a)."""
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, project_root=proj)
+    scope = doc["collection_scope"]
+    assert set(scope) == {"root", "project_root", "compose"}
+    assert scope["root"] == str(Path(fake_harness).resolve())
+    assert scope["project_root"] == str(Path(proj).resolve())
+    assert scope["compose"] is False
+
+
+def test_collection_scope_compose_flag_tracks_the_flag(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    assert doc["collection_scope"]["compose"] is True
+
+
+def test_collection_scope_project_root_is_null_when_unset(fake_harness):
+    """A null project_root is a DISTINCT scope from any path -- absent must not collapse
+    into 'same as whatever ran last'. Exercised directly against build_document (not
+    run_collector/the CLI): argparse's `--project-root` default is `os.getcwd()`, always a
+    truthy string, so Python `None` is unreachable through the subprocess CLI -- only a
+    direct call can supply it, same as the other CLI-unreachable states in this file."""
+    doc = _collector.build_document(fake_harness, None)
+    assert doc["collection_scope"]["project_root"] is None
+
+
+def test_metric_quality_is_complete_when_everything_was_read(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    doc = run_collector(fake_harness, project_root=proj)
+    assert set(doc["metric_quality"]) == set(_collector.METRIC_DEFINITIONS)
+    assert set(doc["metric_quality"].values()) == {"complete"}
+
+
+def test_metric_input_prefixes_key_set_matches_metric_definitions():
+    """A metric missing from the map is undecidable for `partial` and fails silently,
+    which is worse than a wrong prefix."""
+    assert set(_collector._METRIC_INPUT_PREFIXES) == set(_collector.METRIC_DEFINITIONS)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_unreadable_always_loaded_input_makes_weight_metrics_partial(fake_harness):
+    """§6.5a axis 3, the dangerous one: an unreadable file makes words/tokens FALL, which
+    reads as *improving* while visibility actually degraded. That is `inaccessible !=
+    clean` applied to a trend. Real permission failure, no mock."""
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "rules" / "a.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert any(e["path"] == "rules/a.md" for e in doc["inaccessible"])
+    assert doc["metric_quality"]["always_loaded_words"] == "partial"
+    assert doc["metric_quality"]["always_loaded_tokens_est"] == "partial"
+    assert doc["metric_quality"]["orphan_script_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_always_loaded_file_count_partial_on_unreadable_memory_file(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "memory" / "MEMORY.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["always_loaded_file_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_duplicate_pair_count_partial_on_unreadable_skill_rule(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "skills" / "coding-team" / "rules" / "c.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["duplicate_pair_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_instruction_files_over_200_partial_on_unreadable_command(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "commands" / "demo-cmd.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["instruction_files_over_200"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_orphan_registration_count_partial_on_unreadable_hook(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "hooks" / "orphan.py"
+    p.write_text("#!/usr/bin/env python3\nprint('x')\n")
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert any(e["path"] == "hooks/orphan.py" for e in doc["inaccessible"])
+    assert doc["metric_quality"]["orphan_registration_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_orphan_script_count_partial_on_unreadable_hook(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "hooks" / "orphan.py"
+    p.write_text("#!/usr/bin/env python3\nprint('x')\n")
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["orphan_script_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_promotion_candidate_count_partial_on_unreadable_agent(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "agents" / "demo-agent.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["promotion_candidate_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_memory_body_count_partial_on_unreadable_project_memory(fake_harness):
+    proj, slug = _active_slug(fake_harness)
+    p = fake_harness / "projects" / slug / "memory" / "detail.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["memory_body_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_phantom_ref_count_partial_on_unreadable_claude_md(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "CLAUDE.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["phantom_ref_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_phantom_confirmed_count_partial_on_unreadable_skill_md(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "skills" / "demo" / "SKILL.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["phantom_confirmed_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_hooks_with_test_ratio_partial_on_unreadable_hook(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "hooks" / "orphan.py"
+    p.write_text("#!/usr/bin/env python3\nprint('x')\n")
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["hooks_with_test_ratio"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_taint_skills_with_test_ratio_partial_on_unreadable_skill_rule(fake_harness):
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "skills" / "coding-team" / "rules" / "c.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["skills_with_test_ratio"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_unchecked_binary_count_never_tainted_by_any_unreadable_path(fake_harness):
+    """`unchecked_binary_count` is the 14th METRIC_DEFINITIONS row and its
+    _METRIC_INPUT_PREFIXES tuple is EMPTY -- there is no input to make unreadable, so this
+    asserts the converse of every taint test above: no unreadable path anywhere taints it.
+    Never inspected means never partially inspected; it can only move to `unmeasured`, on
+    the envelope paths (see test_empty_document_carries_scope_and_quality)."""
+    proj, _slug = _active_slug(fake_harness)
+    p = fake_harness / "CLAUDE.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = run_collector(fake_harness, project_root=proj)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+def test_duplicate_pair_count_at_cap_is_saturated(fake_harness):
+    """VERIFIED cap: `pairs = pairs[:MAX_PAIRS]`. A series pinned at 50 would otherwise
+    render `unchanged across N measured samples` while the true count climbs -- a
+    pre-placed reassuring-wrong verdict.
+    # Changing this value requires a spec change (S6 §6.5a)."""
+    proj, _slug = _active_slug(fake_harness)
+    body = ("Duplicate shingle body words repeated many times over " * 4)
+    for i in range(_collector.MAX_PAIRS // 4 + 2):   # C(n,2) >= MAX_PAIRS for small n
+        (fake_harness / "rules" / f"dup{i:02d}.md").write_text(body)
+    doc = run_collector(fake_harness, project_root=proj)
+    assert doc["headline"]["duplicate_pair_count"] == _collector.MAX_PAIRS
+    assert doc["metric_quality"]["duplicate_pair_count"] == "saturated"
+
+
+def test_empty_document_carries_scope_and_quality(fake_harness):
+    """Envelope rule (binding rule 5). A crashed run measured nothing, so every metric is
+    `unmeasured` -- never `complete`, which would let a crash envelope claim a measurement
+    it never made."""
+    root = Path(fake_harness).resolve()
+    doc = _collector._empty_document(root)
+    assert doc["collection_scope"] == {"root": str(root), "project_root": None,
+                                       "compose": False}
+    assert set(doc["metric_quality"].values()) == {"unmeasured"}
+    assert set(doc["metric_quality"]) == set(_collector.METRIC_DEFINITIONS)
+
+
+def test_profile_rejection_envelope_marks_every_metric_unmeasured(fake_harness, tmp_path, capsys):
+    """Failure-modes row 3. The profile-rejection envelope is a SEPARATE PRODUCER from the
+    crash path -- `_PROFILE_ERROR_PREFIX` vs `_CRASH_ERROR_PREFIX` -- built via
+    `_empty_document` directly (collector.py main(), the `if profile_error is not None:`
+    branch). That producer's --out block writes it to disk as an ordinary dated sidecar
+    (fixed for the RENDERER'S reading in TRK-051, commit 9d59898); this test pins the
+    COLLECTOR producer itself."""
+    bad_profile = tmp_path / "bad-profile.json"
+    bad_profile.write_text('{"nonsense_key": "x"}')
+    rc = _collector.main(["--root", str(fake_harness), "--profile", str(bad_profile)])
+    assert rc == 2
+    doc = json.loads(capsys.readouterr().out)
+    assert set(doc["metric_quality"].values()) == {"unmeasured"}
+
+
+def test_inaccessible_path_matching_no_predicate_leaves_every_metric_complete():
+    """Failure-modes row 1. An unreadable path that feeds NO trended metric must not taint
+    anything -- the conservative direction is over-tainting a metric that genuinely
+    depends on the input, never tainting the whole board because one unrelated file was
+    unreadable. Exercised directly against `_metric_quality` (same pattern as the
+    `_empty_document`/`_rel` direct-call tests elsewhere in this file): every real,
+    content-scanned surface in this harness (CLAUDE.md, memory/, rules/, skills/, hooks/,
+    commands/, agents/, projects/, settings.json) is already covered by
+    `_METRIC_INPUT_PREFIXES` by design, so a full collector run over `fake_harness` cannot
+    itself produce a path outside every prefix -- that completeness is the point, not a
+    gap in this test."""
+    inaccessible = [{"path": "totally/unrelated/surface.bin", "reason": "unreadable"}]
+    quality = _collector._metric_quality(inaccessible, {"pairs": []})
+    assert inaccessible                                   # the path WAS recorded
+    assert set(quality.values()) == {"complete"}
 
 
 # S7.M1 (F6): eight is_dir() call sites in walk_always_loaded / collect_descriptions /
