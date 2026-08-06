@@ -183,6 +183,79 @@ def _write_sidecar(out_dir, date, doc):
     (Path(out_dir) / f"harness-map-{date}.json").write_text(json.dumps(doc))
 
 
+# S6c Task 3: the sentinel a caller passes to DROP a comparability marker from a
+# `_trend_doc`. `None` cannot serve — `definitions=None` already means "the standard
+# comparable marker set", and `project_root=None` is a REAL scope value the collector
+# emits (a null scope is a distinct scope, never "same as whatever ran last"). Asking for
+# the markerless path is therefore always explicit.
+_NO_MARKERS = object()
+
+
+def _trend_doc(scope_root="/fake/root", project_root=None, compose=False,
+               definitions=None, promotion=1, memory_bodies=1, phantom=(1, 1),
+               hooks=(0, 20), skills=(0, 20), **kw):
+    """A `_minimal_doc` carrying the S6c comparability markers AND variable derived
+    values. Returns a PLAIN DICT the caller may freely mutate before writing it.
+
+    Two independent reasons a bare `_minimal_doc` is unusable for a verdict fixture:
+
+    1. It is MARKERLESS -- no `collection_scope`, no `metric_definitions` -- which
+       correctly reads as UNKNOWN -> `not comparable` (S6 §6.5a / §8.1). A test built on
+       it asserts `improving` and gets `not comparable`, for a reason that has nothing
+       to do with the classifier.
+    2. It FIXES every derived value: promotion_candidates at 1, memory_bodies at 1,
+       phantom_refs at 1, and test_coverage.summary all-zero -- so BOTH ratio series
+       drop every point (`total` of 0 => point dropped) and the four count series are
+       flat by construction. A trend fixture built on it cannot move.
+
+    THE CONTRACT IN ONE LINE: `_trend_doc()` with no arguments produces a point that is
+    comparable on all three axes and MEASURABLE on all six derived series. Every refusal
+    a test wants is requested explicitly:
+
+      * markerless scope      -> `scope_root=_NO_MARKERS`
+      * markerless definitions-> `definitions=_NO_MARKERS`
+      * a scope transition    -> a different `scope_root`/`project_root`/`compose`
+      * a dropped ratio point -> `hooks=(0, 0)` / `skills=(0, 0)` (total 0 => no ratio)
+
+    `hooks`/`skills` therefore default to a NON-ZERO denominator. A zero one would
+    reproduce limitation 2 inside the helper written to remove it: both ratio series
+    would drop every point, `_trend_doc()` would yield four drawable derived series
+    instead of six, and the tempting repair is a pinned literal 4.
+
+    `**kw` forwards to `_minimal_doc` (extra_files, extra_promotion, tokens_a, tokens_b).
+    Owned by Task 3; used by Tasks 4, 5, 7, 8 and 13."""
+    doc = _minimal_doc(**kw)
+    if scope_root is not _NO_MARKERS:
+        doc["collection_scope"] = {"root": scope_root, "project_root": project_root,
+                                   "compose": compose}
+    if definitions is _NO_MARKERS:
+        doc.pop("metric_definitions", None)
+    else:
+        doc["metric_definitions"] = dict(_collector.METRIC_DEFINITIONS
+                                         if definitions is None else definitions)
+    # Axis 3: every metric fully measured. `complete` is the collector's own word for it
+    # (collector._metric_quality), not a synonym invented here.
+    doc["metric_quality"] = {k: "complete" for k in sorted(_collector.METRIC_DEFINITIONS)}
+    doc["promotion_candidates"] = [
+        {"source": f"rules/p{i}.md", "pattern": "NEVER", "excerpt": "NEVER do the thing",
+         "hook_covered": False, "evidence": "INFERRED"}
+        for i in range(promotion)]
+    doc["on_demand"]["memory_bodies"] = [
+        {"path": f"projects/x/memory/note{i}.md", "project_slug": "x", "lines": 5,
+         "words": 40, "evidence": "VERIFIED"}
+        for i in range(memory_bodies)]
+    total_refs, confirmed_refs = phantom
+    doc["phantom_refs"] = [
+        {"source": f"rules/r{i}.md", "ref": f"ghost{i}.md", "kind": "path",
+         "resolved": False if i < confirmed_refs else None,
+         "evidence": "VERIFIED" if i < confirmed_refs else "INFERRED"}
+        for i in range(total_refs)]
+    doc["test_coverage"]["summary"] = {
+        "hooks_with_test": hooks[0], "hooks_total": hooks[1],
+        "skills_with_test": skills[0], "skills_total": skills[1]}
+    return doc
+
+
 # ============================================================= 1. real-data smoke render
 def test_real_data_smoke_render(tmp_path):
     if not REAL_SAMPLE.is_file():
@@ -7839,6 +7912,19 @@ _TOTALITY_TARGETS = (
          "on_demand": {"memory_bodies": v},
          "test_coverage": {"summary": {"hooks_with_test": v, "hooks_total": v,
                                         "skills_with_test": v, "skills_total": v}}})],)),
+    # S6c Task 3: the classifier consumes point values straight out of untrusted sidecar
+    # JSON -- precisely this guard's subject. THREE entries, because the hostile value has
+    # three genuinely different jobs to do here:
+    #   * as a POINT (and a DATE) inside well-shaped lists -- the arithmetic/comparison
+    #     positions, where `all(value == first ...)` and `last > first` live;
+    #   * as the whole `points`/`dates` ARGUMENT -- a non-list where the window slice and
+    #     the 1:1 alignment check happen;
+    #   * as `polarity`/`latest_direction`/`comparability` -- the membership test that
+    #     would raise TypeError on an unhashable value if it were ever a set instead of a
+    #     tuple, and the `str(...)` the refusal path takes.
+    (rh._trend_point_value, lambda v: (v,)),
+    (rh.trend_verdict, lambda v: ([v, v, v], [v, v, v], v, v, v)),
+    (rh.trend_verdict, lambda v: (v, v, "up", "good", rh.COMPARABLE)),
 )
 
 
@@ -7857,3 +7943,363 @@ def test_every_s6b_function_reading_untrusted_json_is_total():
             except Exception as exc:  # noqa: BLE001 -- totality proof: ANY raise is a bug
                 failures.append((fn.__name__, value, type(exc).__name__, str(exc)))
     assert failures == [], failures
+
+
+# ================================= S6c Task 3: TREND_VERDICTS + the verdict classifier
+# EVERY assertion below calls the classifier DIRECTLY. Nothing in this section renders,
+# because nothing reaches HTML yet: the S6b comparability functions shipped unwired and
+# Task 7 owns the whole rendered half of this contract (verdict strings drawn only from
+# the enum, the retired words absent, and the two zero-delta states rendering
+# differently). This is the same shape as the shipped S6b precedent --
+# `test_marker_first_appearance_is_not_a_transition` and
+# `test_no_value_shape_heuristic_is_possible_by_signature` both call their function with
+# no render in the loop.
+#
+# `verdict_text` (never `text`) is the binding for a classifier result. `text` means
+# rendered HTML everywhere else in this suite.
+_DAILY_DATES = [f"2026-07-{d:02d}" for d in range(1, 15)]
+
+
+def _dates_for(points, start=1):
+    """Point-aligned dates, one calendar day apart -- the alignment `trend_verdict`
+    requires (`dates` is 1:1 with `points`, so the span is measured over the points that
+    actually contributed)."""
+    return [f"2026-07-{start + i:02d}" for i in range(len(points))]
+
+
+def test_verdict_enum_is_exactly_seven_values_in_strict_order():
+    """S6 §6.3. Guard states pre-empt direction states, so ORDER is contract, not
+    presentation. Asserts over the WORD column of the seven (word, gate, polarity)
+    rows. # Changing this value requires a spec change (S6 §6.3)."""
+    assert [row[0] for row in rh.TREND_VERDICTS] == [
+        "not measured", "not comparable", "no direction", "unchanged across N",
+        "net unchanged", "improving", "worsening"]
+    # three columns, one per column of report-template.md's TREND_VERDICT_TABLE block
+    # (Task 6 single-sources the two homes against each other).
+    assert all(len(row) == 3 for row in rh.TREND_VERDICTS)
+
+
+def test_below_floor_two_points_gets_no_direction_word():
+    """SPARKLINE_MIN_POINTS is THE one minimum-point rule. 2 is the largest series that
+    must NOT verdict, and the reason is visible (`2 pts · needs 3`) rather than a blank.
+    # Changing this format requires a spec change (S6 §6.3)."""
+    points = [10, 20]
+    verdict = rh.trend_verdict(points=points, dates=_dates_for(points), polarity="up")
+    assert verdict.word == "not measured"
+    assert "needs 3" in verdict.reason
+    assert "2 pts" in verdict.reason
+    # the floor is the constant, never a typed literal
+    assert f"needs {rh.SPARKLINE_MIN_POINTS}" in verdict.reason
+
+
+def test_at_floor_three_points_the_verdict_appears():
+    """The 2->3 transition is the only thing proving the gate is `>= 3`."""
+    two = [10, 20]
+    three = [10, 20, 30]
+    assert rh.trend_verdict(points=two, dates=_dates_for(two),
+                            polarity="up").word == "not measured"
+    assert rh.trend_verdict(points=three, dates=_dates_for(three),
+                            polarity="up").word == "worsening"
+
+
+def test_the_two_zero_delta_states_are_distinct_verdicts():
+    """`net unchanged` (10, 20, 10) means 'moved and came back to baseline';
+    `unchanged across N` (10, 10, 10) means 'never moved at any measured point'. Same
+    arithmetic, opposite meanings. Task 7 asserts they also RENDER differently -- if
+    they collapse at either layer the distinction is decorative."""
+    moved = [10, 20, 10]
+    flat = [10, 10, 10]
+    returned_verdict = rh.trend_verdict(points=moved, dates=_dates_for(moved), polarity="up")
+    flat_verdict = rh.trend_verdict(points=flat, dates=_dates_for(flat), polarity="up")
+    assert returned_verdict.word == "net unchanged"
+    assert flat_verdict.word == "unchanged across N"
+    assert returned_verdict.word != flat_verdict.word
+    assert returned_verdict.text != flat_verdict.text
+    # the N in the word is interpolated in the display text, never left as the letter
+    assert "unchanged across 3 measured runs" in flat_verdict.text
+    assert "measured runs" not in returned_verdict.text
+
+
+def test_polarity_none_yields_no_direction():
+    """Regression test for §6.7's round-1 table, which printed `improving` for
+    always_loaded_file_count -- a direction claim about a metric declared to have no
+    good direction."""
+    points = [10, 8, 6]
+    assert rh._HEADLINE_POLARITY["always_loaded_file_count"] == "none"
+    verdict = rh.trend_verdict(points=points, dates=_dates_for(points), polarity="none")
+    assert verdict.word == "no direction"
+    assert "improving" not in verdict.text
+    assert "worsening" not in verdict.text
+
+
+def test_dual_horizon_disagreement_carries_both_clauses():
+    """100 -> 50 -> 90. Net improving over the window while the LATEST interval
+    worsens. Asserting only the net word does not discharge this -- both clauses are
+    the contract."""
+    points = [100, 50, 90]
+    verdict = rh.trend_verdict(points=points, dates=_dates_for(points), polarity="up",
+                               latest_direction="bad")
+    verdict_text = verdict.text
+    assert verdict.word == "improving"
+    assert "net improving over 3 measured runs" in verdict_text
+    assert "latest interval worsening" in verdict_text
+
+
+def test_dual_horizon_agreement_uses_the_plain_form():
+    """The other half of the same contract: when the two horizons agree there is only
+    one claim to make, and padding it with a redundant second clause would train the
+    operator to skim past the disagreement case that matters."""
+    points = [100, 90, 80]
+    verdict = rh.trend_verdict(points=points, dates=_dates_for(points), polarity="up",
+                               latest_direction="good")
+    assert verdict.word == "improving"
+    assert "latest interval" not in verdict.text
+    assert "measured runs" not in verdict.text
+
+
+def test_every_verdict_except_not_measured_states_point_count_and_date_span():
+    """The `N pts / Md` contract has TWO halves and the date span is the half most
+    likely to be dropped. `improving  4 pts / 14d` is honest; bare `improving` is not --
+    four samples across two weeks and four across two years are different claims.
+    # Changing this format requires a spec change (S6 §6.3)."""
+    points = [7685, 7961, 7944, 6654]
+    dates = ["2026-07-01", "2026-07-05", "2026-07-11", "2026-07-15"]   # span 14 days
+    verdict = rh.trend_verdict(points=points, dates=dates, polarity="up")
+    verdict_text = verdict.text
+    assert "4 pts" in verdict_text and "14d" in verdict_text
+    # every non-`not measured` verdict, not just the direction ones
+    for polarity, comparability, expected in (
+            ("none", rh.COMPARABLE, "no direction"),
+            ("up", "scope changed on 2026-07-11", "not comparable"),
+            ("up", rh.COMPARABLE, "improving")):
+        other = rh.trend_verdict(points=points, dates=dates, polarity=polarity,
+                                 comparability=comparability)
+        assert other.word == expected
+        assert "4 pts" in other.text and "14d" in other.text
+
+
+def test_span_is_measured_over_the_points_not_over_the_window():
+    """A count and a span drawn from DIFFERENT sets is the mismatch the companions exist
+    to prevent. Three points that all landed inside one day is a different claim from
+    three spread across a fortnight, and both must be stated honestly."""
+    points = [10, 20, 30]
+    same_day = ["2026-07-15", "2026-07-15", "2026-07-15"]
+    spread = ["2026-07-01", "2026-07-08", "2026-07-15"]
+    assert "3 pts · 0d" in rh.trend_verdict(points=points, dates=same_day,
+                                            polarity="up").reason
+    assert "3 pts · 14d" in rh.trend_verdict(points=points, dates=spread,
+                                             polarity="up").reason
+
+
+def test_polarity_both_directions_in_one_run():
+    """THE load-bearing polarity fixture. A falling lower-is-better metric beside a
+    rising higher-is-better metric proves nothing -- both are 'improving' and a
+    classifier that infers direction FROM THE DATA passes. Move both in the SAME
+    numeric direction and demand OPPOSITE verdicts.
+
+    No HEADLINE_KEYS row carries polarity "down", so this is the first exercise of a
+    down-polarity series anywhere in the suite -- for the CLASSIFIER. The companion test
+    below covers `_trend_delta`'s own down arm."""
+    # always_loaded_tokens_est 6000->6500->7000 (polarity "up")   => worsening
+    tokens = [6000, 6500, 7000]
+    # hooks_with_test_ratio    12/20->14/20->16/20 (polarity "down") => improving
+    ratios = [{"value": 12, "total": 20, "ratio": 0.6},
+              {"value": 14, "total": 20, "ratio": 0.7},
+              {"value": 16, "total": 20, "ratio": 0.8}]
+    assert rh._HEADLINE_POLARITY["always_loaded_tokens_est"] == "up"
+    assert dict((k, p) for k, _, p in rh.DERIVED_TREND_KEYS)["hooks_with_test_ratio"] == "down"
+    rising = rh.trend_verdict(points=tokens, dates=_dates_for(tokens), polarity="up")
+    also_rising = rh.trend_verdict(points=ratios, dates=_dates_for(ratios), polarity="down")
+    assert rising.word == "worsening"
+    assert also_rising.word == "improving"
+
+
+def test_trend_delta_down_branch_runs_on_a_derived_series():
+    """FIRST-EVER COVERAGE of `_trend_delta`'s `polarity == "down"` arm, which has never
+    executed: zero HEADLINE_KEYS rows carry that polarity, and until S6c no other model
+    existed to feed it.
+
+    Reachable ONLY because Task 2 mirrors build_trend_model's shape closely enough that
+    `_trend_delta` serves BOTH models. Calling it with the derived model is a NEW CALL
+    SITE, not an edit -- `_trend_delta` itself is untouched.
+
+    PRECISE CLAIM, because the plain form is not achievable and overclaiming it would be
+    worse than not writing the test: a ratio series' points are `{value, total, ratio}`
+    DICTS, and `_trend_delta` -> `finite_number(dict)` is None, so
+    `rh._trend_delta(model, "hooks_with_test_ratio")` returns None on the raw model
+    (measured, not assumed -- asserted below). The points are therefore mapped through
+    `_trend_point_value`, the SAME normalizer the classifier uses, before the call.
+    `_trend_delta`'s down arm then executes for the first time, on values that came out
+    of `build_derived_trend_model`, with `_trend_delta` unmodified.
+
+    A rising ratio under polarity "down" must read GOOD; the up-polarity metric rising
+    in the same fixture must read BAD."""
+    dated_docs = [("2026-07-13", _trend_doc(hooks=(12, 20), phantom=(1, 1))),
+                  ("2026-07-14", _trend_doc(hooks=(14, 20), phantom=(2, 2))),
+                  ("2026-07-15", _trend_doc(hooks=(16, 20), phantom=(3, 3)))]
+    model = rh.build_derived_trend_model(dated_docs)
+    # the raw model cannot reach the down arm -- stated as a measurement, not a belief
+    assert rh._trend_delta(model, "hooks_with_test_ratio") is None
+    numeric = {"first_run": model["first_run"],
+               "series": [dict(series,
+                               points=[rh._trend_point_value(p) for p in series["points"]])
+                          for series in model["series"]]}
+    assert rh._trend_delta(numeric, "hooks_with_test_ratio")[1] == "good"
+    # the up-polarity metric rising in the SAME fixture must read the other way
+    assert rh._trend_delta(numeric, "phantom_ref_count")[1] == "bad"
+
+
+def test_non_finite_point_in_the_window_yields_not_measured():
+    """A NaN must not produce a green verdict: `nan > prev` is False and a down arrow
+    reads 'good' under polarity `up`, so the naive path emits a plausible-looking
+    IMPROVING for corrupt data -- the A19b class, in the reassuring direction. Mirror
+    `_coerce_floats`' all-or-nothing guard rather than narrowing it."""
+    for bad in (float("nan"), float("inf"), "12", None):
+        points = [10, bad, 30]
+        verdict = rh.trend_verdict(points=points, dates=_dates_for(points), polarity="up")
+        assert verdict.word == "not measured", bad
+        assert "improving" not in verdict.text, bad
+    # a ratio point whose `ratio` is missing is unusable the same all-or-nothing way
+    unusable = [{"value": 0, "total": 0, "ratio": None},
+                {"value": 1, "total": 2, "ratio": 0.5},
+                {"value": 2, "total": 2, "ratio": 1.0}]
+    assert rh.trend_verdict(points=unusable, dates=_dates_for(unusable),
+                            polarity="down").word == "not measured"
+
+
+def test_rise_then_fall_mirrors_the_real_series():
+    """7685, 7961, 7944, 6654."""
+    points = [7685, 7961, 7944, 6654]
+    assert points[1] > points[0]   # anti-vacuity guard: a future edit cannot flatten the
+                                   # data and leave this passing while testing nothing
+    assert points[-1] < points[0]
+    verdict = rh.trend_verdict(points=points, dates=_dates_for(points), polarity="up",
+                               latest_direction="good")
+    assert verdict.word == "improving"
+
+
+def test_series_length_honesty_three_versus_four():
+    """Two calls; the STATED counts must DIFFER, else a hardcoded string passes."""
+    three = [10, 20, 30]
+    four = [10, 20, 30, 40]
+    three_verdict = rh.trend_verdict(points=three, dates=_dates_for(three), polarity="up")
+    four_verdict = rh.trend_verdict(points=four, dates=_dates_for(four), polarity="up")
+    assert "3 pts" in three_verdict.reason
+    assert "4 pts" in four_verdict.reason
+    assert three_verdict.reason != four_verdict.reason
+
+
+def test_window_and_verdict_read_the_same_slice():
+    """12 points: the verdict reads points[-SPARKLINE_WINDOW:], the same slice the
+    sparkline draws. The first two points are chosen so the WHOLE series and the WINDOW
+    disagree -- a classifier reading the whole series returns the opposite word."""
+    points = [1000, 900] + list(range(10, 20))
+    assert len(points) == 12
+    assert points[-1] < points[0]     # whole series falls  -> `improving` under "up"
+    assert points[-1] > points[2]     # window rises        -> `worsening` under "up"
+    dates = _dates_for(points)
+    verdict = rh.trend_verdict(points=points, dates=dates, polarity="up")
+    assert verdict.word == "worsening"
+    assert f"{rh.SPARKLINE_WINDOW} pts" in verdict.reason
+    # the same slice `_sparkline_cell` draws
+    series = {"key": "k", "polarity": "up", "values": points, "points": points}
+    assert len(rh._series_points(series)[-rh.SPARKLINE_WINDOW:]) == rh.SPARKLINE_WINDOW
+
+
+def test_refusing_comparability_pre_empts_every_direction_word():
+    """S6 §6.3 strict order: a refusing record pre-empts direction. Task 4 supplies the
+    records; Task 3 pins that the parameter is honoured and that its factual reason
+    survives into the text."""
+    points = [100, 50, 10]
+    reason = "memory_body_count — 2026-07-13: definition v1; 2026-07-15: definition v2"
+    verdict = rh.trend_verdict(points=points, dates=_dates_for(points), polarity="up",
+                               latest_direction="good", comparability=reason)
+    assert verdict.word == "not comparable"
+    assert reason in verdict.text
+    assert "improving" not in verdict.text
+
+
+def test_classifier_returns_only_enum_words():
+    """Vocabulary is ASSERTED, not assumed. Drive the classifier across every shape
+    Tasks 3-5 construct and assert the word is always drawn from TREND_VERDICTS.
+    Task 7 asserts the same property of RENDERED output."""
+    words = {row[0] for row in rh.TREND_VERDICTS}
+    shapes = ([], [10], [10, 20], [10, 10, 10], [10, 20, 10], [10, 20, 30], [30, 20, 10],
+              [1000, 900] + list(range(10, 20)), [10, float("nan"), 30], [10, "12", 30],
+              [{"value": 1, "total": 2, "ratio": 0.5}, {"value": 1, "total": 2, "ratio": 0.5},
+               {"value": 2, "total": 2, "ratio": 1.0}],
+              [{"value": 1, "total": 0, "ratio": None}] * 3)
+    seen = set()
+    for points in shapes:
+        for polarity in ("up", "down", "none", None, "sideways"):
+            for latest in (None, "good", "bad", "neutral"):
+                for comparability in (rh.COMPARABLE, "scope changed on 2026-07-11"):
+                    verdict = rh.trend_verdict(points=points, dates=_dates_for(points),
+                                               polarity=polarity, latest_direction=latest,
+                                               comparability=comparability)
+                    assert verdict.word in words, (points, polarity, latest, verdict)
+                    seen.add(verdict.word)
+    # anti-vacuity: the sweep must actually reach every one of the seven, or it is
+    # asserting membership over a set it never populated.
+    assert seen == words
+
+
+def test_verdict_is_deterministic_across_repeat_calls():
+    """Binding rule 9: fixed orderings, no set iteration into output."""
+    points = [10, 20, 15, 40]
+    dates = _dates_for(points)
+    first = rh.trend_verdict(points=points, dates=dates, polarity="up")
+    second = rh.trend_verdict(points=list(points), dates=list(dates), polarity="up")
+    assert first == second
+
+
+def test_trend_point_value_normalizes_both_model_shapes():
+    """One normalizer for both trend models: `build_trend_model` emits bare numbers,
+    `build_derived_trend_model` emits `{value, total, ratio}` for the two ratio series.
+    Without this, a ratio series is unusable to the classifier and both ratio rows would
+    read `not measured` forever."""
+    assert rh._trend_point_value(7) == 7.0
+    assert rh._trend_point_value(0.6) == 0.6
+    assert rh._trend_point_value({"value": 12, "total": 20, "ratio": 0.6}) == 0.6
+    assert rh._trend_point_value({"value": 0, "total": 0, "ratio": None}) is None
+    assert rh._trend_point_value("12") is None
+    assert rh._trend_point_value(True) is None          # bool is not a measurement
+    assert rh._trend_point_value(float("nan")) is None
+    assert rh._trend_point_value(None) is None
+
+
+def test_trend_doc_is_comparable_and_measurable_on_all_six_derived_series():
+    """The `_trend_doc` contract itself (Step 1): no-argument call => comparable on all
+    three axes AND a measured point on every derived series. A regression here silently
+    breaks every verdict fixture in Tasks 4, 5, 7, 8 and 13."""
+    doc = _trend_doc()
+    assert doc["collection_scope"] == {"root": "/fake/root", "project_root": None,
+                                       "compose": False}
+    assert doc["metric_definitions"] == dict(_collector.METRIC_DEFINITIONS)
+    assert set(doc["metric_quality"].values()) == {"complete"}
+    model = rh.build_derived_trend_model([("2026-07-15", doc)])
+    assert len(model["series"]) == len(rh.DERIVED_TREND_KEYS)
+    for series in model["series"]:
+        assert len(series["points"]) == 1, series["key"]
+    # and every refusal is opt-in, never the default
+    markerless = _trend_doc(scope_root=_NO_MARKERS, definitions=_NO_MARKERS)
+    assert "collection_scope" not in markerless
+    assert "metric_definitions" not in markerless
+    dropped = _trend_doc(hooks=(0, 0), skills=(0, 0))
+    dropped_model = rh.build_derived_trend_model([("2026-07-15", dropped)])
+    assert [s["key"] for s in dropped_model["series"] if not s["points"]] == [
+        "hooks_with_test_ratio", "skills_with_test_ratio"]
+
+
+def test_trend_doc_derived_values_actually_vary_across_a_window():
+    """Shape every derived-value fixture takes -- the values must actually vary, or the
+    test proves nothing."""
+    docs = []
+    for i, n in enumerate((92, 96, 98)):
+        docs.append((_DAILY_DATES[i], _trend_doc(memory_bodies=n)))
+    model = rh.build_derived_trend_model(docs)
+    bodies = next(s for s in model["series"] if s["key"] == "memory_body_count")
+    assert bodies["points"] == [92, 96, 98]
+    verdict = rh.trend_verdict(points=bodies["points"], dates=model["dates"], polarity="up")
+    assert verdict.word == "worsening"
+    assert "3 pts · 2d" in verdict.reason

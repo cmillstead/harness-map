@@ -4239,6 +4239,176 @@ def _coerce_floats(values: list[Any]) -> list[float] | None:
     return out
 
 
+# ------------------------------------------------------- S6c §6.3: the trend verdict
+def _trend_point_value(point: Any) -> float | None:
+    """ONE normalizer for a trend point of EITHER model, or None when the point is
+    unusable. `build_trend_model` emits bare numbers; `build_derived_trend_model` emits
+    `{value, total, ratio}` for the two ratio series, and `ratio` is the only field
+    geometry or a verdict may ever read (a bare float would lose the denominator, and a
+    shrinking denominator manufactures a fake improvement).
+
+    Without this, `finite_number({...})` is None for every ratio point, so both ratio
+    rows would read `not measured` forever — verified against the shipped model, not
+    assumed. `finite_number` still does the actual rejecting, so bool/NaN/inf/oversized
+    values are refused here exactly as they are everywhere else in this module."""
+    if isinstance(point, dict):
+        return finite_number(point.get("ratio"))
+    return finite_number(point)
+
+
+def _trend_span_days(dates: list[Any]) -> int:
+    """Calendar days from the FIRST to the LAST date that contributed a measured point.
+
+    `max - min` rather than `last - first`: the model's dates are already ordered, so the
+    two agree on every real input, but a hand-built or corrupt window cannot produce a
+    negative span. An unparseable date contributes no endpoint; fewer than two parseable
+    dates gives 0, which reads as "no observable spread" — the same claim three points
+    that all landed inside one day make."""
+    parsed: list[datetime.date] = []
+    for value in dates:
+        if not isinstance(value, str):
+            continue
+        try:
+            parsed.append(datetime.date.fromisoformat(value))
+        except ValueError:
+            continue
+    if len(parsed) < 2:
+        return 0
+    return (max(parsed) - min(parsed)).days
+
+
+@dataclasses.dataclass(frozen=True)
+class TrendVerdict:
+    """`word` is the ENUM word (always a `TREND_VERDICTS` row 0, so vocabulary is
+    assertable); `text` is the display form with N interpolated and any second horizon
+    clause attached; `reason` is the mandatory companion (`N pts · Md`, or
+    `N pts · needs 3` below the floor)."""
+    word: str
+    text: str
+    reason: str
+
+
+# The one non-refusing value of `trend_verdict`'s `comparability` parameter. ANY other
+# value is a REFUSAL, and the value itself is the factual reason (dates and version
+# numbers — `build_confounded_reason` already returns exactly that shape). Task 4 fills
+# the parameter; the signature is settled here and does not change again.
+COMPARABLE = "comparable"
+
+# Rule-6 compliance: this classifier is a TOTAL function of (measured points, the
+# hardcoded polarity table, the hardcoded definition versions). No branch reads the data
+# to decide what "better" means -- that judgment was made at authoring time and is
+# reviewable in this file. Same construct as GAUGE_BANDS/_gauge_band. Prescriptive
+# verdicts (drag `outcome`) remain the model's and remain capped at `probation` (A4).
+#
+# The one thing that would BREAK this compliance is a heuristic -- "flag it confounded if
+# the number moved suspiciously far." That reads the data to decide what "suspicious"
+# means, and it eats memory_body_count 92/96/98/117, the single real drift finding in the
+# operator's dataset (S6 §8.4). Never write one.
+#
+# Changing this value requires a spec change (S6 §6.3). This table is single-sourced
+# against report-template.md's TREND_VERDICT_TABLE block by
+# test_trend_verdict_table_is_single_sourced -- editing either home without the other
+# turns the suite red.
+TREND_VERDICTS = (   # seven ROWS of (word, gate, polarity), strict evaluation order
+    ("not measured",
+     f"fewer than {SPARKLINE_MIN_POINTS} usable measured points in the window", "any"),
+    ("not comparable",
+     "the window is not comparable on scope, definition version or quality state", "any"),
+    ("no direction", "the metric declares no good direction", "none"),
+    ("unchanged across N", "every measured point in the window equals the first", "any"),
+    ("net unchanged",
+     "the last measured point equals the first, having moved between", "any"),
+    ("improving", "the net move over the window is in the metric's good direction",
+     "up or down"),
+    ("worsening", "the net move over the window is in the metric's bad direction",
+     "up or down"),
+)
+
+
+def trend_verdict(points: Any, dates: Any, polarity: Any,
+                  latest_direction: Any = None,
+                  comparability: Any = COMPARABLE) -> TrendVerdict:
+    """The long-window direction verdict for one series.
+
+    `comparability` DEFAULTS TO COMPARABLE so Task 3's tests exercise the direction
+    states with the default and Task 4 FILLS the parameter rather than reshaping the
+    signature. A refusing record pre-empts every direction word (S6 §6.3 strict order).
+
+    `latest_direction` is an INPUT, not a recomputation. ONE HOME FOR polarity->direction:
+    `_trend_delta`, which owns the LATEST-INTERVAL horizon and is not edited or duplicated
+    here. This function owns only the LONG-WINDOW horizon. Two horizons, two mechanisms,
+    one polarity table — which is what makes the dual-horizon contract honest, since its
+    two clauses genuinely come from two different computations rather than one
+    computation stated twice. Pass `_trend_delta(model, key)[1]` ("good"/"bad"/"neutral")
+    or None.
+
+    `dates` is aligned 1:1 with `points` — the dates that actually CONTRIBUTED a point,
+    which is the same set the count reports and the sparkline draws. A window that is not
+    1:1 cannot state a measurement density, so the span degrades to 0d rather than
+    silently pairing a date to the wrong point.
+
+    Both are windowed to the last `SPARKLINE_WINDOW`, the same slice `_sparkline_cell`
+    draws, so the number the operator reads and the line they see never disagree.
+
+    TOTAL by construction (registered in `_TOTALITY_TARGETS`): every argument may arrive
+    straight out of untrusted sidecar JSON, and no shape may raise."""
+    windowed = list(points)[-SPARKLINE_WINDOW:] if isinstance(points, (list, tuple)) else []
+    aligned = (isinstance(points, (list, tuple)) and isinstance(dates, (list, tuple))
+               and len(dates) == len(points))
+    windowed_dates = list(dates)[-SPARKLINE_WINDOW:] if aligned else []
+
+    # All-or-nothing, mirroring `_coerce_floats` rather than narrowing it: one corrupt
+    # value makes the WHOLE window unusable. A partial line would smuggle a fabricated
+    # measurement back in, and `nan > prev` is False -- which reads as a down arrow, which
+    # reads "good" under polarity `up`. A plausible-looking IMPROVING on corrupt data is
+    # worse than no verdict (A19b, in the reassuring direction).
+    coerced = [_trend_point_value(point) for point in windowed]
+    usable = [] if any(value is None for value in coerced) else [
+        value for value in coerced if value is not None]
+    count = len(usable)
+    if count < SPARKLINE_MIN_POINTS:
+        # `SPARKLINE_MIN_POINTS` is INTERPOLATED, never typed -- one home for the floor.
+        # Changing this format requires a spec change (S6 §6.3).
+        reason = f"{count} pts · needs {SPARKLINE_MIN_POINTS}"
+        return TrendVerdict("not measured", f"not measured · {reason}", reason)
+
+    # Mandatory companions on every verdict except `not measured`: measured point count
+    # AND date span, both halves, always. `improving` alone is not honest -- four samples
+    # across two weeks and four across two years are different claims.
+    # Changing this format requires a spec change (S6 §6.3).
+    reason = f"{count} pts · {_trend_span_days(windowed_dates)}d"
+
+    if comparability != COMPARABLE:
+        detail = str(comparability).strip() or "comparability unknown"
+        return TrendVerdict("not comparable", f"not comparable — {detail} · {reason}",
+                            reason)
+    if polarity not in ("up", "down"):
+        # `in` over a TUPLE, never a frozenset: `polarity` is untrusted leaf content and a
+        # `set`/`dict` membership test raises TypeError on an unhashable value.
+        return TrendVerdict("no direction", f"no direction · {reason}", reason)
+
+    first, last = usable[0], usable[-1]
+    if all(value == first for value in usable):
+        # "never moved at any measured point" -- a different claim from `net unchanged`.
+        phrase = f"unchanged across {count} measured runs"
+        return TrendVerdict("unchanged across N", f"{phrase} · {reason}", reason)
+    if last == first:
+        # "moved and came back to baseline". Same arithmetic as the row above, opposite
+        # meaning; collapsing the two would make the distinction decorative.
+        return TrendVerdict("net unchanged", f"net unchanged · {reason}", reason)
+
+    good = (polarity == "down") if last > first else (polarity == "up")
+    word = "improving" if good else "worsening"
+    opposite = "worsening" if good else "improving"
+    if latest_direction == ("bad" if good else "good"):
+        # The two horizons disagree, so BOTH clauses ship. Never the bare net word: it
+        # would hide the interval the operator can still act on.
+        phrase = f"net {word} over {count} measured runs; latest interval {opposite}"
+    else:
+        phrase = word
+    return TrendVerdict(word, f"{phrase} · {reason}", reason)
+
+
 def _sparkline_svg(dom_id: str, floats: list[float]) -> str:
     """One inline `<svg><polyline>` sparkline (no external assets, §9-R). `floats`
     is already-coerced, already-windowed (SPARKLINE_WINDOW) geometry data — every
