@@ -263,5 +263,77 @@
       "what_must_survive": "<example: the specific behavior/guarantee this surface currently provides that must not be lost if demoted>",
       "risk_if_wrong": "<example: what breaks, silently or loudly, if this candidate is demoted and the judgment turns out to be wrong>"
     }
+  ],
+  "trend_basis": [
+    {
+      "metric": "always_loaded_words",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "always_loaded_tokens_est",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "always_loaded_file_count",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "duplicate_pair_count",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "unchecked_binary_count",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "instruction_files_over_200",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "orphan_registration_count",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "orphan_script_count",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "promotion_candidate_count",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "memory_body_count",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "phantom_ref_count",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "phantom_confirmed_count",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "hooks_with_test_ratio",
+      "prose": "",
+      "inputs_digest": ""
+    },
+    {
+      "metric": "skills_with_test_ratio",
+      "prose": "",
+      "inputs_digest": ""
+    }
   ]
 }

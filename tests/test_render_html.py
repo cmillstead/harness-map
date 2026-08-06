@@ -9999,3 +9999,15 @@ def test_tile_sparkline_is_namespaced_and_follows_the_delta(tmp_path):
     delta_idx = inner.index('class="delta')
     spark_idx = inner.index('id="spark-tile-always_loaded_words"')
     assert v_idx < l_idx < band_idx < delta_idx < spark_idx
+
+
+# ============================================================= S6c Task 11 (§6.8): the
+# trend_basis contract's skeleton, mirroring the 36-cell CIVC completeness doctrine.
+def test_synthesis_template_has_one_trend_basis_row_per_trended_metric():
+    """Mirrors the 36-cell CIVC skeleton doctrine: the writer emits the full skeleton so
+    a gap in coverage is INTENTIONAL (a real judgment) rather than ACCIDENTAL (an
+    omitted row that merely looks like one)."""
+    template_path = Path(__file__).resolve().parents[1] / "synthesis-template.json"
+    rows = json.loads(template_path.read_text(encoding="utf-8"))["trend_basis"]
+    assert ({r["metric"] for r in rows}
+            == {k for k, _, _ in rh.HEADLINE_KEYS} | {k for k, _, _ in rh.DERIVED_TREND_KEYS})

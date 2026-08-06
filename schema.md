@@ -199,6 +199,10 @@ The synthesis pass (B) is not just a report — it also writes a machine-readabl
     {"n": 0, "surface": "<surface>", "evidence": "V|I|IA",
      "outcome": "keep|give it one home|load it later|turn it into a check|probation",
      "what_must_survive": "<prose>", "risk_if_wrong": "<prose>"}
+  ],
+  "trend_basis": [
+    {"metric": "<metric key>", "prose": "<one-sentence interpretive basis>",
+     "inputs_digest": "<first 16 chars of the sha256 described below>"}
   ]
 }
 ```
@@ -220,6 +224,18 @@ The synthesis pass (B) is not just a report — it also writes a machine-readabl
 ### D8 constraint
 
 Per Note (B) above, `retire safely` is disallowed in v1 (no-usage) runs — cap `outcome` at `probation` for any drag candidate that would otherwise warrant retirement.
+
+### `trend_basis` contract (S6 §6.8)
+
+`trend_basis` carries the model's one-sentence interpretive prose for each trended metric — the Trend tab's numeric series can refresh live (`serve.py` re-renders on every appended sidecar) while this prose is a launch-time judgment that does not, so each row is pinned to the exact inputs it was written against with a digest.
+
+`inputs_digest` is the first 16 hex characters of `hashlib.sha256(...).hexdigest()` over the canonical serialization `json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)` of a payload covering, **in this exact order**: `metric_key`; the ordered `(date, value, denominator_or_null)` triplet for every point in the trend window; the ordered list of resolved definition versions, one per point; the ordered list of collection scopes, one per point; the window length. `render_html.py`'s `trend_inputs_digest` is the sole implementation of this recompute, and `trend_basis_for` is the sole resolver that compares a row's stored digest against it.
+
+**CASING WARNING, this contract's equivalent:** a row whose `inputs_digest` does not exactly match the recomputed digest is not repaired, not partially trusted, and not shown alongside a disclaimer — `trend_basis_for` drops the prose entirely and substitutes the single fixed sentence `basis stale for this series` (`render_html.py`'s `TREND_BASIS_STALE_NOTE`). There is no fallback sentence and no partial credit: a mismatched or absent digest means **no prose renders at all** for that row, a silent TOTAL loss rather than a cosmetic slip. An absent row (the model never wrote one for that metric) is a different, quieter outcome — no prose and no stale note, since there is no history to call stale. Get the digest right at write time; recompute it fresh, never hand-copy or reuse a digest from another row or an earlier run.
+
+### `trend_basis` completeness
+
+`trend_basis` should carry exactly one row per trended metric — all 14 keys in `HEADLINE_KEYS` (8) union `DERIVED_TREND_KEYS` (6), the same two constants the Trend tab's series already iterate. This mirrors the CIVC skeleton doctrine above: a metric with no row degrades to no prose and no stale note, the same silent-looking outcome a genuinely-considered "nothing to say" row would produce, so the sidecar-writer must emit the full skeleton to make a gap *intentional* rather than *accidental*. `unchecked_binary_count` gets a row like every other headline metric even though it is excluded from `DERIVED_TREND_KEYS` (S6 §6.8 item 1, Note (B) above) — it still renders in the legacy headline table, and a row the operator can see is a row this contract covers. `synthesis-template.json` in this skill directory carries this full 14-row skeleton (`prose: ""`, `inputs_digest: ""` — an empty digest correctly reads as MISMATCH, so an unfilled row suppresses its own prose rather than fabricating one).
 
 ## (D) Friction telemetry streams
 
