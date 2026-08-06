@@ -7984,6 +7984,36 @@ _TOTALITY_TARGETS = (
     (rh.trend_basis_for, lambda v: (v, v, v, v, v, v)),
     (rh.trend_basis_for,
      lambda v: ([{"metric": v, "inputs_digest": v, "prose": v}], v, [v], [v], [v], v)),
+    # S6c Task 7: the wiring. Every reader below is handed model- or sidecar-derived state
+    # -- a series dict, a provenance table, a date used as a dict KEY, a derived per-date
+    # value -- and each reaches an operation the block comment above names: `dict.get` on a
+    # possibly-unhashable key, a length comparison against a non-sequence, and arithmetic on
+    # an untrusted `ratio`. Same two jobs Tasks 3-5 split: the hostile value as a leaf, and
+    # as the whole argument.
+    # The SERIES container is held at a valid dict, the same narrowing the `doc`/`legacy`
+    # note above records and for the same reason: both producers are this module's own
+    # builders, and every test that hand-builds one builds a dict. The untrusted leaf is
+    # `series["point_dates"]`, which is what the hostile matrix targets.
+    (rh._series_point_dates, lambda v: ({"point_dates": v},)),
+    (rh._trend_window, lambda v: ({"points": [v], "point_dates": v},)),
+    (rh._provenance_record, lambda v: (v, v)),
+    (rh._provenance_record, lambda v: ({"by_date": {"2026-01-01": v}}, v)),
+    (rh._provenance_metric, lambda v: ({"quality": v}, "quality", v, None)),
+    (rh._provenance_metric,
+     lambda v: ({"quality": {"memory_body_count": v}}, "quality", v, None)),
+    (rh._series_axes, lambda v: (v, [v], [v], v)),
+    (rh._series_axes,
+     lambda v: ("memory_body_count", ["2026-01-01"], [v],
+                {"by_date": {"2026-01-01": {"scope": v, "quality": v, "versions": v}}})),
+    (rh.build_trend_provenance, lambda v: (v, v)),
+    (rh.build_trend_provenance, lambda v: ([(v, v)], {"x": v})),
+    (rh._verdict_slug, lambda v: (v,)),
+    (rh._fmt_trend_value, lambda v: (v,)),
+    (rh._fmt_trend_value, lambda v: ({"value": v, "total": v, "ratio": v},)),
+    (rh._trend_latest_direction, lambda v: (v, v)),
+    (rh._trend_latest_direction,
+     lambda v: ({"first_run": False, "series": [{"key": "k", "polarity": v,
+                                                 "points": [v, v]}]}, "k")),
 )
 
 
@@ -8997,3 +9027,647 @@ def test_trend_verdict_table_is_single_sourced_against_the_template():
     # same words, same gate text, same polarity, same ORDER -- case-sensitive.
     # (No "thresholds" here: that column belongs to the BANDS precedent, not to this
     # table, whose three columns are Verdict | Gate | Polarity.)
+
+
+# ========================= S6c Task 7: the RENDERED verdict surface (§6.8, Ambiguities A/B)
+# EVERY assertion below reads a real rendered document. Tasks 3-5 asserted at the FUNCTION
+# level because nothing they built reached HTML -- the S6b comparability machinery they
+# consume shipped unwired, called from nowhere. This section is the other half of that
+# split: the wiring, and the properties only a rendered page can prove.
+#
+# N = len(HEADLINE_KEYS) + len(DERIVED_TREND_KEYS), DERIVED and never typed. The legacy
+# table keeps iterating all 8 headline series INCLUDING unchecked_binary_count (three
+# shipped sparkline-count assertions require it); §6.8's exclusion of that metric governs
+# the DERIVED table, which never had it.
+_RENDERED_TREND_ROWS = len(rh.HEADLINE_KEYS) + len(rh.DERIVED_TREND_KEYS)
+
+# Anchored on the VERDICT CELL, not on a row class: the trend `<tr>` stays bare because
+# `test_trend_table_renders_a_missing_point_as_not_measured` matches `<tr><td>Duplicate
+# pairs</td>` on this table, and binding rule 7 forbids editing that assertion. The
+# verdict cell is what makes a row a trend row anyway.
+_TREND_ROW_RE = re.compile(
+    r'<tr><td>(?:(?!</tr>).)*?<td class="trend-verdict verdict-[a-z0-9-]+"'
+    r'(?:(?!</tr>).)*?</tr>', re.S)
+_VERDICT_CELL_RE = re.compile(
+    r'<td class="trend-verdict verdict-[a-z0-9-]+" data-verdict="([^"]*)">'
+    r'((?:(?!</td>).)*)</td>', re.S)
+
+
+def _dated_trend_docs(per_date, start=13):
+    """`[(date, doc)]` from one `_trend_doc(**kwargs)` mapping per date, one calendar day
+    apart. Each doc is a fresh dict the caller may mutate to opt into a refusal."""
+    return [(f"2026-07-{start + i:02d}", _trend_doc(**kwargs))
+            for i, kwargs in enumerate(per_date)]
+
+
+def _render_corpus(tmp_path, name, dated_docs, synthesis=None):
+    """Write a real dated sidecar corpus -- optionally with a synthesis sidecar -- and
+    render it through the CLI, returning the HTML. Real files, real subprocess, the same
+    fixture style every other render test in this module uses."""
+    out_dir = tmp_path / name
+    out_dir.mkdir()
+    for sidecar_date, doc in dated_docs:
+        _write_sidecar(out_dir, sidecar_date, doc)
+    selected = dated_docs[-1][0]
+    if synthesis is not None:
+        (out_dir / f"harness-synthesis-{selected}.json").write_text(json.dumps(synthesis))
+    proc = run_render(out_dir, "--date", selected, "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    return (out_dir / f"harness-map-{selected}.html").read_text(encoding="utf-8")
+
+
+def _trend_rows(text):
+    """Every rendered trend row across BOTH tables, as raw HTML.
+
+    NON-VACUITY IS THE CALLER'S JOB, and every caller below discharges it: a
+    `for row in _trend_rows(text)` loop passes with ZERO iterations the moment this regex
+    stops matching the markup -- the same false-green Task 6 guards against with its
+    `assert block, "...marker block missing or empty"`. Assert the length against
+    `_RENDERED_TREND_ROWS` before iterating."""
+    return _TREND_ROW_RE.findall(text)
+
+
+def _trend_row(text, label):
+    """The one trend row whose metric cell is exactly `label`. Asserting there is EXACTLY
+    one also pins that no metric renders twice -- two rows for one metric would mean two
+    verdicts for one series."""
+    rows = [row for row in _trend_rows(text) if f"<td>{label}</td>" in row]
+    assert len(rows) == 1, (label, len(rows))
+    return rows[0]
+
+
+def _verdict_of(row_html):
+    """`(enum word, verdict-cell inner HTML)` for one trend row."""
+    match = _VERDICT_CELL_RE.search(row_html)
+    assert match is not None, row_html
+    return match.group(1), match.group(2)
+
+
+def _moving_corpus():
+    """Three comparable dated docs carrying three measured points on every one of the 14
+    rendered series -- the baseline every presentation test below renders."""
+    return _dated_trend_docs([
+        dict(memory_bodies=5, promotion=1, phantom=(2, 2), hooks=(12, 20), skills=(4, 10)),
+        dict(memory_bodies=9, promotion=2, phantom=(2, 2), hooks=(14, 20), skills=(5, 10)),
+        dict(memory_bodies=5, promotion=3, phantom=(2, 2), hooks=(16, 20), skills=(6, 10)),
+    ])
+
+
+# --------------------------------------------------------- Ambiguity A/B: the two surfaces
+def test_sparkline_svg_css_class_and_title_default_to_the_legacy_bytes():
+    """Byte-identity guard (Ambiguity B). `test_sparkline_flat_series_renders_at_the_
+    bottom_not_mid_height` calls `_sparkline_svg("spark-x", [5.0, 5.0, 5.0])` POSITIONALLY
+    with exactly two arguments, so both new parameters must be keyword-only -- and their
+    defaults must reproduce the pre-change bytes exactly, because three shipped assertions
+    COUNT `class="sparkline"` occurrences and a fourth asserts its ABSENCE."""
+    import inspect
+    assert rh._sparkline_svg("spark-x", [5.0, 5.0, 5.0]) == (
+        '<svg class="sparkline" id="spark-x" viewBox="0 0 120.00 24.00" width="120" '
+        'height="24" role="img" aria-labelledby="spark-x-title">'
+        '<title id="spark-x-title">trend sparkline</title>'
+        '<polyline points="0.00,22.00 60.00,22.00 120.00,22.00" fill="none" '
+        'stroke="currentColor" stroke-width="1.5"/></svg>')
+    params = inspect.signature(rh._sparkline_svg).parameters
+    assert params["css_class"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["css_class"].default == "sparkline"
+    assert params["title"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["title"].default is None
+
+
+def test_legacy_headline_sparkline_cell_is_byte_unchanged():
+    """Ambiguity A from the other side. The LEGACY per-date table keeps its min/max/cur
+    span, byte for byte: a shipped regex pins `</svg><span class="sparkline-stats">`
+    adjacency AND the exact stats text, so `_sparkline_cell` is frozen and both new
+    surfaces get their own renderer instead of an extension of this one."""
+    series = {"key": "always_loaded_words", "label": "Always-loaded words",
+              "polarity": "up", "values": [150, 160, 161], "points": [150, 160, 161],
+              "point_dates": ["2026-07-13", "2026-07-14", "2026-07-15"]}
+    assert rh._sparkline_cell(series) == (
+        '<svg class="sparkline" id="spark-always_loaded_words" '
+        'viewBox="0 0 120.00 24.00" width="120" height="24" role="img" '
+        'aria-labelledby="spark-always_loaded_words-title">'
+        '<title id="spark-always_loaded_words-title">trend sparkline</title>'
+        '<polyline points="0.00,22.00 60.00,3.82 120.00,2.00" fill="none" '
+        'stroke="currentColor" stroke-width="1.5"/></svg>'
+        '<span class="sparkline-stats">min 150.00 · max 161.00 · cur 161.00</span>')
+
+
+def test_derived_sparklines_carry_their_own_class_and_namespaced_dom_id(tmp_path):
+    """Pinned from BOTH sides (Ambiguity B): the derived class is present where expected
+    AND the bare `class="sparkline"` count is unchanged. The shipped count assertions are
+    substring-fragile -- `class="sparkline"` WITH its closing quote does not occur inside
+    `class="sparkline sparkline-derived"`. The DOM id is namespaced too, or
+    `id="spark-memory_body_count"` would collide and break `aria-labelledby`."""
+    text = _render_corpus(tmp_path, "derivedspark", _moving_corpus())
+    assert text.count('class="sparkline"') == len(rh.HEADLINE_KEYS)
+    assert text.count('class="sparkline sparkline-derived"') == len(rh.DERIVED_TREND_KEYS)
+    assert 'id="spark-derived-memory_body_count"' in text
+    assert 'id="spark-memory_body_count"' not in text
+    # ...and the legacy namespace is untouched in the same document
+    assert 'id="spark-always_loaded_words"' in text
+    assert 'id="spark-derived-always_loaded_words"' not in text
+
+
+def test_derived_sparklines_respect_the_point_floor_like_the_legacy_ones(tmp_path):
+    """The FOURTH shipped assertion in the sparkline-count family is a NEGATIVE one
+    (`test_sparkline_absent_below_three_sidecars`), and it survives only because every new
+    surface respects `SPARKLINE_MIN_POINTS`. Two sidecars: NEITHER table draws a mark."""
+    text = _render_corpus(tmp_path, "derivedfloor", _dated_trend_docs(
+        [dict(memory_bodies=5), dict(memory_bodies=9)]))
+    assert 'class="sparkline"' not in text
+    assert 'class="sparkline sparkline-derived"' not in text
+    # the tables themselves still render, verdicts and all
+    assert len(_trend_rows(text)) == _RENDERED_TREND_ROWS
+
+
+def test_derived_cell_omits_the_min_max_cur_span_the_legacy_cell_keeps(tmp_path):
+    """§6.8 item 2 on the PROMOTED surface: the span duplicates the adjacent date columns,
+    is wider than the mark it annotates, and prints `.00` on integer counts. Ambiguity A:
+    the LEGACY headline table keeps its span, which a shipped assertion pins."""
+    text = _render_corpus(tmp_path, "derivedspan", _moving_corpus())
+    derived = _trend_row(text, "Memory bodies")
+    legacy = _trend_row(text, "Always-loaded words")
+    assert 'class="sparkline sparkline-derived"' in derived
+    assert 'class="sparkline-stats"' not in derived
+    assert 'class="sparkline-stats"' in legacy
+
+
+def test_svg_title_carries_the_metric_the_verdict_and_the_basis(tmp_path):
+    """`role="img"` + `aria-labelledby` means the `<title>` is the ENTIRE accessible
+    content of the graphic, and today's default says "trend sparkline" -- which tells a
+    screen-reader user nothing the sighted reader of the same row does not get (§6.8
+    item 5). The digest is recomputed HERE from the same covered inputs, so a renderer that
+    fingerprinted a different window would suppress the prose and fail this."""
+    counts = (92, 96, 98)
+    docs = _dated_trend_docs([dict(memory_bodies=n) for n in counts])
+    digest = rh.trend_inputs_digest(
+        "memory_body_count",
+        [[date, float(n), None] for (date, _), n in zip(docs, counts)],
+        [_collector.METRIC_DEFINITIONS["memory_body_count"]] * len(counts),
+        [doc["collection_scope"] for _, doc in docs],
+        rh.SPARKLINE_WINDOW)
+    synthesis = {"schema_version": 1, "trend_basis": [
+        {"metric": "memory_body_count", "prose": "six more bodies since the 13th",
+         "inputs_digest": digest}]}
+    text = _render_corpus(tmp_path, "sparktitle", docs, synthesis=synthesis)
+    row = _trend_row(text, "Memory bodies")
+    title = re.search(
+        r'<title id="spark-derived-memory_body_count-title">([^<]*)</title>', row)
+    assert title is not None, row
+    assert "Memory bodies" in title.group(1)
+    assert "worsening" in title.group(1)
+    assert "six more bodies since the 13th" in title.group(1)
+    # the same prose renders VISIBLY too, with no stale note beside it
+    assert 'class="trend-basis">six more bodies since the 13th</span>' in row
+    assert rh.TREND_BASIS_STALE_NOTE not in row
+
+
+# ------------------------------------------------- the verdict vocabulary, on the page
+def test_rendered_verdict_words_are_drawn_only_from_the_enum(tmp_path):
+    """Asserted over the FULL rendered document, not one row: `data-verdict` carries the
+    enum word alone (the display text interpolates N and may attach a second horizon
+    clause, so the word is not recoverable from it by parsing)."""
+    text = _render_corpus(tmp_path, "enumonly", _moving_corpus())
+    words = re.findall(r'data-verdict="([^"]*)"', text)
+    assert len(words) == _RENDERED_TREND_ROWS, words
+    allowed = {row[0] for row in rh.TREND_VERDICTS}
+    assert set(words) <= allowed, sorted(set(words) - allowed)
+
+
+def test_the_retired_verdict_words_are_absent_from_the_document_and_the_cells(tmp_path):
+    """`frozen 14d` was §6.7's round-1 wording and is retired outright. `stable` is scoped
+    to the verdict CELLS on purpose -- the substring occurs in unrelated prose elsewhere in
+    the page, so a document-wide ban would be a false failure."""
+    text = _render_corpus(tmp_path, "retired", _moving_corpus())
+    assert "frozen 14d" not in text
+    cells = [_verdict_of(row)[1] for row in _trend_rows(text)]
+    assert len(cells) == _RENDERED_TREND_ROWS
+    for cell in cells:
+        assert "stable" not in cell.lower(), cell
+
+
+def test_every_verdict_word_has_a_distinct_mark():
+    """Single-sourced against TREND_VERDICTS: a verdict added without a mark turns this red
+    instead of rendering a silent `?`. Distinctness is the whole point -- two words sharing
+    a silhouette would make the shape channel decorative."""
+    words = [row[0] for row in rh.TREND_VERDICTS]
+    assert sorted(rh._VERDICT_MARKS) == sorted(words)
+    marks = [rh._VERDICT_MARKS[word] for word in words]
+    assert len(set(marks)) == len(marks), marks
+
+
+def test_each_rendered_verdict_carries_word_shape_and_colour_not_colour_alone(tmp_path):
+    """Colour is the THIRD channel, never the first. Every cell carries a WORD (the
+    display text), a SHAPE (a silhouette readable in greyscale, in forced-colors and under
+    every CVD type) and only then a colour class."""
+    text = _render_corpus(tmp_path, "verdictshape", _moving_corpus())
+    rows = _trend_rows(text)
+    assert len(rows) == _RENDERED_TREND_ROWS
+    for row in rows:
+        word, cell = _verdict_of(row)
+        mark = rh._VERDICT_MARKS[word]
+        assert f'<span class="verdict-mark" aria-hidden="true">{mark}</span>' in cell
+        display = re.search(r'<span class="verdict-text">([^<]*)</span>', cell)
+        assert display is not None and display.group(1).strip() != "", cell
+        slug = rh._verdict_slug(word)
+        assert f'<td class="trend-verdict verdict-{slug}"' in row
+        assert f'<td class="trend-mark verdict-{slug}">' in row
+    # ...and every slug the surface can emit has a colour rule, so the third channel is
+    # actually wired rather than merely named
+    for word in rh._VERDICT_MARKS:
+        rule = f".verdict-{rh._verdict_slug(word)} .verdict-mark{{color:var("
+        assert rule in rh.STATIC_STYLE, word
+
+
+def test_verdict_mark_colours_meet_the_large_text_contrast_floor():
+    """The composed-value defect a literal scan of the stylesheet structurally cannot see
+    (the rules carry no hex at all). Every mark colour is resolved against BOTH parsed
+    theme palettes. The mark is sized as WCAG large-scale text (>=18.66px bold), whose
+    floor is 3:1 -- which is why the WORD deliberately keeps the default ink instead:
+    --good and --warn are about 3.1:1 on --surface in the light theme, under the 4.5:1
+    floor for this cell's 0.8rem text.
+    # Changing these values requires a spec change (WCAG 2.1 AA 1.4.3)."""
+    css = rh.STATIC_STYLE
+    sizing = _css_decls(css, ".trend-verdict .verdict-mark")
+    assert "font-size:1.25rem" in sizing and "font-weight:700" in sizing, sizing
+    light = _theme_tokens(_theme_block(css, ":root{"))
+    dark = _theme_tokens(_theme_block(css, ':root[data-theme="dark"]{'))
+    checked = 0
+    for word in rh._VERDICT_MARKS:
+        rule = _css_decls(css, f".verdict-{rh._verdict_slug(word)} .verdict-mark")
+        match = re.search(r"color:var\((--[a-z0-9-]+)\)", rule)
+        assert match, (word, rule)
+        for theme_name, tokens in (("light", light), ("dark", dark)):
+            ratio = _wcag_contrast(tokens[match.group(1)], tokens["--surface"])
+            assert ratio >= 3.0, (
+                f"{theme_name}: {match.group(1)} on --surface = {ratio:.2f}:1, "
+                f"below the 3:1 large-text floor ({word})")
+            checked += 1
+    assert checked == len(rh._VERDICT_MARKS) * 2   # anti-vacuity: the loop really ran
+
+
+def test_unchanged_across_n_gets_an_amber_mark_and_a_dashed_stroke(tmp_path):
+    """`net unchanged` and `unchanged across N` are the same arithmetic and opposite
+    meanings. Three devices separate them: different words, an AMBER token (deliberately
+    NOT --crit -- never having moved is not a regression), and a DASHED stroke."""
+    docs = _dated_trend_docs([dict(memory_bodies=n, phantom=(2, 2)) for n in (5, 9, 5)])
+    text = _render_corpus(tmp_path, "dashed", docs)
+    flat = _trend_row(text, "Phantom refs (total)")
+    assert _verdict_of(flat)[0] == "unchanged across N"
+    assert '<td class="trend-mark verdict-unchanged-across-n">' in flat
+    style = rh.STATIC_STYLE
+    assert "td.verdict-unchanged-across-n .sparkline polyline{stroke-dasharray:3 2}" in style
+    assert ".verdict-unchanged-across-n .verdict-mark{color:var(--warn)}" in style
+    assert ".verdict-unchanged-across-n .verdict-mark{color:var(--crit)}" not in style
+
+
+def test_net_unchanged_and_unchanged_across_n_render_differently(tmp_path):
+    """Same arithmetic, opposite meanings -- if they collapse at the rendering layer the
+    distinction the classifier draws is decorative."""
+    docs = _dated_trend_docs([dict(memory_bodies=n, phantom=(2, 2)) for n in (5, 9, 5)])
+    text = _render_corpus(tmp_path, "twozerostates", docs)
+    flat_word, flat_cell = _verdict_of(_trend_row(text, "Phantom refs (total)"))
+    moved_word, moved_cell = _verdict_of(_trend_row(text, "Memory bodies"))
+    assert flat_word == "unchanged across N"
+    assert moved_word == "net unchanged"
+    assert flat_cell != moved_cell
+    assert "unchanged across 3 measured runs" in flat_cell
+    assert "measured runs" not in moved_cell
+    assert rh._VERDICT_MARKS[flat_word] != rh._VERDICT_MARKS[moved_word]
+
+
+def test_no_direction_renders_for_every_polarity_none_metric_on_both_tables(tmp_path):
+    """§6.7's round-1 table printed `improving` for always_loaded_file_count -- a direction
+    claim about a metric declared to have no good direction. Both tables carry such a
+    metric, so both are checked; `unchecked_binary_count` is the honest case for the word,
+    being permanently 0 and explicitly never inspected."""
+    text = _render_corpus(tmp_path, "nodirection", _moving_corpus())
+    headline = [label for _, label, polarity in rh.HEADLINE_KEYS if polarity == "none"]
+    derived = [label for _, label, polarity in rh.DERIVED_TREND_KEYS if polarity == "none"]
+    assert headline and derived        # anti-vacuity: BOTH tables must contribute a metric
+    for label in headline + derived:
+        word, cell = _verdict_of(_trend_row(text, label))
+        assert word == "no direction", (label, word)
+        assert "improving" not in cell and "worsening" not in cell, label
+
+
+def test_dual_horizon_disagreement_renders_both_clauses(tmp_path):
+    """10 -> 4 -> 6 on a polarity-`up` metric: net improving over the window while the
+    LATEST interval worsens. The bare net word would hide the interval the operator can
+    still act on."""
+    docs = _dated_trend_docs([dict(memory_bodies=n) for n in (10, 4, 6)])
+    text = _render_corpus(tmp_path, "dualhorizon", docs)
+    word, cell = _verdict_of(_trend_row(text, "Memory bodies"))
+    assert word == "improving"
+    assert "net improving over 3 measured runs" in cell
+    assert "latest interval worsening" in cell
+
+
+def test_every_rendered_verdict_except_not_measured_states_count_and_span(tmp_path):
+    """`improving 3 pts / 14d` is honest; a bare `improving` is not -- three samples across
+    a fortnight and three across two years are different claims. Both halves, on every one
+    of the 14 rows."""
+    docs = [("2026-07-01", _trend_doc(memory_bodies=5)),
+            ("2026-07-08", _trend_doc(memory_bodies=9)),
+            ("2026-07-15", _trend_doc(memory_bodies=12))]
+    text = _render_corpus(tmp_path, "companions", docs)
+    rows = _trend_rows(text)
+    assert len(rows) == _RENDERED_TREND_ROWS
+    for row in rows:
+        word, cell = _verdict_of(row)
+        assert word != "not measured", row
+        assert re.search(r"\d+ pts", cell), cell
+        assert "3 pts · 14d" in cell, cell
+
+
+def test_a_below_floor_series_renders_not_measured_with_its_reason(tmp_path):
+    """The other half of the companions contract: below the floor there is no span to
+    state, so the reason states the shortfall instead (`2 pts · needs 3`) rather than a
+    blank cell."""
+    docs = _dated_trend_docs([dict(memory_bodies=n) for n in (5, 9, 12)])
+    del docs[0][1]["on_demand"]["memory_bodies"]
+    text = _render_corpus(tmp_path, "belowfloor", docs)
+    word, cell = _verdict_of(_trend_row(text, "Memory bodies"))
+    assert word == "not measured"
+    assert f"2 pts · needs {rh.SPARKLINE_MIN_POINTS}" in cell
+    # a fully measured sibling in the SAME document is unaffected -- the floor is per series
+    assert _verdict_of(_trend_row(text, "Phantom refs (total)"))[0] != "not measured"
+
+
+# ------------------------------------------- the refusals, rendered beside their reasons
+def test_scope_and_quality_suppression_render_not_comparable_with_the_value_visible(
+        tmp_path):
+    """§6.5a: suppression is DIRECTION-ONLY, on every axis. The value the operator came to
+    read survives every refusal, and the refusal names WHICH axis refused."""
+    scope_docs = _dated_trend_docs([dict(memory_bodies=n) for n in (5, 9, 12)])
+    scope_docs[2][1]["collection_scope"] = {"root": "/other/root", "project_root": None,
+                                            "compose": False}
+    scope_text = _render_corpus(tmp_path, "scopesuppress", scope_docs)
+    scope_row = _trend_row(scope_text, "Memory bodies")
+    scope_word, scope_cell = _verdict_of(scope_row)
+    assert scope_word == "not comparable"
+    assert "collection scope" in scope_cell
+    assert "root=/other/root" in scope_cell
+    assert "<td>12</td>" in scope_row                    # the VALUE still renders
+
+    quality_docs = _dated_trend_docs([dict(memory_bodies=n) for n in (5, 9, 12)])
+    quality_docs[1][1]["metric_quality"]["memory_body_count"] = "partial"
+    quality_text = _render_corpus(tmp_path, "qualitysuppress", quality_docs)
+    quality_row = _trend_row(quality_text, "Memory bodies")
+    quality_word, quality_cell = _verdict_of(quality_row)
+    assert quality_word == "not comparable"
+    assert "quality partial" in quality_cell
+    assert "<td>12</td>" in quality_row
+    # ...and ONLY that metric: quality is recorded per (run, metric), not per run
+    assert _verdict_of(_trend_row(quality_text,
+                                  "Phantom refs (total)"))[0] != "not comparable"
+
+
+def test_a_definition_confounded_row_renders_the_flag_and_no_direction_word(tmp_path):
+    """§8.5: a definition change must never render as a trend. The row states the versions
+    it observed and withholds every direction word."""
+    baseline = dict(_collector.METRIC_DEFINITIONS)
+    bumped = {**baseline, "memory_body_count": baseline["memory_body_count"] + 1}
+    docs = _dated_trend_docs([dict(memory_bodies=5), dict(memory_bodies=9),
+                              dict(memory_bodies=12, definitions=bumped)])
+    text = _render_corpus(tmp_path, "defconfound", docs)
+    word, cell = _verdict_of(_trend_row(text, "Memory bodies"))
+    assert word == "not comparable"
+    assert f"definition v{baseline['memory_body_count']}" in cell
+    assert f"definition v{bumped['memory_body_count']}" in cell
+    for direction in ("improving", "worsening", "unchanged", "no direction"):
+        assert direction not in cell, direction
+    # anti-vacuity: an untouched sibling metric in the SAME document keeps its direction
+    assert _verdict_of(_trend_row(text, "Phantom refs (total)"))[0] != "not comparable"
+
+
+def test_a_denominator_confounded_row_names_the_observed_denominators(tmp_path):
+    """ALL PAIRS, never first-versus-last: `21 -> 20 -> 21` escapes an endpoint check
+    entirely while the middle ratio was computed against a different base, and a shrinking
+    denominator manufactures a fake improvement. The reason states the observed SET."""
+    docs = _dated_trend_docs([dict(hooks=(16, 21)), dict(hooks=(16, 20)),
+                              dict(hooks=(16, 21))])
+    text = _render_corpus(tmp_path, "denomconfound", docs)
+    word, cell = _verdict_of(_trend_row(text, "Hooks with test"))
+    assert word == "not comparable"
+    assert "denominators observed: 20, 21" in cell
+    assert "denominator 21" in cell and "denominator 20" in cell
+    assert _verdict_of(_trend_row(text, "Skills with test"))[0] != "not comparable"
+
+
+def test_a_stale_basis_row_renders_the_note_and_not_the_cached_prose(tmp_path):
+    """§6.8: the model's basis prose must not outlive its inputs. NO FALLBACK SENTENCE --
+    a renderer-authored default is a judgment wearing a default's clothing."""
+    docs = _dated_trend_docs([dict(memory_bodies=n) for n in (92, 96, 98)])
+    synthesis = {"schema_version": 1, "trend_basis": [
+        {"metric": "memory_body_count", "prose": "PROSE THAT MUST NOT RENDER",
+         "inputs_digest": "0123456789abcdef"}]}
+    text = _render_corpus(tmp_path, "stalebasis", docs, synthesis=synthesis)
+    row = _trend_row(text, "Memory bodies")
+    assert 'class="trend-basis-stale"' in row
+    assert rh.TREND_BASIS_STALE_NOTE in row
+    assert "PROSE THAT MUST NOT RENDER" not in text     # nowhere in the whole document
+
+
+def test_a_row_with_no_basis_row_renders_neither_prose_nor_the_stale_note(tmp_path):
+    """A DIFFERENT branch from a stale digest, which is why the stale test does not cover
+    it: the model never wrote a row for this metric, so there was nothing to go stale and
+    emitting the note would invent a history."""
+    docs = _dated_trend_docs([dict(memory_bodies=n) for n in (92, 96, 98)])
+    synthesis = {"schema_version": 1, "trend_basis": [
+        {"metric": "always_loaded_words", "prose": "a row for a different metric",
+         "inputs_digest": "0123456789abcdef"}]}
+    text = _render_corpus(tmp_path, "nobasisrow", docs, synthesis=synthesis)
+    row = _trend_row(text, "Memory bodies")
+    assert 'class="trend-basis"' not in row
+    assert rh.TREND_BASIS_STALE_NOTE not in row
+    # anti-vacuity: the metric that DOES have a row gets the note, so the absence above is
+    # the missing row rather than a dead resolver
+    assert rh.TREND_BASIS_STALE_NOTE in _trend_row(text, "Always-loaded words")
+    # ...and a corpus with no synthesis at all is the same "never wrote one" case
+    assert rh.TREND_BASIS_STALE_NOTE not in _render_corpus(tmp_path, "nosynthesis", docs)
+
+
+def test_derived_ratios_render_as_value_over_total_with_a_percent(tmp_path):
+    """`16 / 21 (76%)` -- never a bare percentage (which hides a shrinking denominator, the
+    exact way a fake improvement is manufactured) and never a bare float."""
+    docs = _dated_trend_docs([dict(hooks=(16, 21)) for _ in range(3)])
+    text = _render_corpus(tmp_path, "ratiofmt", docs)
+    row = _trend_row(text, "Hooks with test")
+    assert row.count("<td>16 / 21 (76%)</td>") == 3
+    assert "0.761" not in row
+    # a measured-but-undefined ratio keeps its raw counts instead of printing a fake 0%
+    zero_text = _render_corpus(tmp_path, "ratiozero",
+                               _dated_trend_docs([dict(skills=(0, 0)) for _ in range(3)]))
+    assert f"<td>0 / 0 ({rh.NOT_MEASURED_TEXT})</td>" in _trend_row(zero_text,
+                                                                    "Skills with test")
+
+
+def test_two_metrics_moving_the_same_direction_render_opposite_verdicts(tmp_path):
+    """THE load-bearing polarity property, RENDERED. Both metrics RISE; a classifier that
+    infers direction FROM THE DATA gives them the same word, so the fixture demands
+    opposite ones in ONE document. Task 3 proves this at the classifier -- without this row
+    it never reaches a page."""
+    docs = _dated_trend_docs([dict(tokens_a=6000, hooks=(12, 20)),
+                              dict(tokens_a=6500, hooks=(14, 20)),
+                              dict(tokens_a=7000, hooks=(16, 20))])
+    text = _render_corpus(tmp_path, "polarityrendered", docs)
+    tokens_row = _trend_row(text, "Always-loaded tokens (est)")
+    ratio_row = _trend_row(text, "Hooks with test")
+    assert rh._HEADLINE_POLARITY["always_loaded_tokens_est"] == "up"
+    assert dict((k, p) for k, _, p in rh.DERIVED_TREND_KEYS)["hooks_with_test_ratio"] == "down"
+    assert _verdict_of(tokens_row)[0] == "worsening"
+    assert _verdict_of(ratio_row)[0] == "improving"
+    # anti-vacuity: both really did rise, so a flattened fixture cannot leave this passing
+    assert "<td>6050</td>" in tokens_row and "<td>7050</td>" in tokens_row
+    assert "<td>12 / 20 (60%)</td>" in ratio_row and "<td>16 / 20 (80%)</td>" in ratio_row
+
+
+# ------------------------------------------------------------------------- THE SEAM TEST
+def test_the_renderer_threads_per_point_dates_versions_and_scopes_to_the_classifier(
+        tmp_path):
+    """THE SEAM TEST, and the reason the function-level/rendered split needed one. Tasks
+    3-5 assert against functions that RECEIVE points, dates, resolved versions and
+    `collection_scope` values as ARGUMENTS, so they pass whether or not anything ever
+    computes them. A green function-level suite can therefore sit on top of a renderer
+    that never wires its inputs -- a dark feature.
+
+    Three properties, each holding only if the renderer threads the value it claims to:
+
+    1. PER-POINT DATES. `memory_body_count` is unmeasured on the first of four runs, so its
+       window spans 07-02..07-15 (3 pts, 13d) while a fully measured sibling in the SAME
+       document spans 07-01..07-15 (4 pts, 14d). A renderer passing the model's full date
+       list would print 14d for both; one passing no dates at all would print 0d.
+    2. PER-POINT DEFINITION VERSIONS. Flipping ONE run's marker names both version numbers
+       in the reason -- values that exist nowhere but in the sidecars.
+    3. PER-POINT SCOPES. Flipping ONE run's `collection_scope` names the scope fields it
+       read, likewise.
+
+    Each has its paired positive: the unflipped corpus yields a DIRECTION word, which is
+    only reachable when the scope and version axes both resolved to real, uniform values.
+    A renderer that refused everything unconditionally fails just as loudly as one that
+    threaded nothing."""
+    dates = ["2026-07-01", "2026-07-02", "2026-07-08", "2026-07-15"]
+    docs = [(date, _trend_doc(memory_bodies=count, phantom=(2, 2)))
+            for date, count in zip(dates, (1, 92, 96, 98))]
+    del docs[0][1]["on_demand"]["memory_bodies"]
+    text = _render_corpus(tmp_path, "seam", docs)
+
+    # 1. the dates that actually CONTRIBUTED, not the model's full date list
+    bodies_word, bodies_cell = _verdict_of(_trend_row(text, "Memory bodies"))
+    sibling_word, sibling_cell = _verdict_of(_trend_row(text, "Phantom refs (total)"))
+    assert "3 pts · 13d" in bodies_cell, bodies_cell
+    assert "4 pts · 14d" in sibling_cell, sibling_cell
+    # ...and both still carry a DIRECTION word, which no unthreaded axis could produce
+    assert bodies_word == "worsening"
+    assert sibling_word == "unchanged across N"
+
+    # 2. the resolved definition version, per point
+    baseline = dict(_collector.METRIC_DEFINITIONS)
+    bumped = {**baseline, "memory_body_count": baseline["memory_body_count"] + 1}
+    version_docs = _dated_trend_docs([dict(memory_bodies=92), dict(memory_bodies=96),
+                                      dict(memory_bodies=98, definitions=bumped)])
+    version_text = _render_corpus(tmp_path, "seamversions", version_docs)
+    version_word, version_cell = _verdict_of(_trend_row(version_text, "Memory bodies"))
+    assert version_word == "not comparable"
+    assert f"2026-07-15: definition v{bumped['memory_body_count']}" in version_cell
+    assert f"2026-07-13: definition v{baseline['memory_body_count']}" in version_cell
+
+    # 3. the collection scope, per point
+    scope_docs = _dated_trend_docs([dict(memory_bodies=92), dict(memory_bodies=96),
+                                    dict(memory_bodies=98)])
+    scope_docs[2][1]["collection_scope"] = {"root": "/fake/root",
+                                            "project_root": "/fake/project",
+                                            "compose": True}
+    scope_text = _render_corpus(tmp_path, "seamscopes", scope_docs)
+    scope_word, scope_cell = _verdict_of(_trend_row(scope_text, "Memory bodies"))
+    assert scope_word == "not comparable"
+    assert "2026-07-15: scope compose=true project_root=/fake/project" in scope_cell
+    assert "2026-07-13: scope compose=false project_root=none" in scope_cell
+
+    # the paired positive for BOTH axes: the unflipped corpus above verdicted a direction
+    assert bodies_word in ("improving", "worsening")
+
+
+def test_series_point_dates_are_recorded_by_the_builders_not_re_derived():
+    """The pairing `trend_verdict` needs lives in the ONE place that knows which slots
+    became points -- the builders' own drop loop. A second reader re-deriving it is the
+    two-homes defect this stage cites against itself three times."""
+    docs = [("2026-07-01", _trend_doc(memory_bodies=5)),
+            ("2026-07-08", _trend_doc(memory_bodies=9)),
+            ("2026-07-15", _trend_doc(memory_bodies=12))]
+    del docs[0][1]["on_demand"]["memory_bodies"]
+    docs[1][1]["headline"].pop("duplicate_pair_count")
+    headline = rh.build_trend_model(docs)
+    derived = rh.build_derived_trend_model(docs)
+    for model in (headline, derived):
+        for series in model["series"]:
+            assert len(rh._series_point_dates(series)) == len(rh._series_points(series)), \
+                series["key"]
+    dropped = next(s for s in derived["series"] if s["key"] == "memory_body_count")
+    assert rh._series_point_dates(dropped) == ["2026-07-08", "2026-07-15"]
+    pair = next(s for s in headline["series"] if s["key"] == "duplicate_pair_count")
+    assert rh._series_point_dates(pair) == ["2026-07-01", "2026-07-15"]
+    # a series built before `point_dates` existed degrades to [] -- never a guess, and
+    # `_trend_window` then refuses to pair the window at all
+    legacy_shape = {"key": "k", "polarity": "up", "values": [1, 2, 3], "points": [1, 2, 3]}
+    assert rh._series_point_dates(legacy_shape) == []
+    assert rh._trend_window(legacy_shape) == ([1, 2, 3], ["undated"] * 3)
+
+
+def test_an_unpaired_window_refuses_rather_than_reading_as_comparable():
+    """The degrade must add doubt, never remove it. With no dates every axis list would be
+    EMPTY, and an empty window is VACUOUSLY comparable on scope, definition and quality --
+    a direction word backed by no comparability evidence at all, the single outcome §6.5a
+    exists to forbid. `_trend_window` pads to `undated` instead, so every axis lookup
+    misses and the row refuses."""
+    legacy_shape = {"key": "memory_body_count", "label": "Memory bodies", "polarity": "up",
+                    "values": [92, 96, 98], "points": [92, 96, 98]}
+    model = {"first_run": False, "series": [legacy_shape], "dates": ["a", "b", "c"]}
+    verdict, prose, stale_note = rh._trend_row_state(legacy_shape, model, None, None)
+    assert verdict.word == "not comparable"
+    assert "scope unknown" in verdict.text
+    assert (prose, stale_note) == (None, None)
+
+
+def test_build_trend_provenance_records_scope_quality_and_resolved_versions():
+    """The extractor half of the seam, asserted directly: one row per date, carrying the
+    run's scope and every trended metric's quality state and RESOLVED definition version.
+    A markerless sidecar whose bytes match no frozen digest resolves UNKNOWN -- never an
+    inferred version, and never a default of `complete`."""
+    marked = _trend_doc(memory_bodies=5)
+    markerless = _trend_doc(scope_root=_NO_MARKERS, definitions=_NO_MARKERS)
+    markerless.pop("metric_quality")
+    provenance = rh.build_trend_provenance(
+        [("2026-07-13", marked), ("2026-07-14", markerless)],
+        {"2026-07-13": json.dumps(marked).encode(),
+         "2026-07-14": json.dumps(markerless).encode()})
+    rows = provenance["by_date"]
+    assert sorted(rows) == ["2026-07-13", "2026-07-14"]
+    assert rows["2026-07-13"]["scope"] == {"root": "/fake/root", "project_root": None,
+                                           "compose": False}
+    assert rows["2026-07-13"]["quality"]["memory_body_count"] == rh.QUALITY_COMPLETE
+    assert rows["2026-07-13"]["versions"]["memory_body_count"] == \
+        _collector.METRIC_DEFINITIONS["memory_body_count"]
+    assert rows["2026-07-14"]["scope"] is None
+    assert rows["2026-07-14"]["quality"]["memory_body_count"] == rh.QUALITY_UNMEASURED
+    assert rows["2026-07-14"]["versions"]["memory_body_count"] is None
+    # every rendered metric gets a row on both axes, derived from the two key tables
+    expected = {key for key, _, _ in rh.HEADLINE_KEYS} | {
+        key for key, _, _ in rh.DERIVED_TREND_KEYS}
+    assert set(rows["2026-07-13"]["quality"]) == expected
+    assert set(rows["2026-07-13"]["versions"]) == expected
+    assert len(expected) == _RENDERED_TREND_ROWS
+
+
+def test_both_trend_tables_render_inside_one_card(tmp_path):
+    """Not a layout preference: the card's title states how many metrics it covers, and N
+    is the number of rows the card renders. Two cards would mean two titles and a count
+    with no single denominator."""
+    text = _render_corpus(tmp_path, "onecard", _moving_corpus())
+    card = re.search(r'<div class="card"><h2>Trend[^<]*</h2>(?:(?!<div class="card">).)*',
+                     text, re.S)
+    assert card is not None
+    assert len(_TREND_ROW_RE.findall(card.group(0))) == _RENDERED_TREND_ROWS
+    assert card.group(0).count('class="sparkline sparkline-derived"') == \
+        len(rh.DERIVED_TREND_KEYS)

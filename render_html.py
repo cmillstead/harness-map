@@ -266,6 +266,25 @@ def _load_sidecar_guarded(path: Path) -> tuple[dict[str, Any] | None, str | None
         return None, f"unparseable: {type(exc).__name__}: {exc}"
 
 
+def _sidecar_bytes_guarded(path: Path) -> bytes:
+    """A sidecar's raw bytes for the definition-version digest lookup, or `b""` when the
+    file cannot be read.
+
+    A SECOND read of a file `load_sidecar` already parsed, deliberately: `load_sidecar`
+    returns only the parsed document, and `resolve_metric_definition_version`'s legacy
+    table is keyed by the sha256 of the FILE. Rereading is the cheap half of that tradeoff
+    (sidecars are small, and the alternative is reshaping a shipped loader's contract).
+
+    Degrading to `b""` on OSError is the conservative direction: an empty digest matches no
+    frozen row, so the version resolves UNKNOWN and the series refuses a direction. Should
+    the file change between the two reads, the digest simply misses and the same refusal
+    follows — never a version attributed to bytes this run did not see."""
+    try:
+        return Path(path).read_bytes()
+    except OSError:
+        return b""
+
+
 def load_synthesis(out_dir: Path, date: str) -> tuple[dict[str, Any] | None, str | None]:
     """(doc|None, error|None) — the synthesis sidecar is OPTIONAL; absence is not an
     error (returns (None, None)). An invalid file is an explicit unavailable state
@@ -956,22 +975,32 @@ def build_trend_model(dated_docs: list[tuple[str, dict[str, Any]]]) -> dict[str,
     A non-numeric but PRESENT value stays in `points` deliberately: it was measured and
     reported, it is just unusable, and `_coerce_floats`/`finite_number` already reject
     the whole window for it. Dropping it here instead would silently narrow that
-    all-or-nothing guard into a partial line."""
+    all-or-nothing guard into a partial line.
+
+    S6c: a THIRD list, `point_dates`, is appended in the SAME pass as `points` and is 1:1
+    with it — the dates that actually CONTRIBUTED a measurement, which is the alignment
+    `trend_verdict` and `_dated_axis` both require. It is built here rather than
+    re-derived downstream because the drop rule above is the only thing that knows which
+    slots became points, and a second reader re-deriving it is the two-homes defect this
+    stage cites against itself. Additive: `_series_point_dates` degrades when it is
+    absent."""
     measured = [(date, doc) for date, doc in dated_docs if _run_was_measured(doc)]
     dates = [date for date, _ in measured]
     series: list[dict[str, Any]] = []
     for key, label, polarity in HEADLINE_KEYS:
         values: list[Any] = []
         points: list[Any] = []
-        for _date, doc in measured:
+        point_dates: list[Any] = []
+        for date, doc in measured:
             headline = doc.get("headline")
             if not isinstance(headline, dict) or key not in headline:
                 values.append(None)
                 continue
             values.append(headline[key])
             points.append(headline[key])
+            point_dates.append(date)
         series.append({"key": key, "label": label, "polarity": polarity,
-                       "values": values, "points": points})
+                       "values": values, "points": points, "point_dates": point_dates})
     return {"dates": dates, "series": series, "first_run": len(measured) <= 1}
 
 
@@ -1087,7 +1116,10 @@ def build_derived_trend_model(dated_docs: list[tuple[str, dict[str, Any]]]) -> d
 
     A ratio point (`{value, total, ratio}`) is measured-but-undefined when `ratio` is
     None -- kept in `values` (so the per-date table can still show the raw counts) but
-    dropped from `points` (so geometry/delta never see a fabricated 0.0)."""
+    dropped from `points` (so geometry/delta never see a fabricated 0.0).
+
+    `point_dates` rides beside `points`, appended in the same pass and for the same
+    reason `build_trend_model` records it -- see that docstring."""
     measured = [(date, doc) for date, doc in dated_docs if _run_was_measured(doc)]
     dates = [date for date, _ in measured]
     series: list[dict[str, Any]] = []
@@ -1095,7 +1127,8 @@ def build_derived_trend_model(dated_docs: list[tuple[str, dict[str, Any]]]) -> d
         extractor = _DERIVED_EXTRACTORS[key]
         values: list[Any] = []
         points: list[Any] = []
-        for _date, doc in measured:
+        point_dates: list[Any] = []
+        for date, doc in measured:
             value = extractor(doc)
             values.append(value)
             if value is None:
@@ -1103,9 +1136,67 @@ def build_derived_trend_model(dated_docs: list[tuple[str, dict[str, Any]]]) -> d
             if isinstance(value, dict) and value.get("ratio") is None:
                 continue
             points.append(value)
+            point_dates.append(date)
         series.append({"key": key, "label": label, "polarity": polarity,
-                       "values": values, "points": points})
+                       "values": values, "points": points, "point_dates": point_dates})
     return {"dates": dates, "series": series, "first_run": len(measured) <= 1}
+
+
+# Every metric the two trend tables render, in table order: the 8 HEADLINE_KEYS (including
+# `unchecked_binary_count`, which the legacy table still iterates) then the 6
+# DERIVED_TREND_KEYS. DERIVED here, never retyped -- the same one-home rule
+# `_HEADLINE_POLARITY` follows, and the denominator Task 9's rendered-row count is
+# measured against.
+_TREND_METRICS: tuple[str, ...] = (tuple(key for key, _, _ in HEADLINE_KEYS)
+                                   + tuple(key for key, _, _ in DERIVED_TREND_KEYS))
+
+
+def build_trend_provenance(
+    dated_docs: Any, sidecar_bytes: Any = None
+) -> dict[str, Any]:
+    """The per-DATE comparability inputs every trend row is judged against: the run's
+    `collection_scope`, and per metric its recorded quality state and its RESOLVED
+    definition version (S6c §6.5a).
+
+    A model builder, not a renderer: it extracts recorded facts and classifies nothing.
+    The renderer pairs these rows to a series' `point_dates`, so a point the drop rule
+    excluded contributes no scope, no quality state and no version — which is what makes
+    the comparability record describe the same window the verdict covers.
+
+    `sidecar_bytes` is `{date: raw file bytes}`, the second half of
+    `resolve_metric_definition_version`'s contract: a markerless historical sidecar
+    resolves through the frozen `LEGACY_METRIC_DEFINITIONS` digest table, and that lookup
+    needs the FILE, not the parsed document. An absent or unreadable entry degrades to
+    `b""`, whose digest matches no frozen row, so the version resolves UNKNOWN — the
+    conservative direction (doubt is added, never removed).
+
+    Quality defaults to `unmeasured` and scope/version to UNKNOWN for any date this map
+    does not carry. There is no default of `complete` and no default version anywhere in
+    this function.
+
+    TOTAL by construction (registered in `_TOTALITY_TARGETS`): `dated_docs` and every
+    document in it arrive straight out of untrusted sidecar JSON, and no shape may raise."""
+    byte_map = sidecar_bytes if isinstance(sidecar_bytes, dict) else {}
+    rows: dict[str, dict[str, Any]] = {}
+    entries = list(dated_docs) if isinstance(dated_docs, (list, tuple)) else []
+    for entry in entries:
+        if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+            continue
+        date, doc = entry
+        document = doc if isinstance(doc, dict) else {}
+        # `str(date)`, never the raw value: a corrupt date out of a hand-built window may
+        # be unhashable, and a dict key that raises is the T5.1 defect class. Every real
+        # date already IS a str (find_sidecars' filename regex), so this is a no-op there.
+        raw = byte_map.get(str(date))
+        raw_bytes = raw if isinstance(raw, bytes) else b""
+        rows[str(date)] = {
+            "scope": document.get("collection_scope"),
+            "quality": {metric: metric_quality_state(document, metric)
+                        for metric in _TREND_METRICS},
+            "versions": {metric: resolve_metric_definition_version(
+                document, raw_bytes, metric) for metric in _TREND_METRICS},
+        }
+    return {"by_date": rows}
 
 
 def build_dupweb_model(doc: dict[str, Any]) -> dict[str, Any]:
@@ -2504,6 +2595,33 @@ tr.tier-project td:first-child{border-left:3px solid var(--tier-project)}
    the cell's text color so the mark stays legible in both themes without a new token. */
 .sparkline{color:var(--accent);vertical-align:middle}
 .sparkline-stats{margin-left:6px;font-size:0.72rem;color:var(--muted);font-variant-numeric:tabular-nums}
+/* S6c trend verdicts. Colour is the THIRD channel, never the first: the WORD carries the
+   meaning, the MARK carries a silhouette (circle / triangle / dash / square / hatch) that
+   survives greyscale, forced-colors and every CVD type, and only then does colour
+   reinforce it. The mark is 1.25rem/700 — WCAG 2.1 large-scale text, whose 3:1 floor every
+   token below clears in BOTH themes (pinned by
+   test_verdict_mark_colours_meet_the_large_text_contrast_floor). The WORD deliberately
+   does NOT take a semantic token: --good and --warn resolve to roughly 3.1:1 on --surface
+   in the light theme, under the 4.5:1 floor for this cell's 0.8rem text — the composed-
+   value defect a literal scan of the stylesheet structurally cannot see. */
+.trend-verdict{font-size:0.8rem}
+.trend-verdict .verdict-mark{font-size:1.25rem;font-weight:700;line-height:1;margin-right:6px;vertical-align:middle}
+.trend-verdict .verdict-text{vertical-align:middle}
+.verdict-improving .verdict-mark{color:var(--good)}
+.verdict-worsening .verdict-mark{color:var(--crit)}
+/* `unchanged across N` and `net unchanged` are the same arithmetic and opposite meanings.
+   An AMBER token — deliberately NOT --crit, since never having moved is not a regression —
+   plus a DASHED stroke separate them at a glance, on top of the different words. */
+.verdict-unchanged-across-n .verdict-mark{color:var(--warn)}
+td.verdict-unchanged-across-n .sparkline polyline{stroke-dasharray:3 2}
+.verdict-net-unchanged .verdict-mark{color:var(--muted)}
+.verdict-no-direction .verdict-mark{color:var(--muted)}
+.verdict-not-comparable .verdict-mark{color:var(--muted)}
+.verdict-not-measured .verdict-mark{color:var(--muted)}
+.trend-basis,.trend-basis-stale{display:block;font-size:0.72rem;color:var(--muted);margin-top:2px}
+.trend-basis-stale{font-style:italic}
+.sparkline-derived{color:var(--accent-2)}
+h3.trend-subhead{font-size:0.72rem;margin:14px 0 6px 0;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
 /* Composed-settings source-tier badges (T7b) — the 3-way user/project/local vocabulary
    (`_normalize_settings_tier`), distinct from the `.badge.tier-operator`/`.badge.tier-project`
    pair above (the binary skills/agents/rules NODE tag). "user" and "project" reuse those same
@@ -3279,6 +3397,23 @@ def _series_points(series: dict[str, Any]) -> list[Any]:
     if points is None:
         return [value for value in series.get("values", []) if value is not None]
     return list(points)
+
+
+def _series_point_dates(series: dict[str, Any]) -> list[Any]:
+    """The dates that CONTRIBUTED each measured point of one series — 1:1 with
+    `_series_points`, which is the alignment `trend_verdict` (for the span) and
+    `_dated_axis` (for every comparability axis) both require.
+
+    Recorded by whichever builder produced the series, in the same pass that decided which
+    slots became points, so the drop rule has exactly ONE home. This is the accessor, never
+    a second derivation of it.
+
+    A series built before `point_dates` existed (several tests construct one literally)
+    degrades to `[]` rather than guessing. `_trend_window` then refuses to pair the window
+    at all, which resolves every axis UNKNOWN — the safe direction. Inventing dates here
+    would silently pair a scope or a version to the wrong point."""
+    dates = series.get("point_dates")
+    return list(dates) if isinstance(dates, (list, tuple)) else []
 
 
 def _trend_delta(trend_model, key):
@@ -4307,8 +4442,8 @@ COMPARABLE = "comparable"
 #
 # Changing this value requires a spec change (S6 §6.3). This table is single-sourced
 # against report-template.md's TREND_VERDICT_TABLE block by
-# test_trend_verdict_table_is_single_sourced -- editing either home without the other
-# turns the suite red.
+# test_trend_verdict_table_is_single_sourced_against_the_template -- editing either home
+# without the other turns the suite red.
 TREND_VERDICTS = (   # seven ROWS of (word, gate, polarity), strict evaluation order
     ("not measured",
      f"fewer than {SPARKLINE_MIN_POINTS} usable measured points in the window", "any"),
@@ -4822,10 +4957,28 @@ def trend_basis_for(trend_basis: Any, metric_key: Any, points: Any,
     return (prose if isinstance(prose, str) else None), None
 
 
-def _sparkline_svg(dom_id: str, floats: list[float]) -> str:
+def _sparkline_svg(dom_id: str, floats: list[float], *, css_class: str = "sparkline",
+                   title: str | None = None) -> str:
     """One inline `<svg><polyline>` sparkline (no external assets, §9-R). `floats`
     is already-coerced, already-windowed (SPARKLINE_WINDOW) geometry data — every
-    coordinate goes through `_fmt_float` (§4.6), never raw `str()`/f-string floats."""
+    coordinate goes through `_fmt_float` (§4.6), never raw `str()`/f-string floats.
+
+    `css_class` and `title` are KEYWORD-ONLY with byte-preserving defaults, and both
+    halves of that are load-bearing. Keyword-only: an existing test calls
+    `_sparkline_svg("spark-x", [5.0, 5.0, 5.0])` positionally with exactly two arguments.
+    Byte-preserving: three shipped assertions count `class="sparkline"` occurrences
+    against `len(HEADLINE_KEYS)` and a fourth asserts the substring is ABSENT below the
+    point floor, so the legacy surface's bytes may not move (S6c Ambiguity B).
+
+    The namespaces are disjoint by construction — `class="sparkline"` WITH its closing
+    quote does not occur inside `class="sparkline sparkline-derived"`:
+
+      legacy headline table   `sparkline`                      `spark-{key}`
+      derived trend table     `sparkline sparkline-derived`    `spark-derived-{key}`
+
+    `title` is the whole accessible affordance: `role="img"` + `aria-labelledby` means a
+    screen-reader user hears this string and nothing else about the line, so the default
+    "trend sparkline" tells them nothing a caller with a verdict in hand could not."""
     lo, hi = min(floats), max(floats)
     span = (hi - lo) or 1.0  # flat series: avoid /0. NOTE the line renders at the BOTTOM
                              # (y = H - PAD = 22.0), not mid-height -- (f - lo) is 0 for
@@ -4839,10 +4992,11 @@ def _sparkline_svg(dom_id: str, floats: list[float]) -> str:
         points.append(f"{_fmt_float(x)},{_fmt_float(y)}")
     poly = " ".join(points)
     return (
-        f'<svg class="sparkline" id="{esc_html(dom_id)}" '
+        f'<svg class="{esc_html(css_class)}" id="{esc_html(dom_id)}" '
         f'viewBox="0 0 {_fmt_float(_SPARKLINE_W)} {_fmt_float(_SPARKLINE_H)}" '
         f'width="120" height="24" role="img" aria-labelledby="{esc_html(dom_id)}-title">'
-        f'<title id="{esc_html(dom_id)}-title">trend sparkline</title>'
+        f'<title id="{esc_html(dom_id)}-title">'
+        f'{esc_html("trend sparkline" if title is None else title)}</title>'
         f'<polyline points="{esc_html(poly)}" fill="none" stroke="currentColor" '
         f'stroke-width="1.5"/></svg>'
     )
@@ -4875,28 +5029,325 @@ def _sparkline_cell(series: dict[str, Any]) -> str:
     return svg + stats
 
 
-def _render_trend_body(model):
+# ------------------------------------------- S6c Task 7 (§6.8): the verdict SURFACE
+#
+# Everything above this line — the classifier, the four comparability axes, the basis
+# digest — shipped UNWIRED, callable from nowhere. This block is the wiring, and the
+# properties it must satisfy are rendered ones: a verdict word drawn only from the enum,
+# both companions on every non-`not measured` row, the refusal's factual reason beside the
+# value it refuses to direct, and per-POINT provenance actually threaded rather than left
+# at a parameter default.
+#
+# Nothing here re-decides anything. Each function below either windows, looks up, or
+# formats; the judgment stays in `trend_verdict` and `series_comparability`.
+
+
+def _trend_window(series: dict[str, Any]) -> tuple[list[Any], list[Any]]:
+    """One series' `(points, dates)` window — the last `SPARKLINE_WINDOW` measured points
+    and the dates that produced them, PAIRED. The one home for this slice, so the number
+    the operator reads, the line they see and the axes the row is judged on can never
+    disagree about which runs counted.
+
+    A window whose dates are not 1:1 with its points degrades to `undated` — the same
+    vocabulary and the same rule `_dated_axis` applies. That degrade is deliberately in the
+    CONSERVATIVE direction: with no dates, every axis lookup misses and resolves UNKNOWN,
+    so the row refuses a direction. Falling back to the model's full `dates` list instead
+    would pair a scope or a version to the wrong point, and passing no dates at all would
+    make an empty axis list VACUOUSLY comparable — a direction word backed by no
+    comparability evidence, the single outcome §6.5a exists to forbid."""
+    points = _series_points(series)[-SPARKLINE_WINDOW:]
+    dates = _series_point_dates(series)[-SPARKLINE_WINDOW:]
+    if len(dates) != len(points):
+        return points, ["undated"] * len(points)
+    return points, dates
+
+
+def _provenance_record(provenance: Any, date: Any) -> dict[str, Any]:
+    """`build_trend_provenance`'s row for one date, or `{}` when the table, the row or the
+    date is missing or mis-shaped.
+
+    `dict.get` is wrapped: a date arriving unhashable out of a hand-built model would raise
+    TypeError inside the lookup itself — the T5.1 defect class. An empty record resolves
+    every axis to its UNKNOWN value, which refuses the row rather than clearing it."""
+    rows = provenance.get("by_date") if isinstance(provenance, dict) else None
+    if not isinstance(rows, dict):
+        return {}
+    try:
+        record = rows.get(date)
+    except TypeError:
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _provenance_metric(record: dict[str, Any], axis: str, metric: Any,
+                       default: Any) -> Any:
+    """One per-metric value out of a provenance record's `quality` or `versions` table.
+
+    The default is always the UNKNOWN value for its axis (`unmeasured` for quality, `None`
+    for a version). There is no default of `complete` and no default version anywhere on
+    this path — absent is not a measurement."""
+    table = record.get(axis)
+    if not isinstance(table, dict):
+        return default
+    try:
+        return table.get(metric, default)
+    except TypeError:
+        return default
+
+
+def _series_axes(metric: Any, dates: list[Any], points: list[Any],
+                 provenance: Any) -> tuple[list[Any], list[Any], list[Any], list[Any]]:
+    """`(scopes, quality_states, definition_versions, denominators)` for one windowed
+    series, each 1:1 with `points`.
+
+    ONE home for the threading, because the comparability record and the basis digest both
+    read it: a row judged against one window and fingerprinted against another would let a
+    stale prose sentence outlive exactly the input that moved the verdict.
+
+    The scope is a property of the RUN, so it is read per DATE and carries no metric;
+    quality and version are per (run, metric). Denominators come from the POINTS — a
+    ratio's `total` is carried on the point itself, and `_trend_point_denominator` is its
+    one extractor."""
+    records = [_provenance_record(provenance, date) for date in dates]
+    scopes = [record.get("scope") for record in records]
+    quality = [_provenance_metric(record, "quality", metric, QUALITY_UNMEASURED)
+               for record in records]
+    versions = [_provenance_metric(record, "versions", metric, None)
+                for record in records]
+    denominators = [_trend_point_denominator(point) for point in points]
+    return scopes, quality, versions, denominators
+
+
+def _trend_latest_direction(model: Any, key: Any) -> Any:
+    """The LATEST-INTERVAL direction (`good`/`bad`/`neutral`) for one series, or None.
+
+    `_trend_delta` owns polarity->direction and is neither edited nor duplicated here —
+    this is a new CALL SITE. A derived ratio point is a `{value, total, ratio}` dict, which
+    `finite_number` rejects, so the points are normalized through `_trend_point_value` (the
+    one normalizer for either model) before the call. That is exactly the shape
+    `test_trend_delta_down_branch_runs_on_a_derived_series` measured and pinned."""
+    series_list = model.get("series") if isinstance(model, dict) else None
+    series = next((s for s in (series_list or [])
+                   if isinstance(s, dict) and s.get("key") == key), None)
+    if series is None:
+        return None
+    numeric = {"first_run": model.get("first_run"),
+               "series": [dict(series, points=[_trend_point_value(point)
+                                               for point in _series_points(series)])]}
+    delta = _trend_delta(numeric, key)
+    return delta[1] if delta else None
+
+
+def _trend_row_state(series: dict[str, Any], model: Any, provenance: Any,
+                     trend_basis: Any) -> tuple[TrendVerdict, str | None, str | None]:
+    """`(verdict, basis prose, stale note)` for one trend row of EITHER model.
+
+    The whole seam in one function: the window and its dates come from the builder's own
+    drop rule, the four axes from the recorded provenance, the comparability record from
+    the shipped engine, the verdict from the shipped classifier, and the basis from the
+    shipped digest resolver — all over the SAME window.
+
+    `window_length` for the digest is `SPARKLINE_WINDOW`, the configured window rather than
+    the realized point count. §6.8 names a changed WINDOW as a trigger, and a length
+    derived from the points would be redundant with the point list already in the payload,
+    making that trigger unreachable."""
+    key = series.get("key")
+    points, dates = _trend_window(series)
+    scopes, quality, versions, denominators = _series_axes(key, dates, points, provenance)
+    comparability = series_comparability(key, dates, scopes, quality, denominators,
+                                         versions)
+    verdict = trend_verdict(points, dates, series.get("polarity"),
+                            _trend_latest_direction(model, key), comparability)
+    triplets = [[date, _trend_point_value(point), _trend_point_denominator(point)]
+                for date, point in zip(dates, points)]
+    prose, stale_note = trend_basis_for(trend_basis, key, triplets, versions, scopes,
+                                        SPARKLINE_WINDOW)
+    return verdict, prose, stale_note
+
+
+# One mark per TREND_VERDICTS word. FIVE silhouettes — circle, triangle, dash, square,
+# hatch — chosen because they stay distinguishable in greyscale, under forced-colors, and
+# under every CVD type, which is what makes colour the THIRD channel rather than the first.
+# The two circles differ by fill and the two triangles by orientation, so all seven marks
+# are distinct without inventing a sixth shape family.
+# `test_every_verdict_word_has_a_distinct_mark` single-sources this against TREND_VERDICTS:
+# adding a verdict without a mark turns the suite red.
+_VERDICT_MARKS = {
+    "not measured": "○",
+    "not comparable": "▨",
+    "no direction": "■",
+    "unchanged across N": "–",
+    "net unchanged": "●",
+    "improving": "▲",
+    "worsening": "▼",
+}
+
+
+def _verdict_slug(word: Any) -> str:
+    """A verdict word as a CSS/DOM token (`unchanged across N` -> `unchanged-across-n`).
+    Derived from the word, never a second hand-written table, and constrained to
+    `[a-z0-9-]` so the result is safe in a class attribute by construction."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(word).lower()).strip("-")
+    return slug or "unknown"
+
+
+def _render_verdict_cell(verdict: TrendVerdict, prose: str | None,
+                         stale_note: str | None) -> str:
+    """One Direction cell: mark, then the full display text, then the basis line.
+
+    `data-verdict` carries the ENUM word alone. The display text interpolates N and may
+    attach a second horizon clause or a factual refusal reason, so the word is not
+    recoverable from it by parsing — and "the rendered vocabulary is exactly
+    TREND_VERDICTS" is a property that has to be assertable over a whole document.
+
+    The mark is `aria-hidden`: it is redundant with the word beside it, and announcing
+    "black up-pointing triangle" before "worsening" is noise, not information."""
+    slug = _verdict_slug(verdict.word)
+    if prose:
+        basis = f'<span class="trend-basis">{esc_html(prose)}</span>'
+    elif stale_note:
+        basis = f'<span class="trend-basis-stale">{esc_html(stale_note)}</span>'
+    else:
+        # Neither prose nor a note: the model never wrote a row for this metric, so there
+        # was nothing to go stale. Emitting a note here would invent a history (§6.8).
+        basis = ""
+    return (f'<td class="trend-verdict verdict-{slug}" '
+            f'data-verdict="{esc_html(verdict.word)}">'
+            f'<span class="verdict-mark" aria-hidden="true">'
+            f'{esc_html(_VERDICT_MARKS.get(verdict.word, "?"))}</span>'
+            f'<span class="verdict-text">{esc_html(verdict.text)}</span>{basis}</td>')
+
+
+def _sparkline_title(label: Any, verdict: TrendVerdict, prose: str | None,
+                     stale_note: str | None) -> str:
+    """The `<title>` of a derived sparkline: metric, verdict, and the basis if there is a
+    current one. This is the ENTIRE accessible content of the graphic — without it a
+    screen-reader user hears "trend sparkline" and learns nothing the sighted reader of the
+    same row learns."""
+    parts = [str(label), verdict.text]
+    if prose:
+        parts.append(prose)
+    elif stale_note:
+        parts.append(stale_note)
+    return " — ".join(parts)
+
+
+def _derived_sparkline_cell(series: dict[str, Any], title: str) -> str:
+    """The DERIVED table's sparkline cell. Three differences from `_sparkline_cell`, which
+    is byte-frozen (S6c Ambiguity A) and therefore not extended:
+
+    * its own class and DOM-id namespace, so the four shipped `class="sparkline"`
+      assertions keep counting exactly the eight legacy marks;
+    * NO min/max/cur span — it duplicates the adjacent date columns, is wider than the mark
+      it annotates, and prints `.00` on integer counts (§6.8 item 2);
+    * the verdict and basis ride in the `<title>`.
+
+    Geometry goes through `_trend_point_value`, the ONE normalizer, because a ratio point
+    is a dict that `_coerce_floats` rejects outright. All-or-nothing, mirroring
+    `_coerce_floats` rather than narrowing it: one unusable point drops the whole line."""
+    window = _series_points(series)[-SPARKLINE_WINDOW:]
+    if len(window) < SPARKLINE_MIN_POINTS:
+        return ""
+    floats = [value for value in (_trend_point_value(point) for point in window)
+              if value is not None]
+    if len(floats) != len(window):
+        return ""
+    return _sparkline_svg(f"spark-derived-{series.get('key')}", floats,
+                          css_class="sparkline sparkline-derived", title=title)
+
+
+def _fmt_trend_value(value: Any) -> str:
+    """One DERIVED per-date cell, escaped.
+
+    A ratio renders `16 / 21 (76%)` — numerator, denominator AND share together. A bare
+    percentage hides a shrinking denominator (the exact way a fake improvement is
+    manufactured, which is why the denominator axis exists), and a bare float is
+    unreadable. A measured-but-undefined ratio (`total` of 0) still shows its raw counts
+    with the not-measured mark in the share position, rather than vanishing or printing a
+    fabricated 0%."""
+    if value is None:
+        return esc_html(TREND_NOT_MEASURED_TEXT)
+    if isinstance(value, dict):
+        ratio = finite_number(value.get("ratio"))
+        share = TREND_NOT_MEASURED_TEXT if ratio is None else f"{ratio * 100:.0f}%"
+        return (f'{esc_html(value.get("value"))} / {esc_html(value.get("total"))} '
+                f'({esc_html(share)})')
+    return esc_html(value)
+
+
+def _render_trend_table(model: Any, provenance: Any, trend_basis: Any, *,
+                        derived: bool) -> str:
+    """One trend table — Metric, Trend, Direction, then the unchanged per-date columns.
+
+    `derived` selects the two things that genuinely differ between the surfaces (the
+    sparkline cell and the value formatter) rather than duplicating the row assembly: both
+    tables carry a verdict for every series, and a second copy of that loop is how the two
+    would drift apart on the contract Task 9 counts rows against."""
+    series_list = (model.get("series") if isinstance(model, dict) else None) or []
+    # ≥3 MEASURED points on at least one series: prepend a sparkline column ahead of the
+    # unchanged per-date columns (SPEC_4 §3) — below the gate the table renders exactly as
+    # before this milestone. Per-series, not per-sidecar (pre-flight exit gate): a series
+    # can hold fewer points than there are dates, and the cell renderers re-apply the same
+    # floor to each cell, so a column only appears when something can actually fill it.
+    show_sparklines = any(len(_series_points(s)) >= SPARKLINE_MIN_POINTS
+                          for s in series_list)
+    rows = []
+    for series in series_list:
+        verdict, prose, stale_note = _trend_row_state(series, model, provenance,
+                                                      trend_basis)
+        label = series.get("label", "")
+        if derived:
+            spark = _derived_sparkline_cell(
+                series, _sparkline_title(label, verdict, prose, stale_note))
+            value_cells = "".join(f'<td>{_fmt_trend_value(v)}</td>'
+                                  for v in series.get("values", []))
+        else:
+            spark = _sparkline_cell(series)
+            value_cells = "".join(
+                f'<td>{esc_html(TREND_NOT_MEASURED_TEXT if v is None else v)}</td>'
+                for v in series.get("values", []))
+        # The `<tr>` stays BARE. `test_trend_table_renders_a_missing_point_as_not_measured`
+        # matches `<tr><td>Duplicate pairs</td>` on this very table, and binding rule 7
+        # forbids editing that assertion — so the verdict class rides on the two `<td>`s
+        # that need it (the mark cell for the dashed stroke, the verdict cell for colour),
+        # exactly the way `_render_dupweb_body` moved its group class onto the `<tbody>`
+        # for the same reason.
+        slug = _verdict_slug(verdict.word)
+        rows.append(
+            f'<tr><td>{esc_html(label)}</td>'
+            + (f'<td class="trend-mark verdict-{slug}">{spark}</td>'
+               if show_sparklines else '')
+            + _render_verdict_cell(verdict, prose, stale_note)
+            + value_cells + '</tr>')
+    spark_header = '<th>Trend</th>' if show_sparklines else ''
+    header = "".join(f'<th>{esc_html(d)}</th>'
+                     for d in ((model.get("dates") if isinstance(model, dict) else None)
+                               or []))
+    return (f'<div class="overflow-x"><table><tr><th>Metric</th>{spark_header}'
+            f'<th>Direction</th>{header}</tr>{"".join(rows)}</table></div>')
+
+
+def _render_trend_body(model, derived_model=None, provenance=None, trend_basis=None):
+    """The Trend card: the legacy 8-headline table and the 6-metric derived table, in ONE
+    `<div class="card">`.
+
+    One card, not two, and that is a contract rather than a layout preference: Task 9's
+    title states how many metrics the card covers, and `N` is the number of rows the card
+    renders. Two cards would mean two titles and a count with no single denominator.
+
+    Every argument after `model` is optional, and each absence degrades honestly: with no
+    derived model the second table is omitted, with no provenance every axis resolves
+    UNKNOWN and every row refuses a direction, and with no `trend_basis` no row carries
+    prose or a stale note. That is also what makes the several tests that call this with a
+    hand-built model keep working unchanged."""
     if model["first_run"]:
         body = '<p class="empty-state">first run — no baseline</p>'
     else:
-        # ≥3 MEASURED points on at least one series: prepend a sparkline column ahead of
-        # the unchanged per-date columns (SPEC_4 §3) — below the gate the table renders
-        # exactly as before this milestone. Per-series, not per-sidecar (pre-flight exit
-        # gate): a series can now hold fewer points than there are dates, and
-        # `_sparkline_cell` re-applies the same floor to each cell, so a column only
-        # appears when something can actually fill it.
-        show_sparklines = any(len(_series_points(s)) >= SPARKLINE_MIN_POINTS
-                              for s in model["series"])
-        rows = "".join(
-            f'<tr><td>{esc_html(s["label"])}</td>'
-            + (f'<td>{_sparkline_cell(s)}</td>' if show_sparklines else '')
-            + "".join(f'<td>{esc_html(TREND_NOT_MEASURED_TEXT if v is None else v)}</td>'
-                      for v in s["values"]) + '</tr>'
-            for s in model["series"])
-        spark_header = '<th>Trend</th>' if show_sparklines else ''
-        header = "".join(f'<th>{esc_html(d)}</th>' for d in model["dates"])
-        body = (f'<div class="overflow-x"><table><tr><th>Metric</th>{spark_header}'
-                f'{header}</tr>{rows}</table></div>')
+        body = _render_trend_table(model, provenance, trend_basis, derived=False)
+        if isinstance(derived_model, dict) and not derived_model.get("first_run"):
+            body += ('<h3 class="trend-subhead">Derived metrics</h3>'
+                     + _render_trend_table(derived_model, provenance, trend_basis,
+                                           derived=True))
     return f'<div class="card"><h2>Trend (8 headline metrics)</h2>{body}</div>'
 
 
@@ -5191,7 +5642,7 @@ def _render_hygiene_view(doc, models, copy_payload):
         f'{_render_length_flags_body(doc)}'
         f'{_render_dupweb_body(models["dupweb"], (doc.get("duplication") or {}).get("pairs", []) or [])}'
         f'{_render_unchecked_binaries_body(doc)}'
-        f'{_render_trend_body(models["trend"])}'
+        f'{_render_trend_body(models["trend"], models.get("derived_trend"), models.get("trend_provenance"), models.get("trend_basis"))}'
         '<h2>Wiring integrity</h2>'
         f'{_render_bipartite_body(models["bipartite"])}'
         f'{_render_composed_settings_body(doc)}'
@@ -5856,10 +6307,29 @@ def _render_from_out_dir_inner(
     if synth_err is not None:
         skipped.append({"date": sel_date, "reason": synth_err})
 
+    # Raw bytes for the definition-version digest lookup, restricted to the dates that
+    # actually joined the series — a sidecar excluded for a schema/root mismatch is not
+    # re-read for a version nothing will consult.
+    joined_dates = {date for date, _ in dated_docs}
+    sidecar_bytes = {date: _sidecar_bytes_guarded(path) for date, path in sidecars
+                     if date in joined_dates}
+
     models = {
         "context_weight": build_contextweight_model(doc),
         "bipartite": build_bipartite_model(doc),
         "trend": build_trend_model(dated_docs),
+        # The derived table's sibling model, built from the SAME `dated_docs` so the two
+        # tables can never disagree about which runs counted as measurements.
+        "derived_trend": build_derived_trend_model(dated_docs),
+        # The per-date comparability inputs both tables' verdicts are judged against. The
+        # raw file BYTES are the second half of `resolve_metric_definition_version`'s
+        # contract -- a markerless historical sidecar resolves through the frozen legacy
+        # digest table, which needs the file rather than the parsed document.
+        "trend_provenance": build_trend_provenance(dated_docs, sidecar_bytes),
+        # The model-authored basis rows, `.get()`-tolerantly. An absent or non-list value
+        # means the model never wrote a row, which `trend_basis_for` distinguishes from a
+        # row whose digest went stale.
+        "trend_basis": synth.get("trend_basis") if isinstance(synth, dict) else None,
         "dupweb": build_dupweb_model(doc),
         "civc": build_civc_model(synth),
         "drag": build_dragcandidate_model(synth),
