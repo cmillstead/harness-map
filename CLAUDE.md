@@ -54,6 +54,7 @@ harness-map is a production-grade, read-only inventory of the Claude Code harnes
 - Fixture policy: fixtures are real temp trees/repos/streams built in-test; nothing golden is regenerated without a spec section saying how.
 - No new top-level files in the skill dir beyond the ledger in SPEC_2 §4; no new dependencies, period.
 - Commit style: `harness-map S<stage>.M<n>: <imperative summary>`.
+- A collector detector change is not done until it has been run once against a real harness root and the expected numbers named in the change. A green suite over `fake_harness` does not certify a detector — the fixture corpus is systematically gentler than the input the tool is built to read. `HARNESS_MAP_REAL_ROOT=<path> python3 -m pytest -q` runs that check.
 
 ## Current state
 
