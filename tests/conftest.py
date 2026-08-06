@@ -73,9 +73,13 @@ def pathological_harness(fake_harness):
       1. `long_single_token` -- a 2000-char command with no whitespace/"/" (instance 1's
          exact crash shape, scaled past the measured live 1948-char command): the WHOLE
          command tokenizes as ONE shlex token whose `.name` exceeds
-         `_MAX_SCRIPT_TOKEN_LEN` (255), so `_looks_like_existing_hook_script` must
-         short-circuit before any `is_file()` syscall (a real ENAMETOOLONG risk on this
-         filesystem -- verified directly against a 2000-char path during T1).
+         `_MAX_SCRIPT_TOKEN_LEN` (255) (a real ENAMETOOLONG risk on this filesystem --
+         verified directly against a 2000-char path during T1). Scope note, so this
+         docstring does not overclaim: `_looks_like_existing_hook_script` carries TWO
+         independent defenses -- the length guard AND a wrapping `except OSError` -- and
+         what the tests over this shape pin is the COMBINED pair, not the length guard in
+         isolation. Deleting either one alone still returns False before a crash reaches
+         the document; only a full revert of BOTH reddens them.
       2. `bracket_commands` -- 8 `[ ... ] && ...` compounds: instance 2's exact live
          shape, the `[` first token the shipped name-allowlist fix was inert against.
       3. `nested_quote_command` -- deeply nested single/double quoting, with the `&&`
