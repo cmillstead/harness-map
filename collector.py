@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -6630,7 +6630,19 @@ def _check_select_prior_sidecar(out_dir: Path, today: str) -> tuple[str, dict[st
     candidates = []
     for p in entries:
         m = _CHECK_SIDECAR_RE.match(p.name)
-        if m and m.group(1) < today:
+        if not m:
+            continue
+        # F8 (TRK-051): _CHECK_SIDECAR_RE is STRUCTURAL only (\d{4}-\d{2}-\d{2}), so
+        # harness-map-2026-02-31.json matches -- and since selection sorts on the
+        # captured STRING, an impossible date can sort as newer than every real one and
+        # become the comparison baseline. date.fromisoformat is the calendar gate, the
+        # same shape render_html._date_prefix's fix took (AMENDMENTS A27); a match that
+        # fails it is treated as not-a-sidecar, never as a candidate.
+        try:
+            date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if m.group(1) < today:
             candidates.append((m.group(1), p))
     candidates.sort(key=lambda t: t[0], reverse=True)  # newest first (fixed order, F4.4)
     if not candidates:
@@ -6679,7 +6691,16 @@ def _check_select_synthesis_pair(
     candidates = []
     for p in entries:
         m = _CHECK_SYNTHESIS_RE.match(p.name)
-        if m and m.group(1) < today:
+        if not m:
+            continue
+        # F8 (TRK-051): same calendar gate as _check_select_prior_sidecar above -- the
+        # regex is structural only, so an impossible date would otherwise sort as newer
+        # than every real one.
+        try:
+            date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if m.group(1) < today:
             candidates.append((m.group(1), p))
     candidates.sort(key=lambda t: t[0], reverse=True)  # newest first
     if len(candidates) < 2:

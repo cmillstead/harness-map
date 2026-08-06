@@ -7519,6 +7519,93 @@ def test_check_synthesis_regex_matches_render_html_naming(tmp_path):
     assert err is None
     assert found_doc == sidecar_doc
 
+def test_check_impossible_prior_sidecar_dates_are_ignored(fake_harness, tmp_path):
+    # F8 (TRK-051): _CHECK_SIDECAR_RE is STRUCTURAL only (\d{4}-\d{2}-\d{2}), so each of
+    # these filenames matches it despite naming no real calendar date. None may become a
+    # D7 candidate -- with all three excluded, out_dir holds no prior sidecar at all.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    for bad_date in ("2026-02-31", "2026-13-01", "2026-00-10"):
+        _write_check_sidecar(out_dir, bad_date, {"always_loaded_tokens_est": 200,
+            "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert out.strip() == "First run — no prior map (baseline)."
+
+def test_check_impossible_date_sorting_newest_does_not_become_baseline(fake_harness, tmp_path):
+    # The ordering case (this is what makes F8 a defect rather than a curiosity): D7 walks
+    # candidates NEWEST FIRST by the captured date STRING. "2026-02-31" > "2026-02-15"
+    # lexically despite naming no real February date, so pre-fix it is D7-selected FIRST --
+    # the real prior sidecar is never even reached, let alone compared.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, "2026-02-15", {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    _write_check_sidecar(out_dir, "2026-02-31", {"always_loaded_tokens_est": 99999,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "harness-map-2026-02-31.json" not in out
+    assert "No regression detected (baseline: harness-map-2026-02-15.json)." in out
+
+def test_check_real_prior_alongside_adjacent_impossible_date_still_compares(fake_harness, tmp_path):
+    # A real prior sidecar's normal D7 selection and comparison must be UNAFFECTED by an
+    # impossible sibling sitting right next to it in the same out_dir.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, _days_ago(1), {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    _write_check_sidecar(out_dir, "2026-02-31", {"always_loaded_tokens_est": 0,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    (fake_harness / "hooks" / "orphan_a.py").write_text("# nobody\n")   # forces a real finding
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: orphan_script_count increased" in out
+
+def test_check_leap_year_prior_sidecar_date_is_selectable(fake_harness, tmp_path):
+    # Leap year, valid direction: 2024 IS a leap year, so Feb 29 is a real calendar date
+    # and must be selectable exactly like any other.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, "2024-02-29", {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert "No regression detected (baseline: harness-map-2024-02-29.json)." in out
+
+def test_check_non_leap_year_february_29_prior_sidecar_is_ignored(fake_harness, tmp_path):
+    # Leap year, invalid direction: 2026 is NOT a leap year, so Feb 29 is structurally
+    # sidecar-shaped but not a real calendar date and must be ignored.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_sidecar(out_dir, "2026-02-29", {"always_loaded_tokens_est": 200,
+        "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0})
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 0, (out, err)
+    assert out.strip() == "First run — no prior map (baseline)."
+
+def test_check_synthesis_impossible_date_sorting_newest_does_not_become_pair_member(fake_harness, tmp_path):
+    # Same ordering trap as test_check_impossible_date_sorting_newest_does_not_become_
+    # baseline above, at _check_select_synthesis_pair instead: pre-fix, "2026-02-31" sorts
+    # newest and enters the compared PAIR, producing a REGRESSION finding from a bogus cell
+    # (thin -> empty) while the real historical regression between the two genuine
+    # sidecars (covered -> thin) is never reached.
+    proj = _check_empty_project(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _write_check_synthesis(out_dir, "2026-02-10", [("Afford", "context", "covered")])
+    _write_check_synthesis(out_dir, "2026-02-20", [("Afford", "context", "thin")])
+    _write_check_synthesis(out_dir, "2026-02-31", [("Afford", "context", "empty")])
+    rc, out, err = run_check(fake_harness, out_dir, project_root=proj)
+    assert rc == 1, (out, err)
+    assert "REGRESSION: CIVC Afford/context regressed covered -> thin" in out
+    assert "thin -> empty" not in out
+
 def test_check_nonexistent_root_exits_two_not_clean(tmp_path):
     # F2 (P1): pre-fix, a nonexistent --root produced an empty current document, every
     # real prior value read as an improvement, and --check printed
