@@ -78,10 +78,14 @@ def pathological_harness(fake_harness):
          filesystem -- verified directly against a 2000-char path during T1).
       2. `bracket_commands` -- 8 `[ ... ] && ...` compounds: instance 2's exact live
          shape, the `[` first token the shipped name-allowlist fix was inert against.
-      3. `nested_quote_command` -- deeply nested single/double quoting with `&&`
-         embedded INSIDE the quoted argument, invisible to the shlex-tokenized form and
-         visible only on the RAW command string `_has_shell_control_syntax` scans (see
-         that function's docstring for why it checks raw text, not tokens).
+      3. `nested_quote_command` -- deeply nested single/double quoting, with the `&&`
+         control operator OUTSIDE the quoted argument, so shlex genuinely splits it into
+         a standalone token and the command IS actually shell-interpreted (a real `&&`
+         compound with a heavily-quoted first operand). The invisible-to-shlex case --
+         `&&` embedded INSIDE the quotes, which `_has_shell_control_syntax`'s raw-string
+         scan currently flags as `no_script` even though no real shell would treat it as
+         a control operator there -- is a genuine collector false positive, filed as
+         TRK-056, and is deliberately NOT pinned by this fixture.
       4. `unbalanced_quote_command` -- `shlex.split` raises ValueError: a genuine,
          disclosed coverage gap, kept singular so tests can assert it is the ONLY
          `commands_unparsed` contributor here.
@@ -93,9 +97,10 @@ def pathological_harness(fake_harness):
     long_single_token = "{" + ("a" * 1998) + "}"  # 2000 chars total; no whitespace, no
                                                     # "/", not "env"/an interpreter name
     bracket_commands = [f"[ -f flag{i} ] && echo {i}" for i in range(8)]
-    # The `&& z` sits INSIDE the double-quoted argument (shlex hands `_script_from_command`
-    # a single token for it) -- only the RAW-string scan sees it.
-    nested_quote_command = """rtk hook "a 'b \\"c\\" b' a && z\""""
+    # The `&&` sits OUTSIDE the double-quoted argument, so shlex splits it into its own
+    # standalone token -- this genuinely IS shell control syntax, unlike the quoted-`&&`
+    # false-positive shape (TRK-056, not pinned here; see the docstring above).
+    nested_quote_command = """rtk hook "a 'b \\"c\\" b' a" && z"""
     unbalanced_quote_command = "echo 'unterminated"
 
     settings = json.loads((root / "settings.json").read_text())

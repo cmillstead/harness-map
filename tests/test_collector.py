@@ -24,10 +24,12 @@ _spec.loader.exec_module(_collector)
 _rel = _collector._rel
 
 # Optional real-root acceptance fixture (TRK-049 T3). Set HARNESS_MAP_REAL_ROOT to a real
-# harness ROOT DIRECTORY (not a sidecar file) to enable the real-root acceptance test; it
-# skips when unset or not a directory -- same shape as HARNESS_MAP_REAL_SAMPLE
-# (test_render_html.py:26), just directory- rather than file-gated. No absolute literal
-# here on purpose -- this repo is public (see test_no_absolute_home_literal_in_runtime_modules).
+# harness ROOT DIRECTORY (not a sidecar file) to enable the real-root acceptance test. Unlike
+# HARNESS_MAP_REAL_SAMPLE (test_render_html.py:26), unset and invalid are NOT the same outcome
+# here: unset (or empty) skips quietly, as before, but a value that IS set and does not resolve
+# to a directory FAILS loudly instead of skipping -- a typo'd path must never silently report
+# "the acceptance check ran" when the collector never executed (TRK-049 P2 fix). No absolute
+# literal here on purpose -- this repo is public (see test_no_absolute_home_literal_in_runtime_modules).
 _real_root_env = os.environ.get("HARNESS_MAP_REAL_ROOT", "")
 REAL_ROOT = Path(_real_root_env) if _real_root_env else Path("/nonexistent/harness-map-real-root")
 
@@ -429,17 +431,15 @@ def test_pathological_bracket_prefixed_hook_commands_classify_as_no_script(patho
 
 
 def test_pathological_nested_quoting_hook_command_tokenizes_and_classifies(pathological_harness):
-    # Row 3: deeply nested single/double quoting with `&&` embedded INSIDE the quoted
-    # argument -- shlex must round-trip it without raising, and _has_shell_control_syntax
-    # must still catch the embedded `&&` (a raw-string substring scan does; matching
-    # against EXACT shlex tokens instead would not, since shlex folds the whole quoted
-    # argument -- including its embedded `&&` -- into ONE token that no longer equals the
-    # standalone "&&" member of _SHELL_CONTROL_SYNTAX). Verified load-bearing directly:
-    # switching the real function to an exact-token match reddens this assertion
-    # (this row's nested-quote command AND row 1's brace-delimited token both fold their
-    # control chars into a single non-standalone token, so both flip to "unparsed" and
-    # commands_no_script drops from 10 to 8 -- every test in this block shares the one
-    # combined fixture, so that drop is visible here too).
+    # Row 3: deeply nested single/double quoting in the first operand, with the `&&`
+    # control operator OUTSIDE the quotes -- shlex must round-trip the nested quoting
+    # without raising, and this command genuinely IS shell-interpreted (a real shell
+    # would run it as two commands), so `no_script` is the correct classification here
+    # regardless of whether _has_shell_control_syntax matches on the raw string or on
+    # exact tokens. (The embedded-INSIDE-quotes shape -- where a raw-string scan flags
+    # `&&` that no shell would actually treat as a control operator -- is a genuine
+    # collector false positive, filed as TRK-056 and deliberately not pinned by this
+    # fixture; see conftest.py::pathological_harness.)
     doc = run_collector(pathological_harness)
     hooks = doc["enforcement"]["hooks"]
     assert hooks["commands_no_script"] == 10
@@ -8237,13 +8237,21 @@ def test_definition_version_validator_matches_render_html():
 #      harness classification was completely INERT (zero classified, all real hooks
 #      still a coverage gap). Suite green throughout.
 # HARNESS_MAP_REAL_ROOT (module top, next to run_collector) points at a real harness
-# ROOT DIRECTORY -- not a sidecar -- and this test skips when it is unset or not a
-# directory, the same shape test_render_html.py's REAL_SAMPLE smoke tests use for a
-# missing file.
+# ROOT DIRECTORY -- not a sidecar. Unset (or empty) skips, the ordinary state, same shape
+# test_render_html.py's REAL_SAMPLE smoke tests use for a missing file. But a value that IS
+# set and does not resolve to a real directory -- e.g. a typo'd path -- must FAIL rather
+# than skip: a skip-shaped green run in that case would look identical to "the acceptance
+# check ran and passed" while the collector never executed at all, defeating the whole
+# point of this test (TRK-049 P2 fix).
 
 def test_real_root_acceptance_no_crash_envelope_and_hooks_classified():
-    if not REAL_ROOT.is_dir():
+    if not _real_root_env:
         pytest.skip("real harness root not present on this machine")
+    if not REAL_ROOT.is_dir():
+        pytest.fail(
+            f"HARNESS_MAP_REAL_ROOT={_real_root_env!r} does not resolve to a directory -- "
+            "the real-root acceptance check did NOT run"
+        )
     doc = run_collector(REAL_ROOT, project_root=REAL_ROOT)
 
     # Anti-crash-envelope: would have caught escape 1 above.
