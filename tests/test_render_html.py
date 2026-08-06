@@ -9804,3 +9804,104 @@ def test_disclosure_is_absent_once_the_corpus_is_comparable(tmp_path):
     # happen to omit the note for an unrelated reason (e.g. an empty card)
     for label in _all_rendered_metric_labels(text):
         assert _verdict_of(_trend_row(text, label))[0] != "not comparable", label
+
+
+# ============================================== S6c Task 9: fork (1) discoverability
+# The reported bug, root-caused: an operator saw a `down 992` delta on the Weight view,
+# opened the only affordance attached to it -- the gauge drill -- and hit a dead end.
+# `_GAUGE_TAB_HINT` had no entry for `always_loaded_words` or `always_loaded_tokens_est`,
+# so those two tiles' drill panels returned WITHOUT the "-> open the ... tab" pointer
+# every other count/aggregate gauge already carries. The Trend card (which DOES carry
+# the real per-file history those two tiles summarize) was also buried 5th of 6 cards
+# deep in the Hygiene view, roughly 20 scroll ticks past the fold -- so even an operator
+# who found the tab by other means had to hunt for the table once there.
+
+def _panel_for(text, key):
+    """The gauge-drawer inner HTML for one gauge key -- same non-greedy `</div>` anchor
+    every gauge-drill assertion in this module already uses (the drawer's own content
+    carries no nested `<div>`, so the first `</div>` closes the drawer, not a false
+    early stop)."""
+    match = re.search(rf'id="gdrawer-{key}"[^>]*>(.*?)</div>', text, re.S)
+    assert match is not None, key
+    return match.group(1)
+
+
+def test_both_weight_tiles_point_onward_to_hygiene(tmp_path):
+    """THE REGRESSION TEST FOR THE REPORTED BUG -- it must fail against pre-S6c source.
+    The operator saw a `down 992` delta, opened the only affordance attached to it, and
+    hit a dead end: `_GAUGE_TAB_HINT` had no entry for always_loaded_words or
+    always_loaded_tokens_est, so those two tiles' drill panels returned WITHOUT the
+    '-> open the ... tab' pointer every other tile gets."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "weighthint"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    for key in ("always_loaded_words", "always_loaded_tokens_est"):
+        assert "open the Hygiene tab for the full table" in _panel_for(text, key)
+
+
+def test_trend_card_is_first_in_the_hygiene_view(tmp_path):
+    """Was 5th of 6 cards deep in the Hygiene view, roughly 20 scroll ticks past the
+    fold. The Trend card is now the first thing the view renders -- assert its heading
+    precedes Length flags, Duplication pairs, Phantom refs and Unchecked binaries."""
+    text = _render_corpus(tmp_path, "trendfirst", _moving_corpus())
+    hyg = re.search(r'<section id="view-hygiene".*?</section>', text, re.S)
+    assert hyg is not None
+    hyg_html = hyg.group(0)
+    trend_idx = hyg_html.index("<h2>Trend")
+    for marker in ("<h2>Length flags</h2>", "<h2>Duplication pairs",
+                  "<h2>Phantom refs</h2>", "Unchecked binaries:"):
+        marker_idx = hyg_html.index(marker)
+        assert trend_idx < marker_idx, (marker, trend_idx, marker_idx)
+
+
+def test_trend_card_title_still_starts_with_trend(tmp_path):
+    """Pins compatibility with the shipped
+    test_hygiene_view_folds_dup_phantom_trend_and_wiring (`"Trend" in hyg_html`) rather
+    than trusting it -- the retitle changes everything after the word "Trend", never
+    the word itself."""
+    text = _render_corpus(tmp_path, "trendtitleword", _moving_corpus())
+    match = re.search(r'<div class="card"><h2>(Trend[^<]*)</h2>', text)
+    assert match is not None, text
+    assert match.group(1).startswith("Trend")
+
+
+def test_trend_card_title_count_equals_the_rendered_row_count(tmp_path):
+    """N IS DERIVED. A test pinning the literal 13 or 14 recreates the exact defect one
+    milestone later -- the round-1 text hardcoded '(12 metrics)' and was already stale
+    when written. This assertion is what makes the count self-correcting when a metric
+    is added or excluded. N counts BOTH tables: the 8 HEADLINE_KEYS the legacy table
+    still iterates (including unchecked_binary_count, which three shipped sparkline
+    assertions require) plus the 6 DERIVED_TREND_KEYS."""
+    text = _render_corpus(tmp_path, "trendtitlecount", _moving_corpus())
+    match = re.search(r'<h2>Trend[^(]*\((\d+) metrics\)</h2>', text)
+    assert match is not None, text
+    title_n = int(match.group(1))
+    rendered_n = len(_trend_rows(text))
+    assert rendered_n == _RENDERED_TREND_ROWS
+    assert rendered_n == len(rh.HEADLINE_KEYS) + len(rh.DERIVED_TREND_KEYS)
+    assert title_n == rendered_n
+
+
+def test_four_views_and_copy_payloads_are_untouched(tmp_path):
+    """Fork (1): NO NEW TAB. Moving the Trend card inside the Hygiene view and
+    retitling it must not add, remove, or rename any view or copy-payload island -- a
+    sibling guard naming that invariant explicitly, since Task 9 touches the same view
+    fork (1) already resolved."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "fourviewsuntouched"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    for vid in ("view-overview", "view-weight", "view-friction", "view-hygiene"):
+        assert f'id="{vid}"' in text
+    assert 'id="view-coverage"' not in text
+    assert text.count('class="view-btn"') == 4
+    for vid in ("overview", "weight", "friction", "hygiene"):
+        assert f'<script type="application/json" id="copy-{vid}">' in text
+    assert 'id="copy-coverage"' not in text

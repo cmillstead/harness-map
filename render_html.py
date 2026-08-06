@@ -3292,6 +3292,7 @@ _GAUGE_TAB_HINT = {
     "always_loaded_file_count": "Weight", "instruction_files_over_200": "Hygiene",
     "duplicate_pair_count": "Hygiene", "phantom_ref_count": "Hygiene",
     "friction_total": "Friction",
+    "always_loaded_words": "Hygiene", "always_loaded_tokens_est": "Hygiene",
 }
 
 
@@ -3380,7 +3381,7 @@ def _gauge_drill_html(key, models, doc, joined, footer, codex_aggregate):
                  for c in cells]
         return ('<p class="gauge-contributors-label">Top contributors '
                 '(largest always-loaded files — not a complete list)</p>'
-                + _drill_list(items, cls="gauge-contributors"))
+                + _drill_list(items, cls="gauge-contributors") + tab)
     return ""
 
 
@@ -5387,7 +5388,9 @@ def _render_trend_body(model, derived_model=None, provenance=None, trend_basis=N
             body += ('<h3 class="trend-subhead">Derived metrics</h3>'
                      + _render_trend_table(derived_model, provenance, trend_basis,
                                            derived=True))
-    return f'<div class="card"><h2>Trend (8 headline metrics)</h2>{body}</div>'
+    n_metrics = len(HEADLINE_KEYS) + len(DERIVED_TREND_KEYS)
+    return (f'<div class="card"><h2>Trend — direction over the measured history '
+            f'({n_metrics} metrics)</h2>{body}</div>')
 
 
 def _render_dupweb_body(model, raw_pairs):
@@ -5678,10 +5681,10 @@ def _render_hygiene_view(doc, models, copy_payload):
         '<section id="view-hygiene" class="view" role="tabpanel" '
         'aria-labelledby="view-btn-hygiene" tabindex="-1">'
         f'<div class="view-toolbar">{_render_copy_controls("hygiene", copy_payload)}</div>'
+        f'{_render_trend_body(models["trend"], models.get("derived_trend"), models.get("trend_provenance"), models.get("trend_basis"))}'
         f'{_render_length_flags_body(doc)}'
         f'{_render_dupweb_body(models["dupweb"], (doc.get("duplication") or {}).get("pairs", []) or [])}'
         f'{_render_unchecked_binaries_body(doc)}'
-        f'{_render_trend_body(models["trend"], models.get("derived_trend"), models.get("trend_provenance"), models.get("trend_basis"))}'
         '<h2>Wiring integrity</h2>'
         f'{_render_bipartite_body(models["bipartite"])}'
         f'{_render_composed_settings_body(doc)}'
