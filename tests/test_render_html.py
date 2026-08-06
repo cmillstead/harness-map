@@ -4689,6 +4689,66 @@ def test_tier_tokens_present_in_light_and_dark_static_style():
     assert style.count("--tier-project:#22d3ee") == 2   # dark theme (media dark + [data-theme=dark])
 
 
+def _theme_block(css, opener):
+    """Return the declaration text of a theme variable block, given its exact opener."""
+    i = css.index(opener)
+    return css[i + len(opener):css.index("}", i)]
+
+
+def _theme_tokens(block):
+    return dict(d.split(":", 1) for d in block.split(";") if d.startswith("--"))
+
+
+def test_light_and_dark_theme_blocks_each_stay_in_sync():
+    """Rejects the single most likely dark-mode regression in this file: the dark theme is
+    declared TWICE (@media prefers-color-scheme, and :root[data-theme="dark"]) and the light
+    theme TWICE (:root, and :root[data-theme="light"]). Editing or adding a token in only one
+    member of a pair makes the manual theme toggle render differently from the same theme
+    picked up from the OS -- a divergence nothing else in the suite would catch."""
+    css = rh.STATIC_STYLE
+    # --r and --mono are declared once, only in the base :root{} block, on purpose: they are
+    # theme-invariant (same border-radius and font stack in both themes), and every
+    # [data-theme=...] selector still resolves them from :root{} via normal CSS custom
+    # property inheritance. They are excluded from the pairwise sync check below because
+    # they are the one deliberate exception to "every token appears in all four blocks".
+    invariant_tokens = {"--r", "--mono"}
+    light_a = {k: v for k, v in _theme_tokens(_theme_block(css, ":root{")).items()
+               if k not in invariant_tokens}
+    light_b = _theme_tokens(_theme_block(css, ':root[data-theme="light"]{'))
+    dark_a = {k: v for k, v in _theme_tokens(
+        _theme_block(css, "@media (prefers-color-scheme: dark){:root{")).items()
+        if k not in invariant_tokens}
+    dark_b = _theme_tokens(_theme_block(css, ':root[data-theme="dark"]{'))
+    assert light_a == light_b, "light :root and [data-theme=light] diverged"
+    assert dark_a == dark_b, "dark @media and [data-theme=dark] diverged"
+    assert set(light_a) == set(dark_a), "a token exists in one theme but not the other"
+
+
+def test_no_unthemed_color_literal_in_the_stylesheet():
+    """Rejects a hardcoded hex/rgb() creeping into a rule outside the four theme-variable
+    blocks -- exactly the class of defect that makes a control legible in light mode and
+    invisible in dark. Every remaining literal must be on this allowlist with a stated
+    reason; a new one fails the test until it is either mapped to a variable or added here
+    deliberately."""
+    css = rh.STATIC_STYLE
+    for opener in (":root{", ':root[data-theme="light"]{',
+                   "@media (prefers-color-scheme: dark){:root{", ':root[data-theme="dark"]{'):
+        block = _theme_block(css, opener)
+        css = css.replace(block, "", 1)
+    found = set(re.findall(r"#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)", css))
+    allowed = {
+        # .friction-badge: paint-order:stroke halo. White fill over a black outline must read
+        # over ANY cell fill in EITHER theme -- these two are load-bearing BECAUSE they do
+        # not theme.
+        "#fff", "#000",
+        # HEAT_RAMP (render_html.py:89), appended via _HEAT_CSS. A sequential magnitude ramp
+        # emitted identically into the cell stroke and the legend swatch; theming it would
+        # desynchronize the legend from the data it explains.
+        "#FCAE91", "#FB6A4A", "#DE2D26", "#A50F15",
+    }
+    assert found <= allowed, f"unthemed color literal(s) in the stylesheet: {sorted(found - allowed)}"
+
+
 def test_one_executable_script_and_csp_hash_reconciles_with_tier_composition(tmp_path):
     doc = _minimal_doc()
     doc["tier_composition"] = TIER_COMPOSITION_FIXTURE
