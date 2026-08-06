@@ -2217,6 +2217,9 @@ main{padding:16px 20px}
 .inspector{position:sticky;top:52px;background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:14px;max-height:70vh;overflow-y:auto}
 .empty-state{color:var(--muted);font-style:italic}
 .script-desc{display:block;color:var(--muted);font-size:0.78rem;margin-top:2px}
+.hook-list{margin:6px 0 0;padding-left:20px}
+.hook-list li{margin:8px 0;line-height:1.5}
+.hook-list .script-desc{margin-top:4px}
 table{border-collapse:collapse;width:100%;font-size:0.85rem}
 th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;font-family:var(--mono);font-variant-numeric:tabular-nums}
 th{color:var(--muted);font-weight:600}
@@ -4021,11 +4024,17 @@ def _render_bipartite_body(model):
         f'<li class="badge orphan">{esc_html(n["script"])} ({esc_html(n["target_status"])})</li>'
         for n in model["left_orphans"]) or '<li class="empty-state">none</li>'
     right_html = "".join(_row(n, "right") for n in model["right"]) or '<li class="empty-state">none</li>'
+    # TRK-021 finding 3: all three cards are one visual family and share one class, so the
+    # spacing rules cannot drift apart. A class (not `.card ul`) so the rules cannot reach
+    # `.digest-group ul` / `.tier-dark-callout ul` / `.gauge-drill`, which tie on specificity
+    # and today win only by source order.
     return (
-        '<div class="card"><h2>Registered hooks (settings.json)</h2><ul>' + left_html + '</ul></div>'
-        '<div class="card"><h2>Orphan registrations</h2><ul>' + orphan_html + '</ul></div>'
-        '<div class="card"><h2>Scripts on disk (registration/reachability status)</h2><ul>'
-        + right_html + '</ul></div>'
+        '<div class="card"><h2>Registered hooks (settings.json)</h2>'
+        '<ul class="hook-list">' + left_html + '</ul></div>'
+        '<div class="card"><h2>Orphan registrations</h2>'
+        '<ul class="hook-list">' + orphan_html + '</ul></div>'
+        '<div class="card"><h2>Scripts on disk (registration/reachability status)</h2>'
+        '<ul class="hook-list">' + right_html + '</ul></div>'
     )
 
 

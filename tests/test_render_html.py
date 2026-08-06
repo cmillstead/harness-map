@@ -1060,6 +1060,31 @@ def test_gauge_button_content_is_top_anchored(tmp_path):
     assert "float" not in chev
 
 
+def test_hook_cards_share_one_spaced_list_style(tmp_path):
+    """Rejects two pre-TRK-021 behaviors. (1) The three bipartite hook cards emitted bare
+    unclassed <ul>s, so every entry inherited UA defaults and the "Scripts on disk" card --
+    where each <li> stacks a name, a badge and a description -- rendered as an unreadable
+    wall. (2) The naive fix, `.card ul`, would also hit `.digest-group ul` and
+    `.tier-dark-callout ul`, which tie on specificity and win only by source order.
+    Also pins that `.hook-list li` sets no padding: it out-ranks `.badge`, and a padding
+    declaration here would silently flatten every orphan-registration pill."""
+    doc = _minimal_doc()
+    out_dir = tmp_path / "hook_lists"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    for heading in ("Registered hooks (settings.json)",
+                    "Orphan registrations",
+                    "Scripts on disk (registration/reachability status)"):
+        assert f"<h2>{heading}</h2><ul class=\"hook-list\">" in text
+    li = _css_decls(rh.STATIC_STYLE, ".hook-list li")
+    assert "margin:" in li and "line-height:" in li
+    assert "padding" not in li
+    assert _css_decls(rh.STATIC_STYLE, ".hook-list") != ""
+
+
 def test_csp_hashes_match_recomputed_static_blocks(tmp_path):
     doc = _minimal_doc()
     out_dir = tmp_path / "csp_hash"
