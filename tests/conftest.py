@@ -85,11 +85,13 @@ def pathological_harness(fake_harness):
       3. `nested_quote_command` -- deeply nested single/double quoting, with the `&&`
          control operator OUTSIDE the quoted argument, so shlex genuinely splits it into
          a standalone token and the command IS actually shell-interpreted (a real `&&`
-         compound with a heavily-quoted first operand). The invisible-to-shlex case --
-         `&&` embedded INSIDE the quotes, which `_has_shell_control_syntax`'s raw-string
-         scan currently flags as `no_script` even though no real shell would treat it as
-         a control operator there -- is a genuine collector false positive, filed as
-         TRK-056, and is deliberately NOT pinned by this fixture.
+         compound with a heavily-quoted first operand). The complementary case -- `&&`
+         embedded INSIDE the quotes -- classifies `unparsed`, not `no_script`, under A62's
+         quote-aware rule: an operator only counts as shell control syntax OUTSIDE quotes
+         (`$(` and a backtick are the one exception, and only inside double quotes). That
+         case is pinned in test_collector.py's `test_shell_control_syntax_quote_awareness_*`
+         tests, not here -- adding it to this fixture would move `commands_unparsed` from
+         1 to 2 and break several counts this fixture's tests already pin.
       4. `unbalanced_quote_command` -- `shlex.split` raises ValueError: a genuine,
          disclosed coverage gap, kept singular so tests can assert it is the ONLY
          `commands_unparsed` contributor here.
@@ -102,8 +104,9 @@ def pathological_harness(fake_harness):
                                                     # "/", not "env"/an interpreter name
     bracket_commands = [f"[ -f flag{i} ] && echo {i}" for i in range(8)]
     # The `&&` sits OUTSIDE the double-quoted argument, so shlex splits it into its own
-    # standalone token -- this genuinely IS shell control syntax, unlike the quoted-`&&`
-    # false-positive shape (TRK-056, not pinned here; see the docstring above).
+    # standalone token -- this genuinely IS shell control syntax under A62's quote-aware
+    # rule, unlike a quoted `&&` (which classifies `unparsed`; see the docstring above and
+    # test_collector.py's `test_shell_control_syntax_quote_awareness_*` tests).
     nested_quote_command = """rtk hook "a 'b \\"c\\" b' a" && z"""
     unbalanced_quote_command = "echo 'unterminated"
 

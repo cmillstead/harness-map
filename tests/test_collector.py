@@ -347,7 +347,7 @@ def test_shlex_unparseable_hook_command_is_unparsed(fake_harness):
 
 
 def _shell_control_syntax_operator_boundary_table():
-    """TRK-056/A62: table pinning `_has_shell_control_syntax`'s quote-aware contract.
+    """A62: table pinning `_has_shell_control_syntax`'s quote-aware contract.
     Returns `(no_script_rows, unparsed_rows)`, each a list of `(label, command)` pairs.
     Every payload is deliberately free of a `.py`/`.sh` suffix and of any name under the
     fixture's (empty) hooks dir, so `_references_script_token` never fires first and
@@ -406,7 +406,7 @@ def _shell_control_syntax_operator_boundary_table():
 
 
 def test_shell_control_syntax_quote_awareness_no_script_rows(fake_harness):
-    # TRK-056/A62 T2: batches every "should classify no_script, never a blind spot" row
+    # A62 T2: batches every "should classify no_script, never a blind spot" row
     # from the quoting-boundary table into ONE settings.json / collector run, mirroring
     # test_hook_command_coverage_totals_and_headline_denominator's multi-command style.
     no_script_rows, _ = _shell_control_syntax_operator_boundary_table()
@@ -420,7 +420,7 @@ def test_shell_control_syntax_quote_awareness_no_script_rows(fake_harness):
 
 
 def test_shell_control_syntax_quote_awareness_unparsed_rows(fake_harness):
-    # TRK-056/A62 T2: batches every "should stay unparsed AND a disclosed blind spot" row,
+    # A62 T2: batches every "should stay unparsed AND a disclosed blind spot" row,
     # including the 4 exact BUG-table rows the ticket names and one deliberate .py-token
     # trap row proving _references_script_token still wins first regardless of quoting.
     _, unparsed_rows = _shell_control_syntax_operator_boundary_table()
@@ -547,10 +547,11 @@ def test_pathological_nested_quoting_hook_command_tokenizes_and_classifies(patho
     # without raising, and this command genuinely IS shell-interpreted (a real shell
     # would run it as two commands), so `no_script` is the correct classification here
     # regardless of whether _has_shell_control_syntax matches on the raw string or on
-    # exact tokens. (The embedded-INSIDE-quotes shape -- where a raw-string scan flags
-    # `&&` that no shell would actually treat as a control operator -- is a genuine
-    # collector false positive, filed as TRK-056 and deliberately not pinned by this
-    # fixture; see conftest.py::pathological_harness.)
+    # exact tokens. (The embedded-INSIDE-quotes shape -- where the same `&&` sits inside
+    # a quoted argument instead -- classifies `unparsed`, not `no_script`, under A62's
+    # quote-aware rule: an operator only counts as shell control syntax OUTSIDE quotes.
+    # That case is pinned in test_shell_control_syntax_quote_awareness_* above, not here;
+    # see conftest.py::pathological_harness.)
     doc = run_collector(pathological_harness)
     hooks = doc["enforcement"]["hooks"]
     assert hooks["commands_no_script"] == 10
