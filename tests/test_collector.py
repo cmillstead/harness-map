@@ -6254,6 +6254,204 @@ def test_detect_skill_test_coverage_unsearchable_root_records_error(unsearchable
     assert result == []
     assert any("skills" in e for e in errors)
 
+
+# TRK-050 T1: `sorted(p for p in <dir>.iterdir() if p.is_dir())` ran the is_dir() probe
+# INSIDE the comprehension at seven call sites -- one child raising OSError aborted the
+# whole generator, silently discarding every SIBLING with it, not just the bad one. Each
+# test below builds a REAL two-child tree (one good child, one child that is a symlink
+# into a chmod(0) target so p.is_dir() raises EACCES) and proves the good sibling still
+# comes back. Sibling survival is the load-bearing assertion: a fix that still collapses
+# to [] but merely adds an error message would also pass an "error recorded"-only check.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_operator_tier_nodes_unreadable_skill_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    skills_dir = root / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    (good / "SKILL.md").write_text("---\ndescription: d\n---\nbody\n")
+    hidden = tmp_path / "hidden-bad-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        inaccessible: list = []
+        nodes = _collector._walk_operator_tier_nodes(root, inaccessible)
+    finally:
+        os.chmod(hidden, 0o755)
+    names = {n["name"] for n in nodes if n["surface"] == "skill"}
+    assert "good-skill" in names, "sibling must survive one bad child"
+    assert "skills/bad-skill" in {e["path"] for e in inaccessible}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_project_tier_nodes_unreadable_skill_child_keeps_siblings(tmp_path):
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    (good / "SKILL.md").write_text("body\n")
+    hidden = tmp_path / "hidden-bad-project-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        out_of_root_refs: list = []
+        errors: list = []
+        nodes = _collector._walk_project_tier_nodes(project_root, out_of_root_refs, errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    names = {n["name"] for n in nodes if n["surface"] == "skill"}
+    assert "good-skill" in names, "sibling must survive one bad child"
+    assert any("project skills child is_dir failed" in e and "bad-skill" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_always_loaded_unreadable_project_slug_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    projects_dir = root / "projects"
+    good_slug = "good-project"
+    (projects_dir / good_slug / "memory").mkdir(parents=True)
+    (projects_dir / good_slug / "memory" / "MEMORY.md").write_text("hi\n")
+    hidden = tmp_path / "hidden-bad-project-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (projects_dir / "bad-project").symlink_to(hidden / "bad-project")
+    try:
+        inaccessible: list = []
+        errors: list = []
+        _files, variants = _collector.walk_always_loaded(root, None, inaccessible, errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert any(v["project_slug"] == good_slug for v in variants), "sibling project must survive"
+    assert any("projects child is_dir failed" in e and "bad-project" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_always_loaded_projects_listing_failure_distinct_from_child_failure(tmp_path):
+    """The projects-slug comprehension's listing-level except used to be completely
+    silent (`except OSError: candidate_dirs = []`, no errors[] entry at all). This proves
+    (1) a listing-level failure (projects_dir itself chmod(0), so it stats as a dir but
+    cannot be listed) is now recorded, and (2) its message is text-distinguishable from
+    the per-child failure message above -- a regression collapsing the two into one
+    generic message would fail this."""
+    root = tmp_path / "harness-listing"
+    projects_dir = root / "projects"
+    projects_dir.mkdir(parents=True)
+    os.chmod(projects_dir, 0)
+    try:
+        errors: list = []
+        _collector.walk_always_loaded(root, None, [], errors)
+    finally:
+        os.chmod(projects_dir, 0o755)
+    assert any("projects listing failed" in e for e in errors), errors
+    assert not any("projects child is_dir failed" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_always_loaded_unreadable_sub_skill_child_keeps_sibling_rules(tmp_path):
+    root = tmp_path / "harness"
+    skills_root = root / "skills"
+    good_rules = skills_root / "good-skill" / "rules"
+    good_rules.mkdir(parents=True)
+    (good_rules / "r.md").write_text("# rule\nbody\n")
+    hidden = tmp_path / "hidden-bad-sub-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_root / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        inaccessible: list = []
+        errors: list = []
+        files, _variants = _collector.walk_always_loaded(root, None, inaccessible, errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert any(f["path"] == "skills/good-skill/rules/r.md" for f in files), \
+        "sibling sub-skill's rules must survive"
+    assert any("skills child is_dir failed" in e and "bad-skill" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_descriptions_unreadable_skill_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    skills_dir = root / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    (good / "SKILL.md").write_text("---\ndescription: fine skill\n---\nbody\n")
+    hidden = tmp_path / "hidden-bad-desc-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        inaccessible: list = []
+        skill_desc, _agent_desc = _collector.collect_descriptions(root, inaccessible)
+    finally:
+        os.chmod(hidden, 0o755)
+    names = {s["name"] for s in skill_desc}
+    assert "good-skill" in names, "sibling must survive one bad child"
+    assert "skills/bad-skill" in {e["path"] for e in inaccessible}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_on_demand_unreadable_skill_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    skills_dir = root / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    (good / "SKILL.md").write_text("body\n")
+    hidden = tmp_path / "hidden-bad-ondemand-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        inaccessible: list = []
+        skills, _internal, _memory = _collector.collect_on_demand(root, None, inaccessible)
+    finally:
+        os.chmod(hidden, 0o755)
+    names = {s["name"] for s in skills}
+    assert "good-skill" in names, "sibling must survive one bad child"
+    assert "skills/bad-skill" in {e["path"] for e in inaccessible}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_hook_test_stems_unreadable_skill_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    skills_root = root / "skills"
+    good_tests = skills_root / "good-skill" / "hooks" / "tests"
+    good_tests.mkdir(parents=True)
+    (good_tests / "test_guard.py").write_text("# test\n")
+    hidden = tmp_path / "hidden-bad-hookstems-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_root / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        errors: list = []
+        stems = _collector._hook_test_stems(root, errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert "guard" in stems, "sibling skill's hook test stem must survive"
+    assert any("skills child is_dir failed" in e and "bad-skill" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_detect_skill_test_coverage_unreadable_skill_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    skills_dir = root / "skills"
+    good = skills_dir / "good-skill"
+    (good / "tests").mkdir(parents=True)
+    hidden = tmp_path / "hidden-bad-coverage-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        errors: list = []
+        result = _collector._detect_skill_test_coverage(root, errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    names = {r["name"] for r in result}
+    assert "good-skill" in names, "sibling skill must survive one bad child"
+    assert any("skills child is_dir failed" in e and "bad-skill" in e for e in errors)
+
+
 # S7.M3b (F6): _read_text's is_file() probe and parse_settings's is_file()/is_symlink()
 # probes were the last unguarded ENOENT-only-swallow sites in this same class -- each one
 # also re-raises EACCES from an unsearchable ancestor. Guarded now; the two tests below
@@ -6500,6 +6698,251 @@ def test_main_unsearchable_root_never_triggers_crash_backstop(unsearchable_root)
     reaches it."""
     doc = run_collector(unsearchable_root)
     assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
+
+
+# TRK-050 T2: the same defect class T1 fixed (a bad child's is_dir() aborting the whole
+# `sorted(p for p in <dir>.iterdir() if p.is_dir())` comprehension and discarding every
+# sibling with it) at the four remaining call sites: _project_tier_duplication_corpus
+# (which ALREADY recorded a message on the collapse -- proof that a recorded error is not
+# the same property as sibling survival), and _compose_project_input_paths + the two
+# skills/projects listings inside iter_input_paths, none of which had anywhere to record
+# an error before this task. Sibling survival is the load-bearing assertion throughout.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_tier_duplication_corpus_unreadable_skill_child_keeps_siblings(tmp_path):
+    """Unlike the other six T1 sites, this one already appended a blind_spots message on
+    collapse -- but the message sat on top of a TOTAL loss of every project skill in the
+    scan, not just the bad one, for as long as this code has existed. Proves the good
+    sibling's SKILL.md now survives instead of merely being reported missing."""
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    (good / "SKILL.md").write_text(
+        "---\ndescription: d\n---\nThis skill has plenty of distinct normalized words here.\n")
+    hidden = tmp_path / "hidden-bad-dupcorpus-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        corpus = _collector._project_tier_duplication_corpus(
+            project_root, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(hidden, 0o755)
+    rel_paths = {rel for rel, _tier, _shingles in corpus}
+    assert ".claude/skills/good-skill/SKILL.md" in rel_paths, "sibling must survive one bad child"
+    assert any("project skills child is_dir failed" in b and "bad-skill" in b for b in blind_spots)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_tier_duplication_corpus_skills_listing_failure_distinct_from_child_failure(
+    tmp_path,
+):
+    """TRK-050 T5 F4: the fourth T2 site (_project_tier_duplication_corpus) was the only
+    one of the four missing this test. A listing-level failure (.claude/skills itself
+    unlistable) and a per-child failure (one bad child among listable siblings) must
+    record TEXT-DISTINGUISHABLE messages -- a regression collapsing the two into one
+    generic message would fail this. Mirrors
+    test_compose_project_input_paths_listing_failure_distinct_from_child_failure and
+    test_iter_input_paths_skills_listing_failure_distinct_from_child_failure."""
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    skills_dir.mkdir(parents=True)
+    os.chmod(skills_dir, 0)
+    try:
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        _collector._project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(skills_dir, 0o755)
+    assert any("project skills listing failed" in b for b in blind_spots), blind_spots
+    assert not any("project skills child is_dir failed" in b for b in blind_spots)
+    assert not any("project skills is_dir failed" in b for b in blind_spots)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_compose_project_input_paths_unreadable_skill_child_keeps_siblings(tmp_path):
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    hidden = tmp_path / "hidden-bad-composepaths-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        errors: list = []
+        paths = _collector._compose_project_input_paths(project_root, errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert (good / "SKILL.md") in paths, "sibling must survive one bad child"
+    assert any("compose project skills child is_dir failed" in e and "bad-skill" in e
+               for e in errors)
+
+
+def test_compose_project_input_paths_errors_default_none_discarded(tmp_path):
+    """Optional `errors` param (TRK-050 T2): the pre-existing single-argument call shape
+    must keep working byte-identically -- discarding rather than crashing when omitted."""
+    project_root = tmp_path / "repo"
+    (project_root / ".claude" / "skills" / "good-skill").mkdir(parents=True)
+    paths = _collector._compose_project_input_paths(project_root)
+    assert (project_root / ".claude" / "skills" / "good-skill" / "SKILL.md") in paths
+
+
+def test_compose_project_input_paths_absent_skills_dir_records_nothing(tmp_path):
+    """TRK-050 T5 F1: an ABSENT .claude/skills dir is a normal, valid project layout (no
+    project skills yet) -- must not be reported as a collection failure. Companion to
+    test_compose_project_input_paths_listing_failure_distinct_from_child_failure below,
+    which covers the PRESENT-but-unlistable direction; a fix guarding only one direction
+    is the defect this test catches."""
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    errors: list = []
+    _collector._compose_project_input_paths(project_root, errors)
+    assert not any("skills" in e for e in errors), errors
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_compose_project_input_paths_listing_failure_distinct_from_child_failure(tmp_path):
+    """A listing-level failure (the skills dir itself unlistable) and a per-child failure
+    (one bad child among listable siblings) must record TEXT-DISTINGUISHABLE messages --
+    a regression collapsing the two into one generic message would fail this."""
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    skills_dir.mkdir(parents=True)
+    os.chmod(skills_dir, 0)
+    try:
+        errors: list = []
+        _collector._compose_project_input_paths(project_root, errors)
+    finally:
+        os.chmod(skills_dir, 0o755)
+    assert any("compose project skills listing failed" in e for e in errors), errors
+    assert not any("compose project skills child is_dir failed" in e for e in errors)
+
+
+def test_iter_input_paths_absent_projects_and_skills_dirs_record_nothing(tmp_path):
+    """TRK-050 T5 F1: an ABSENT projects/ or skills/ dir is a normal, valid harness (none
+    registered/created yet) -- iterdir() raising ENOENT for a never-created dir must not
+    be reported as a collection failure. Companion to the PRESENT-but-unlistable
+    direction covered by test_iter_input_paths_unreadable_project_slug_child_keeps_siblings,
+    test_iter_input_paths_unreadable_skill_child_keeps_siblings, and
+    test_iter_input_paths_skills_listing_failure_distinct_from_child_failure -- a fix
+    guarding only one direction is the defect this test catches."""
+    root = tmp_path / "harness"
+    root.mkdir()
+    errors: list = []
+    _collector.iter_input_paths(root, errors=errors)
+    assert not any("projects" in e for e in errors), errors
+    assert not any("skills" in e for e in errors), errors
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_projects_listing_failure_distinct_from_child_failure(tmp_path):
+    """The skills listing has this test already
+    (test_iter_input_paths_skills_listing_failure_distinct_from_child_failure); the
+    projects listing did not. A listing-level failure (projects/ itself unlistable) and
+    a per-child failure (one bad child among listable siblings) must record TEXT-
+    DISTINGUISHABLE messages -- a regression collapsing the two into one generic message
+    would fail this."""
+    root = tmp_path / "harness"
+    projects_dir = root / "projects"
+    projects_dir.mkdir(parents=True)
+    os.chmod(projects_dir, 0)
+    try:
+        errors: list = []
+        _collector.iter_input_paths(root, errors=errors)
+    finally:
+        os.chmod(projects_dir, 0o755)
+    assert any("watcher projects listing failed" in e for e in errors), errors
+    assert not any("watcher projects child is_dir failed" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_unreadable_project_slug_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    projects_dir = root / "projects"
+    good_slug = "good-project"
+    (projects_dir / good_slug / "memory").mkdir(parents=True)
+    (projects_dir / good_slug / "memory" / "MEMORY.md").write_text("hi\n")
+    hidden = tmp_path / "hidden-bad-iterpaths-project-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (projects_dir / "bad-project").symlink_to(hidden / "bad-project")
+    try:
+        errors: list = []
+        paths = set(map(str, _collector.iter_input_paths(root, errors=errors)))
+    finally:
+        os.chmod(hidden, 0o755)
+    assert str(projects_dir / good_slug / "memory") in paths, "sibling project must survive"
+    assert any("watcher projects child is_dir failed" in e and "bad-project" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_unreadable_skill_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    skills_dir = root / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    hidden = tmp_path / "hidden-bad-iterpaths-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        errors: list = []
+        paths = set(map(str, _collector.iter_input_paths(root, errors=errors)))
+    finally:
+        os.chmod(hidden, 0o755)
+    assert str(good) in paths, "sibling skill dir must survive one bad child"
+    assert any("watcher skills child is_dir failed" in e and "bad-skill" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_skills_listing_failure_distinct_from_child_failure(tmp_path):
+    root = tmp_path / "harness"
+    skills_dir = root / "skills"
+    skills_dir.mkdir(parents=True)
+    os.chmod(skills_dir, 0)
+    try:
+        errors: list = []
+        _collector.iter_input_paths(root, errors=errors)
+    finally:
+        os.chmod(skills_dir, 0o755)
+    assert any("watcher skills listing failed" in e for e in errors), errors
+    assert not any("watcher skills child is_dir failed" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_compose_threads_errors_into_compose_project_input_paths(tmp_path):
+    """`errors` (TRK-050 T2) is threaded from iter_input_paths into
+    _compose_project_input_paths in compose mode, not just handled locally -- proves the
+    thread-through by reaching a compose-project-skills child failure via the OUTER
+    function's own `errors` list."""
+    root = tmp_path / "harness"
+    root.mkdir()
+    project_root = tmp_path / "repo"
+    compose_skills_dir = project_root / ".claude" / "skills"
+    compose_skills_dir.mkdir(parents=True)
+    hidden = tmp_path / "hidden-bad-compose-thread-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (compose_skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        errors: list = []
+        _collector.iter_input_paths(root, project_root, compose=True, errors=errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert any("compose project skills child is_dir failed" in e and "bad-skill" in e
+               for e in errors)
+
+
+def test_iter_input_paths_errors_default_none_discarded(fake_harness):
+    """Optional `errors` param (TRK-050 T2): the pre-existing call shape (no `errors`
+    kwarg) -- used by every iter_input_paths test above this one, and by serve.py's live
+    watcher -- must keep working byte-identically."""
+    paths = _collector.iter_input_paths(fake_harness)
+    assert paths  # non-empty on a real fixture; proves the call didn't silently break
 
 
 # ---------------------------------------------------------------------------------
