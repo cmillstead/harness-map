@@ -7039,16 +7039,18 @@ def build_document(
                 "complete; see collection_scope.hygiene_tiers.")
         # TRK-023 T7 (R3-7/R4-7; the phantom-ref cut is recorded in the plan header and
         # spec AMENDMENTS A64): of the six per-file hygiene analyses, ONE
-        # (collect_promotion_candidates) now covers the project tier, and only when
-        # --compose, --project-root, and a completed project scan all hold together (see
-        # project_hygiene_corpus/project_hygiene_scan_complete above and
-        # _hygiene_tiers_value's three-value contract). The other five --
-        # flag_long_instructions, _staleness_corpus, check_phantom_refs,
-        # detect_test_coverage, _hooks_body_corpus -- stay OPERATOR-TIER-ONLY.
-        # check_phantom_refs is deferred on a SECURITY-DESIGN ground, not merely unbuilt:
-        # it answers existence questions about attacker-influenced paths, which is an
-        # oracle when the input is untrusted (see the plan header's scope cut). The
-        # literal below is read by tests/test_collector.py::
+        # (collect_promotion_candidates) now covers the project tier whenever --compose
+        # and --project-root both hold (see project_hygiene_corpus/
+        # project_hygiene_scan_complete above and _hygiene_tiers_value's three-value
+        # contract) -- including a PARTIAL scan's readable rows, which are still emitted,
+        # never withheld (post-exec Codex review F6; T4's collect_promotion_candidates
+        # tags every row on `project_corpus is not None` alone, with no separate
+        # completeness gate). The other five -- flag_long_instructions, _staleness_corpus,
+        # check_phantom_refs, detect_test_coverage, _hooks_body_corpus -- stay
+        # OPERATOR-TIER-ONLY. check_phantom_refs is deferred on a SECURITY-DESIGN ground,
+        # not merely unbuilt: it answers existence questions about attacker-influenced
+        # paths, which is an oracle when the input is untrusted (see the plan header's
+        # scope cut). The literal below is read by tests/test_collector.py::
         # test_compose_hygiene_scans_are_operator_only_and_disclosed, which asserts the
         # substring "OPERATOR tier only" and all six function names appear -- do not
         # "clean up" this wording without checking that test first (rule 7: additions
@@ -7061,16 +7063,16 @@ def build_document(
             "(the operator instruction corpus). A genuinely oversized, phantom-referencing "
             "or untested PROJECT-tier file is still not flagged. ONE analysis "
             "(collect_promotion_candidates -> promotion_candidates) can cover the project "
-            "tier, and does so ONLY when --compose is set AND --project-root is given AND "
-            "that project scan completes; its project-tier rows then carry tier=\"project\". "
-            "Read collection_scope.hygiene_tiers for what this run actually scanned: "
-            "[\"operator\"] means no project tier was scanned at all, "
-            "[\"operator\",\"project\"] means it was scanned completely, and "
-            "[\"operator\",\"project:partial\"] means it was attempted and incomplete — a "
-            "further blind_spots entry then names what was missed. Even when complete, that "
-            "scan covers the repo-root CLAUDE.md/CLAUDE.local.md and the .claude/ rules, "
-            "agents, commands and skills surfaces only: NESTED CLAUDE.md files are never "
-            "scanned.")
+            "tier, and does so whenever --compose is set AND --project-root is given -- "
+            "including a PARTIAL scan's readable rows, which are still emitted with "
+            "tier=\"project\", never withheld. Read collection_scope.hygiene_tiers for "
+            "what this run actually scanned: [\"operator\"] means no project tier was "
+            "scanned at all, [\"operator\",\"project\"] means it was scanned completely, "
+            "and [\"operator\",\"project:partial\"] means it was attempted and incomplete "
+            "— a further blind_spots entry then names what was missed. Even when "
+            "complete, that scan covers the repo-root CLAUDE.md/CLAUDE.local.md and the "
+            ".claude/ rules, agents, commands and skills surfaces only: NESTED CLAUDE.md "
+            "files are never scanned.")
         # R2-B: name BOTH roots walked (today's `doc["root"]` is operator-only) — additive,
         # so a non-compose run's schema is byte-identical to before this field existed.
         project_containment_root = Path(project_root).expanduser().resolve() if project_root else None

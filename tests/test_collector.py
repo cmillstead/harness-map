@@ -3477,6 +3477,22 @@ def test_compose_disclosure_names_the_surface_and_nested_limits(fake_harness, tm
     assert "project:partial" in disclosure
 
 
+def test_compose_disclosure_does_not_overclaim_completion_is_required(fake_harness, tmp_path):
+    # Post-exec Codex review F6: the disclosure previously claimed project-tier
+    # promotion rows appear ONLY when the project scan completes -- false, since a
+    # partial scan's readable rows still pass through (T4's contract). Pin the corrected
+    # wording and the absence of the old, false claim.
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    disclosure = next((b for b in doc["blind_spots"] if "OPERATOR tier only" in b), None)
+    assert disclosure is not None
+    assert "AND that project scan completes" not in disclosure
+    assert "PARTIAL scan's readable rows" in disclosure
+    assert "never withheld" in disclosure
+
+
 def test_non_compose_has_no_hygiene_scope_disclosure(fake_harness):
     proj, _slug = _active_slug(fake_harness)
     doc = run_collector(fake_harness, project_root=proj)
@@ -9680,6 +9696,28 @@ def test_project_tier_hygiene_corpus_escaping_populated_skills_dir_gates_the_dir
     assert scan_complete is False
     assert len(out_of_root_refs) == 1
     assert out_of_root_refs[0]["trusted"] is False
+
+
+# Post-exec Codex review F6: the compose disclosure claimed project-tier promotion rows
+# appear ONLY when the project scan completes -- false. A PARTIAL scan's READABLE rows
+# still pass through collect_promotion_candidates unconditionally on
+# `project_hygiene_corpus is not None` (T4's own contract). This is the behavioral proof,
+# through build_document's real wiring rather than a direct call.
+
+def test_partial_project_hygiene_scan_still_emits_project_tier_promotion_rows(tmp_path):
+    root = tmp_path / "harness"
+    root.mkdir()
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    # One file forces the scan incomplete...
+    (proj / ".claude" / "rules" / "huge.md").write_text("word " * 60000)
+    # ...a second, readable file still carries a promotable pattern.
+    (proj / ".claude" / "rules" / "a.md").write_text("NEVER commit secrets. " + "word " * 10)
+    doc = _collector.build_document(root, proj, compose=True)
+    assert doc["collection_scope"]["hygiene_tiers"] == ["operator", "project:partial"]
+    project_rows = [c for c in doc["promotion_candidates"] if c.get("tier") == "project"]
+    assert any(c["source"] == ".claude/rules/a.md" for c in project_rows)
 
 
 # TRK-023 T4: collect_promotion_candidates' project-tier half. Direct-call style,
