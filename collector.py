@@ -2261,7 +2261,12 @@ def walk_always_loaded(
             except OSError as e:
                 # A single unlistable/unstat-able child must not abort the whole
                 # comprehension and discard every sibling with it (TRK-050 T1).
-                errors.append(f"skills child is_dir failed for {p}: {e}")
+                # TRK-050 T5 F2: scan-named prefix so this always-loaded sub-rules scan's
+                # entry is distinguishable from the byte-identical messages
+                # _hook_test_stems and _detect_skill_test_coverage independently emit for
+                # the SAME skills/ dir -- one unreadable skill child used to produce three
+                # indistinguishable errors[] entries.
+                errors.append(f"always-loaded skills child is_dir failed for {p}: {e}")
         for skill_dir in sub_skill_dirs:
             sub_rules = skill_dir / sub_rules_dir_name
             try:
@@ -4823,13 +4828,17 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
     except OSError as e:
         # Same "inaccessible is NOT clean" invariant: an unreadable .claude/skills yields
         # zero skill SKILL.md candidates with no signal unless recorded here.
-        blind_spots.append(f"project skills not probed for duplication scan: {e}")
+        # TRK-050 T5 F5: distinct text from the iterdir() failure just below -- the two
+        # are different failure modes (mutually exclusive within one call: an ancestor
+        # that fails is_dir() never reaches iterdir()), and a reader could not tell which
+        # occurred when both shared one literal.
+        blind_spots.append(f"project skills is_dir failed for duplication scan: {e}")
         skills_dir_is_dir = False
     if skills_dir_is_dir:
         try:
             skill_entries = sorted(skills_dir.iterdir())
         except OSError as e:
-            blind_spots.append(f"project skills not probed for duplication scan: {e}")
+            blind_spots.append(f"project skills listing failed for duplication scan: {e}")
             skill_entries = []
         skill_dirs = []
         for p in skill_entries:
@@ -5596,7 +5605,10 @@ def _hook_test_stems(root, errors, *, profile: dict[str, Any] | None = None):
             try:
                 skill_entries = sorted(skills_root.iterdir())
             except OSError as e:
-                errors.append(f"skills listing failed for {skills_root}: {e}")
+                # TRK-050 T5 F2: scan-named prefix -- see the always-loaded sub-rules scan
+                # comment above for why this must be distinguishable from the byte-
+                # identical message _detect_skill_test_coverage emits for the same dir.
+                errors.append(f"hook test stems skills listing failed for {skills_root}: {e}")
                 skill_entries = []
             skill_dirs = []
             for p in skill_entries:
@@ -5606,7 +5618,7 @@ def _hook_test_stems(root, errors, *, profile: dict[str, Any] | None = None):
                 except OSError as e:
                     # A single unlistable/unstat-able child must not abort the whole
                     # comprehension and discard every sibling with it (TRK-050 T1).
-                    errors.append(f"skills child is_dir failed for {p}: {e}")
+                    errors.append(f"hook test stems skills child is_dir failed for {p}: {e}")
             for skill_dir in skill_dirs:
                 # M11 (SPEC_7 §2): the per-skill hooks/tests join stays a literal --
                 # re-deriving it from hook_test_globs's "skills/*/..." entry is
@@ -5736,7 +5748,10 @@ def _detect_skill_test_coverage(root, errors, *, profile: dict[str, Any] | None 
     try:
         skill_entries = sorted(skills_dir.iterdir())
     except OSError as e:
-        errors.append(f"skills listing failed for {skills_dir}: {e}")
+        # TRK-050 T5 F2: scan-named prefix -- see the always-loaded sub-rules scan
+        # comment above for why this must be distinguishable from the byte-identical
+        # message _hook_test_stems emits for the same dir.
+        errors.append(f"skill test coverage skills listing failed for {skills_dir}: {e}")
         skill_entries = []
     skill_dirs = []
     for p in skill_entries:
@@ -5746,7 +5761,7 @@ def _detect_skill_test_coverage(root, errors, *, profile: dict[str, Any] | None 
         except OSError as e:
             # A single unlistable/unstat-able child must not abort the whole
             # comprehension and discard every sibling with it (TRK-050 T1).
-            errors.append(f"skills child is_dir failed for {p}: {e}")
+            errors.append(f"skill test coverage skills child is_dir failed for {p}: {e}")
     return [{"name": d.name, "has_test": _skill_has_test_asset(d, errors)} for d in skill_dirs]
 
 
@@ -5947,13 +5962,27 @@ def _compose_project_input_paths(project_root, errors=None):
             paths.update((project_root / rel_dir).glob(pattern))
         except OSError:
             pass
+    # TRK-050 T5 F1: an ABSENT skills dir is a normal, valid project layout -- iterdir()
+    # raising ENOENT for a never-created dir must record NOTHING, only a PRESENT-but-
+    # unlistable dir is a real disclosure-worthy failure. `_probe_is_dir` swallows the
+    # ENOENT family and returns False for "absent", but re-raises EACCES from an
+    # unreadable ANCESTOR -- that escape is itself recorded, matching the house pattern
+    # walk_always_loaded/_hook_test_stems/_detect_skill_test_coverage already use.
     compose_skills_dir = harness_root / "skills"
+    skill_entries: list[Path] = []
     try:
-        skill_entries = sorted(compose_skills_dir.iterdir())
+        compose_skills_dir_is_dir = _probe_is_dir(compose_skills_dir)
     except OSError as e:
         if errors is not None:
-            errors.append(f"compose project skills listing failed for {compose_skills_dir}: {e}")
-        skill_entries = []
+            errors.append(f"compose project skills is_dir failed for {compose_skills_dir}: {e}")
+        compose_skills_dir_is_dir = False
+    if compose_skills_dir_is_dir:
+        try:
+            skill_entries = sorted(compose_skills_dir.iterdir())
+        except OSError as e:
+            if errors is not None:
+                errors.append(f"compose project skills listing failed for {compose_skills_dir}: {e}")
+            skill_entries = []
     skill_dirs = []
     for p in skill_entries:
         try:
@@ -6044,7 +6073,16 @@ def iter_input_paths(
     to swallow an OSError into an empty dir list with no signal at all; threaded through to
     `_compose_project_input_paths` in compose mode too. Recorded here instead when a caller
     supplies a list. Defaults to None (discarded) so this function's pre-existing call shape
-    (positional root/project_root/compose, keyword-only profile) keeps working."""
+    (positional root/project_root/compose, keyword-only profile) keeps working.
+
+    TRK-050 T5 F3, disclosed honestly: no PRODUCTION caller supplies `errors` yet. `main()`
+    calls this during argument validation, before a document (or an errors[] list) exists;
+    serve.py's watcher snapshot function returns a bare dict of Paths with no error channel
+    of its own. Both are exercised only via `errors=None`, so every per-child/listing
+    failure this parameter can now report is disclosed exclusively in tests today — a real
+    unlistable projects/skills dir during a live watch is still silently treated as absent
+    by every current caller. Wiring a disclosure surface into the watcher is a design change
+    tracked separately, not done by this fix."""
     profile = PROFILE_CLAUDE_CODE if profile is None else profile
     root = Path(root)
     paths = set()
@@ -6112,12 +6150,25 @@ def iter_input_paths(
     slug_dirs = []
     if projects_name is not None:
         projects_dir = root / projects_name
+        # TRK-050 T5 F1: an ABSENT projects dir is a normal, valid harness (no projects
+        # registered yet) -- iterdir() raising ENOENT for a never-created dir must record
+        # NOTHING; only a PRESENT-but-unlistable dir is a real disclosure-worthy failure.
+        # `_probe_is_dir` swallows the ENOENT family (absent -> False) but re-raises EACCES
+        # from an unreadable ANCESTOR, which is itself recorded here.
+        slug_entries: list[Path] = []
         try:
-            slug_entries = sorted(projects_dir.iterdir())
+            projects_dir_is_dir = _probe_is_dir(projects_dir)
         except OSError as e:
             if errors is not None:
-                errors.append(f"watcher projects listing failed for {projects_dir}: {e}")
-            slug_entries = []
+                errors.append(f"watcher projects is_dir failed for {projects_dir}: {e}")
+            projects_dir_is_dir = False
+        if projects_dir_is_dir:
+            try:
+                slug_entries = sorted(projects_dir.iterdir())
+            except OSError as e:
+                if errors is not None:
+                    errors.append(f"watcher projects listing failed for {projects_dir}: {e}")
+                slug_entries = []
         for p in slug_entries:
             try:
                 if p.is_dir():
@@ -6144,12 +6195,22 @@ def iter_input_paths(
     skill_dirs = []
     if skills_name is not None:
         watcher_skills_dir = root / skills_name
+        # TRK-050 T5 F1: an ABSENT skills dir is a normal, valid harness -- see the
+        # matching comment on the projects listing above for the full rationale.
+        skill_entries: list[Path] = []
         try:
-            skill_entries = sorted(watcher_skills_dir.iterdir())
+            watcher_skills_dir_is_dir = _probe_is_dir(watcher_skills_dir)
         except OSError as e:
             if errors is not None:
-                errors.append(f"watcher skills listing failed for {watcher_skills_dir}: {e}")
-            skill_entries = []
+                errors.append(f"watcher skills is_dir failed for {watcher_skills_dir}: {e}")
+            watcher_skills_dir_is_dir = False
+        if watcher_skills_dir_is_dir:
+            try:
+                skill_entries = sorted(watcher_skills_dir.iterdir())
+            except OSError as e:
+                if errors is not None:
+                    errors.append(f"watcher skills listing failed for {watcher_skills_dir}: {e}")
+                skill_entries = []
         for p in skill_entries:
             try:
                 if p.is_dir():

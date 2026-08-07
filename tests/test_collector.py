@@ -6737,6 +6737,32 @@ def test_project_tier_duplication_corpus_unreadable_skill_child_keeps_siblings(t
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_tier_duplication_corpus_skills_listing_failure_distinct_from_child_failure(
+    tmp_path,
+):
+    """TRK-050 T5 F4: the fourth T2 site (_project_tier_duplication_corpus) was the only
+    one of the four missing this test. A listing-level failure (.claude/skills itself
+    unlistable) and a per-child failure (one bad child among listable siblings) must
+    record TEXT-DISTINGUISHABLE messages -- a regression collapsing the two into one
+    generic message would fail this. Mirrors
+    test_compose_project_input_paths_listing_failure_distinct_from_child_failure and
+    test_iter_input_paths_skills_listing_failure_distinct_from_child_failure."""
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    skills_dir.mkdir(parents=True)
+    os.chmod(skills_dir, 0)
+    try:
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        _collector._project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(skills_dir, 0o755)
+    assert any("project skills listing failed" in b for b in blind_spots), blind_spots
+    assert not any("project skills child is_dir failed" in b for b in blind_spots)
+    assert not any("project skills is_dir failed" in b for b in blind_spots)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
 def test_compose_project_input_paths_unreadable_skill_child_keeps_siblings(tmp_path):
     project_root = tmp_path / "repo"
     skills_dir = project_root / ".claude" / "skills"
@@ -6765,6 +6791,19 @@ def test_compose_project_input_paths_errors_default_none_discarded(tmp_path):
     assert (project_root / ".claude" / "skills" / "good-skill" / "SKILL.md") in paths
 
 
+def test_compose_project_input_paths_absent_skills_dir_records_nothing(tmp_path):
+    """TRK-050 T5 F1: an ABSENT .claude/skills dir is a normal, valid project layout (no
+    project skills yet) -- must not be reported as a collection failure. Companion to
+    test_compose_project_input_paths_listing_failure_distinct_from_child_failure below,
+    which covers the PRESENT-but-unlistable direction; a fix guarding only one direction
+    is the defect this test catches."""
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    errors: list = []
+    _collector._compose_project_input_paths(project_root, errors)
+    assert not any("skills" in e for e in errors), errors
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
 def test_compose_project_input_paths_listing_failure_distinct_from_child_failure(tmp_path):
     """A listing-level failure (the skills dir itself unlistable) and a per-child failure
@@ -6781,6 +6820,43 @@ def test_compose_project_input_paths_listing_failure_distinct_from_child_failure
         os.chmod(skills_dir, 0o755)
     assert any("compose project skills listing failed" in e for e in errors), errors
     assert not any("compose project skills child is_dir failed" in e for e in errors)
+
+
+def test_iter_input_paths_absent_projects_and_skills_dirs_record_nothing(tmp_path):
+    """TRK-050 T5 F1: an ABSENT projects/ or skills/ dir is a normal, valid harness (none
+    registered/created yet) -- iterdir() raising ENOENT for a never-created dir must not
+    be reported as a collection failure. Companion to the PRESENT-but-unlistable
+    direction covered by test_iter_input_paths_unreadable_project_slug_child_keeps_siblings,
+    test_iter_input_paths_unreadable_skill_child_keeps_siblings, and
+    test_iter_input_paths_skills_listing_failure_distinct_from_child_failure -- a fix
+    guarding only one direction is the defect this test catches."""
+    root = tmp_path / "harness"
+    root.mkdir()
+    errors: list = []
+    _collector.iter_input_paths(root, errors=errors)
+    assert not any("projects" in e for e in errors), errors
+    assert not any("skills" in e for e in errors), errors
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_projects_listing_failure_distinct_from_child_failure(tmp_path):
+    """The skills listing has this test already
+    (test_iter_input_paths_skills_listing_failure_distinct_from_child_failure); the
+    projects listing did not. A listing-level failure (projects/ itself unlistable) and
+    a per-child failure (one bad child among listable siblings) must record TEXT-
+    DISTINGUISHABLE messages -- a regression collapsing the two into one generic message
+    would fail this."""
+    root = tmp_path / "harness"
+    projects_dir = root / "projects"
+    projects_dir.mkdir(parents=True)
+    os.chmod(projects_dir, 0)
+    try:
+        errors: list = []
+        _collector.iter_input_paths(root, errors=errors)
+    finally:
+        os.chmod(projects_dir, 0o755)
+    assert any("watcher projects listing failed" in e for e in errors), errors
+    assert not any("watcher projects child is_dir failed" in e for e in errors)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
