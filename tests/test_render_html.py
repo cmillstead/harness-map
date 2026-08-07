@@ -8521,6 +8521,48 @@ def test_malformed_collection_scope_is_unknown_never_raises():
                                                          ("2026-07-14", _SCOPE_MAIN)]), bad
 
 
+def test_hygiene_tiers_makes_an_old_and_new_compose_scope_incomparable():
+    """TRK-023 T5, R3-5/R3-8. The mechanism proof the whole resolution rests on: a scope
+    carrying the new `hygiene_tiers` field differs from an otherwise-identical
+    pre-TRK-023 scope in a field this module's own docstring already promised to notice
+    ("a field this module does not yet name"), so `scope_comparable` refuses the pair
+    without any new comparability logic -- and two scopes of the SAME new shape still
+    compare equal, so the mechanism does not merely refuse everything."""
+    old_composed = dict(_SCOPE_COMPOSED)
+    new_composed = dict(_SCOPE_COMPOSED, hygiene_tiers=["operator", "project"])
+    assert rh.scope_comparable([old_composed, new_composed]) is False
+    assert rh.scope_comparable([new_composed, old_composed]) is False
+    # anti-vacuity: two identically-shaped new scopes still compare
+    assert rh.scope_comparable([new_composed, dict(new_composed)]) is True
+
+
+def test_scope_readable_accepts_the_three_emitted_hygiene_tiers_values():
+    # Changing this value requires a spec change (SPEC_6 §6.5a).
+    for tiers in (["operator"], ["operator", "project"], ["operator", "project:partial"]):
+        scope = dict(_SCOPE_COMPOSED, hygiene_tiers=tiers)
+        assert rh._scope_readable(scope) is True, tiers
+
+
+def test_scope_readable_rejects_malformed_hygiene_tiers():
+    # `[]` is in the REJECT list here, matching R3-8's prose -- the earlier
+    # []-is-hostile-but-also-valid contradiction is resolved in favour of the emitter.
+    bad_values = ([], None, "operator", ["operator", 3], ["bogus"], ["project"],
+                  ["project", "operator"], ["operator", "operator"])
+    for bad in bad_values:
+        scope = dict(_SCOPE_COMPOSED, hygiene_tiers=bad)
+        assert rh._scope_readable(scope) is False, bad
+
+
+def test_scope_readable_still_accepts_an_unknown_future_key():
+    """R3-8's anti-whitelist pin: an unnamed key must not make an otherwise-valid scope
+    UNKNOWN. `scope_comparable`'s "differing in ANY field includes a field this module
+    does not yet name" depends on staying permissive about keys it has never heard of --
+    validating `hygiene_tiers`'s VALUE and staying permissive about unknown KEYS are
+    different things, and only the first is tightened."""
+    scope = dict(_SCOPE_MAIN, future_key=1)
+    assert rh._scope_readable(scope) is True
+
+
 def test_absent_metric_quality_is_treated_as_unmeasured_never_complete():
     """Failure-modes row, and it fires on EVERY legacy sidecar -- A52 measured all 7
     live sidecars and none carries `metric_quality`. Absent is not a measurement:

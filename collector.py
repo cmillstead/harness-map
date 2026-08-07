@@ -6713,6 +6713,26 @@ def _metric_quality(inaccessible: list[dict[str, Any]],
     return quality
 
 
+def _hygiene_tiers_value(project_corpus: list[tuple[str, str]] | None,
+                          scan_complete: bool) -> list[str]:
+    """TRK-023 T5 (R3-5): the compose-only `collection_scope["hygiene_tiers"]` value, in
+    exactly three fixed literals -- never a two-value collapse. Collapsing an INCOMPLETE
+    project scan into the same value as NO project scan would let two runs that failed in
+    different ways carry an identical scope and compare, so a partial scan could chart a
+    false improvement against a run that never attempted the project tier at all.
+
+    `project_corpus is None` means no project tier was scanned AT ALL (non-compose, or
+    compose with `project_root=None`) -- `["operator"]`. A non-`None` corpus that finished
+    is scope-distinct from one that did not, so `project:partial` is its own third value,
+    never merged into either neighbor. Changing this value requires a spec change
+    (SPEC_6 §6.5a)."""
+    if project_corpus is None:
+        return ["operator"]
+    if scan_complete:
+        return ["operator", "project"]
+    return ["operator", "project:partial"]
+
+
 def build_document(
     root: Path, project_root: Path | None, compose: bool = False, *,
     profile: dict[str, Any] | None = None,
@@ -6774,9 +6794,19 @@ def build_document(
                                             compose=compose, out_of_root_refs=out_of_root_refs,
                                             profile=profile)
     corpus_files = _staleness_corpus(root, inaccessible, blind_spots, profile=profile)
+    # TRK-023 T5: the project half of the hygiene corpus, compose-only. Gated on the SAME
+    # (compose and project_root is not None) condition scan_duplication already uses --
+    # one gate, one meaning. `check_phantom_refs` is NOT wired to it (cut from this
+    # slice by operator ruling; see the plan header).
+    project_hygiene_corpus: list[tuple[str, str]] | None = None
+    project_hygiene_scan_complete = True
+    if compose and project_root is not None:
+        project_hygiene_corpus, project_hygiene_scan_complete = _project_tier_hygiene_corpus(
+            project_root, inaccessible, blind_spots, out_of_root_refs)
     phantom_refs = check_phantom_refs(root, corpus_files, inaccessible, blind_spots, profile=profile)
-    promotion_candidates = collect_promotion_candidates(root, corpus_files, settings,
-                                                         profile=profile)
+    promotion_candidates = collect_promotion_candidates(
+        root, corpus_files, settings, profile=profile,
+        project_corpus=project_hygiene_corpus)
     # S2 gate fix: git-age SIGNAL only (never a "stale" verdict). Topology is discovered
     # ONCE and collect_git_age is pure with respect to it, so git_age_available can never
     # disagree with the timestamps it labels (Codex #5). `available` replaces the deleted
@@ -6929,6 +6959,20 @@ def build_document(
         "errors": errors,
     }
     if compose:
+        # R3-5: the value records WHICH TIERS WERE FULLY SCANNED, and an incomplete
+        # project scan is a DISTINCT scope from a complete one -- see the three-value
+        # contract in _hygiene_tiers_value's docstring. cast (not assert), matching the
+        # M1 typing-only precedent above: `doc`'s inferred value type is too wide for
+        # mypy to index into a second time with zero runtime effect either way.
+        cast(dict[str, Any], doc["collection_scope"])["hygiene_tiers"] = (
+            _hygiene_tiers_value(project_hygiene_corpus, project_hygiene_scan_complete))
+        if project_hygiene_corpus is not None and not project_hygiene_scan_complete:
+            # R3-5: the degradation is visible in the report, not only in the scope
+            # field -- a reader scanning blind_spots must not have to know to look at
+            # collection_scope.hygiene_tiers to learn the project-tier scan was partial.
+            blind_spots.append(
+                "project-tier hygiene scan (feeding promotion_candidates) did not "
+                "complete; see collection_scope.hygiene_tiers.")
         # T11 (disclose-and-defer, operator-approved 2026-07-22): the per-file hygiene
         # analyses above (flag_long_instructions, _staleness_corpus, check_phantom_refs,
         # collect_promotion_candidates, detect_test_coverage, _hooks_body_corpus) take no

@@ -9454,6 +9454,121 @@ def test_promotion_candidates_operator_rows_tagged_when_project_corpus_present(t
     assert all(c["tier"] == "operator" for c in operator_rows)
 
 
+# TRK-023 T5: build_document wiring of the project-tier hygiene corpus into
+# collection_scope["hygiene_tiers"] and collect_promotion_candidates(project_corpus=...).
+# Direct build_document calls, matching the T3/S7.M3c precedent
+# (test_build_document_compose_unsearchable_root_is_degraded_not_crashed above) --
+# hygiene_tiers is only reachable via a null project_root, which the CLI's
+# --project-root (defaulting to os.getcwd()) can never produce.
+
+def test_compose_collection_scope_records_hygiene_tiers(tmp_path):
+    root = tmp_path / "harness"
+    root.mkdir()
+    project_root = tmp_path / "compose-proj"
+    (project_root / ".claude" / "rules").mkdir(parents=True)
+    (project_root / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (project_root / ".claude" / "rules" / "a.md").write_text("Project rule body " * 10)
+    doc = _collector.build_document(root, project_root, compose=True)
+    assert doc["collection_scope"]["hygiene_tiers"] == ["operator", "project"]
+
+
+def test_non_compose_collection_scope_has_no_hygiene_tiers(tmp_path):
+    root = tmp_path / "harness"
+    root.mkdir()
+    doc = _collector.build_document(root, None)
+    assert "hygiene_tiers" not in doc["collection_scope"]
+    # The constraint-4 guard: non-compose output stays exactly the three original keys.
+    assert set(doc["collection_scope"]) == {"root", "project_root", "compose"}
+
+
+def test_empty_document_collection_scope_unchanged(tmp_path):
+    empty = _collector._empty_document(tmp_path)
+    assert set(empty["collection_scope"]) == {"root", "project_root", "compose"}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_incomplete_project_scan_is_scope_distinct_from_complete(tmp_path):
+    # R3-5: two runs that failed differently must not carry the same scope, and an
+    # incomplete run must not compare equal to either a complete run or a no-project
+    # run. Three-way distinctness is the property; asserting only "differs from
+    # complete" would still pass for the old two-value collapse this fix replaces.
+    root = tmp_path / "harness"
+    root.mkdir()
+
+    complete_proj = tmp_path / "compose-proj-complete"
+    (complete_proj / ".claude" / "rules").mkdir(parents=True)
+    (complete_proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (complete_proj / ".claude" / "rules" / "a.md").write_text("Project rule body " * 10)
+    complete_doc = _collector.build_document(root, complete_proj, compose=True)
+
+    partial_proj = tmp_path / "compose-proj-partial"
+    rules_dir = partial_proj / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "a.md").write_text("Project rule body behind a locked dir " * 10)
+    os.chmod(rules_dir, 0)
+    try:
+        partial_doc = _collector.build_document(root, partial_proj, compose=True)
+    finally:
+        os.chmod(rules_dir, 0o755)
+
+    no_project_doc = _collector.build_document(root, None, compose=True)
+
+    complete_tiers = complete_doc["collection_scope"]["hygiene_tiers"]
+    partial_tiers = partial_doc["collection_scope"]["hygiene_tiers"]
+    no_project_tiers = no_project_doc["collection_scope"]["hygiene_tiers"]
+
+    assert complete_tiers == ["operator", "project"]
+    assert partial_tiers == ["operator", "project:partial"]
+    assert no_project_tiers == ["operator"]
+    assert partial_tiers != complete_tiers
+    assert partial_tiers != no_project_tiers
+    assert complete_tiers != no_project_tiers
+    # The degradation is visible in the report, not only in the scope field.
+    assert any("project-tier hygiene scan" in b and "did not complete" in b
+               for b in partial_doc["blind_spots"])
+
+
+def test_compose_without_project_root_reports_operator_only(tmp_path):
+    root = tmp_path / "harness"
+    (root / "rules").mkdir(parents=True)
+    (root / "rules" / "a.md").write_text("NEVER commit secrets.")
+    doc = _collector.build_document(root, None, compose=True)
+    hygiene_tiers = doc["collection_scope"]["hygiene_tiers"]
+    assert hygiene_tiers == ["operator"]
+    assert doc["promotion_candidates"], "fixture must produce at least one candidate"
+    no_tier_rows = not any("tier" in c for c in doc["promotion_candidates"])
+    assert no_tier_rows
+    # The two facts agree: no project tier scanned means no tier tagging either.
+    assert (hygiene_tiers == ["operator"]) == no_tier_rows
+
+
+def test_compose_project_hygiene_deterministic_across_hashseed(tmp_path):
+    root = tmp_path / "harness"
+    root.mkdir()
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / ".claude" / "agents").mkdir(parents=True)
+    (proj / ".claude" / "commands").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\nNEVER commit secrets. " + "word " * 20)
+    (proj / ".claude" / "rules" / "a.md").write_text("NEVER commit secrets. " + "word " * 10)
+    (proj / ".claude" / "agents" / "b.md").write_text("ALWAYS run tests. " + "word " * 10)
+    (proj / ".claude" / "commands" / "c.md").write_text("MUST validate input. " + "word " * 10)
+
+    def run_with_seed(seed):
+        env = dict(os.environ, PYTHONHASHSEED=str(seed))
+        proc = subprocess.run([sys.executable, str(COLLECTOR), "--root", str(root),
+                               "--project-root", str(proj), "--compose"],
+                              capture_output=True, text=True, timeout=30, env=env)
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)
+
+    d0 = run_with_seed("0")
+    d1 = run_with_seed("1")
+    assert d0["promotion_candidates"], "fixture must exercise the project tier"
+    assert d0["promotion_candidates"] == d1["promotion_candidates"]
+    assert d0["collection_scope"] == d1["collection_scope"]
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
 def test_hook_test_stems_locked_hook_tests_dir_records_error(tmp_path):
     root = tmp_path / "harness"
