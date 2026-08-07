@@ -1735,9 +1735,19 @@ def _walk_operator_tier_nodes(root, inaccessible=None, *, profile: dict[str, Any
             skills_dir_is_dir = False
     if skills_dir_is_dir and skill_manifest_name is not None:
         try:
-            skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
+            skill_entries = sorted(skills_dir.iterdir())
         except OSError:
-            skill_dirs = []
+            _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+            skill_entries = []
+        skill_dirs = []
+        for p in skill_entries:
+            try:
+                if p.is_dir():
+                    skill_dirs.append(p)
+            except OSError:
+                # A single unlistable/unstat-able child must not abort the whole
+                # comprehension and discard every sibling with it (TRK-050 T1).
+                _append_inaccessible_once(inaccessible, _rel_safe(root, p))
         for skill_dir in skill_dirs:
             skill_md = skill_dir / skill_manifest_name
             present, ok = _safe_exists(skill_md)
@@ -1803,9 +1813,19 @@ def _walk_project_tier_nodes(project_root, out_of_root_refs, errors):
             _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skills_dir)
         else:
             try:
-                skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
-            except OSError:
-                skill_dirs = []
+                skill_entries = sorted(skills_dir.iterdir())
+            except OSError as e:
+                errors.append(f"project skills listing failed for {skills_dir}: {e}")
+                skill_entries = []
+            skill_dirs = []
+            for p in skill_entries:
+                try:
+                    if p.is_dir():
+                        skill_dirs.append(p)
+                except OSError as e:
+                    # A single unlistable/unstat-able child must not abort the whole
+                    # comprehension and discard every sibling with it (TRK-050 T1).
+                    errors.append(f"project skills child is_dir failed for {p}: {e}")
             for skill_dir in skill_dirs:
                 sd_contained, _identity = _project_tier_gate(skill_dir, project_root, containment_stat)
                 if not sd_contained:
@@ -2119,9 +2139,19 @@ def walk_always_loaded(
     slug_dirs: list[Path] = []
     if projects_dir_is_dir and projects_dir is not None and projects_glob_pattern is not None:
         try:
-            candidate_dirs = sorted(p for p in projects_dir.iterdir() if p.is_dir())
-        except OSError:
-            candidate_dirs = []
+            project_entries = sorted(projects_dir.iterdir())
+        except OSError as e:
+            errors.append(f"projects listing failed for {projects_dir}: {e}")
+            project_entries = []
+        candidate_dirs = []
+        for p in project_entries:
+            try:
+                if p.is_dir():
+                    candidate_dirs.append(p)
+            except OSError as e:
+                # A single unlistable/unstat-able child must not abort the whole
+                # comprehension and discard every sibling with it (TRK-050 T1).
+                errors.append(f"projects child is_dir failed for {p}: {e}")
         try:
             glob_matches = set(root.glob(projects_glob_pattern))
         except OSError:
@@ -2219,10 +2249,19 @@ def walk_always_loaded(
             skills_root_is_dir = False
     if skills_root_is_dir and sub_rules_dir_name is not None and skills_root is not None:
         try:
-            sub_skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
+            sub_skill_entries = sorted(skills_root.iterdir())
         except OSError as e:
             errors.append(f"skills iterdir failed for {skills_root}: {e}")
-            sub_skill_dirs = []
+            sub_skill_entries = []
+        sub_skill_dirs = []
+        for p in sub_skill_entries:
+            try:
+                if p.is_dir():
+                    sub_skill_dirs.append(p)
+            except OSError as e:
+                # A single unlistable/unstat-able child must not abort the whole
+                # comprehension and discard every sibling with it (TRK-050 T1).
+                errors.append(f"skills child is_dir failed for {p}: {e}")
         for skill_dir in sub_skill_dirs:
             sub_rules = skill_dir / sub_rules_dir_name
             try:
@@ -2293,9 +2332,19 @@ def collect_descriptions(
             skills_dir_is_dir = False
     if skills_dir_is_dir and skill_manifest_name is not None:
         try:
-            skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
+            skill_entries = sorted(skills_dir.iterdir())
         except OSError:
-            skill_dirs = []
+            _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+            skill_entries = []
+        skill_dirs = []
+        for p in skill_entries:
+            try:
+                if p.is_dir():
+                    skill_dirs.append(p)
+            except OSError:
+                # A single unlistable/unstat-able child must not abort the whole
+                # comprehension and discard every sibling with it (TRK-050 T1).
+                _append_inaccessible_once(inaccessible, _rel_safe(root, p))
         for skill_dir in skill_dirs:
             skill_md = skill_dir / skill_manifest_name
             present, ok = _safe_exists(skill_md)
@@ -2373,9 +2422,19 @@ def collect_on_demand(
             skills_dir_is_dir = False
     if skills_dir_is_dir and skill_manifest_name is not None:
         try:
-            skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
+            skill_entries = sorted(skills_dir.iterdir())
         except OSError:
-            skill_dirs = []
+            _append_inaccessible_once(inaccessible, _rel_safe(root, skills_dir))
+            skill_entries = []
+        skill_dirs = []
+        for p in skill_entries:
+            try:
+                if p.is_dir():
+                    skill_dirs.append(p)
+            except OSError:
+                # A single unlistable/unstat-able child must not abort the whole
+                # comprehension and discard every sibling with it (TRK-050 T1).
+                _append_inaccessible_once(inaccessible, _rel_safe(root, p))
         for skill_dir in skill_dirs:
             name = skill_dir.name
             skill_md = skill_dir / skill_manifest_name
@@ -5512,9 +5571,19 @@ def _hook_test_stems(root, errors, *, profile: dict[str, Any] | None = None):
             skills_root_is_dir = False
         if skills_root_is_dir:
             try:
-                skill_dirs = sorted(p for p in skills_root.iterdir() if p.is_dir())
-            except OSError:
-                skill_dirs = []
+                skill_entries = sorted(skills_root.iterdir())
+            except OSError as e:
+                errors.append(f"skills listing failed for {skills_root}: {e}")
+                skill_entries = []
+            skill_dirs = []
+            for p in skill_entries:
+                try:
+                    if p.is_dir():
+                        skill_dirs.append(p)
+                except OSError as e:
+                    # A single unlistable/unstat-able child must not abort the whole
+                    # comprehension and discard every sibling with it (TRK-050 T1).
+                    errors.append(f"skills child is_dir failed for {p}: {e}")
             for skill_dir in skill_dirs:
                 # M11 (SPEC_7 §2): the per-skill hooks/tests join stays a literal --
                 # re-deriving it from hook_test_globs's "skills/*/..." entry is
@@ -5635,9 +5704,19 @@ def _detect_skill_test_coverage(root, errors, *, profile: dict[str, Any] | None 
     if not skills_dir_is_dir:
         return []
     try:
-        skill_dirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
-    except OSError:
-        skill_dirs = []
+        skill_entries = sorted(skills_dir.iterdir())
+    except OSError as e:
+        errors.append(f"skills listing failed for {skills_dir}: {e}")
+        skill_entries = []
+    skill_dirs = []
+    for p in skill_entries:
+        try:
+            if p.is_dir():
+                skill_dirs.append(p)
+        except OSError as e:
+            # A single unlistable/unstat-able child must not abort the whole
+            # comprehension and discard every sibling with it (TRK-050 T1).
+            errors.append(f"skills child is_dir failed for {p}: {e}")
     return [{"name": d.name, "has_test": _skill_has_test_asset(d, errors)} for d in skill_dirs]
 
 
