@@ -5088,15 +5088,22 @@ def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of
       3. Each project skill's `<repo>/.claude/skills/<name>/SKILL.md`.
 
     EVERY read routes through `_project_tier_gate` + `_read_project_file` (H2) -- an
-    escaping symlink is recorded to `out_of_root_refs` and NEVER read. A surface
-    directory may still be ENUMERATED before its containment is decided (a pre-existing,
-    measured gap shared with `_project_tier_duplication_corpus`, recorded in spec
-    AMENDMENTS A64) -- no byte outside `project_root` ever crosses the gate. The skill
-    DIRECTORY is gated before its `SKILL.md` is even probed for existence, unlike the
-    duplication-corpus template this function is modelled on: that template probes
-    `SKILL.md` before the per-candidate gate runs, making the file's presence an
-    existence oracle for an escaping skill directory (spec AMENDMENTS A64); this new
-    code does not copy that shape.
+    escaping symlink is recorded to `out_of_root_refs` and NEVER read. Unlike
+    `_project_tier_duplication_corpus` (spec AMENDMENTS A64 known gap, left as-is there
+    per this ticket's scope fence), EVERY surface directory here -- each
+    `_PROJECT_DUP_SURFACE_DIRS` entry AND `.claude/skills` itself -- is also gated through
+    `_project_tier_gate` BEFORE it is globbed or `iterdir()`'d (post-exec Codex review F1):
+    an escaping symlink whose target is EMPTY used to be completely silent, since there
+    was nothing left to gate at the file/child level once enumeration found no
+    candidates; gating the directory first closes that regardless of whether the
+    escaping target is empty or populated. `_probe_is_dir` still runs before the gate on
+    each surface directory, so a genuinely absent one is skipped silently (matching step
+    1's "absent is normal" contract) rather than misread as an escape. No byte outside
+    `project_root` ever crosses the gate. The skill DIRECTORY is gated before its
+    `SKILL.md` is even probed for existence, unlike the duplication-corpus template this
+    function is modelled on: that template probes `SKILL.md` before the per-candidate
+    gate runs, making the file's presence an existence oracle for an escaping skill
+    directory (spec AMENDMENTS A64); this new code does not copy that shape.
 
     Unlike `_project_tier_duplication_corpus`, `_read_project_file` returning
     `text is None` is recorded to `inaccessible` here -- a deliberate divergence: the
@@ -5141,29 +5148,56 @@ def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of
 
     # 2. `.claude/{rules,agents,commands}` -- same enumeration shape
     #    `_project_tier_duplication_corpus` uses (spec Design F5/R3-6: keeping the
-    #    template's shape here rather than diverging from its sibling).
+    #    template's shape here rather than diverging from its sibling), EXCEPT for the
+    #    post-exec Codex review F1 fix below: the surface DIRECTORY itself is gated
+    #    through `_project_tier_gate` before its contents are ever globbed, not merely
+    #    the resulting candidate files. `_probe_is_dir` runs first and swallows a
+    #    genuinely absent directory silently (matching step 1's "absent is normal"
+    #    contract) -- it also follows a symlink to determine whether SOMETHING is a
+    #    directory there, without enumerating any child, so an escaping symlink to an
+    #    EMPTY target is no longer silent: gating runs before the glob that would
+    #    otherwise find nothing to record. Mirrors the shipped `_walk_project_tier`
+    #    rules_dir shape (is_dir, then gate, then glob) rather than the duplication-
+    #    corpus template, which still enumerates before gating (spec AMENDMENTS A64
+    #    known gap, left as-is in that sibling function per this ticket's scope fence).
     for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
         d = project_root / rel_dir
         try:
-            if _probe_is_dir(d):
-                dir_matches = sorted(d.glob(pattern))
-                candidates.extend(dir_matches)
-                # _disclose_unlistable_glob returns None; its only effect is an append to
-                # blind_spots when the directory is present but unlistable -- detect that
-                # by length delta rather than reimplementing its scandir probe here.
-                before = len(blind_spots)
-                _disclose_unlistable_glob(d, pattern, dir_matches, blind_spots,
-                                           "project hygiene corpus")
-                if len(blind_spots) > before:
-                    scan_complete = False
+            d_is_dir = _probe_is_dir(d)
         except OSError as e:
             blind_spots.append(f"project {rel_dir} not probed for hygiene scan: {e}")
             scan_complete = False
             continue
+        if not d_is_dir:
+            continue
+        contained, _identity = _project_tier_gate(d, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, d)
+            scan_complete = False
+            continue                       # never glob an escaping directory's children
+        try:
+            dir_matches = sorted(d.glob(pattern))
+        except OSError as e:
+            blind_spots.append(f"project {rel_dir} not probed for hygiene scan: {e}")
+            scan_complete = False
+            continue
+        candidates.extend(dir_matches)
+        # _disclose_unlistable_glob returns None; its only effect is an append to
+        # blind_spots when the directory is present but unlistable -- detect that
+        # by length delta rather than reimplementing its scandir probe here.
+        before = len(blind_spots)
+        _disclose_unlistable_glob(d, pattern, dir_matches, blind_spots,
+                                   "project hygiene corpus")
+        if len(blind_spots) > before:
+            scan_complete = False
 
     # 3. Each project skill's SKILL.md -- the skill DIRECTORY is gated BEFORE its
     #    SKILL.md is even probed for existence (see docstring: the addendum fix this
-    #    new code must apply that the duplication-corpus template does not).
+    #    new code must apply that the duplication-corpus template does not). F1: the
+    #    `.claude/skills` surface directory itself gets the SAME directory-level gate as
+    #    step 2 above, before it is ever probed with `iterdir()` -- previously only the
+    #    per-skill subdirectories were gated, leaving `.claude/skills` itself as silent
+    #    as the step-2 hole when the escaping target was empty.
     skills_dir = project_root / ".claude" / "skills"
     try:
         skills_dir_is_dir = _probe_is_dir(skills_dir)
@@ -5171,7 +5205,14 @@ def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of
         blind_spots.append(f"project skills is_dir failed for hygiene scan: {e}")
         scan_complete = False
         skills_dir_is_dir = False
+    skills_dir_contained = False
     if skills_dir_is_dir:
+        skills_dir_contained, _identity = _project_tier_gate(
+            skills_dir, project_root, containment_stat)
+        if not skills_dir_contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skills_dir)
+            scan_complete = False
+    if skills_dir_is_dir and skills_dir_contained:
         try:
             skill_entries = sorted(skills_dir.iterdir())
         except OSError as e:
@@ -5181,7 +5222,7 @@ def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of
         skill_dirs = []
         for p in skill_entries:
             try:
-                if p.is_dir():
+                if _probe_is_dir(p):
                     skill_dirs.append(p)
             except OSError as e:
                 # A single unlistable/unstat-able child must not abort the whole

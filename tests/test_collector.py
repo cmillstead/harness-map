@@ -9528,10 +9528,13 @@ def test_project_hygiene_scan_incomplete_when_a_file_vanishes_between_gate_and_s
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
 def test_project_tier_hygiene_corpus_escaping_surface_dir_is_not_read(tmp_path):
-    # R3-6: proves the READ half of the "never traverse" promise still holds even though
-    # the ENUMERATE half does not (spec Design section F5). Deliberately does NOT assert
-    # the outside child's NAME is absent -- that would encode the false "never traverse"
-    # promise as a test and redden on shipped, measured behaviour.
+    # R3-6: proves the READ half of the "never traverse" promise holds. Originally the
+    # ENUMERATE half did not (the child's name still reached out_of_root_refs, spec
+    # Design section F5) -- post-exec Codex review F1 closed that: the surface directory
+    # is now gated before it is ever globbed, so the child is never enumerated at all.
+    # The strengthened assertion below (the child's NAME is absent too) is additive,
+    # pinning F1's fix; see test_project_tier_hygiene_corpus_escaping_populated_surface_dir_gates_the_directory
+    # for the fuller regression coverage of that fix.
     project_root = tmp_path / "repo"
     (project_root / ".claude").mkdir(parents=True)
     outside = tmp_path / "outside-rules-3"
@@ -9545,7 +9548,100 @@ def test_project_tier_hygiene_corpus_escaping_surface_dir_is_not_read(tmp_path):
         project_root, inaccessible, blind_spots, out_of_root_refs)
     assert not any("DISTINCTIVE-OUTSIDE-CONTENT" in text for _rel, text in corpus)
     assert any(r["trusted"] is False for r in out_of_root_refs)
+    assert not any("leak.md" in r["name"] for r in out_of_root_refs)
     assert scan_complete is False
+
+
+# Post-exec Codex review F1: the surface directory itself must clear containment BEFORE
+# any glob/iterdir enumerates it -- not merely its resulting candidate files. Before this
+# fix an EMPTY escaping directory was completely silent (nothing to gate at the file
+# level, so scan_complete stayed True and out_of_root_refs stayed empty), which
+# contradicts inaccessible != clean. Four tests: both surface groups (the
+# _PROJECT_DUP_SURFACE_DIRS loop and .claude/skills), each in both the EMPTY and
+# POPULATED escaping cases.
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_hygiene_corpus_escaping_empty_surface_dir_is_disclosed(tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / ".claude").mkdir(parents=True)
+    outside = tmp_path / "outside-empty-rules"
+    outside.mkdir()  # genuinely empty -- nothing for the pre-fix code to gate
+    (project_root / ".claude" / "rules").symlink_to(outside)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert corpus == []
+    assert scan_complete is False
+    assert any(r["trusted"] is False for r in out_of_root_refs)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_hygiene_corpus_escaping_populated_surface_dir_gates_the_directory(
+        tmp_path):
+    # The fix gates the DIRECTORY before globbing, so a populated escaping surface dir
+    # records exactly ONE out_of_root_ref (the directory) -- symmetric with the empty
+    # case above -- and its children are never enumerated at all.
+    project_root = tmp_path / "repo"
+    (project_root / ".claude").mkdir(parents=True)
+    outside = tmp_path / "outside-populated-rules"
+    outside.mkdir()
+    (outside / "a.md").write_text("SENTINEL-A-must-never-be-read\n")
+    (outside / "b.md").write_text("SENTINEL-B-must-never-be-read\n")
+    (project_root / ".claude" / "rules").symlink_to(outside)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert not any("SENTINEL-A" in text or "SENTINEL-B" in text for _rel, text in corpus)
+    assert corpus == []
+    assert scan_complete is False
+    assert len(out_of_root_refs) == 1
+    assert out_of_root_refs[0]["trusted"] is False
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_hygiene_corpus_escaping_empty_skills_dir_is_disclosed(tmp_path):
+    # The same hole one level up -- `.claude/skills` itself was never gated before
+    # `_probe_is_dir` + `iterdir()`. An empty escaping target was completely silent.
+    project_root = tmp_path / "repo"
+    (project_root / ".claude").mkdir(parents=True)
+    outside = tmp_path / "outside-empty-skills"
+    outside.mkdir()
+    (project_root / ".claude" / "skills").symlink_to(outside)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert corpus == []
+    assert scan_complete is False
+    assert any(r["trusted"] is False for r in out_of_root_refs)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_hygiene_corpus_escaping_populated_skills_dir_gates_the_directory(
+        tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / ".claude").mkdir(parents=True)
+    outside = tmp_path / "outside-populated-skills"
+    outside.mkdir()
+    (outside / "demo").mkdir()
+    (outside / "demo" / "SKILL.md").write_text(
+        "---\ndescription: d\n---\nSENTINEL-SKILL-must-never-be-read\n")
+    (project_root / ".claude" / "skills").symlink_to(outside)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert not any("SENTINEL-SKILL" in text for _rel, text in corpus)
+    assert corpus == []
+    assert scan_complete is False
+    assert len(out_of_root_refs) == 1
+    assert out_of_root_refs[0]["trusted"] is False
 
 
 # TRK-023 T4: collect_promotion_candidates' project-tier half. Direct-call style,
