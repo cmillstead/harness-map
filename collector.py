@@ -1508,8 +1508,10 @@ def _references_script_token(tokens, root, profile):
 # (background), a literal newline, bare `(`/`)` (a subshell with no `$`), `${...}`
 # parameter expansion, `$((...))` arithmetic expansion, comment-only input (`# ...`), and
 # assignment-only input (`FOO=bar cmd`) are not scanned for at all, quoted or not. Bare
-# `{`/`}` are scanned for unconditionally, quoted or not, and can flag a literal `{`/`}`
-# character that is not functioning as brace-expansion syntax — narrowing that would mean
+# `{`/`}` are scanned for OUTSIDE quotes only — the quote-aware scan reaches them like any
+# other token, so `rtk hook {foo}` hits while `rtk hook "{foo}"` and `rtk hook '{foo}'` do
+# not (verified by direct call) — and can flag a literal `{`/`}` character that is not
+# functioning as brace-expansion syntax — narrowing that would mean
 # editing the `bracket_commands`/`long_single_token` shapes `pathological_harness` already
 # pins, which CLAUDE.md's assertion rule forbids, so that residual stays open too.
 _SHELL_CONTROL_SYNTAX = frozenset(("$(", "&&", "||", "|", ";", "<", ">", "{", "}", "`"))
