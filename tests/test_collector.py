@@ -346,6 +346,112 @@ def test_shlex_unparseable_hook_command_is_unparsed(fake_harness):
     assert any("unparseable hook command" in bs for bs in doc["blind_spots"])
 
 
+def _shell_control_syntax_operator_boundary_table():
+    """A62: table pinning `_has_shell_control_syntax`'s quote-aware contract.
+    Returns `(no_script_rows, unparsed_rows)`, each a list of `(label, command)` pairs.
+    Every payload is deliberately free of a `.py`/`.sh` suffix and of any name under the
+    fixture's (empty) hooks dir, so `_references_script_token` never fires first and
+    silently proves nothing about quoting -- EXCEPT the one deliberate trap row at the
+    end of `unparsed_rows`, which pins that exact interaction instead of hiding it.
+
+    That trap row's command differs from the one named in the dispatch message
+    (`rtk hook "x.py > z"`): verified directly, shlex merges the whole quoted string into
+    ONE token ("x.py > z", ending in " z"), so `_references_script_token`'s `.py`-suffix
+    check does NOT match it and the row is unparsed only because BOTH checks return
+    False (branch 3) -- it exercises the same quoting rule as the BUG rows above, not the
+    reference-token trap. `rtk hook x.py "> z"` (unquoted `x.py`, `>` isolated in its own
+    quoted token) does exercise it: `_references_script_token` is True and
+    `_has_shell_control_syntax` is False, and the row is still unparsed regardless of
+    what quoting says -- the actual boundary this row is meant to pin."""
+    ops = ("$(", "&&", "||", "|", ";", "<", ">", "{", "}", "`")
+    no_script_rows = [
+        ("double-quoted $( still counts (command substitution expands there)",
+         'rtk hook "x $( y"'),
+        ("double-quoted backtick still counts (command substitution expands there)",
+         'rtk hook "x ` y"'),
+        ("operator immediately after a closing double quote resumes the scan outside",
+         'rtk hook "safe"|reader'),
+        ("operator immediately after a closing single quote resumes the scan outside",
+         "rtk hook 'safe'|reader"),
+        ("control row: unquoted && stays shell control syntax",
+         "rtk hook claude && echo hi"),
+    ]
+    unparsed_rows = [
+        (f"single-quoted {op!r} does not count", f"rtk hook 'x {op} y'")
+        for op in ops
+    ] + [
+        (f"double-quoted {op!r} does not count", f'rtk hook "x {op} y"')
+        for op in ops if op not in ("$(", "`")
+    ] + [
+        ("escaped $( inside double quotes is literal, does not count",
+         'rtk hook "\\$(whoami)"'),
+        ("escaped backtick pair inside double quotes is literal, does not count",
+         'rtk hook "\\`whoami\\`"'),
+        ("control row: escaped && outside quotes does not count",
+         "rtk hook a \\&\\& b"),
+        ("BUG row 1 (A62): && inside double quotes used to false-positive no_script",
+         'rtk hook "a && z"'),
+        ("BUG row 2 (A62): ; inside single quotes used to false-positive no_script",
+         "rtk hook 'a; z'"),
+        ("BUG row 3 (A62): | inside double quotes used to false-positive no_script",
+         'rtk hook "a | z"'),
+        ("BUG row 4 (A62): $( inside single quotes used to false-positive no_script",
+         "rtk hook '$(whoami)'"),
+        ("trap row: a real .py token outside quotes still wins over a quoted operator "
+         "that would otherwise (correctly) not count -- _references_script_token fires "
+         "first regardless of what _has_shell_control_syntax says",
+         'rtk hook x.py "> z"'),
+    ]
+    return no_script_rows, unparsed_rows
+
+
+def test_shell_control_syntax_quote_awareness_no_script_rows(fake_harness):
+    # A62 T2: batches every "should classify no_script, never a blind spot" row
+    # from the quoting-boundary table into ONE settings.json / collector run, mirroring
+    # test_hook_command_coverage_totals_and_headline_denominator's multi-command style.
+    no_script_rows, _ = _shell_control_syntax_operator_boundary_table()
+    commands = [command for _, command in no_script_rows]
+    (fake_harness / "settings.json").write_text(json.dumps(_hooks_settings(commands)))
+    doc = run_collector(fake_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_no_script"] == len(no_script_rows)
+    assert hooks["commands_unparsed"] == 0
+    assert not any("unsupported hook command form" in bs for bs in doc["blind_spots"])
+
+
+def test_shell_control_syntax_quote_awareness_unparsed_rows(fake_harness):
+    # A62 T2: batches every "should stay unparsed AND a disclosed blind spot" row,
+    # including the 4 exact BUG-table rows the ticket names and one deliberate .py-token
+    # trap row proving _references_script_token still wins first regardless of quoting.
+    _, unparsed_rows = _shell_control_syntax_operator_boundary_table()
+    commands = [command for _, command in unparsed_rows]
+    assert len(set(commands)) == len(commands)  # every row distinct, no accidental overlap
+    (fake_harness / "settings.json").write_text(json.dumps(_hooks_settings(commands)))
+    doc = run_collector(fake_harness)
+    hooks = doc["enforcement"]["hooks"]
+    assert hooks["commands_unparsed"] == len(unparsed_rows)
+    assert hooks["commands_no_script"] == 0
+    for label, command in unparsed_rows:
+        assert any(command in bs for bs in doc["blind_spots"]), (
+            f"{label}: expected a blind spot naming {command!r}")
+
+
+def test_dot_py_token_reference_wins_over_a_quoted_operator_directly():
+    # Direct-call pin of the trap row's mechanics (same pattern as
+    # test_empty_hook_command_resolution_emits_a_note_directly): the .py-suffixed token
+    # sits OUTSIDE quotes and is what makes _references_script_token true; the operator
+    # inside the quoted "> z" token correctly does NOT count under the new quoting rule.
+    # Both are true at once, and the command still classifies "unparsed" -- for the
+    # script-reference reason, not the quoting one.
+    command = 'rtk hook x.py "> z"'
+    tokens = _collector.shlex.split(command)
+    assert _collector._references_script_token(
+        tokens, Path("/fake/root"), _collector.PROFILE_CLAUDE_CODE) is True
+    assert _collector._has_shell_control_syntax(command) is False
+    resolution = _collector._script_from_command(command, Path("/fake/root"))
+    assert resolution.kind == "unparsed"
+
+
 def test_empty_hook_command_resolution_emits_a_note_directly():
     # TRK-025 T1 row 1316: _script_from_command used to return (None, None) SILENTLY for
     # an empty token list. Exercised directly (same pattern as the _rel/_empty_document
@@ -441,10 +547,11 @@ def test_pathological_nested_quoting_hook_command_tokenizes_and_classifies(patho
     # without raising, and this command genuinely IS shell-interpreted (a real shell
     # would run it as two commands), so `no_script` is the correct classification here
     # regardless of whether _has_shell_control_syntax matches on the raw string or on
-    # exact tokens. (The embedded-INSIDE-quotes shape -- where a raw-string scan flags
-    # `&&` that no shell would actually treat as a control operator -- is a genuine
-    # collector false positive, filed as TRK-056 and deliberately not pinned by this
-    # fixture; see conftest.py::pathological_harness.)
+    # exact tokens. (The embedded-INSIDE-quotes shape -- where the same `&&` sits inside
+    # a quoted argument instead -- classifies `unparsed`, not `no_script`, under A62's
+    # quote-aware rule: an operator only counts as shell control syntax OUTSIDE quotes.
+    # That case is pinned in test_shell_control_syntax_quote_awareness_* above, not here;
+    # see conftest.py::pathological_harness.)
     doc = run_collector(pathological_harness)
     hooks = doc["enforcement"]["hooks"]
     assert hooks["commands_no_script"] == 10

@@ -1491,15 +1491,89 @@ def _references_script_token(tokens, root, profile):
 # does internally. Bounded and bug-for-bug reproducible (unlike a name allowlist, which
 # would need to grow forever): measured against the real 8 commands, every one contains
 # at least one of these; `rtk hook claude` and `caffeinate -i hooks/mystery.py` contain
-# none. Checked against the RAW `command` string, not the shlex tokens — tokenizing
-# strips quoting, which would hide a `&&`/`;`/`$(...)` embedded inside a quoted argument.
+# none. Checked against the RAW `command` string, not the shlex tokens — tokenizing loses
+# quote structure entirely, and quote structure is exactly what decides whether an
+# operator is evidence of shell interpretation (TRK-056, A62): a real `/bin/sh` hands a
+# quoted operator to the exec'd program as a single literal argument, never as syntax —
+# verified directly, `/bin/sh` passes `rtk hook "a && z"` the one literal argument
+# `a && z` — so a hit found only INSIDE quotes must NOT count. The one exception is `$(`
+# and a backtick, which still expand INSIDE DOUBLE quotes (command substitution runs
+# there), so those two keep counting even when double-quoted. `_has_shell_control_syntax`
+# implements this with a single left-to-right quote-tracking scan; see its docstring for
+# the exact rule.
+#
+# This is a bounded detector rule, not a claim of POSIX completeness — per
+# codex-learnings C10 the detector does not model the shell, and the following remain
+# known residuals of the A45 heuristic, documented here rather than fixed: a bare `&`
+# (background), a literal newline, bare `(`/`)` (a subshell with no `$`), `${...}`
+# parameter expansion, `$((...))` arithmetic expansion, comment-only input (`# ...`), and
+# assignment-only input (`FOO=bar cmd`) are not scanned for at all, quoted or not. Bare
+# `{`/`}` are scanned for OUTSIDE quotes only — the quote-aware scan reaches them like any
+# other token, so `rtk hook {foo}` hits while `rtk hook "{foo}"` and `rtk hook '{foo}'` do
+# not (verified by direct call) — and can flag a literal `{`/`}` character that is not
+# functioning as brace-expansion syntax — narrowing that would mean
+# editing the `bracket_commands`/`long_single_token` shapes `pathological_harness` already
+# pins, which CLAUDE.md's assertion rule forbids, so that residual stays open too.
 _SHELL_CONTROL_SYNTAX = frozenset(("$(", "&&", "||", "|", ";", "<", ">", "{", "}", "`"))
 
 
 def _has_shell_control_syntax(command):
-    """True when `command` contains any `_SHELL_CONTROL_SYNTAX` token — see that
-    constant's comment for the reasoning."""
-    return any(tok in command for tok in _SHELL_CONTROL_SYNTAX)
+    """True when a real shell would see one of `_SHELL_CONTROL_SYNTAX`'s tokens as an
+    OPERATOR — not as literal text inside a quoted argument. See that constant's comment
+    for the reasoning and the residual gaps this does NOT close (TRK-056, A62).
+
+    A single left-to-right pass tracks quote state. This is a bounded heuristic, not a
+    shell lexer — no backslash-newline, no `${...}` nesting, no `$'...'`, no here-docs;
+    see the residual-gap comment above `_SHELL_CONTROL_SYNTAX`. The quoting rule:
+
+    - Inside single quotes: everything is literal, backslash included. No operator
+      counts, and a single quote cannot be escaped from within itself.
+    - Inside double quotes: `$(` and a backtick still count (command substitution still
+      expands there); every other operator does not.
+    - Backslash escapes the very next character everywhere EXCEPT inside single quotes —
+      that includes inside double quotes, so `"\\$(...)"` and `` "\\`...\\`" `` do NOT
+      count. POSIX only special-cases backslash before `$`, backtick, `"`, `\\`, and
+      newline inside double quotes; treating every character there as escapable is a
+      deliberate simplification of POSIX, outcome-neutral for this operator set, since
+      `$(` and backtick are the only two tokens that count inside double quotes anyway.
+    - Unterminated quote: unreachable in production (`_script_from_command`'s
+      `shlex.split` call raises `ValueError` and returns "unparsed" before this function
+      is ever reached), but chosen deliberately rather than left an accident — the scan
+      runs off the end of the string in whatever quote state it is in and returns False.
+    """
+    in_single = False
+    in_double = False
+    i = 0
+    length = len(command)
+    while i < length:
+        ch = command[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2  # escapes the next character everywhere except inside single quotes
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            elif ch == "`" or command.startswith("$(", i):
+                return True
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if any(command.startswith(tok, i) for tok in _SHELL_CONTROL_SYNTAX):
+            return True
+        i += 1
+    return False
 
 
 def _script_from_command(command, root, *, profile: dict[str, Any] | None = None) -> _HookCommandResolution:
