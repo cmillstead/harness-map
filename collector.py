@@ -2748,9 +2748,16 @@ def collect_config(
 
 
 def _hook_disk_files(root, *, profile: dict[str, Any] | None = None):
-    """hooks/*.py + hooks/*.sh on disk, name-sorted, never raising (an unreadable hooks/
-    dir yields []). Deliberately single-level: no recursion, so there is no walk to
-    follow symlinks through — a symlinked hook FILE is included by name. Shared by
+    """hooks/*.py + hooks/*.sh on disk, name-sorted. MEASURED 2026-08-06 on CPython
+    3.11.14 against a real 0o000 hooks dir: Path.glob() raises nothing and returns []
+    — an unreadable hooks/ dir is indistinguishable here from an absent or genuinely
+    empty one, so "never raising" is a blind spot, not a guarantee: a locked-out hooks
+    dir is silently reported as a clean empty result to both downstream callers. Fix
+    tracked separately under TRK-082 (spec AMENDMENTS A59), which covers this and 19
+    other glob sites together rather than fixing one and fragmenting the rest — see
+    _hooks_body_corpus's docstring for the os.scandir-based fix this function does NOT
+    yet have. Deliberately single-level: no recursion, so there is no walk to follow
+    symlinks through — a symlinked hook FILE is included by name. Shared by
     reconcile_hooks and _detect_hook_test_coverage, which both need the identical
     guarded + sorted listing before diverging into their own downstream logic.
 
@@ -5656,11 +5663,18 @@ def _detect_hook_test_coverage(root, errors, *, profile: dict[str, Any] | None =
 
 def _skill_has_test_asset(skill_dir, errors=None):
     """PRESENCE-only signal (see _detect_hook_test_coverage docstring): a tests/ dir, an
-    evals/ dir, or any test_*.py / *_eval.* file anywhere under the skill dir. Unlike
-    _safe_exists, Path.is_dir() does NOT swallow PermissionError (only ENOENT-family
-    errors) — a permission-denied skill dir is already surfaced as inaccessible by
-    collect_descriptions()/collect_on_demand(); this function must only avoid crashing
-    the whole run, not duplicate that reporting.
+    evals/ dir, or any test_*.py / *_eval.* file anywhere under the skill dir. MEASURED
+    on CPython 3.11.14 against a real EACCES tree: unlike _safe_exists, Path.is_dir()
+    does NOT swallow PermissionError (only ENOENT-family errors) — a permission-denied
+    skill dir raises here rather than reading False, so it is already surfaced as
+    inaccessible by collect_descriptions()/collect_on_demand(); this function must only
+    avoid crashing the whole run, not duplicate that reporting. This is version-
+    dependent and NOT re-verified on every interpreter: on 3.14, Path.is_dir() is
+    documented/expected to swallow PermissionError too (not measured here — only
+    3.11.14 is installed on this machine). If that holds, the "already surfaced
+    elsewhere" justification above stops applying on 3.14 — a permission-denied skill
+    dir would read as a silent False here, duplicating no report, because there would be
+    no report to duplicate.
 
     The recursive test_*.py / *_eval.* search walks _iter_descendant_dirs(skill_dir) — the
     SAME pruned descendant walk the watcher uses (Codex r4 fix) — rather than
