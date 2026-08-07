@@ -6700,6 +6700,175 @@ def test_main_unsearchable_root_never_triggers_crash_backstop(unsearchable_root)
     assert not any(e.startswith(_collector._CRASH_ERROR_PREFIX) for e in doc["errors"])
 
 
+# TRK-050 T2: the same defect class T1 fixed (a bad child's is_dir() aborting the whole
+# `sorted(p for p in <dir>.iterdir() if p.is_dir())` comprehension and discarding every
+# sibling with it) at the four remaining call sites: _project_tier_duplication_corpus
+# (which ALREADY recorded a message on the collapse -- proof that a recorded error is not
+# the same property as sibling survival), and _compose_project_input_paths + the two
+# skills/projects listings inside iter_input_paths, none of which had anywhere to record
+# an error before this task. Sibling survival is the load-bearing assertion throughout.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_tier_duplication_corpus_unreadable_skill_child_keeps_siblings(tmp_path):
+    """Unlike the other six T1 sites, this one already appended a blind_spots message on
+    collapse -- but the message sat on top of a TOTAL loss of every project skill in the
+    scan, not just the bad one, for as long as this code has existed. Proves the good
+    sibling's SKILL.md now survives instead of merely being reported missing."""
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    (good / "SKILL.md").write_text(
+        "---\ndescription: d\n---\nThis skill has plenty of distinct normalized words here.\n")
+    hidden = tmp_path / "hidden-bad-dupcorpus-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        corpus = _collector._project_tier_duplication_corpus(
+            project_root, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(hidden, 0o755)
+    rel_paths = {rel for rel, _tier, _shingles in corpus}
+    assert ".claude/skills/good-skill/SKILL.md" in rel_paths, "sibling must survive one bad child"
+    assert any("project skills child is_dir failed" in b and "bad-skill" in b for b in blind_spots)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_compose_project_input_paths_unreadable_skill_child_keeps_siblings(tmp_path):
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    hidden = tmp_path / "hidden-bad-composepaths-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        errors: list = []
+        paths = _collector._compose_project_input_paths(project_root, errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert (good / "SKILL.md") in paths, "sibling must survive one bad child"
+    assert any("compose project skills child is_dir failed" in e and "bad-skill" in e
+               for e in errors)
+
+
+def test_compose_project_input_paths_errors_default_none_discarded(tmp_path):
+    """Optional `errors` param (TRK-050 T2): the pre-existing single-argument call shape
+    must keep working byte-identically -- discarding rather than crashing when omitted."""
+    project_root = tmp_path / "repo"
+    (project_root / ".claude" / "skills" / "good-skill").mkdir(parents=True)
+    paths = _collector._compose_project_input_paths(project_root)
+    assert (project_root / ".claude" / "skills" / "good-skill" / "SKILL.md") in paths
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_compose_project_input_paths_listing_failure_distinct_from_child_failure(tmp_path):
+    """A listing-level failure (the skills dir itself unlistable) and a per-child failure
+    (one bad child among listable siblings) must record TEXT-DISTINGUISHABLE messages --
+    a regression collapsing the two into one generic message would fail this."""
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    skills_dir.mkdir(parents=True)
+    os.chmod(skills_dir, 0)
+    try:
+        errors: list = []
+        _collector._compose_project_input_paths(project_root, errors)
+    finally:
+        os.chmod(skills_dir, 0o755)
+    assert any("compose project skills listing failed" in e for e in errors), errors
+    assert not any("compose project skills child is_dir failed" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_unreadable_project_slug_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    projects_dir = root / "projects"
+    good_slug = "good-project"
+    (projects_dir / good_slug / "memory").mkdir(parents=True)
+    (projects_dir / good_slug / "memory" / "MEMORY.md").write_text("hi\n")
+    hidden = tmp_path / "hidden-bad-iterpaths-project-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (projects_dir / "bad-project").symlink_to(hidden / "bad-project")
+    try:
+        errors: list = []
+        paths = set(map(str, _collector.iter_input_paths(root, errors=errors)))
+    finally:
+        os.chmod(hidden, 0o755)
+    assert str(projects_dir / good_slug / "memory") in paths, "sibling project must survive"
+    assert any("watcher projects child is_dir failed" in e and "bad-project" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_unreadable_skill_child_keeps_siblings(tmp_path):
+    root = tmp_path / "harness"
+    skills_dir = root / "skills"
+    good = skills_dir / "good-skill"
+    good.mkdir(parents=True)
+    hidden = tmp_path / "hidden-bad-iterpaths-skill-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        errors: list = []
+        paths = set(map(str, _collector.iter_input_paths(root, errors=errors)))
+    finally:
+        os.chmod(hidden, 0o755)
+    assert str(good) in paths, "sibling skill dir must survive one bad child"
+    assert any("watcher skills child is_dir failed" in e and "bad-skill" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_skills_listing_failure_distinct_from_child_failure(tmp_path):
+    root = tmp_path / "harness"
+    skills_dir = root / "skills"
+    skills_dir.mkdir(parents=True)
+    os.chmod(skills_dir, 0)
+    try:
+        errors: list = []
+        _collector.iter_input_paths(root, errors=errors)
+    finally:
+        os.chmod(skills_dir, 0o755)
+    assert any("watcher skills listing failed" in e for e in errors), errors
+    assert not any("watcher skills child is_dir failed" in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_compose_threads_errors_into_compose_project_input_paths(tmp_path):
+    """`errors` (TRK-050 T2) is threaded from iter_input_paths into
+    _compose_project_input_paths in compose mode, not just handled locally -- proves the
+    thread-through by reaching a compose-project-skills child failure via the OUTER
+    function's own `errors` list."""
+    root = tmp_path / "harness"
+    root.mkdir()
+    project_root = tmp_path / "repo"
+    compose_skills_dir = project_root / ".claude" / "skills"
+    compose_skills_dir.mkdir(parents=True)
+    hidden = tmp_path / "hidden-bad-compose-thread-target"
+    hidden.mkdir()
+    os.chmod(hidden, 0)
+    (compose_skills_dir / "bad-skill").symlink_to(hidden / "bad-skill")
+    try:
+        errors: list = []
+        _collector.iter_input_paths(root, project_root, compose=True, errors=errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert any("compose project skills child is_dir failed" in e and "bad-skill" in e
+               for e in errors)
+
+
+def test_iter_input_paths_errors_default_none_discarded(fake_harness):
+    """Optional `errors` param (TRK-050 T2): the pre-existing call shape (no `errors`
+    kwarg) -- used by every iter_input_paths test above this one, and by serve.py's live
+    watcher -- must keep working byte-identically."""
+    paths = _collector.iter_input_paths(fake_harness)
+    assert paths  # non-empty on a real fixture; proves the call didn't silently break
+
+
 # ---------------------------------------------------------------------------------
 # WRITE-SIDE CONTAINMENT — what these tests do and do NOT pin.
 #
