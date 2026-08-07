@@ -9265,6 +9265,60 @@ def test_iter_input_paths_pattern_loop_wildcard_dir_locked_no_record(tmp_path):
     assert errors == []
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_pattern_loop_errors_order_deterministic_across_hashseed(tmp_path):
+    """CLAUDE.md rule 9: deterministic output across PYTHONHASHSEED, no bare set()
+    iteration into output. iter_input_paths' pattern loop iterates
+    `set(_instruction_globs(...) + ...)` -- a bare set of pattern STRINGS -- and the new
+    TRK-082 T3 disclosure call appends to `errors` inside that loop, so the ORDER of
+    `errors` entries (not `paths`, which is sorted at return regardless of loop order)
+    previously depended on PYTHONHASHSEED's str-hash randomization. `errors` has no
+    production consumer today (per the function's own docstring), but TRK-086 is an open
+    ticket whose entire scope is wiring that sink into a caller -- the order must be
+    fixed now, not left for that ticket to inherit silently.
+
+    Four probeable directories (rules/agents/commands/hooks) are locked simultaneously
+    so a bare set() actually has enough entries to reorder between seeds. This spawns two
+    real subprocesses (PYTHONHASHSEED is read once at interpreter startup, so it cannot
+    be varied in-process) and compares the RECORD ORDER, not a diff of full output."""
+    root = tmp_path / "harness"
+    locked_dirs = []
+    for name, ext in (("rules", "md"), ("agents", "md"), ("commands", "md"), ("hooks", "py")):
+        d = root / name
+        d.mkdir(parents=True)
+        (d / f"match.{ext}").write_text("x")
+        locked_dirs.append(d)
+    for d in locked_dirs:
+        os.chmod(d, 0)
+    try:
+        script = (
+            "import importlib.util, json\n"
+            f"spec = importlib.util.spec_from_file_location('c', {str(COLLECTOR)!r})\n"
+            "c = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(c)\n"
+            "errors = []\n"
+            f"c.iter_input_paths({str(root)!r}, errors=errors)\n"
+            "print(json.dumps(errors))\n"
+        )
+
+        def run_with_seed(seed):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            proc = subprocess.run([sys.executable, "-c", script],
+                                  capture_output=True, text=True, timeout=30, env=env)
+            assert proc.returncode == 0, proc.stderr
+            return json.loads(proc.stdout)
+
+        errors_seed_a = run_with_seed("1")
+        errors_seed_b = run_with_seed("42")
+    finally:
+        for d in locked_dirs:
+            os.chmod(d, 0o755)
+
+    # All 4 locked dirs (plus hooks/tests, unreachable through locked hooks) must be
+    # represented, or this proves nothing about reordering a genuinely multi-entry list.
+    assert len(errors_seed_a) >= 4
+    assert errors_seed_a == errors_seed_b
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
 def test_pattern_loop_glob_listability_disclosure_labels_distinct_for_shared_rules_dir(tmp_path):
     """root/rules is independently globbed via "rules/*.md" by all FOUR pattern-loop
     sites (_deduped_instruction_files, scan_duplication, _staleness_corpus,

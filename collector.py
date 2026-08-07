@@ -6255,9 +6255,16 @@ def iter_input_paths(
     #    profile's glob keys). Covers rules, skills/*/rules, skills SKILL.md (top + nested),
     #    phases/prompts/agents md, commands, agents, hooks/*.py|*.sh, and hooks/tests +
     #    skills/*/hooks/tests scripts. --
-    for pattern in set(_instruction_globs(profile) + tuple(profile["duplication_globs"])
-                       + tuple(profile["rules_globs"]) + tuple(profile["hook_script_globs"])
-                       + tuple(profile["hook_test_globs"])):
+    # sorted() (CLAUDE.md rule 9): a bare set() of pattern STRINGS iterates in
+    # PYTHONHASHSEED-dependent order. `paths` is sorted at return regardless of this
+    # loop's order, but TRK-082 T3's glob-listability disclosure now appends to `errors`
+    # INSIDE this loop -- that record order must not depend on hash seed either, even
+    # though no production caller supplies `errors` today (TRK-086 is the open ticket to
+    # wire one in, and must not inherit this order silently).
+    for pattern in sorted(set(
+            _instruction_globs(profile) + tuple(profile["duplication_globs"])
+            + tuple(profile["rules_globs"]) + tuple(profile["hook_script_globs"])
+            + tuple(profile["hook_test_globs"]))):
         try:
             pattern_matches = list(root.glob(pattern))
         except OSError:
