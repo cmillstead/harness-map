@@ -6468,6 +6468,17 @@ def build_document(
         "The always-loaded classification of skills/*/rules/*.md (each sub-skill's rules dir) "
         "reflects the design's assertion and cannot be statically verified — CC's actual "
         "session-start injection set is not introspectable from disk.",
+        # TRK-082 T4 (spec AMENDMENTS A59 requirement 4): STANDING and UNCONDITIONAL, same
+        # as every other entry in this literal list. A wildcard in the directory position
+        # (skills/*/...) has no single directory for _disclose_unlistable_glob to probe, so
+        # a locked skills/<name>/ is undetectable at this layer and would otherwise read as
+        # an all-clear -- the disclosure exists precisely because the failure it names
+        # cannot be conditioned on.
+        "Glob patterns whose wildcard sits in the directory position — the skills/*/... "
+        "family (SKILL.md, phases, prompts, agents, rules, and hook-test globs) — cannot "
+        "tell an empty match from an unreadable intermediate skills/<name>/ directory, so a "
+        "locked skill directory's matches drop out with no disclosure. Single-directory "
+        "globs are unaffected: their own unlistable target is named when locked.",
     ]
 
     out_of_root_refs: list[dict[str, Any]] = []

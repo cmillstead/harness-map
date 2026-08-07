@@ -2600,7 +2600,19 @@ def test_description_extraction_is_read_only(fake_harness):
 # empty, CHANGED is empty, and ADDED is exactly `.collection_scope.root`,
 # `.collection_scope.project_root`, `.collection_scope.compose`, and the fourteen
 # `.metric_quality.<metric>` paths -- no existing value changed.
-_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan.", "Line-range citations (`path.md:12-19`) are checked for the FILE only \\u2014 the line range itself is never validated, so a stale range in an otherwise-valid citation is invisible to this scan.", "Placeholder and glob tokens are recognized only when they are PATH-SHAPED \\u2014 a backticked `<slug>.md`, `{session}.md` or `*.md` with no directory separator is not detected as a reference at all, so it is neither resolved nor reported."], "collection_scope": {"compose": false, "project_root": "<PROJECT_ROOT>", "root": "<ROOT>"}, "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"commands_no_script": 0, "commands_resolved": 0, "commands_total": 0, "commands_unparsed": 0, "orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "hook_commands_examined": 0, "hook_commands_total": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "metric_definitions": {"always_loaded_file_count": 1, "always_loaded_tokens_est": 1, "always_loaded_words": 1, "duplicate_pair_count": 1, "hooks_with_test_ratio": 1, "instruction_files_over_200": 1, "memory_body_count": 1, "orphan_registration_count": 1, "orphan_script_count": 1, "phantom_confirmed_count": 4, "phantom_ref_count": 4, "promotion_candidate_count": 1, "skills_with_test_ratio": 1, "unchecked_binary_count": 1}, "metric_quality": {"always_loaded_file_count": "complete", "always_loaded_tokens_est": "complete", "always_loaded_words": "complete", "duplicate_pair_count": "complete", "hooks_with_test_ratio": "complete", "instruction_files_over_200": "complete", "memory_body_count": "complete", "orphan_registration_count": "complete", "orphan_script_count": "complete", "phantom_confirmed_count": "complete", "phantom_ref_count": "complete", "promotion_candidate_count": "complete", "skills_with_test_ratio": "complete", "unchecked_binary_count": "complete"}, "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "staleness_null_reasons": {"agents/demo-agent.md": "no_repo", "commands/demo-cmd.md": "no_repo", "rules/a.md": "no_repo", "rules/b.md": "no_repo", "skills/coding-team/rules/c.md": "no_repo", "skills/demo/SKILL.md": "no_repo", "skills/demo/phases/p1.md": "no_repo"}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
+# TRK-082 T4: regenerated again, same rule and same reason, for one new additive
+# `blind_spots` entry -- the standing, unconditional glob-listability disclosure for
+# the skills/*/... wildcard-directory family (spec AMENDMENTS A59 requirement 4). It
+# must land BEFORE the trailing two entries pinned by
+# test_new_blind_spots_are_the_last_two_so_no_existing_index_shifts, so it cannot be a
+# pure tail append the way the D4 pair above was: it inserts at `.blind_spots[5]`,
+# pushing the pre-existing `.blind_spots[5..7]` down to `[6..8]`. Verified mechanically:
+# REMOVED is empty, ADDED is exactly `.blind_spots[8]`, and the only CHANGED paths are
+# `.blind_spots[5]`, `.blind_spots[6]`, `.blind_spots[7]` -- each one is the PRIOR
+# entry's unmodified string now one index later (a pure insertion, not a content edit);
+# no blind_spot entry's TEXT changed and none was removed. `blob == _GOLDEN_...` is
+# unchanged.
+_GOLDEN_NON_COMPOSE_DOC_JSON = '{"always_loaded": {"agent_descriptions": [{"evidence": "VERIFIED", "name": "demo-agent", "words": 7}], "conditional_variants": [{"evidence": "VERIFIED", "lines": 2, "path": "projects/other-proj-slug/memory/MEMORY.md", "project_slug": "other-proj-slug", "tokens_est": 6, "words": 5}], "files": [{"category": "claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 55, "words": 42}, {"category": "project_claude_md", "evidence": "VERIFIED", "lines": 2, "path": "CLAUDE.md", "tokens_est": 38, "words": 29}, {"category": "memory", "evidence": "VERIFIED", "lines": 2, "path": "projects/<SLUG>/memory/MEMORY.md", "tokens_est": 9, "words": 7}, {"category": "memory", "evidence": "VERIFIED", "lines": 1, "path": "memory/MEMORY.md", "tokens_est": 3, "words": 2}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/a.md", "tokens_est": 39, "words": 30}, {"category": "rule", "evidence": "VERIFIED", "lines": 1, "path": "rules/b.md", "tokens_est": 39, "words": 30}, {"category": "coding_team_rule", "evidence": "VERIFIED", "lines": 1, "path": "skills/coding-team/rules/c.md", "tokens_est": 39, "words": 30}], "skill_descriptions": [{"evidence": "VERIFIED", "name": "demo", "words": 7}], "totals": {"file_count": 7, "tokens_est": 222, "words": 170}}, "blind_spots": ["SessionStart hook emissions (runtime-only text injected at session start) are not statically collectable.", "MCP server runtime instructions (e.g. engram/firecrawl tool-use guidance) are not vendored as local files.", "Other projects\' CLAUDE.md files (outside --project-root) are not read; only their memory/MEMORY.md index is inventoried as a conditional_variant.", "Knowledge-base/wiki documents cited by rules but hosted outside this repo are not fetched or verified.", "The always-loaded classification of skills/*/rules/*.md (each sub-skill\'s rules dir) reflects the design\'s assertion and cannot be statically verified \\u2014 CC\'s actual session-start injection set is not introspectable from disk.", "Glob patterns whose wildcard sits in the directory position \\u2014 the skills/*/... family (SKILL.md, phases, prompts, agents, rules, and hook-test globs) \\u2014 cannot tell an empty match from an unreadable intermediate skills/<name>/ directory, so a locked skill directory\'s matches drop out with no disclosure. Single-directory globs are unaffected: their own unlistable target is named when locked.", "commands/demo-cmd.md has fewer than 8 normalized words; skipped in duplication scan.", "Line-range citations (`path.md:12-19`) are checked for the FILE only \\u2014 the line range itself is never validated, so a stale range in an otherwise-valid citation is invisible to this scan.", "Placeholder and glob tokens are recognized only when they are PATH-SHAPED \\u2014 a backticked `<slug>.md`, `{session}.md` or `*.md` with no directory separator is not detected as a reference at all, so it is neither resolved nor reported."], "collection_scope": {"compose": false, "project_root": "<PROJECT_ROOT>", "root": "<ROOT>"}, "config": {"cleanup_period_days": 3650, "enabled_plugins": [{"enabled": true, "name": "demo-plugin@official"}, {"enabled": false, "name": "off-plugin@official"}], "env_key_count": 2, "env_keys": ["ENABLE_X", "FAKE_TOKEN"], "evidence": "VERIFIED", "installed_plugin_count": 1, "installed_plugins": ["demo-plugin@official"], "marketplace_count": 2, "marketplaces": ["community", "official"], "model": "opus[1m]", "plugin_count": 2, "sandbox": true}, "duplication": {"metric": "containment", "pairs": [], "shingle_k": 8, "threshold": 0.6}, "enforcement": {"hooks": {"commands_no_script": 0, "commands_resolved": 0, "commands_total": 0, "commands_unparsed": 0, "orphan_registrations": [], "orphan_scripts": [], "registered": [], "scripts_on_disk": []}, "permissions": {"allow_count": 0, "ask_count": 0, "deny_count": 0, "evidence": "VERIFIED"}}, "errors": [], "headline": {"always_loaded_file_count": 7, "always_loaded_tokens_est": 222, "always_loaded_words": 170, "duplicate_pair_count": 0, "hook_commands_examined": 0, "hook_commands_total": 0, "instruction_files_over_200": 0, "orphan_registration_count": 0, "orphan_script_count": 0, "unchecked_binary_count": 0}, "inaccessible": [], "instruction_length_flags": [], "metric_definitions": {"always_loaded_file_count": 1, "always_loaded_tokens_est": 1, "always_loaded_words": 1, "duplicate_pair_count": 1, "hooks_with_test_ratio": 1, "instruction_files_over_200": 1, "memory_body_count": 1, "orphan_registration_count": 1, "orphan_script_count": 1, "phantom_confirmed_count": 4, "phantom_ref_count": 4, "promotion_candidate_count": 1, "skills_with_test_ratio": 1, "unchecked_binary_count": 1}, "metric_quality": {"always_loaded_file_count": "complete", "always_loaded_tokens_est": "complete", "always_loaded_words": "complete", "duplicate_pair_count": "complete", "hooks_with_test_ratio": "complete", "instruction_files_over_200": "complete", "memory_body_count": "complete", "orphan_registration_count": "complete", "orphan_script_count": "complete", "phantom_confirmed_count": "complete", "phantom_ref_count": "complete", "promotion_candidate_count": "complete", "skills_with_test_ratio": "complete", "unchecked_binary_count": "complete"}, "on_demand": {"memory_bodies": [{"evidence": "VERIFIED", "lines": 1, "path": "projects/<SLUG>/memory/detail.md", "project_slug": "<SLUG>", "words": 24}], "skill_internal_bodies": [{"evidence": "VERIFIED", "kind": "phase", "lines": 1, "path": "skills/demo/phases/p1.md", "skill": "demo", "words": 24}], "skills": [{"evidence": "VERIFIED", "has_test": false, "lines": 6, "name": "demo", "words": 16}]}, "phantom_refs": [], "promotion_candidates": [], "schema_version": 1, "staleness": {"git_age_available": false, "last_commit_ts": {"agents/demo-agent.md": null, "commands/demo-cmd.md": null, "rules/a.md": null, "rules/b.md": null, "skills/coding-team/rules/c.md": null, "skills/demo/SKILL.md": null, "skills/demo/phases/p1.md": null}}, "staleness_null_reasons": {"agents/demo-agent.md": "no_repo", "commands/demo-cmd.md": "no_repo", "rules/a.md": "no_repo", "rules/b.md": "no_repo", "skills/coding-team/rules/c.md": "no_repo", "skills/demo/SKILL.md": "no_repo", "skills/demo/phases/p1.md": "no_repo"}, "test_coverage": {"hooks": [], "skills": [{"has_test": false, "name": "coding-team"}, {"has_test": false, "name": "demo"}], "summary": {"hooks_total": 0, "hooks_with_test": 0, "skills_total": 2, "skills_with_test": 0}}}'
 
 
 def test_non_compose_output_byte_identical_to_pre_change(fake_harness):
@@ -9375,6 +9387,75 @@ def test_pattern_loop_sites_absent_dirs_record_nothing(tmp_path):
     errors4: list = []
     _collector.iter_input_paths(root, errors=errors4)
     assert errors4 == []
+
+
+# ============================================================================
+# TRK-082 T4 -- the disclosure half: a standing blind_spots entry for the
+# multi-level (wildcard-in-directory-position) skills/*/... glob family
+# ============================================================================
+# T1-T3 fixed every site with a SINGLE directory to probe. A wildcard in the
+# directory component itself (the skills/*/... family: SKILL.md, phases, prompts,
+# agents, rules, hook tests -- spec AMENDMENTS A59/A60) has no single directory for
+# _disclose_unlistable_glob to target, so a locked intermediate skills/<name>/ is
+# indistinguishable from a genuinely empty one and produces no per-pattern record.
+# That gap is undetectable at this layer, so the disclosure naming it is STANDING and
+# UNCONDITIONAL (build_document's static blind_spots list) rather than gated on
+# anything this run happened to observe -- a conditional disclosure would be silent in
+# exactly the case it exists to cover.
+
+def _wildcard_dir_entry(doc):
+    return next((b for b in doc["blind_spots"]
+                 if "skills/*/..." in b and "wildcard" in b), None)
+
+def test_glob_family_blind_spot_present_on_clean_fully_readable_harness(tmp_path):
+    """The unconditional property: present even when nothing is locked and nothing was
+    detected. This is the one that would silently regress if a later edit made the
+    disclosure conditional on some runtime signal -- there is no such signal to gate on,
+    since the whole point is that the failure is invisible from here."""
+    root = tmp_path / "harness"
+    root.mkdir()
+    doc = _collector.build_document(root, None)
+    entry = _wildcard_dir_entry(doc)
+    assert entry is not None, doc["blind_spots"]
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_glob_family_blind_spot_present_when_a_skills_star_dir_is_locked(tmp_path):
+    """Also present when a skills/*/... directory genuinely IS locked -- the disclosure
+    does not disappear just because there happens to be a real instance of the gap it
+    describes."""
+    root = tmp_path / "harness"
+    nested_rules = root / "skills" / "foo" / "rules"
+    nested_rules.mkdir(parents=True)
+    (nested_rules / "match.md").write_text("x")
+    os.chmod(nested_rules, 0)
+    try:
+        doc = _collector.build_document(root, None)
+    finally:
+        os.chmod(nested_rules, 0o755)
+    entry = _wildcard_dir_entry(doc)
+    assert entry is not None, doc["blind_spots"]
+
+def test_glob_family_blind_spot_names_the_multilevel_wildcard_limitation(tmp_path):
+    root = tmp_path / "harness"
+    root.mkdir()
+    doc = _collector.build_document(root, None)
+    entry = _wildcard_dir_entry(doc)
+    assert entry is not None, doc["blind_spots"]
+    assert "wildcard sits in the directory position" in entry
+    assert "skills/<name>/" in entry
+    assert "cannot tell an empty match from an unreadable" in entry
+
+def test_glob_family_blind_spot_does_not_overclaim_single_directory_globs(tmp_path):
+    """Guard against the overclaim: T1-T3 already disambiguate a single-directory glob's
+    own unlistable target (it IS named when locked), so this entry must not read as if
+    the whole glob surface were blind."""
+    root = tmp_path / "harness"
+    root.mkdir()
+    doc = _collector.build_document(root, None)
+    entry = _wildcard_dir_entry(doc)
+    assert entry is not None, doc["blind_spots"]
+    assert "Single-directory globs are unaffected" in entry
+    assert "named when locked" in entry
 
 
 # ============================================================================
