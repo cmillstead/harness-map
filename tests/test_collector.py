@@ -3440,6 +3440,43 @@ def test_compose_hygiene_scans_are_operator_only_and_disclosed(fake_harness, tmp
         assert name in disclosure, f"disclosure must name {name}"
 
 
+def test_compose_disclosure_separates_covered_analysis_from_operator_only_ones(fake_harness, tmp_path):
+    # Strengthens test_compose_hygiene_scans_are_operator_only_and_disclosed, which only
+    # checks each name APPEARS somewhere in the disclosure -- a string claiming the
+    # OPPOSITE partition (all six operator-only, or promotion_candidates missing) would
+    # still pass that test. Split the literal at "ONE analysis" and assert the partition
+    # holds in BOTH directions, never on the whole string.
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    disclosure = next((b for b in doc["blind_spots"] if "OPERATOR tier only" in b), None)
+    assert disclosure is not None
+    operator_clause, _, covered_clause = disclosure.partition("ONE analysis")
+    for name in ("flag_long_instructions", "check_phantom_refs", "detect_test_coverage",
+                 "_hooks_body_corpus", "_staleness_corpus"):
+        assert name in operator_clause, f"{name} must be in the operator-only clause"
+    assert "collect_promotion_candidates" not in operator_clause
+    assert "collect_promotion_candidates" in covered_clause
+    for name in ("flag_long_instructions", "check_phantom_refs", "detect_test_coverage",
+                 "_hooks_body_corpus", "_staleness_corpus"):
+        assert name not in covered_clause, f"{name} must not be in the covered-analysis clause"
+
+
+def test_compose_disclosure_names_the_surface_and_nested_limits(fake_harness, tmp_path):
+    # R4-7: the disclosure must not overclaim project-tier coverage -- it names the
+    # nested-CLAUDE.md exclusion explicitly and gives the reader the project:partial
+    # signal to check, so "0 project flags" is never misread as "project fully scanned".
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    doc = run_collector(fake_harness, "--compose", project_root=proj)
+    disclosure = next((b for b in doc["blind_spots"] if "OPERATOR tier only" in b), None)
+    assert disclosure is not None
+    assert "NESTED CLAUDE.md files are never scanned" in disclosure
+    assert "project:partial" in disclosure
+
+
 def test_non_compose_has_no_hygiene_scope_disclosure(fake_harness):
     proj, _slug = _active_slug(fake_harness)
     doc = run_collector(fake_harness, project_root=proj)

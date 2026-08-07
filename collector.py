@@ -6981,21 +6981,40 @@ def build_document(
             blind_spots.append(
                 "project-tier hygiene scan (feeding promotion_candidates) did not "
                 "complete; see collection_scope.hygiene_tiers.")
-        # T11 (disclose-and-defer, operator-approved 2026-07-22): the per-file hygiene
-        # analyses above (flag_long_instructions, _staleness_corpus, check_phantom_refs,
-        # collect_promotion_candidates, detect_test_coverage, _hooks_body_corpus) take no
-        # project_root and run OPERATOR-TIER-ONLY, even in --compose — a genuinely
-        # oversized/stale/phantom/promotion-candidate/untested PROJECT-tier file is never
-        # flagged by them. Full per-tier hygiene is deferred to v1.1 (see the plan); this
-        # discloses the current limitation so "0 project flags" is never misread as
-        # "project clean" ([[no-known-broken]]: a silent gap is a trap).
+        # TRK-023 T7 (R3-7/R4-7; the phantom-ref cut is recorded in the plan header and
+        # spec AMENDMENTS A64): of the six per-file hygiene analyses, ONE
+        # (collect_promotion_candidates) now covers the project tier, and only when
+        # --compose, --project-root, and a completed project scan all hold together (see
+        # project_hygiene_corpus/project_hygiene_scan_complete above and
+        # _hygiene_tiers_value's three-value contract). The other five --
+        # flag_long_instructions, _staleness_corpus, check_phantom_refs,
+        # detect_test_coverage, _hooks_body_corpus -- stay OPERATOR-TIER-ONLY.
+        # check_phantom_refs is deferred on a SECURITY-DESIGN ground, not merely unbuilt:
+        # it answers existence questions about attacker-influenced paths, which is an
+        # oracle when the input is untrusted (see the plan header's scope cut). The
+        # literal below is read by tests/test_collector.py::
+        # test_compose_hygiene_scans_are_operator_only_and_disclosed, which asserts the
+        # substring "OPERATOR tier only" and all six function names appear -- do not
+        # "clean up" this wording without checking that test first (rule 7: additions
+        # only, no editing an existing assertion).
         blind_spots.append(
-            "Compose mode: instruction_length_flags, staleness, phantom_refs, "
-            "promotion_candidates, test_coverage, and the hooks-body duplication corpus "
-            "(flag_long_instructions, _staleness_corpus, check_phantom_refs, "
-            "collect_promotion_candidates, detect_test_coverage, _hooks_body_corpus) scan "
-            "the OPERATOR tier only — project-tier files are NOT covered by these "
-            "analyses in v1.")
+            "Compose mode, per-file hygiene coverage. Five analyses scan the OPERATOR "
+            "tier only: flag_long_instructions (instruction_length_flags), "
+            "check_phantom_refs (phantom_refs), detect_test_coverage (test_coverage), "
+            "_hooks_body_corpus (the hooks-body duplication corpus), and _staleness_corpus "
+            "(the operator instruction corpus). A genuinely oversized, phantom-referencing "
+            "or untested PROJECT-tier file is still not flagged. ONE analysis "
+            "(collect_promotion_candidates -> promotion_candidates) can cover the project "
+            "tier, and does so ONLY when --compose is set AND --project-root is given AND "
+            "that project scan completes; its project-tier rows then carry tier=\"project\". "
+            "Read collection_scope.hygiene_tiers for what this run actually scanned: "
+            "[\"operator\"] means no project tier was scanned at all, "
+            "[\"operator\",\"project\"] means it was scanned completely, and "
+            "[\"operator\",\"project:partial\"] means it was attempted and incomplete — a "
+            "further blind_spots entry then names what was missed. Even when complete, that "
+            "scan covers the repo-root CLAUDE.md/CLAUDE.local.md and the .claude/ rules, "
+            "agents, commands and skills surfaces only: NESTED CLAUDE.md files are never "
+            "scanned.")
         # R2-B: name BOTH roots walked (today's `doc["root"]` is operator-only) — additive,
         # so a non-compose run's schema is byte-identical to before this field existed.
         project_containment_root = Path(project_root).expanduser().resolve() if project_root else None
