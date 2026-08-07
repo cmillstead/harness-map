@@ -8672,6 +8672,101 @@ def test_definition_version_validator_matches_render_html():
 
 
 # ============================================================================
+# TRK-082 T1 -- _disclose_unlistable_glob (helper only, not yet wired anywhere)
+# ============================================================================
+# glob() swallows PermissionError on the directory itself and returns [], which is
+# indistinguishable from an empty or absent directory (spec AMENDMENTS A59/A60; see
+# _hooks_body_corpus's docstring for the same defect, already fixed there via
+# os.scandir). This helper is the shared probe every other glob call site will adopt in
+# T2/T3 -- these tests pin its contract in isolation, calling it directly rather than
+# through any call site.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_disclose_unlistable_glob_locked_dir_with_match_records_directory(tmp_path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "match.md").write_text("x")
+    os.chmod(locked, 0)
+    try:
+        sink: list = []
+        _collector._disclose_unlistable_glob(tmp_path, "locked/*.md", [], sink, "demo")
+    finally:
+        os.chmod(locked, 0o755)
+    assert len(sink) == 1
+    assert str(locked) in sink[0]
+
+def test_disclose_unlistable_glob_empty_dir_no_record(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    sink: list = []
+    _collector._disclose_unlistable_glob(tmp_path, "empty/*.md", [], sink, "demo")
+    assert sink == []
+
+def test_disclose_unlistable_glob_absent_dir_no_record(tmp_path):
+    sink: list = []
+    _collector._disclose_unlistable_glob(tmp_path, "absent/*.md", [], sink, "demo")
+    assert sink == []
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_disclose_unlistable_glob_nonempty_matches_short_circuits_no_syscall(tmp_path):
+    """`matches` truthy must return before the scandir probe ever runs. Proven, not just
+    asserted: `locked` is genuinely 0o000 and DOES contain a real match, so if the helper
+    probed it anyway the probe would raise and append a record. An empty sink here is
+    only possible if the early return fired first."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "match.md").write_text("x")
+    os.chmod(locked, 0)
+    try:
+        sink: list = []
+        fake_matches = [Path("already-found.md")]
+        _collector._disclose_unlistable_glob(tmp_path, "locked/*.md", fake_matches, sink, "demo")
+    finally:
+        os.chmod(locked, 0o755)
+    assert sink == []
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_disclose_unlistable_glob_wildcard_dir_component_early_return(tmp_path):
+    """A wildcard in the pattern's directory component has no single directory to probe
+    and must return early, silently. Proven, not just asserted: `*` is also a legal POSIX
+    filename, so a real directory literally named `*` sits under `skills/`, containing a
+    genuinely locked `rules/` with a real match inside. If the wildcard check were
+    missing, `base / "skills/*/rules"` would resolve to that REAL locked directory and
+    raise, appending a record -- the same shape as the previous test's proof, applied to
+    the wildcard-vs-literal-dirname branch instead of the matches-truthy branch."""
+    star_dir = tmp_path / "skills" / "*" / "rules"
+    star_dir.mkdir(parents=True)
+    (star_dir / "match.md").write_text("x")
+    os.chmod(star_dir, 0)
+    try:
+        sink: list = []
+        _collector._disclose_unlistable_glob(
+            tmp_path, "skills/*/rules/*.md", [], sink, "demo")
+    finally:
+        os.chmod(star_dir, 0o755)
+    assert sink == []
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_disclose_unlistable_glob_dir_part_probes_subdir_not_base(tmp_path):
+    """A pattern with a directory part (`rules/*.md`) must probe `base/rules`, the
+    directory the glob actually reads, not `base` itself. Proven, not just asserted:
+    `tmp_path` (the base) is left readable throughout, so a buggy probe of `base` instead
+    of `base/rules` would find nothing wrong and leave `sink` empty. Only probing the
+    genuinely-locked `rules/` subdirectory produces the record this test requires."""
+    rules_dir = tmp_path / "rules"
+    rules_dir.mkdir()
+    (rules_dir / "match.md").write_text("x")
+    os.chmod(rules_dir, 0)
+    try:
+        sink: list = []
+        _collector._disclose_unlistable_glob(tmp_path, "rules/*.md", [], sink, "demo")
+    finally:
+        os.chmod(rules_dir, 0o755)
+    assert len(sink) == 1
+    assert str(rules_dir) in sink[0]
+
+
+# ============================================================================
 # TRK-049 T3 -- real-root acceptance test
 # ============================================================================
 # Complements the pathological_harness battery above (conftest.py:61): that corpus is

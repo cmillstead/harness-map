@@ -11,6 +11,7 @@ import ast
 import errno
 import json
 import os
+import posixpath
 import re
 import secrets
 import shlex
@@ -394,6 +395,52 @@ def _safe_exists(path):
         return (_probe_exists(path) or _probe_is_symlink(path)), True
     except OSError:
         return False, False
+
+
+def _disclose_unlistable_glob(base: Path, pattern: str, matches, sink: list[str],
+                              label: str) -> None:
+    """glob() cannot tell an empty directory from an unreadable one (spec AMENDMENTS
+    A59/A60). MEASURED on CPython 3.11.14 against a real 0o000 dir with a genuine match
+    inside it: `Path.glob()` raises nothing and returns `[]` -- indistinguishable from a
+    directory that is merely empty or absent. `os.scandir` DOES raise, so this probes it
+    -- but ONLY on the empty-result path (an empty glob is common and legitimate; the
+    extra syscall must not land on every call site unconditionally).
+
+    `pattern` is a glob pattern STRING, always forward-slash-separated regardless of
+    platform (mirroring the profile's `hook_script_globs`/`container_dirs` convention
+    elsewhere in this file) -- `posixpath.dirname`, not `pathlib`, is deliberate here:
+    it parses the pattern's directory component as text, before any `Path` is built from
+    it.
+
+    A wildcard in the directory component (`skills/*/rules/*.md`) has no single
+    directory to probe -- that half of the blind spot is covered separately by a
+    `blind_spots` disclosure (TRK-082 T4), and this function returns early, silently, so
+    every call site can hand its raw pattern here without first hand-classifying it.
+
+    An ABSENT target directory returns with no record: a harness that simply lacks an
+    optional directory is not a blind spot, and reporting one here would be the exact
+    false-positive TRK-050's review caught and reversed. Only a PRESENT-but-unlistable
+    directory is recorded, naming it by path.
+
+    The probe consumes at most one entry off the scandir iterator, purely to force the
+    syscall -- it never sorts, collects, or exposes entry names, so this stays
+    deterministic across `PYTHONHASHSEED` like every other signal in this file. The
+    residual TOCTOU gap (the directory could still change state between this probe and
+    the `glob()` call it is disclosing for) is accepted, not engineered around -- the
+    goal is to stop reporting a locked surface as clean, not to close a race."""
+    if matches:
+        return
+    dirpart = posixpath.dirname(pattern)
+    if any(c in dirpart for c in "*?["):
+        return
+    target = base / dirpart if dirpart else base
+    try:
+        with os.scandir(target) as it:
+            next(iter(it), None)
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        sink.append(f"{label} listing failed for {target}: {e}")
 
 
 def _resolves_inside_root(candidate, root, root_stat):
