@@ -4603,6 +4603,13 @@ QUALITY_UNMEASURED = "unmeasured"
 # Changing these keys requires a spec change (S6 §6.5a).
 _SCOPE_FIELDS = ("root", "project_root", "compose")
 
+# TRK-023 T5 (R3-8): the exact three literals `collector.py`'s `_hygiene_tiers_value` can
+# produce for `collection_scope["hygiene_tiers"]`. Validated to the EMITTER's actual
+# output, not to a looser shape ("any list of two known strings") that would also accept
+# `[]`, `null`, a bare string, `["project"]`, a reversed pair, or duplicates -- none of
+# which the emitter can produce. Changing this value requires a spec change (SPEC_6 §6.5a).
+_HYGIENE_TIERS_VALUES = (["operator"], ["operator", "project"], ["operator", "project:partial"])
+
 
 def metric_quality_state(doc: Any, metric: Any) -> str:
     """The recorded quality state of one metric on one sidecar, or `unmeasured`.
@@ -4629,15 +4636,27 @@ def _scope_readable(scope: Any) -> bool:
     """True iff `scope` is a `collection_scope` this module can compare field-by-field:
     a dict carrying all three fields at their emitted types (`root` a str,
     `project_root` a str or null -- a null scope is a DISTINCT scope, never "unset" --
-    and `compose` a bool). Anything else is UNKNOWN."""
+    and `compose` a bool). Anything else is UNKNOWN.
+
+    TRK-023 T5 (R3-8): `hygiene_tiers`, when PRESENT, is validated to exactly the three
+    literals `_HYGIENE_TIERS_VALUES` names -- an old sidecar that never emitted the field
+    keeps passing unchanged. This validates one named field's VALUE; it is NOT a key
+    whitelist. Rejecting a KEY this function does not name would destroy the property
+    `scope_comparable` depends on ("differing in ANY field includes a field this module
+    does not yet name") -- an unknown key must stay permitted, only `hygiene_tiers`'s
+    value is tightened."""
     if not isinstance(scope, dict):
         return False
     if not all(field in scope for field in _SCOPE_FIELDS):
         return False
     project_root = scope["project_root"]
-    return (isinstance(scope["root"], str)
+    if not (isinstance(scope["root"], str)
             and (project_root is None or isinstance(project_root, str))
-            and isinstance(scope["compose"], bool))
+            and isinstance(scope["compose"], bool)):
+        return False
+    if "hygiene_tiers" in scope and scope["hygiene_tiers"] not in _HYGIENE_TIERS_VALUES:
+        return False
+    return True
 
 
 def scope_comparable(scopes: Any) -> bool:

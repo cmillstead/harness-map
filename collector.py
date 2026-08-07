@@ -107,13 +107,21 @@ _METRIC_INPUT_PREFIXES: dict[str, tuple[str, ...]] = {
     "always_loaded_words":        ("CLAUDE.md", "memory/", "rules/", "skills/"),
     "always_loaded_tokens_est":   ("CLAUDE.md", "memory/", "rules/", "skills/"),
     "always_loaded_file_count":   ("CLAUDE.md", "memory/", "rules/", "skills/"),
-    "duplicate_pair_count":       ("CLAUDE.md", "rules/", "skills/", "hooks/"),
+    "duplicate_pair_count":       ("CLAUDE.md", "rules/", "skills/", "hooks/",
+                                   ".claude/", "CLAUDE.local.md"),
     "instruction_files_over_200": ("CLAUDE.md", "rules/", "skills/", "commands/",
                                    "agents/", "hooks/"),
     "orphan_registration_count":  ("settings.json", "hooks/"),
     "orphan_script_count":        ("hooks/",),
+    # TRK-023 T6: ".claude/" + "CLAUDE.local.md" cover the project-tier hygiene
+    # corpus's rel-path shapes (relative to project_root, not root) -- neither the
+    # pre-existing "CLAUDE.md" prefix nor "rules/"/"agents/"/"commands/"/"skills/"
+    # match a project-tier path ("CLAUDE.local.md".startswith("CLAUDE.md") is
+    # False; ".claude/rules/a.md" does not start with "rules/"). The phantom pair
+    # is excluded: its detector was cut from TRK-023 slice A, so it no longer
+    # reads project files at all.
     "promotion_candidate_count":  ("CLAUDE.md", "rules/", "skills/", "commands/",
-                                   "agents/"),
+                                   "agents/", ".claude/", "CLAUDE.local.md"),
     "memory_body_count":          ("memory/", "projects/"),
     "phantom_ref_count":          ("CLAUDE.md", "rules/", "skills/", "commands/",
                                    "agents/"),
@@ -4969,6 +4977,10 @@ def _ordered_capped_shingles(words, k=SHINGLE_K, cap=MAX_SHINGLES_PER_FILE):
 _PROJECT_DUP_SURFACE_DIRS = ((".claude/rules", "*.md"), (".claude/agents", "*.md"),
                              (".claude/commands", "*.md"))
 
+# TRK-023 slice A: project-tier always-loaded instruction files fed into the hygiene
+# corpus -- the project analog of the operator corpus's `root_instructions` file.
+_PROJECT_HYGIENE_ROOT_FILES = ("CLAUDE.md", "CLAUDE.local.md")
+
 
 def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs):
     """Project-tier half of the M4 cross-tier duplication corpus (T4): `.claude/rules`,
@@ -5064,6 +5076,208 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
             continue
         corpus.append((_rel(project_root, fp), "project", shingles))
     return corpus
+
+
+def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of_root_refs):
+    """Project-tier hygiene corpus feeding `collect_promotion_candidates`'s project half
+    (TRK-023 T2). Three surface groups, read in this fixed order:
+      1. `<repo>/CLAUDE.md` and `<repo>/CLAUDE.local.md` -- the project's own always-loaded
+         instructions, the closest analog of the operator corpus's `root_instructions` file.
+      2. Each `(rel_dir, pattern)` in `_PROJECT_DUP_SURFACE_DIRS` (`.claude/rules/*.md`,
+         `.claude/agents/*.md`, `.claude/commands/*.md`).
+      3. Each project skill's `<repo>/.claude/skills/<name>/SKILL.md`.
+
+    EVERY read routes through `_project_tier_gate` + `_read_project_file` (H2) -- an
+    escaping symlink is recorded to `out_of_root_refs` and NEVER read. Unlike
+    `_project_tier_duplication_corpus` (spec AMENDMENTS A64 known gap, left as-is there
+    per this ticket's scope fence), EVERY surface directory here -- each
+    `_PROJECT_DUP_SURFACE_DIRS` entry AND `.claude/skills` itself -- is also gated through
+    `_project_tier_gate` BEFORE it is globbed or `iterdir()`'d (post-exec Codex review F1):
+    an escaping symlink whose target is EMPTY used to be completely silent, since there
+    was nothing left to gate at the file/child level once enumeration found no
+    candidates; gating the directory first closes that regardless of whether the
+    escaping target is empty or populated. `_probe_is_dir` still runs before the gate on
+    each surface directory, so a genuinely absent one is skipped silently (matching step
+    1's "absent is normal" contract) rather than misread as an escape. No byte outside
+    `project_root` ever crosses the gate. The skill DIRECTORY is gated before its
+    `SKILL.md` is even probed for existence, unlike the duplication-corpus template this
+    function is modelled on: that template probes `SKILL.md` before the per-candidate
+    gate runs, making the file's presence an existence oracle for an escaping skill
+    directory (spec AMENDMENTS A64); this new code does not copy that shape.
+
+    Unlike `_project_tier_duplication_corpus`, `_read_project_file` returning
+    `text is None` is recorded to `inaccessible` here -- a deliberate divergence: the
+    template drops a read failure silently, a known `inaccessible != clean` gap this new
+    corpus must not inherit.
+
+    Returns `(corpus, scan_complete)`, mirroring `_hooks_body_corpus`'s established
+    `(corpus, complete)` two-tuple shape -- not a new invention. `scan_complete` is
+    `False` if ANY surface could not be fully examined: an unstattable containment root,
+    a gate refusal, an unlistable or locked surface directory, an oversize file, a
+    vanished/unstat-able candidate, or an unreadable file -- so a genuinely-empty scan is
+    structurally distinguishable from one that silently lost data (spec Design section
+    F3): `project is not None` alone cannot tell "scanned, found nothing" from "could not
+    read", and `scan_complete` is the channel that makes the difference visible."""
+    project_root = Path(project_root)
+    scan_complete = True
+    corpus: list[tuple[str, str]] = []
+    seen_refs: set[str] = set()
+    seen_physical: set[Any] = set()
+    try:
+        containment_stat = os.stat(project_root)
+    except OSError as e:
+        # F3 path 3, the silent one in the template: a bare `return corpus` records
+        # nothing anywhere. This corpus must not inherit that -- disclose and degrade.
+        blind_spots.append(f"project root not probed for hygiene scan: {e}")
+        return corpus, False
+
+    candidates: list[Path] = []
+
+    # 1. Repo-root always-loaded instructions. Absent is normal (never a blind spot);
+    #    an undeterminable presence (a locked ancestor) is recorded to `inaccessible`,
+    #    mirroring `_hooks_body_corpus`'s `_safe_exists` + not-ok handling.
+    for fname in _PROJECT_HYGIENE_ROOT_FILES:
+        fp = project_root / fname
+        present, ok = _safe_exists(fp)
+        if not ok:
+            _append_inaccessible_once(inaccessible, _rel_safe(project_root, fp))
+            scan_complete = False
+            continue
+        if present:
+            candidates.append(fp)
+
+    # 2. `.claude/{rules,agents,commands}` -- same enumeration shape
+    #    `_project_tier_duplication_corpus` uses (spec Design F5/R3-6: keeping the
+    #    template's shape here rather than diverging from its sibling), EXCEPT for the
+    #    post-exec Codex review F1 fix below: the surface DIRECTORY itself is gated
+    #    through `_project_tier_gate` before its contents are ever globbed, not merely
+    #    the resulting candidate files. `_probe_is_dir` runs first and swallows a
+    #    genuinely absent directory silently (matching step 1's "absent is normal"
+    #    contract) -- it also follows a symlink to determine whether SOMETHING is a
+    #    directory there, without enumerating any child, so an escaping symlink to an
+    #    EMPTY target is no longer silent: gating runs before the glob that would
+    #    otherwise find nothing to record. Mirrors the shipped `_walk_project_tier`
+    #    rules_dir shape (is_dir, then gate, then glob) rather than the duplication-
+    #    corpus template, which still enumerates before gating (spec AMENDMENTS A64
+    #    known gap, left as-is in that sibling function per this ticket's scope fence).
+    for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
+        d = project_root / rel_dir
+        try:
+            d_is_dir = _probe_is_dir(d)
+        except OSError as e:
+            blind_spots.append(f"project {rel_dir} not probed for hygiene scan: {e}")
+            scan_complete = False
+            continue
+        if not d_is_dir:
+            continue
+        contained, _identity = _project_tier_gate(d, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, d)
+            scan_complete = False
+            continue                       # never glob an escaping directory's children
+        try:
+            dir_matches = sorted(d.glob(pattern))
+        except OSError as e:
+            blind_spots.append(f"project {rel_dir} not probed for hygiene scan: {e}")
+            scan_complete = False
+            continue
+        candidates.extend(dir_matches)
+        # _disclose_unlistable_glob returns None; its only effect is an append to
+        # blind_spots when the directory is present but unlistable -- detect that
+        # by length delta rather than reimplementing its scandir probe here.
+        before = len(blind_spots)
+        _disclose_unlistable_glob(d, pattern, dir_matches, blind_spots,
+                                   "project hygiene corpus")
+        if len(blind_spots) > before:
+            scan_complete = False
+
+    # 3. Each project skill's SKILL.md -- the skill DIRECTORY is gated BEFORE its
+    #    SKILL.md is even probed for existence (see docstring: the addendum fix this
+    #    new code must apply that the duplication-corpus template does not). F1: the
+    #    `.claude/skills` surface directory itself gets the SAME directory-level gate as
+    #    step 2 above, before it is ever probed with `iterdir()` -- previously only the
+    #    per-skill subdirectories were gated, leaving `.claude/skills` itself as silent
+    #    as the step-2 hole when the escaping target was empty.
+    skills_dir = project_root / ".claude" / "skills"
+    try:
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
+    except OSError as e:
+        blind_spots.append(f"project skills is_dir failed for hygiene scan: {e}")
+        scan_complete = False
+        skills_dir_is_dir = False
+    skills_dir_contained = False
+    if skills_dir_is_dir:
+        skills_dir_contained, _identity = _project_tier_gate(
+            skills_dir, project_root, containment_stat)
+        if not skills_dir_contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skills_dir)
+            scan_complete = False
+    if skills_dir_is_dir and skills_dir_contained:
+        try:
+            skill_entries = sorted(skills_dir.iterdir())
+        except OSError as e:
+            blind_spots.append(f"project skills listing failed for hygiene scan: {e}")
+            scan_complete = False
+            skill_entries = []
+        skill_dirs = []
+        for p in skill_entries:
+            try:
+                if _probe_is_dir(p):
+                    skill_dirs.append(p)
+            except OSError as e:
+                # A single unlistable/unstat-able child must not abort the whole
+                # comprehension and discard every sibling with it (TRK-050 T2).
+                blind_spots.append(f"project skills child is_dir failed for {p}: {e}")
+                scan_complete = False
+        for skill_dir in skill_dirs:
+            contained, _identity = _project_tier_gate(skill_dir, project_root, containment_stat)
+            if not contained:
+                _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skill_dir)
+                scan_complete = False
+                continue                       # never probe SKILL.md beneath an escaping dir
+            skill_md = skill_dir / "SKILL.md"
+            present, ok = _safe_exists(skill_md)
+            if not ok:
+                _append_inaccessible_once(inaccessible, _rel_safe(project_root, skill_md))
+                scan_complete = False
+                continue
+            if present:
+                candidates.append(skill_md)
+
+    for fp in candidates:
+        key = _physical_key(fp)
+        if key in seen_physical:
+            continue
+        seen_physical.add(key)
+        contained, _identity = _project_tier_gate(fp, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, fp)
+            scan_complete = False
+            continue
+        try:
+            size = fp.stat().st_size
+        except OSError:
+            # F3 path 3b, the other silent one: a bare `continue` here records nothing --
+            # a file removed or locked between the gate and this stat vanishes with no
+            # trace. Record it instead.
+            _append_inaccessible_once(inaccessible, _rel_safe(project_root, fp))
+            scan_complete = False
+            continue
+        if size > MAX_FILE_BYTES:
+            blind_spots.append(
+                f"{_rel(project_root, fp)} exceeds {MAX_FILE_BYTES} bytes; skipped in hygiene corpus.")
+            scan_complete = False
+            continue
+        text, _evidence = _read_project_file(fp, project_root, containment_stat)
+        if text is None:
+            # Deliberate divergence from `_project_tier_duplication_corpus`, which drops
+            # a read failure silently -- reproducing that here would ship a known
+            # `inaccessible != clean` gap in new code.
+            _append_inaccessible_once(inaccessible, _rel_safe(project_root, fp))
+            scan_complete = False
+            continue
+        corpus.append((_rel(project_root, fp), text))
+    return corpus, scan_complete
 
 
 def scan_duplication(
@@ -5713,6 +5927,7 @@ def collect_promotion_candidates(
     settings: dict[str, Any],
     *,
     profile: dict[str, Any] | None = None,
+    project_corpus: list[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Prose in an instruction file that reads like a hard rule (NEVER/ALWAYS/must, a
     numeric cap, a required-file assertion) but may have no corresponding hook enforcing
@@ -5722,8 +5937,17 @@ def collect_promotion_candidates(
     M11 (SPEC_7 §2): `profile` is forwarded to _hooks_body_corpus so a non-default profile's
     hooks corpus is read from ITS hooks dir, not PROFILE_CLAUDE_CODE's; corpus_files itself
     already arrives pre-built by this function's caller, so nothing else here needs to read
-    the profile directly."""
-    candidates: list[dict[str, Any]] = []
+    the profile directly.
+
+    TRK-023 T4: `project_corpus` is the project-tier half of the same scan (compose-only,
+    built by `_project_tier_hygiene_corpus`). `project_corpus is not None` is the SINGLE
+    authoritative state for tier tagging — there is no second `compose` flag here — so a
+    non-compose or project-root-less caller that omits it gets byte-identical untagged
+    rows, and a caller that supplies it (even an empty list) gets every row tagged
+    `"tier": "operator"` or `"tier": "project"`. Both halves share `combined_lower`: a
+    project rule's `hook_covered` cross-references the same OPERATOR hook corpus a plain
+    operator rule does — there is no project-tier hook corpus to build."""
+    tag_tier = project_corpus is not None
     # `complete` is unused HERE on purpose: every promotion candidate already ships as
     # evidence=INFERRED and `hook_covered` is an advisory hint, not a verdict, so there is
     # no confident negative to downgrade. `inaccessible` is not threaded in either — the
@@ -5733,18 +5957,28 @@ def collect_promotion_candidates(
     commands_lower = "\n".join(_iter_hook_commands(settings)).lower()
     combined_lower = hooks_corpus_lower + "\n" + commands_lower
 
-    for rel_path, text in corpus_files:
-        for pattern_name, regex in _PROMOTION_PATTERNS:
-            for m in regex.finditer(text):
-                excerpt = _excerpt_around(text, m.start(), m.end())
-                hook_covered = _hook_covered(excerpt, m.group(0), combined_lower)
-                candidates.append({
-                    "source": rel_path,
-                    "pattern": pattern_name,
-                    "excerpt": excerpt,
-                    "hook_covered": hook_covered,
-                    "evidence": "INFERRED",
-                })
+    def _scan(corpus: list[tuple[str, str]], tier: str | None) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for rel_path, text in corpus:
+            for pattern_name, regex in _PROMOTION_PATTERNS:
+                for m in regex.finditer(text):
+                    excerpt = _excerpt_around(text, m.start(), m.end())
+                    hook_covered = _hook_covered(excerpt, m.group(0), combined_lower)
+                    row = {
+                        "source": rel_path,
+                        "pattern": pattern_name,
+                        "excerpt": excerpt,
+                        "hook_covered": hook_covered,
+                        "evidence": "INFERRED",
+                    }
+                    if tier is not None:
+                        row["tier"] = tier
+                    rows.append(row)
+        return rows
+
+    candidates = _scan(corpus_files, "operator" if tag_tier else None)
+    if project_corpus is not None:
+        candidates.extend(_scan(project_corpus, "project"))
     return candidates
 
 
@@ -6492,7 +6726,9 @@ def iter_input_paths(
 
 
 def _metric_quality(inaccessible: list[dict[str, Any]],
-                     duplication_section: dict[str, Any]) -> dict[str, str]:
+                     duplication_section: dict[str, Any],
+                     *,
+                     project_hygiene_scan_incomplete: bool = False) -> dict[str, str]:
     """Per-metric measurement-state (S6c §6.5a axis 3): `complete | partial | saturated`
     for every key in METRIC_DEFINITIONS, iterating `sorted(METRIC_DEFINITIONS)` for
     cross-`PYTHONHASHSEED` determinism (`unmeasured` is set only by `_empty_document`, on
@@ -6505,9 +6741,19 @@ def _metric_quality(inaccessible: list[dict[str, Any]],
     never be tainted -- it is always `complete`, never inspected means never partially
     inspected.
 
+    Post-exec Codex review F2: `inaccessible[]` is not the only way a metric's input can
+    go unmeasured. `_project_tier_hygiene_corpus`'s oversize-file branch (and other
+    non-`inaccessible` degradation paths it may gain) sets `scan_complete=False` while
+    recording ONLY a `blind_spots` entry, so no `_METRIC_INPUT_PREFIXES` taint could ever
+    catch it. `project_hygiene_scan_incomplete` is that additional, explicitly-threaded
+    signal (never a module-level global) -- when True it forces
+    `promotion_candidate_count` to `partial`, and ONLY that metric: `duplicate_pair_count`
+    is fed by the separate `_project_tier_duplication_corpus`, whose own completeness
+    signal is unrelated and pre-existing, and is deliberately left alone (scope fence).
+
     Registered in the T5.1 totality guard (`_TOTALITY_TARGETS`,
-    tests/test_render_html.py): unlike its S6b neighbors, both arguments here are
-    structures THIS SAME RUN just built in-process, never values parsed back out of a
+    tests/test_render_html.py): unlike its S6b neighbors, both positional arguments here
+    are structures THIS SAME RUN just built in-process, never values parsed back out of a
     past run's sidecar -- but shape-guarded regardless (`isinstance` checks below) so a
     future caller passing a malformed structure degrades to `complete` rather than
     raising, the same total-function property every registered entry shares."""
@@ -6520,12 +6766,32 @@ def _metric_quality(inaccessible: list[dict[str, Any]],
             quality[metric] = "saturated"
             continue
         prefixes = _METRIC_INPUT_PREFIXES.get(metric, ())
-        if prefixes and any(isinstance(path, str) and path.startswith(prefix)
-                             for path in paths for prefix in prefixes):
-            quality[metric] = "partial"
-        else:
-            quality[metric] = "complete"
+        tainted = bool(prefixes and any(isinstance(path, str) and path.startswith(prefix)
+                                         for path in paths for prefix in prefixes))
+        if metric == "promotion_candidate_count" and project_hygiene_scan_incomplete:
+            tainted = True
+        quality[metric] = "partial" if tainted else "complete"
     return quality
+
+
+def _hygiene_tiers_value(project_corpus: list[tuple[str, str]] | None,
+                          scan_complete: bool) -> list[str]:
+    """TRK-023 T5 (R3-5): the compose-only `collection_scope["hygiene_tiers"]` value, in
+    exactly three fixed literals -- never a two-value collapse. Collapsing an INCOMPLETE
+    project scan into the same value as NO project scan would let two runs that failed in
+    different ways carry an identical scope and compare, so a partial scan could chart a
+    false improvement against a run that never attempted the project tier at all.
+
+    `project_corpus is None` means no project tier was scanned AT ALL (non-compose, or
+    compose with `project_root=None`) -- `["operator"]`. A non-`None` corpus that finished
+    is scope-distinct from one that did not, so `project:partial` is its own third value,
+    never merged into either neighbor. Changing this value requires a spec change
+    (SPEC_6 §6.5a)."""
+    if project_corpus is None:
+        return ["operator"]
+    if scan_complete:
+        return ["operator", "project"]
+    return ["operator", "project:partial"]
 
 
 def build_document(
@@ -6589,9 +6855,19 @@ def build_document(
                                             compose=compose, out_of_root_refs=out_of_root_refs,
                                             profile=profile)
     corpus_files = _staleness_corpus(root, inaccessible, blind_spots, profile=profile)
+    # TRK-023 T5: the project half of the hygiene corpus, compose-only. Gated on the SAME
+    # (compose and project_root is not None) condition scan_duplication already uses --
+    # one gate, one meaning. `check_phantom_refs` is NOT wired to it (cut from this
+    # slice by operator ruling; see the plan header).
+    project_hygiene_corpus: list[tuple[str, str]] | None = None
+    project_hygiene_scan_complete = True
+    if compose and project_root is not None:
+        project_hygiene_corpus, project_hygiene_scan_complete = _project_tier_hygiene_corpus(
+            project_root, inaccessible, blind_spots, out_of_root_refs)
     phantom_refs = check_phantom_refs(root, corpus_files, inaccessible, blind_spots, profile=profile)
-    promotion_candidates = collect_promotion_candidates(root, corpus_files, settings,
-                                                         profile=profile)
+    promotion_candidates = collect_promotion_candidates(
+        root, corpus_files, settings, profile=profile,
+        project_corpus=project_hygiene_corpus)
     # S2 gate fix: git-age SIGNAL only (never a "stale" verdict). Topology is discovered
     # ONCE and collect_git_age is pure with respect to it, so git_age_available can never
     # disagree with the timestamps it labels (Codex #5). `available` replaces the deleted
@@ -6738,27 +7014,65 @@ def build_document(
                             if project_root is not None else None,
             "compose": bool(compose),
         },
-        "metric_quality": _metric_quality(inaccessible, duplication_section),
+        "metric_quality": _metric_quality(
+            inaccessible, duplication_section,
+            project_hygiene_scan_incomplete=(project_hygiene_corpus is not None
+                                              and not project_hygiene_scan_complete)),
         "inaccessible": inaccessible,
         "blind_spots": blind_spots,
         "errors": errors,
     }
     if compose:
-        # T11 (disclose-and-defer, operator-approved 2026-07-22): the per-file hygiene
-        # analyses above (flag_long_instructions, _staleness_corpus, check_phantom_refs,
-        # collect_promotion_candidates, detect_test_coverage, _hooks_body_corpus) take no
-        # project_root and run OPERATOR-TIER-ONLY, even in --compose — a genuinely
-        # oversized/stale/phantom/promotion-candidate/untested PROJECT-tier file is never
-        # flagged by them. Full per-tier hygiene is deferred to v1.1 (see the plan); this
-        # discloses the current limitation so "0 project flags" is never misread as
-        # "project clean" ([[no-known-broken]]: a silent gap is a trap).
+        # R3-5: the value records WHICH TIERS WERE FULLY SCANNED, and an incomplete
+        # project scan is a DISTINCT scope from a complete one -- see the three-value
+        # contract in _hygiene_tiers_value's docstring. cast (not assert), matching the
+        # M1 typing-only precedent above: `doc`'s inferred value type is too wide for
+        # mypy to index into a second time with zero runtime effect either way.
+        cast(dict[str, Any], doc["collection_scope"])["hygiene_tiers"] = (
+            _hygiene_tiers_value(project_hygiene_corpus, project_hygiene_scan_complete))
+        if project_hygiene_corpus is not None and not project_hygiene_scan_complete:
+            # R3-5: the degradation is visible in the report, not only in the scope
+            # field -- a reader scanning blind_spots must not have to know to look at
+            # collection_scope.hygiene_tiers to learn the project-tier scan was partial.
+            blind_spots.append(
+                "project-tier hygiene scan (feeding promotion_candidates) did not "
+                "complete; see collection_scope.hygiene_tiers.")
+        # TRK-023 T7 (R3-7/R4-7; the phantom-ref cut is recorded in the plan header and
+        # spec AMENDMENTS A64): of the six per-file hygiene analyses, ONE
+        # (collect_promotion_candidates) now covers the project tier whenever --compose
+        # and --project-root both hold (see project_hygiene_corpus/
+        # project_hygiene_scan_complete above and _hygiene_tiers_value's three-value
+        # contract) -- including a PARTIAL scan's readable rows, which are still emitted,
+        # never withheld (post-exec Codex review F6; T4's collect_promotion_candidates
+        # tags every row on `project_corpus is not None` alone, with no separate
+        # completeness gate). The other five -- flag_long_instructions, _staleness_corpus,
+        # check_phantom_refs, detect_test_coverage, _hooks_body_corpus -- stay
+        # OPERATOR-TIER-ONLY. check_phantom_refs is deferred on a SECURITY-DESIGN ground,
+        # not merely unbuilt: it answers existence questions about attacker-influenced
+        # paths, which is an oracle when the input is untrusted (see the plan header's
+        # scope cut). The literal below is read by tests/test_collector.py::
+        # test_compose_hygiene_scans_are_operator_only_and_disclosed, which asserts the
+        # substring "OPERATOR tier only" and all six function names appear -- do not
+        # "clean up" this wording without checking that test first (rule 7: additions
+        # only, no editing an existing assertion).
         blind_spots.append(
-            "Compose mode: instruction_length_flags, staleness, phantom_refs, "
-            "promotion_candidates, test_coverage, and the hooks-body duplication corpus "
-            "(flag_long_instructions, _staleness_corpus, check_phantom_refs, "
-            "collect_promotion_candidates, detect_test_coverage, _hooks_body_corpus) scan "
-            "the OPERATOR tier only — project-tier files are NOT covered by these "
-            "analyses in v1.")
+            "Compose mode, per-file hygiene coverage. Five analyses scan the OPERATOR "
+            "tier only: flag_long_instructions (instruction_length_flags), "
+            "check_phantom_refs (phantom_refs), detect_test_coverage (test_coverage), "
+            "_hooks_body_corpus (the hooks-body duplication corpus), and _staleness_corpus "
+            "(the operator instruction corpus). A genuinely oversized, phantom-referencing "
+            "or untested PROJECT-tier file is still not flagged. ONE analysis "
+            "(collect_promotion_candidates -> promotion_candidates) can cover the project "
+            "tier, and does so whenever --compose is set AND --project-root is given -- "
+            "including a PARTIAL scan's readable rows, which are still emitted with "
+            "tier=\"project\", never withheld. Read collection_scope.hygiene_tiers for "
+            "what this run actually scanned: [\"operator\"] means no project tier was "
+            "scanned at all, [\"operator\",\"project\"] means it was scanned completely, "
+            "and [\"operator\",\"project:partial\"] means it was attempted and incomplete "
+            "— a further blind_spots entry then names what was missed. Even when "
+            "complete, that scan covers the repo-root CLAUDE.md/CLAUDE.local.md and the "
+            ".claude/ rules, agents, commands and skills surfaces only: NESTED CLAUDE.md "
+            "files are never scanned.")
         # R2-B: name BOTH roots walked (today's `doc["root"]` is operator-only) — additive,
         # so a non-compose run's schema is byte-identical to before this field existed.
         project_containment_root = Path(project_root).expanduser().resolve() if project_root else None
