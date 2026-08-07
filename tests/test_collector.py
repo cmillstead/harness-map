@@ -6350,6 +6350,44 @@ def test_non_compose_metric_quality_unchanged_by_new_taint_prefixes(fake_harness
     assert doc["metric_quality"]["duplicate_pair_count"] == "partial"
 
 
+def test_incomplete_project_hygiene_scan_taints_promotion_candidate_count(tmp_path):
+    # Post-exec Codex review F2: `_metric_quality` only ever consulted `inaccessible[]`,
+    # but an oversize project-tier file (`_project_tier_hygiene_corpus`'s MAX_FILE_BYTES
+    # branch) sets `scan_complete=False` and records ONLY a blind_spots entry -- it is
+    # never appended to `inaccessible`, so no `_METRIC_INPUT_PREFIXES` taint check could
+    # ever catch it. Before this fix, two runs that were BOTH partial in this exact way
+    # shared identical scope AND identical (wrongly-`complete`) metric_quality, letting a
+    # trend verdict compare them as if the corpus had been read in full both times.
+    root = tmp_path / "harness"
+    root.mkdir()
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "huge.md").write_text("word " * 60000)  # > MAX_FILE_BYTES
+    doc = _collector.build_document(root, proj, compose=True)
+    assert doc["collection_scope"]["hygiene_tiers"] == ["operator", "project:partial"]
+    assert not any(e["path"] == ".claude/rules/huge.md" for e in doc["inaccessible"])
+    assert doc["metric_quality"]["promotion_candidate_count"] == "partial"
+    # scope fence: duplicate_pair_count is fed by a DIFFERENT function
+    # (_project_tier_duplication_corpus) whose own completeness signal is unrelated and
+    # pre-existing -- this fix must not touch it.
+    assert doc["metric_quality"]["duplicate_pair_count"] == "complete"
+
+
+def test_complete_project_hygiene_scan_leaves_promotion_candidate_count_complete(tmp_path):
+    # Regression pin for the fix above: a project scan that genuinely completes must NOT
+    # be downgraded to partial just because compose+project_root were given.
+    root = tmp_path / "harness"
+    root.mkdir()
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    (proj / ".claude" / "rules" / "a.md").write_text("NEVER commit secrets.\n")
+    doc = _collector.build_document(root, proj, compose=True)
+    assert doc["collection_scope"]["hygiene_tiers"] == ["operator", "project"]
+    assert doc["metric_quality"]["promotion_candidate_count"] == "complete"
+
+
 def test_empty_document_carries_scope_and_quality(fake_harness):
     """Envelope rule (binding rule 5). A crashed run measured nothing, so every metric is
     `unmeasured` -- never `complete`, which would let a crash envelope claim a measurement

@@ -6726,7 +6726,9 @@ def iter_input_paths(
 
 
 def _metric_quality(inaccessible: list[dict[str, Any]],
-                     duplication_section: dict[str, Any]) -> dict[str, str]:
+                     duplication_section: dict[str, Any],
+                     *,
+                     project_hygiene_scan_incomplete: bool = False) -> dict[str, str]:
     """Per-metric measurement-state (S6c §6.5a axis 3): `complete | partial | saturated`
     for every key in METRIC_DEFINITIONS, iterating `sorted(METRIC_DEFINITIONS)` for
     cross-`PYTHONHASHSEED` determinism (`unmeasured` is set only by `_empty_document`, on
@@ -6739,9 +6741,19 @@ def _metric_quality(inaccessible: list[dict[str, Any]],
     never be tainted -- it is always `complete`, never inspected means never partially
     inspected.
 
+    Post-exec Codex review F2: `inaccessible[]` is not the only way a metric's input can
+    go unmeasured. `_project_tier_hygiene_corpus`'s oversize-file branch (and other
+    non-`inaccessible` degradation paths it may gain) sets `scan_complete=False` while
+    recording ONLY a `blind_spots` entry, so no `_METRIC_INPUT_PREFIXES` taint could ever
+    catch it. `project_hygiene_scan_incomplete` is that additional, explicitly-threaded
+    signal (never a module-level global) -- when True it forces
+    `promotion_candidate_count` to `partial`, and ONLY that metric: `duplicate_pair_count`
+    is fed by the separate `_project_tier_duplication_corpus`, whose own completeness
+    signal is unrelated and pre-existing, and is deliberately left alone (scope fence).
+
     Registered in the T5.1 totality guard (`_TOTALITY_TARGETS`,
-    tests/test_render_html.py): unlike its S6b neighbors, both arguments here are
-    structures THIS SAME RUN just built in-process, never values parsed back out of a
+    tests/test_render_html.py): unlike its S6b neighbors, both positional arguments here
+    are structures THIS SAME RUN just built in-process, never values parsed back out of a
     past run's sidecar -- but shape-guarded regardless (`isinstance` checks below) so a
     future caller passing a malformed structure degrades to `complete` rather than
     raising, the same total-function property every registered entry shares."""
@@ -6754,11 +6766,11 @@ def _metric_quality(inaccessible: list[dict[str, Any]],
             quality[metric] = "saturated"
             continue
         prefixes = _METRIC_INPUT_PREFIXES.get(metric, ())
-        if prefixes and any(isinstance(path, str) and path.startswith(prefix)
-                             for path in paths for prefix in prefixes):
-            quality[metric] = "partial"
-        else:
-            quality[metric] = "complete"
+        tainted = bool(prefixes and any(isinstance(path, str) and path.startswith(prefix)
+                                         for path in paths for prefix in prefixes))
+        if metric == "promotion_candidate_count" and project_hygiene_scan_incomplete:
+            tainted = True
+        quality[metric] = "partial" if tainted else "complete"
     return quality
 
 
@@ -7002,7 +7014,10 @@ def build_document(
                             if project_root is not None else None,
             "compose": bool(compose),
         },
-        "metric_quality": _metric_quality(inaccessible, duplication_section),
+        "metric_quality": _metric_quality(
+            inaccessible, duplication_section,
+            project_hygiene_scan_incomplete=(project_hygiene_corpus is not None
+                                              and not project_hygiene_scan_complete)),
         "inaccessible": inaccessible,
         "blind_spots": blind_spots,
         "errors": errors,
