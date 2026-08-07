@@ -4969,6 +4969,10 @@ def _ordered_capped_shingles(words, k=SHINGLE_K, cap=MAX_SHINGLES_PER_FILE):
 _PROJECT_DUP_SURFACE_DIRS = ((".claude/rules", "*.md"), (".claude/agents", "*.md"),
                              (".claude/commands", "*.md"))
 
+# TRK-023 slice A: project-tier always-loaded instruction files fed into the hygiene
+# corpus -- the project analog of the operator corpus's `root_instructions` file.
+_PROJECT_HYGIENE_ROOT_FILES = ("CLAUDE.md", "CLAUDE.local.md")
+
 
 def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs):
     """Project-tier half of the M4 cross-tier duplication corpus (T4): `.claude/rules`,
@@ -5064,6 +5068,167 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
             continue
         corpus.append((_rel(project_root, fp), "project", shingles))
     return corpus
+
+
+def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of_root_refs):
+    """Project-tier hygiene corpus feeding `collect_promotion_candidates`'s project half
+    (TRK-023 T2). Three surface groups, read in this fixed order:
+      1. `<repo>/CLAUDE.md` and `<repo>/CLAUDE.local.md` -- the project's own always-loaded
+         instructions, the closest analog of the operator corpus's `root_instructions` file.
+      2. Each `(rel_dir, pattern)` in `_PROJECT_DUP_SURFACE_DIRS` (`.claude/rules/*.md`,
+         `.claude/agents/*.md`, `.claude/commands/*.md`).
+      3. Each project skill's `<repo>/.claude/skills/<name>/SKILL.md`.
+
+    EVERY read routes through `_project_tier_gate` + `_read_project_file` (H2) -- an
+    escaping symlink is recorded to `out_of_root_refs` and NEVER read. A surface
+    directory may still be ENUMERATED before its containment is decided (a pre-existing,
+    measured gap shared with `_project_tier_duplication_corpus`, recorded in spec
+    AMENDMENTS A64) -- no byte outside `project_root` ever crosses the gate. The skill
+    DIRECTORY is gated before its `SKILL.md` is even probed for existence, unlike the
+    duplication-corpus template this function is modelled on: that template probes
+    `SKILL.md` before the per-candidate gate runs, making the file's presence an
+    existence oracle for an escaping skill directory (spec AMENDMENTS A64); this new
+    code does not copy that shape.
+
+    Unlike `_project_tier_duplication_corpus`, `_read_project_file` returning
+    `text is None` is recorded to `inaccessible` here -- a deliberate divergence: the
+    template drops a read failure silently, a known `inaccessible != clean` gap this new
+    corpus must not inherit.
+
+    Returns `(corpus, scan_complete)`, mirroring `_hooks_body_corpus`'s established
+    `(corpus, complete)` two-tuple shape -- not a new invention. `scan_complete` is
+    `False` if ANY surface could not be fully examined: an unstattable containment root,
+    a gate refusal, an unlistable or locked surface directory, an oversize file, a
+    vanished/unstat-able candidate, or an unreadable file -- so a genuinely-empty scan is
+    structurally distinguishable from one that silently lost data (spec Design section
+    F3): `project is not None` alone cannot tell "scanned, found nothing" from "could not
+    read", and `scan_complete` is the channel that makes the difference visible."""
+    project_root = Path(project_root)
+    scan_complete = True
+    corpus: list[tuple[str, str]] = []
+    seen_refs: set[str] = set()
+    seen_physical: set[Any] = set()
+    try:
+        containment_stat = os.stat(project_root)
+    except OSError as e:
+        # F3 path 3, the silent one in the template: a bare `return corpus` records
+        # nothing anywhere. This corpus must not inherit that -- disclose and degrade.
+        blind_spots.append(f"project root not probed for hygiene scan: {e}")
+        return corpus, False
+
+    candidates: list[Path] = []
+
+    # 1. Repo-root always-loaded instructions. Absent is normal (never a blind spot);
+    #    an undeterminable presence (a locked ancestor) is recorded to `inaccessible`,
+    #    mirroring `_hooks_body_corpus`'s `_safe_exists` + not-ok handling.
+    for fname in _PROJECT_HYGIENE_ROOT_FILES:
+        fp = project_root / fname
+        present, ok = _safe_exists(fp)
+        if not ok:
+            _append_inaccessible_once(inaccessible, _rel_safe(project_root, fp))
+            scan_complete = False
+            continue
+        if present:
+            candidates.append(fp)
+
+    # 2. `.claude/{rules,agents,commands}` -- same enumeration shape
+    #    `_project_tier_duplication_corpus` uses (spec Design F5/R3-6: keeping the
+    #    template's shape here rather than diverging from its sibling).
+    for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
+        d = project_root / rel_dir
+        try:
+            if _probe_is_dir(d):
+                dir_matches = sorted(d.glob(pattern))
+                candidates.extend(dir_matches)
+                # _disclose_unlistable_glob returns None; its only effect is an append to
+                # blind_spots when the directory is present but unlistable -- detect that
+                # by length delta rather than reimplementing its scandir probe here.
+                before = len(blind_spots)
+                _disclose_unlistable_glob(d, pattern, dir_matches, blind_spots,
+                                           "project hygiene corpus")
+                if len(blind_spots) > before:
+                    scan_complete = False
+        except OSError as e:
+            blind_spots.append(f"project {rel_dir} not probed for hygiene scan: {e}")
+            scan_complete = False
+            continue
+
+    # 3. Each project skill's SKILL.md -- the skill DIRECTORY is gated BEFORE its
+    #    SKILL.md is even probed for existence (see docstring: the addendum fix this
+    #    new code must apply that the duplication-corpus template does not).
+    skills_dir = project_root / ".claude" / "skills"
+    try:
+        skills_dir_is_dir = _probe_is_dir(skills_dir)
+    except OSError as e:
+        blind_spots.append(f"project skills is_dir failed for hygiene scan: {e}")
+        scan_complete = False
+        skills_dir_is_dir = False
+    if skills_dir_is_dir:
+        try:
+            skill_entries = sorted(skills_dir.iterdir())
+        except OSError as e:
+            blind_spots.append(f"project skills listing failed for hygiene scan: {e}")
+            scan_complete = False
+            skill_entries = []
+        skill_dirs = []
+        for p in skill_entries:
+            try:
+                if p.is_dir():
+                    skill_dirs.append(p)
+            except OSError as e:
+                # A single unlistable/unstat-able child must not abort the whole
+                # comprehension and discard every sibling with it (TRK-050 T2).
+                blind_spots.append(f"project skills child is_dir failed for {p}: {e}")
+                scan_complete = False
+        for skill_dir in skill_dirs:
+            contained, _identity = _project_tier_gate(skill_dir, project_root, containment_stat)
+            if not contained:
+                _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skill_dir)
+                scan_complete = False
+                continue                       # never probe SKILL.md beneath an escaping dir
+            skill_md = skill_dir / "SKILL.md"
+            present, ok = _safe_exists(skill_md)
+            if not ok:
+                _append_inaccessible_once(inaccessible, _rel_safe(project_root, skill_md))
+                scan_complete = False
+                continue
+            if present:
+                candidates.append(skill_md)
+
+    for fp in candidates:
+        key = _physical_key(fp)
+        if key in seen_physical:
+            continue
+        seen_physical.add(key)
+        contained, _identity = _project_tier_gate(fp, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, fp)
+            scan_complete = False
+            continue
+        try:
+            size = fp.stat().st_size
+        except OSError:
+            # F3 path 3b, the other silent one: a bare `continue` here records nothing --
+            # a file removed or locked between the gate and this stat vanishes with no
+            # trace. Record it instead.
+            _append_inaccessible_once(inaccessible, _rel_safe(project_root, fp))
+            scan_complete = False
+            continue
+        if size > MAX_FILE_BYTES:
+            blind_spots.append(
+                f"{_rel(project_root, fp)} exceeds {MAX_FILE_BYTES} bytes; skipped in hygiene corpus.")
+            scan_complete = False
+            continue
+        text, _evidence = _read_project_file(fp, project_root, containment_stat)
+        if text is None:
+            # Deliberate divergence from `_project_tier_duplication_corpus`, which drops
+            # a read failure silently -- reproducing that here would ship a known
+            # `inaccessible != clean` gap in new code.
+            _append_inaccessible_once(inaccessible, _rel_safe(project_root, fp))
+            scan_complete = False
+            continue
+        corpus.append((_rel(project_root, fp), text))
+    return corpus, scan_complete
 
 
 def scan_duplication(

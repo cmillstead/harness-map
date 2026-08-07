@@ -9075,6 +9075,337 @@ def test_project_tier_duplication_corpus_rules_dir_locked_records_blind_spot(tmp
                for b in blind_spots)
 
 
+# TRK-023 T2: _project_tier_hygiene_corpus, the project half of the promotion-candidate
+# hygiene scan (spec Design section "The shared project-tier corpus"). Direct-call style,
+# matching the _project_tier_duplication_corpus tests immediately above.
+
+def test_project_tier_hygiene_corpus_collects_claude_rules_agents_commands_and_skills(tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / ".claude" / "rules").mkdir(parents=True)
+    (project_root / ".claude" / "agents").mkdir(parents=True)
+    (project_root / ".claude" / "commands").mkdir(parents=True)
+    (project_root / ".claude" / "skills" / "demo").mkdir(parents=True)
+    (project_root / "CLAUDE.md").write_text("root instructions\n")
+    (project_root / ".claude" / "rules" / "a.md").write_text("a rule body\n")
+    (project_root / ".claude" / "agents" / "b.md").write_text("an agent body\n")
+    (project_root / ".claude" / "commands" / "c.md").write_text("a command body\n")
+    (project_root / ".claude" / "skills" / "demo" / "SKILL.md").write_text(
+        "---\ndescription: d\n---\nskill body\n")
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    rel_paths = {rel for rel, _text in corpus}
+    assert rel_paths == {
+        "CLAUDE.md",
+        ".claude/rules/a.md",
+        ".claude/agents/b.md",
+        ".claude/commands/c.md",
+        ".claude/skills/demo/SKILL.md",
+    }
+    assert scan_complete is True
+    assert blind_spots == []
+    assert inaccessible == []
+    assert out_of_root_refs == []
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_hygiene_corpus_escaping_symlink_is_recorded_not_read(tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / ".claude").mkdir(parents=True)
+    outside = tmp_path / "outside-rules"
+    outside.mkdir()
+    (outside / "leak.md").write_text("SENTINEL-OUTSIDE-CONTENT-must-never-be-read\n")
+    (project_root / ".claude" / "rules").symlink_to(outside)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert not any("SENTINEL-OUTSIDE-CONTENT" in text for _rel, text in corpus)
+    assert any(r["trusted"] is False for r in out_of_root_refs)
+    assert scan_complete is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_tier_hygiene_corpus_unreadable_file_records_inaccessible(tmp_path):
+    # This is the deliberate divergence from the dup-corpus template (spec Design
+    # section): a read failure here is recorded to `inaccessible`, never dropped silently.
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    target = rules_dir / "locked.md"
+    target.write_text("a rule nobody can read\n")
+    os.chmod(target, 0)
+    try:
+        inaccessible: list = []
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+            project_root, inaccessible, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(target, 0o644)
+    assert inaccessible == [{"path": ".claude/rules/locked.md", "reason": "unreadable"}]
+    assert not any(rel == ".claude/rules/locked.md" for rel, _text in corpus)
+    assert scan_complete is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_tier_hygiene_corpus_locked_rules_dir_records_blind_spot(tmp_path):
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text("a rule body behind a locked directory\n")
+    os.chmod(rules_dir, 0)
+    try:
+        inaccessible: list = []
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+            project_root, inaccessible, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    assert corpus == []
+    assert any("project hygiene corpus listing failed" in b and str(rules_dir) in b
+               for b in blind_spots)
+    assert scan_complete is False
+
+
+def test_project_tier_hygiene_corpus_absent_dirs_record_nothing(tmp_path):
+    # TRK-050 review finding, pinned again here: absent is not a blind spot.
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert corpus == []
+    assert blind_spots == []
+    assert inaccessible == []
+    assert out_of_root_refs == []
+    assert scan_complete is True
+
+
+def test_project_tier_hygiene_corpus_oversize_file_disclosed_and_skipped(tmp_path):
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "huge.md").write_text("word " * 60000)  # > MAX_FILE_BYTES (200_000)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert not any(rel == ".claude/rules/huge.md" for rel, _text in corpus)
+    assert any("huge.md" in b and "exceeds" in b for b in blind_spots)
+    assert scan_complete is False
+
+
+def test_project_tier_hygiene_corpus_is_a_subset_of_compose_watch_surface(tmp_path):
+    # SPEC_1 §2 invariant 6 (watcher superset). Changing this value requires a spec
+    # change (SPEC_1 §2).
+    project_root = tmp_path / "repo"
+    (project_root / ".claude" / "rules").mkdir(parents=True)
+    (project_root / ".claude" / "agents").mkdir(parents=True)
+    (project_root / ".claude" / "commands").mkdir(parents=True)
+    (project_root / ".claude" / "skills" / "demo").mkdir(parents=True)
+    (project_root / "CLAUDE.md").write_text("root instructions\n")
+    (project_root / "CLAUDE.local.md").write_text("local root instructions\n")
+    (project_root / ".claude" / "rules" / "a.md").write_text("a rule body\n")
+    (project_root / ".claude" / "agents" / "b.md").write_text("an agent body\n")
+    (project_root / ".claude" / "commands" / "c.md").write_text("a command body\n")
+    (project_root / ".claude" / "skills" / "demo" / "SKILL.md").write_text(
+        "---\ndescription: d\n---\nskill body\n")
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert scan_complete is True
+    watch_surface = _collector._compose_project_input_paths(project_root)
+    read_paths = {project_root / rel for rel, _text in corpus}
+    assert read_paths, "fixture must exercise all three surface groups"
+    assert read_paths <= watch_surface
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_hygiene_corpus_escaping_skill_dir_reveals_nothing(tmp_path):
+    # T2 addendum: the duplication-corpus template probes a skill's SKILL.md for
+    # existence BEFORE gating its directory, making presence an existence oracle for an
+    # escaping skill dir. This new code gates the directory first -- both branches below
+    # must equalise to the same out_of_root_refs shape regardless of what lies outside.
+    def _run(label, outside_skill_md_present):
+        project_root = tmp_path / f"repo-{label}"
+        skills_dir = project_root / ".claude" / "skills"
+        skills_dir.mkdir(parents=True)
+        outside = tmp_path / f"outside-skill-{label}"
+        outside.mkdir()
+        if outside_skill_md_present:
+            (outside / "SKILL.md").write_text("---\ndescription: d\n---\nbody\n")
+        (skills_dir / "demo").symlink_to(outside)
+        inaccessible: list = []
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        _collector._project_tier_hygiene_corpus(
+            project_root, inaccessible, blind_spots, out_of_root_refs)
+        return out_of_root_refs
+
+    present_refs = _run("present", True)
+    absent_refs = _run("absent", False)
+    assert len(present_refs) == len(absent_refs) == 1
+    assert present_refs[0]["trusted"] is False
+    assert absent_refs[0]["trusted"] is False
+
+
+# spec Design section F3 -- a genuinely-empty scan must be structurally distinguishable
+# from a failed one. Four concrete failure paths, each proven to set `scan_complete`
+# False (T5 threads it into `collection_scope["hygiene_tiers"]`; these tests pin the
+# corpus function's own contract, which that threading depends on).
+
+def test_project_hygiene_scan_complete_true_on_a_genuinely_empty_project(tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / ".claude" / "rules").mkdir(parents=True)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert corpus == []
+    assert scan_complete is True
+    assert blind_spots == []
+    assert inaccessible == []
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_hygiene_scan_incomplete_when_a_surface_dir_escapes(tmp_path):
+    # F3 path 1.
+    project_root = tmp_path / "repo"
+    (project_root / ".claude").mkdir(parents=True)
+    outside = tmp_path / "outside-rules-2"
+    outside.mkdir()
+    (outside / "leak.md").write_text("body\n")
+    (project_root / ".claude" / "rules").symlink_to(outside)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    _corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert scan_complete is False
+
+
+def test_project_hygiene_scan_incomplete_on_oversize_file(tmp_path):
+    # F3 path 2.
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "huge.md").write_text("word " * 60000)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    _corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert scan_complete is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_hygiene_scan_incomplete_when_containment_root_unstattable(tmp_path):
+    # F3 path 3, the silent one: the template's bare `return corpus` records nothing
+    # anywhere. Assert BOTH scan_complete AND a blind_spots entry -- asserting only the
+    # former would let a silent regression back in.
+    parent = tmp_path / "locked-parent"
+    parent.mkdir()
+    project_root = parent / "repo"
+    project_root.mkdir()
+    os.chmod(parent, 0)
+    try:
+        inaccessible: list = []
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+            project_root, inaccessible, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(parent, 0o755)
+    assert corpus == []
+    assert scan_complete is False
+    assert any("project root not probed for hygiene scan" in b for b in blind_spots)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_hygiene_scan_incomplete_on_locked_surface_dir(tmp_path):
+    # F3 path 4.
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text("body behind a locked directory\n")
+    os.chmod(rules_dir, 0)
+    try:
+        inaccessible: list = []
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        _corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+            project_root, inaccessible, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    assert scan_complete is False
+
+
+def test_project_hygiene_scan_incomplete_when_a_file_vanishes_between_gate_and_stat(
+        tmp_path, monkeypatch):  # mock-ok: interposes on Path.stat for one real file to
+    # simulate the TOCTOU window between _project_tier_gate's os.stat and the
+    # per-candidate fp.stat() call -- no real chmod/rmdir sequencing can portably
+    # reproduce a file vanishing in that exact window (same precedent as
+    # test_walk_contained_dirs_scandir_failure_is_reported_not_silent above). F3 path 3b
+    # (R3-4): the template's bare `continue` here records nothing -- assert an
+    # `inaccessible` entry names it, not just scan_complete, so a regression that dropped
+    # the recording while still degrading scan_complete would fail this test.
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    target = rules_dir / "match.md"
+    target.write_text("some real content for the hygiene corpus\n")
+
+    real_stat = Path.stat
+
+    def _failing_stat(self, *args, **kwargs):
+        if self == target:
+            raise OSError("simulated vanish between gate and stat")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _failing_stat)  # mock-ok: see function comment
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert scan_complete is False
+    assert any(e.get("path") == ".claude/rules/match.md" for e in inaccessible)
+    assert corpus == []
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_hygiene_corpus_escaping_surface_dir_is_not_read(tmp_path):
+    # R3-6: proves the READ half of the "never traverse" promise still holds even though
+    # the ENUMERATE half does not (spec Design section F5). Deliberately does NOT assert
+    # the outside child's NAME is absent -- that would encode the false "never traverse"
+    # promise as a test and redden on shipped, measured behaviour.
+    project_root = tmp_path / "repo"
+    (project_root / ".claude").mkdir(parents=True)
+    outside = tmp_path / "outside-rules-3"
+    outside.mkdir()
+    (outside / "leak.md").write_text("DISTINCTIVE-OUTSIDE-CONTENT-must-never-be-read\n")
+    (project_root / ".claude" / "rules").symlink_to(outside)
+    inaccessible: list = []
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus, scan_complete = _collector._project_tier_hygiene_corpus(
+        project_root, inaccessible, blind_spots, out_of_root_refs)
+    assert not any("DISTINCTIVE-OUTSIDE-CONTENT" in text for _rel, text in corpus)
+    assert any(r["trusted"] is False for r in out_of_root_refs)
+    assert scan_complete is False
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
 def test_hook_test_stems_locked_hook_tests_dir_records_error(tmp_path):
     root = tmp_path / "harness"
