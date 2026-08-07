@@ -6208,6 +6208,111 @@ def test_duplicate_pair_count_at_cap_is_saturated(fake_harness):
     assert doc["metric_quality"]["duplicate_pair_count"] == "saturated"
 
 
+# TRK-023 T6: close the project-tier taint gap in _METRIC_INPUT_PREFIXES.
+# `promotion_candidate_count` and `duplicate_pair_count` gain ".claude/" and
+# "CLAUDE.local.md" -- the two rel-path shapes the project-tier hygiene corpus emits
+# (relative to project_root, not root) that neither the pre-existing "CLAUDE.md"
+# prefix nor "rules/"/"agents/"/"commands/"/"skills/" could ever match. The phantom
+# pair is deliberately excluded (its detector was cut from this slice).
+
+def test_metric_definitions_unchanged_by_project_tier_hygiene():
+    """R3-10/F1 regression pin: closing the taint gap must not bump any
+    METRIC_DEFINITIONS version -- `metric_definitions` ships inside the shared `doc = {`
+    literal, before the first `if compose:`, so any version bump would make a
+    non-compose run differ from `main` and break the byte-identity gate.
+    # Changing this value requires a spec change (SPEC_6 §8.1)."""
+    assert _collector.METRIC_DEFINITIONS["phantom_ref_count"] == 4
+    assert _collector.METRIC_DEFINITIONS["phantom_confirmed_count"] == 4
+    assert _collector.METRIC_DEFINITIONS["promotion_candidate_count"] == 1
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_unreadable_project_claude_local_md_taints_promotion_metric_quality(tmp_path):
+    """F4 pin: `"CLAUDE.local.md".startswith("CLAUDE.md")` is False, so the two share no
+    prefix relationship -- before this fix, an unreadable project CLAUDE.local.md left
+    `promotion_candidate_count` reading `complete`, a false-clean measurement state."""
+    root = tmp_path / "harness"
+    root.mkdir()
+    proj = tmp_path / "compose-proj"
+    proj.mkdir()
+    p = proj / "CLAUDE.local.md"
+    p.write_text("Project-local instructions " * 10)
+    os.chmod(p, 0o000)
+    try:
+        doc = _collector.build_document(root, proj, compose=True)
+    finally:
+        os.chmod(p, 0o644)
+    assert any(e["path"] == "CLAUDE.local.md" for e in doc["inaccessible"])
+    assert doc["metric_quality"]["promotion_candidate_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_unreadable_project_rule_taints_promotion_candidate_count(tmp_path):
+    """`.claude/` prefix pin: an unreadable `.claude/rules/*.md` file now taints
+    `promotion_candidate_count`, the project-tier analog of the pre-existing operator
+    `"rules/"` prefix."""
+    root = tmp_path / "harness"
+    root.mkdir()
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    p = proj / ".claude" / "rules" / "a.md"
+    p.write_text("NEVER commit secrets. " + "word " * 10)
+    os.chmod(p, 0o000)
+    try:
+        doc = _collector.build_document(root, proj, compose=True)
+    finally:
+        os.chmod(p, 0o644)
+    assert any(e["path"] == ".claude/rules/a.md" for e in doc["inaccessible"])
+    assert doc["metric_quality"]["promotion_candidate_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_unreadable_project_rule_taints_duplicate_pair_count(tmp_path):
+    """The pre-existing gap, now closed: the SAME unreadable `.claude/rules/*.md` file
+    was already recorded to `inaccessible` (via `_walk_project_tier`'s always-loaded
+    scan) before this fix, but no `duplicate_pair_count` prefix matched a `.claude/`-
+    shaped path -- the metric read `complete` despite an unread project-tier input."""
+    root = tmp_path / "harness"
+    root.mkdir()
+    proj = tmp_path / "compose-proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("# proj\n" + "word " * 20)
+    p = proj / ".claude" / "rules" / "a.md"
+    p.write_text("Project rule body " * 10)
+    os.chmod(p, 0o000)
+    try:
+        doc = _collector.build_document(root, proj, compose=True)
+    finally:
+        os.chmod(p, 0o644)
+    assert any(e["path"] == ".claude/rules/a.md" for e in doc["inaccessible"])
+    assert doc["metric_quality"]["duplicate_pair_count"] == "partial"
+    assert doc["metric_quality"]["unchecked_binary_count"] == "complete"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
+def test_non_compose_metric_quality_unchanged_by_new_taint_prefixes(fake_harness):
+    """Part A(ii) pin: a non-compose run scans the operator root alone, whose recorded
+    `inaccessible[].path` entries are root-relative (`CLAUDE.md`, `rules/…`, `skills/…`)
+    -- never `.claude/`-shaped, never `CLAUDE.local.md`. The two new prefixes therefore
+    have nothing to match in non-compose output; a real unreadable operator rule still
+    taints both metrics via the PRE-EXISTING `"rules/"` prefix, unaffected by the
+    addition."""
+    p = fake_harness / "rules" / "a.md"
+    os.chmod(p, 0o000)
+    try:
+        doc = _collector.build_document(fake_harness, None, compose=False)
+    finally:
+        os.chmod(p, 0o644)
+    assert doc["inaccessible"], "fixture must produce at least one inaccessible entry"
+    assert not any(e["path"].startswith(".claude/") or e["path"] == "CLAUDE.local.md"
+                   for e in doc["inaccessible"])
+    assert doc["metric_quality"]["promotion_candidate_count"] == "partial"
+    assert doc["metric_quality"]["duplicate_pair_count"] == "partial"
+
+
 def test_empty_document_carries_scope_and_quality(fake_harness):
     """Envelope rule (binding rule 5). A crashed run measured nothing, so every metric is
     `unmeasured` -- never `complete`, which would let a crash envelope claim a measurement

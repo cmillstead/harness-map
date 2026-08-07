@@ -107,13 +107,21 @@ _METRIC_INPUT_PREFIXES: dict[str, tuple[str, ...]] = {
     "always_loaded_words":        ("CLAUDE.md", "memory/", "rules/", "skills/"),
     "always_loaded_tokens_est":   ("CLAUDE.md", "memory/", "rules/", "skills/"),
     "always_loaded_file_count":   ("CLAUDE.md", "memory/", "rules/", "skills/"),
-    "duplicate_pair_count":       ("CLAUDE.md", "rules/", "skills/", "hooks/"),
+    "duplicate_pair_count":       ("CLAUDE.md", "rules/", "skills/", "hooks/",
+                                   ".claude/", "CLAUDE.local.md"),
     "instruction_files_over_200": ("CLAUDE.md", "rules/", "skills/", "commands/",
                                    "agents/", "hooks/"),
     "orphan_registration_count":  ("settings.json", "hooks/"),
     "orphan_script_count":        ("hooks/",),
+    # TRK-023 T6: ".claude/" + "CLAUDE.local.md" cover the project-tier hygiene
+    # corpus's rel-path shapes (relative to project_root, not root) -- neither the
+    # pre-existing "CLAUDE.md" prefix nor "rules/"/"agents/"/"commands/"/"skills/"
+    # match a project-tier path ("CLAUDE.local.md".startswith("CLAUDE.md") is
+    # False; ".claude/rules/a.md" does not start with "rules/"). The phantom pair
+    # is excluded: its detector was cut from TRK-023 slice A, so it no longer
+    # reads project files at all.
     "promotion_candidate_count":  ("CLAUDE.md", "rules/", "skills/", "commands/",
-                                   "agents/"),
+                                   "agents/", ".claude/", "CLAUDE.local.md"),
     "memory_body_count":          ("memory/", "projects/"),
     "phantom_ref_count":          ("CLAUDE.md", "rules/", "skills/", "commands/",
                                    "agents/"),
