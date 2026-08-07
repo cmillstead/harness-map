@@ -3794,7 +3794,14 @@ def _deduped_instruction_files(root: Path, inaccessible: list[dict[str, Any]],
         # dependent. D4's budget-exhaustion truncation silences a SUFFIX of this list, so
         # an unsorted order would make "which files went unmeasured" nondeterministic.
         # Sorted by the string form, matching build_document's rel-path sort (F11).
-        for fp in sorted(root.glob(pattern), key=str):
+        pattern_matches = sorted(root.glob(pattern), key=str)
+        # TRK-082 T3: an unlistable (but present) directory for this pattern is
+        # indistinguishable from a genuinely empty one via glob() alone -- disclose it
+        # the same way scan_duplication/_staleness_corpus do (blind_spots, since this
+        # function has no per-pattern try/except OSError to route through).
+        _disclose_unlistable_glob(root, pattern, pattern_matches, blind_spots,
+                                   "instruction files")
+        for fp in pattern_matches:
             key = _physical_key(fp)
             if key in seen:
                 continue
@@ -5021,6 +5028,9 @@ def scan_duplication(
             candidates = sorted(root.glob(pattern))
         except OSError:
             candidates = []
+        # TRK-082 T3: an unlistable (but present) directory yields the same empty
+        # `candidates` as a genuinely empty one -- disclose the gap.
+        _disclose_unlistable_glob(root, pattern, candidates, blind_spots, "duplication scan")
         for fp in candidates:
             # A file reachable via multiple glob paths (a rules/ deploy symlink pointing at
             # its skills/coding-team/rules/ submodule source) is ONE physical file — it must
@@ -5223,6 +5233,10 @@ def _staleness_corpus(root, inaccessible, blind_spots, *, profile: dict[str, Any
             candidates = sorted(root.glob(pattern))
         except OSError:
             candidates = []
+        # TRK-082 T3: an unlistable (but present) directory yields the same empty
+        # `candidates` as a genuinely empty one -- disclose the gap, matching the
+        # adjacent `_contained_or_disclosed` handler's blind_spots channel.
+        _disclose_unlistable_glob(root, pattern, candidates, blind_spots, "staleness corpus")
         for fp in candidates:
             key = _physical_key(fp)
             if not _contained_or_disclosed(fp, key, root, root_stat,
@@ -6245,9 +6259,18 @@ def iter_input_paths(
                        + tuple(profile["rules_globs"]) + tuple(profile["hook_script_globs"])
                        + tuple(profile["hook_test_globs"])):
         try:
-            paths.update(root.glob(pattern))
+            pattern_matches = list(root.glob(pattern))
         except OSError:
             continue
+        paths.update(pattern_matches)
+        # TRK-082 T3: an unlistable (but present) directory for this pattern is
+        # indistinguishable from a genuinely empty one via glob() alone -- disclose it,
+        # matching the `errors` channel this function already uses for every other
+        # listing failure below (optional: no production caller supplies `errors` yet,
+        # per the docstring's TRK-050 T5 F3 note).
+        if errors is not None:
+            _disclose_unlistable_glob(root, pattern, pattern_matches, errors,
+                                       "watcher inputs")
 
     # -- projects/*/memory: MEMORY.md index (walk_always_loaded / conditional_variants) plus,
     #    for the active project, memory bodies (collect_on_demand). Yield each memory dir

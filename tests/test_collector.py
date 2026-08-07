@@ -9131,6 +9131,199 @@ def test_glob_listability_disclosure_absent_dirs_record_nothing(tmp_path):
 
 
 # ============================================================================
+# TRK-082 T3 -- wiring _disclose_unlistable_glob into the 4 pattern-loop sites
+# ============================================================================
+# Unlike T2's single-directory sites, each function below loops over a LIST of glob
+# patterns spanning both sides of the probeable/wildcard-directory line (spec AMENDMENTS
+# A60): a pattern like "rules/*.md" has a single directory to probe, while
+# "skills/*/rules/*.md" has a wildcard in its directory component and no single
+# directory to probe. The helper self-selects on that predicate, so each site below
+# calls it unconditionally inside its loop.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_deduped_instruction_files_locked_rules_dir_records_blind_spot(tmp_path):
+    root = tmp_path / "harness"
+    rules_dir = root / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text("x")
+    os.chmod(rules_dir, 0)
+    try:
+        inaccessible: list = []
+        blind_spots: list = []
+        files = _collector._deduped_instruction_files(root, inaccessible, blind_spots)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    assert files == []
+    assert any("instruction files listing failed" in b and str(rules_dir) in b
+               for b in blind_spots)
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_deduped_instruction_files_wildcard_dir_locked_no_record(tmp_path):
+    """skills/*/rules/*.md has a wildcard directory component -- no single directory to
+    probe, so a locked skills/foo/rules must produce NO record from this helper, even
+    though it genuinely contains a match. That half of the blind spot is disclosed
+    separately (TRK-082 T4), not here."""
+    root = tmp_path / "harness"
+    nested_rules = root / "skills" / "foo" / "rules"
+    nested_rules.mkdir(parents=True)
+    (nested_rules / "match.md").write_text("x")
+    os.chmod(nested_rules, 0)
+    try:
+        inaccessible: list = []
+        blind_spots: list = []
+        _collector._deduped_instruction_files(root, inaccessible, blind_spots)
+    finally:
+        os.chmod(nested_rules, 0o755)
+    assert blind_spots == []
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_scan_duplication_locked_commands_dir_records_blind_spot(tmp_path):
+    root = tmp_path / "harness"
+    commands_dir = root / "commands"
+    commands_dir.mkdir(parents=True)
+    (commands_dir / "match.md").write_text("x")
+    os.chmod(commands_dir, 0)
+    try:
+        blind_spots: list = []
+        _collector.scan_duplication(root, blind_spots)
+    finally:
+        os.chmod(commands_dir, 0o755)
+    assert any("duplication scan listing failed" in b and str(commands_dir) in b
+               for b in blind_spots)
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_scan_duplication_wildcard_dir_locked_no_record(tmp_path):
+    root = tmp_path / "harness"
+    nested_rules = root / "skills" / "foo" / "rules"
+    nested_rules.mkdir(parents=True)
+    (nested_rules / "match.md").write_text("x")
+    os.chmod(nested_rules, 0)
+    try:
+        blind_spots: list = []
+        _collector.scan_duplication(root, blind_spots)
+    finally:
+        os.chmod(nested_rules, 0o755)
+    assert blind_spots == []
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_staleness_corpus_locked_rules_dir_records_blind_spot(tmp_path):
+    root = tmp_path / "harness"
+    rules_dir = root / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text("x")
+    os.chmod(rules_dir, 0)
+    try:
+        inaccessible: list = []
+        blind_spots: list = []
+        _collector._staleness_corpus(root, inaccessible, blind_spots)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    assert any("staleness corpus listing failed" in b and str(rules_dir) in b
+               for b in blind_spots)
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_staleness_corpus_wildcard_dir_locked_no_record(tmp_path):
+    root = tmp_path / "harness"
+    nested_rules = root / "skills" / "foo" / "rules"
+    nested_rules.mkdir(parents=True)
+    (nested_rules / "match.md").write_text("x")
+    os.chmod(nested_rules, 0)
+    try:
+        inaccessible: list = []
+        blind_spots: list = []
+        _collector._staleness_corpus(root, inaccessible, blind_spots)
+    finally:
+        os.chmod(nested_rules, 0o755)
+    assert blind_spots == []
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_pattern_loop_locked_hooks_dir_records_error(tmp_path):
+    root = tmp_path / "harness"
+    hooks_dir = root / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "match.py").write_text("# x\n")
+    os.chmod(hooks_dir, 0)
+    try:
+        errors: list = []
+        _collector.iter_input_paths(root, errors=errors)
+    finally:
+        os.chmod(hooks_dir, 0o755)
+    assert any("watcher inputs listing failed" in e and str(hooks_dir) in e for e in errors)
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_pattern_loop_wildcard_dir_locked_no_record(tmp_path):
+    root = tmp_path / "harness"
+    nested_rules = root / "skills" / "foo" / "rules"
+    nested_rules.mkdir(parents=True)
+    (nested_rules / "match.md").write_text("x")
+    os.chmod(nested_rules, 0)
+    try:
+        errors: list = []
+        _collector.iter_input_paths(root, errors=errors)
+    finally:
+        os.chmod(nested_rules, 0o755)
+    assert errors == []
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_pattern_loop_glob_listability_disclosure_labels_distinct_for_shared_rules_dir(tmp_path):
+    """root/rules is independently globbed via "rules/*.md" by all FOUR pattern-loop
+    sites (_deduped_instruction_files, scan_duplication, _staleness_corpus,
+    iter_input_paths) -- proves each site's disclosure for the SAME locked directory
+    carries distinct, scan-named text, matching T2's collision guard
+    (test_glob_listability_disclosure_labels_distinct_for_shared_rules_dir above) applied
+    to the pattern-loop sites instead of the single-directory ones."""
+    root = tmp_path / "harness"
+    rules_dir = root / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text("x")
+    os.chmod(rules_dir, 0)
+    try:
+        blind_spots1: list = []
+        _collector._deduped_instruction_files(root, [], blind_spots1)
+        blind_spots2: list = []
+        _collector.scan_duplication(root, blind_spots2)
+        blind_spots3: list = []
+        _collector._staleness_corpus(root, [], blind_spots3)
+        errors4: list = []
+        _collector.iter_input_paths(root, errors=errors4)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    msg1 = next(b for b in blind_spots1 if str(rules_dir) in b)
+    msg2 = next(b for b in blind_spots2 if str(rules_dir) in b)
+    msg3 = next(b for b in blind_spots3 if str(rules_dir) in b)
+    msg4 = next(e for e in errors4 if str(rules_dir) in e)
+    assert msg1.startswith("instruction files listing failed")
+    assert msg2.startswith("duplication scan listing failed")
+    assert msg3.startswith("staleness corpus listing failed")
+    assert msg4.startswith("watcher inputs listing failed")
+    assert len({msg1, msg2, msg3, msg4}) == 4
+
+def test_pattern_loop_sites_absent_dirs_record_nothing(tmp_path):
+    """Absent directories at all 4 pattern-loop sites must record ZERO entries -- the
+    inverse of the locked-dir bug, and TRK-050's worst review finding, applied here to
+    the pattern-loop sites (T2's test_glob_listability_disclosure_absent_dirs_record_
+    nothing above covers the single-directory sites)."""
+    root = tmp_path / "harness"
+    root.mkdir()
+
+    blind_spots1: list = []
+    _collector._deduped_instruction_files(root, [], blind_spots1)
+    assert blind_spots1 == []
+
+    blind_spots2: list = []
+    _collector.scan_duplication(root, blind_spots2)
+    assert blind_spots2 == []
+
+    blind_spots3: list = []
+    _collector._staleness_corpus(root, [], blind_spots3)
+    assert blind_spots3 == []
+
+    errors4: list = []
+    _collector.iter_input_paths(root, errors=errors4)
+    assert errors4 == []
+
+
+# ============================================================================
 # TRK-049 T3 -- real-root acceptance test
 # ============================================================================
 # Complements the pathological_harness battery above (conftest.py:61): that corpus is
