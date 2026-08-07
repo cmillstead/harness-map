@@ -5878,6 +5878,7 @@ def collect_promotion_candidates(
     settings: dict[str, Any],
     *,
     profile: dict[str, Any] | None = None,
+    project_corpus: list[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Prose in an instruction file that reads like a hard rule (NEVER/ALWAYS/must, a
     numeric cap, a required-file assertion) but may have no corresponding hook enforcing
@@ -5887,8 +5888,17 @@ def collect_promotion_candidates(
     M11 (SPEC_7 §2): `profile` is forwarded to _hooks_body_corpus so a non-default profile's
     hooks corpus is read from ITS hooks dir, not PROFILE_CLAUDE_CODE's; corpus_files itself
     already arrives pre-built by this function's caller, so nothing else here needs to read
-    the profile directly."""
-    candidates: list[dict[str, Any]] = []
+    the profile directly.
+
+    TRK-023 T4: `project_corpus` is the project-tier half of the same scan (compose-only,
+    built by `_project_tier_hygiene_corpus`). `project_corpus is not None` is the SINGLE
+    authoritative state for tier tagging — there is no second `compose` flag here — so a
+    non-compose or project-root-less caller that omits it gets byte-identical untagged
+    rows, and a caller that supplies it (even an empty list) gets every row tagged
+    `"tier": "operator"` or `"tier": "project"`. Both halves share `combined_lower`: a
+    project rule's `hook_covered` cross-references the same OPERATOR hook corpus a plain
+    operator rule does — there is no project-tier hook corpus to build."""
+    tag_tier = project_corpus is not None
     # `complete` is unused HERE on purpose: every promotion candidate already ships as
     # evidence=INFERRED and `hook_covered` is an advisory hint, not a verdict, so there is
     # no confident negative to downgrade. `inaccessible` is not threaded in either — the
@@ -5898,18 +5908,28 @@ def collect_promotion_candidates(
     commands_lower = "\n".join(_iter_hook_commands(settings)).lower()
     combined_lower = hooks_corpus_lower + "\n" + commands_lower
 
-    for rel_path, text in corpus_files:
-        for pattern_name, regex in _PROMOTION_PATTERNS:
-            for m in regex.finditer(text):
-                excerpt = _excerpt_around(text, m.start(), m.end())
-                hook_covered = _hook_covered(excerpt, m.group(0), combined_lower)
-                candidates.append({
-                    "source": rel_path,
-                    "pattern": pattern_name,
-                    "excerpt": excerpt,
-                    "hook_covered": hook_covered,
-                    "evidence": "INFERRED",
-                })
+    def _scan(corpus: list[tuple[str, str]], tier: str | None) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for rel_path, text in corpus:
+            for pattern_name, regex in _PROMOTION_PATTERNS:
+                for m in regex.finditer(text):
+                    excerpt = _excerpt_around(text, m.start(), m.end())
+                    hook_covered = _hook_covered(excerpt, m.group(0), combined_lower)
+                    row = {
+                        "source": rel_path,
+                        "pattern": pattern_name,
+                        "excerpt": excerpt,
+                        "hook_covered": hook_covered,
+                        "evidence": "INFERRED",
+                    }
+                    if tier is not None:
+                        row["tier"] = tier
+                    rows.append(row)
+        return rows
+
+    candidates = _scan(corpus_files, "operator" if tag_tier else None)
+    if project_corpus is not None:
+        candidates.extend(_scan(project_corpus, "project"))
     return candidates
 
 

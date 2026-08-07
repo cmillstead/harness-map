@@ -9406,6 +9406,54 @@ def test_project_tier_hygiene_corpus_escaping_surface_dir_is_not_read(tmp_path):
     assert scan_complete is False
 
 
+# TRK-023 T4: collect_promotion_candidates' project-tier half. Direct-call style,
+# matching the T2 tests immediately above -- `project_corpus is not None` is the single
+# authoritative state for tier tagging, so these exercise it without going through
+# build_document's wiring (T5), which passes a real `_project_tier_hygiene_corpus` result.
+
+def test_promotion_candidates_project_corpus_yields_tier_project_rows(tmp_path):
+    root = tmp_path / "harness"
+    root.mkdir()
+    project_corpus = [(".claude/rules/a.md", "NEVER commit secrets.")]
+    candidates = _collector.collect_promotion_candidates(
+        root, [], {}, project_corpus=project_corpus)
+    project_rows = [c for c in candidates if c.get("tier") == "project"]
+    assert project_rows
+    assert project_rows[0]["source"] == ".claude/rules/a.md"
+
+
+def test_promotion_candidates_have_no_tier_key_without_compose(fake_harness):
+    (fake_harness / "rules" / "a.md").write_text("NEVER commit secrets.")
+    doc = run_collector(fake_harness)
+    assert doc["promotion_candidates"]
+    assert all("tier" not in c for c in doc["promotion_candidates"])
+
+
+def test_promotion_candidates_project_row_hook_covered_uses_operator_hooks(tmp_path):
+    root = tmp_path / "harness"
+    (root / "hooks").mkdir(parents=True)
+    (root / "hooks" / "write-guard.py").write_text("# enforces write_guard checks\n")
+    project_corpus = [(".claude/rules/a.md", "NEVER bypass write_guard.")]
+    candidates = _collector.collect_promotion_candidates(
+        root, [], {}, project_corpus=project_corpus)
+    project_never_rows = [c for c in candidates
+                           if c.get("tier") == "project" and c["pattern"] == "NEVER"]
+    assert project_never_rows
+    assert project_never_rows[0]["hook_covered"] is True
+
+
+def test_promotion_candidates_operator_rows_tagged_when_project_corpus_present(tmp_path):
+    root = tmp_path / "harness"
+    root.mkdir()
+    corpus_files = [("rules/a.md", "NEVER commit secrets.")]
+    project_corpus = [(".claude/rules/b.md", "ALWAYS run tests.")]
+    candidates = _collector.collect_promotion_candidates(
+        root, corpus_files, {}, project_corpus=project_corpus)
+    operator_rows = [c for c in candidates if c["source"] == "rules/a.md"]
+    assert operator_rows
+    assert all(c["tier"] == "operator" for c in operator_rows)
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
 def test_hook_test_stems_locked_hook_tests_dir_records_error(tmp_path):
     root = tmp_path / "harness"
