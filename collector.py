@@ -2066,12 +2066,15 @@ def _hook_nodes_from_composed(composed_hooks):
     return nodes
 
 
-# tier-precedence: CC-docs (HIGH confidence), live-verify deferred 2026-07-22 (T1
-# RESOLUTION). Skills/commands: operator SHADOWS project (operator wins a name
-# collision). Agents: project SHADOWS user — the INVERSE of skills. Rules/CLAUDE files/
-# hooks: UNION (both tiers load, no winner). This resolver keys the collision winner OFF
-# THE SURFACE — it is not one global rule; getting a surface backwards inverts the
-# "overrides M" headline count.
+# tier-precedence: live-verified 2026-08-07 against real `claude -p` sessions (CC
+# 2.1.224, macOS) — all six surfaces matched this table, no code change resulted
+# (AMENDMENTS A63). Skills/commands: operator SHADOWS project (operator wins a name
+# collision). Agents: project SHADOWS user — the INVERSE of skills, now measured rather
+# than inferred. Rules/CLAUDE files/hooks: UNION (both tiers load, no winner). This
+# resolver keys the collision winner OFF THE SURFACE — it is not one global rule; getting
+# a surface backwards inverts the "overrides M" headline count. Scope: this establishes
+# what a real session resolved to on 2.1.224, not documented intent, and not stability
+# across versions.
 _SURFACE_MERGE: dict[str, dict[str, Any]] = {
     "skill": {"merge": "shadow", "winner_tier": "operator"},
     "command": {"merge": "shadow", "winner_tier": "operator"},
@@ -3116,15 +3119,18 @@ def reconcile_hooks(
 
 
 # --- T5: settings / hooks / MCP full-chain merge (compose mode only) ---
-# tier-precedence: CC-docs (HIGH confidence), live-verify deferred 2026-07-22 (T1
-# RESOLUTION). Three settings SOURCES — User (`~/.claude/settings.json`, the operator's
-# own `parse_settings` result), Project (`<repo>/.claude/settings.json`), Local
-# (`<repo>/.claude/settings.local.json`) — precedence Local > Project > User for every
-# key EXCEPT `permissions`, which instead MERGES (union, deny wins a same-rule conflict —
-# §3 merge table). Hooks are a separate merge rule again: UNION, every tier's matching
-# hooks fire, no precedence winner. Every function below is additive/compose-only; the
-# operator-only `parse_settings`/`collect_permissions`/`reconcile_hooks`/`collect_config`
-# above are UNCHANGED so non-compose output stays byte-identical.
+# tier-precedence: live-verified 2026-08-07 against real `claude -p` sessions (CC
+# 2.1.224, macOS) — all six surfaces matched this table, no code change resulted
+# (AMENDMENTS A63); this establishes what a real session resolved to on 2.1.224, not
+# documented intent, and not stability across versions. Three settings SOURCES — User
+# (`~/.claude/settings.json`, the operator's own `parse_settings` result), Project
+# (`<repo>/.claude/settings.json`), Local (`<repo>/.claude/settings.local.json`) —
+# precedence Local > Project > User for every key EXCEPT `permissions`, which instead
+# MERGES (union, deny wins a same-rule conflict — §3 merge table). Hooks are a separate
+# merge rule again: UNION, every tier's matching hooks fire, no precedence winner. Every
+# function below is additive/compose-only; the operator-only
+# `parse_settings`/`collect_permissions`/`reconcile_hooks`/`collect_config` above are
+# UNCHANGED so non-compose output stays byte-identical.
 
 def _iter_hook_entries(settings):
     """Like `_iter_hook_commands`, but yields `(event, matcher, command)` instead of just
