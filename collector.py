@@ -1722,6 +1722,9 @@ def _walk_project_tier(project_root, inaccessible, errors, out_of_root_refs, bli
             except OSError as e:
                 errors.append(f"project rules glob failed for {rules_dir}: {e}")
                 rule_files = []
+            else:
+                _disclose_unlistable_glob(rules_dir, "*.md", rule_files, errors,
+                                           "project rules")
     for f in rule_files:
         key = _physical_key(f)
         if key in seen:
@@ -1817,6 +1820,11 @@ def _walk_operator_tier_nodes(root, inaccessible=None, *, profile: dict[str, Any
             files = sorted(d.glob("*.md"))
         except OSError:
             files = []
+        else:
+            glob_errors: list[str] = []
+            _disclose_unlistable_glob(d, "*.md", files, glob_errors, "operator tier nodes")
+            if glob_errors:
+                _append_inaccessible_once(inaccessible, _rel_safe(root, d))
         for f in files:
             nodes.append({"surface": surface, "name": f.stem, "tier": "operator",
                           "path": _rel(root, f)})
@@ -1906,6 +1914,8 @@ def _walk_project_tier_nodes(project_root, out_of_root_refs, errors):
             files = sorted(d.glob("*.md"))
         except OSError:
             files = []
+        else:
+            _disclose_unlistable_glob(d, "*.md", files, errors, "project tier nodes")
         for f in files:
             f_contained, _identity = _project_tier_gate(f, project_root, containment_stat)
             if not f_contained:
@@ -2203,6 +2213,9 @@ def walk_always_loaded(
             glob_matches = set(root.glob(projects_glob_pattern))
         except OSError:
             glob_matches = set()
+        else:
+            _disclose_unlistable_glob(root, projects_glob_pattern, glob_matches, errors,
+                                       "always-loaded projects")
         slug_dirs = [p for p in candidate_dirs if p in glob_matches]
     for slug_dir in slug_dirs:
         if memory_dir_name is None or memory_index_name is None:
@@ -2336,6 +2349,8 @@ def walk_always_loaded(
         except OSError as e:
             errors.append(f"rules glob failed for {rules_dir}: {e}")
             continue
+        else:
+            _disclose_unlistable_glob(rules_dir, "*.md", names, errors, "always-loaded rules")
         for f in names:
             key = _physical_key(f)
             if key in seen:
@@ -2429,6 +2444,12 @@ def collect_descriptions(
             agent_files = sorted(agents_dir.glob("*.md"))
         except OSError:
             agent_files = []
+        else:
+            glob_errors: list[str] = []
+            _disclose_unlistable_glob(agents_dir, "*.md", agent_files, glob_errors,
+                                       "descriptions agents")
+            if glob_errors:
+                _append_inaccessible_once(inaccessible, _rel_safe(root, agents_dir))
         for f in agent_files:
             text = _read_checked(root, f, inaccessible)
             if text is None:
@@ -2525,6 +2546,12 @@ def collect_on_demand(
                     body_files = sorted(target.glob("*.md"))
                 except OSError:
                     body_files = []
+                else:
+                    glob_errors: list[str] = []
+                    _disclose_unlistable_glob(target, "*.md", body_files, glob_errors,
+                                               "on-demand skill body")
+                    if glob_errors:
+                        _append_inaccessible_once(inaccessible, _rel_safe(root, target))
                 for f in body_files:
                     text = _read_checked(root, f, inaccessible)
                     if text is None:
@@ -2556,6 +2583,12 @@ def collect_on_demand(
                 mem_files = sorted(mem_dir.glob("*.md"))
             except OSError:
                 mem_files = []
+            else:
+                glob_errors = []
+                _disclose_unlistable_glob(mem_dir, "*.md", mem_files, glob_errors,
+                                           "on-demand project memory")
+                if glob_errors:
+                    _append_inaccessible_once(inaccessible, _rel_safe(root, mem_dir))
             for f in mem_files:
                 if f.name == profile["memory_index_name"]:
                     continue
@@ -2799,16 +2832,14 @@ def collect_config(
     }
 
 
-def _hook_disk_files(root, *, profile: dict[str, Any] | None = None):
+def _hook_disk_files(root, *, profile: dict[str, Any] | None = None,
+                      errors: list[str] | None = None):
     """hooks/*.py + hooks/*.sh on disk, name-sorted. MEASURED 2026-08-06 on CPython
     3.11.14 against a real 0o000 hooks dir: Path.glob() raises nothing and returns []
     — an unreadable hooks/ dir is indistinguishable here from an absent or genuinely
     empty one, so "never raising" is a blind spot, not a guarantee: a locked-out hooks
-    dir is silently reported as a clean empty result to both downstream callers. Fix
-    tracked separately under TRK-082 (spec AMENDMENTS A59), which covers this and 19
-    other glob sites together rather than fixing one and fragmenting the rest — see
-    _hooks_body_corpus's docstring for the os.scandir-based fix this function does NOT
-    yet have. Deliberately single-level: no recursion, so there is no walk to follow
+    dir is silently reported as a clean empty result to both downstream callers.
+    Deliberately single-level: no recursion, so there is no walk to follow
     symlinks through — a symlinked hook FILE is included by name. Shared by
     reconcile_hooks and _detect_hook_test_coverage, which both need the identical
     guarded + sorted listing before diverging into their own downstream logic.
@@ -2816,17 +2847,29 @@ def _hook_disk_files(root, *, profile: dict[str, Any] | None = None):
     M11 (SPEC_7 §2): the hooks dir and its script extensions come from `profile`
     (defaulting to PROFILE_CLAUDE_CODE) — `hook_script_globs` entries are glob patterns
     ROOTED at container_dirs["hooks"] (e.g. "hooks/*.py"), so only their basename
-    ("*.py") is re-applied against the profile's hooks dir."""
+    ("*.py") is re-applied against the profile's hooks dir.
+
+    `errors` (TRK-082 T2, optional): no build_document channel is in scope at this call
+    depth (both callers -- reconcile_hooks and _detect_hook_test_coverage -- have their
+    own errors[] but neither currently threads it in here), so this is a bare optional
+    sink following the `_skill_has_test_asset(errors=None)` precedent -- defaulting to
+    None keeps every existing call site byte-identical. Wiring it into a caller is a
+    separate change (TRK-086), deliberately not done here."""
     profile = PROFILE_CLAUDE_CODE if profile is None else profile
     hooks_name = profile["container_dirs"]["hooks"]
     if hooks_name is None:
         return []
     hooks_dir = root / hooks_name
     try:
-        disk_files = sorted(
-            [fp for pattern in profile["hook_script_globs"]
-             for fp in hooks_dir.glob(Path(pattern).name)],
-            key=lambda p: p.name)
+        disk_files = []
+        for pattern in profile["hook_script_globs"]:
+            glob_pattern = Path(pattern).name
+            pattern_matches = list(hooks_dir.glob(glob_pattern))
+            disk_files.extend(pattern_matches)
+            if errors is not None:
+                _disclose_unlistable_glob(hooks_dir, glob_pattern, pattern_matches, errors,
+                                           "hook disk files")
+        disk_files = sorted(disk_files, key=lambda p: p.name)
     except OSError:
         return []
     return disk_files
@@ -4862,7 +4905,10 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
         d = project_root / rel_dir
         try:
             if _probe_is_dir(d):
-                candidates.extend(sorted(d.glob(pattern)))
+                dir_matches = sorted(d.glob(pattern))
+                candidates.extend(dir_matches)
+                _disclose_unlistable_glob(d, pattern, dir_matches, blind_spots,
+                                           "project duplication corpus")
         except OSError as e:
             # Inaccessible is NOT clean: an unreadable project-tier surface dir yields
             # zero candidates for it, which reads identically to "nothing there" unless
@@ -5684,9 +5730,11 @@ def _hook_test_stems(root, errors, *, profile: dict[str, Any] | None = None):
         except OSError:
             continue
         try:
-            test_files = test_dir.glob("*.py")
+            test_files = sorted(test_dir.glob("*.py"))
         except OSError:
             test_files = []
+        else:
+            _disclose_unlistable_glob(test_dir, "*.py", test_files, errors, "hook test stems")
         for f in test_files:
             stem = f.stem
             if stem.startswith("test_"):
@@ -5763,15 +5811,23 @@ def _skill_has_test_asset(skill_dir, errors=None):
 
     for d in _iter_descendant_dirs(skill_dir, onerror=_record_walk_error):
         try:
-            if next(d.glob("test_*.py"), None) is not None:
-                return True
+            found = next(d.glob("test_*.py"), None)
         except OSError:
             pass
+        else:
+            if found is not None:
+                return True
+            if errors is not None:
+                _disclose_unlistable_glob(d, "test_*.py", [], errors, "skill test coverage")
         try:
-            if next(d.glob("*_eval.*"), None) is not None:
-                return True
+            found = next(d.glob("*_eval.*"), None)
         except OSError:
             pass
+        else:
+            if found is not None:
+                return True
+            if errors is not None:
+                _disclose_unlistable_glob(d, "*_eval.*", [], errors, "skill test coverage")
     return False
 
 
@@ -6005,10 +6061,15 @@ def _compose_project_input_paths(project_root, errors=None):
     #    consumes for `.claude/{rules,agents,commands}`, plus each project skill's SKILL.md
     #    (the T4 node model + M4 corpus both read exactly this file per skill dir). --
     for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
+        d = project_root / rel_dir
         try:
-            paths.update((project_root / rel_dir).glob(pattern))
+            dir_matches = list(d.glob(pattern))
         except OSError:
-            pass
+            continue
+        paths.update(dir_matches)
+        if errors is not None:
+            _disclose_unlistable_glob(d, pattern, dir_matches, errors,
+                                       "compose project duplication")
     # TRK-050 T5 F1: an ABSENT skills dir is a normal, valid project layout -- iterdir()
     # raising ENOENT for a never-created dir must record NOTHING, only a PRESENT-but-
     # unlistable dir is a real disclosure-worthy failure. `_probe_is_dir` swallows the
@@ -6229,9 +6290,13 @@ def iter_input_paths(
         mem_dir = slug_dir / "memory"
         paths.add(mem_dir)
         try:
-            paths.update(mem_dir.glob("*.md"))
+            mem_matches = list(mem_dir.glob("*.md"))
         except OSError:
-            pass
+            continue
+        paths.update(mem_matches)
+        if errors is not None:
+            _disclose_unlistable_glob(mem_dir, "*.md", mem_matches, errors,
+                                       "watcher projects memory")
 
     # -- per-skill dirs: each skill dir + ALL descendant dirs (membership) so a test_*.py /
     #    *_eval.* added at any depth flips has_test (_skill_has_test_asset rglob). The skill's

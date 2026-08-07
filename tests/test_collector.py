@@ -8767,6 +8767,370 @@ def test_disclose_unlistable_glob_dir_part_probes_subdir_not_base(tmp_path):
 
 
 # ============================================================================
+# TRK-082 T2 -- wiring _disclose_unlistable_glob into 15 single-directory glob sites
+# ============================================================================
+# Each test below proves a GENUINELY LOCKED (chmod 0, containing a real match, never
+# merely empty) directory now produces a record where the site previously produced
+# silence -- through the site's own public entry point, not the T1 helper directly.
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_project_tier_rules_dir_locked_records_error(tmp_path):
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text("x")
+    os.chmod(rules_dir, 0)
+    try:
+        inaccessible: list = []
+        errors: list = []
+        out_of_root_refs: list = []
+        files = _collector._walk_project_tier(project_root, inaccessible, errors,
+                                               out_of_root_refs)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    assert files == []
+    assert any("project rules listing failed" in e and str(rules_dir) in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_operator_tier_nodes_agents_dir_locked_records_inaccessible(tmp_path):
+    root = tmp_path / "harness"
+    agents_dir = root / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "match.md").write_text("x")
+    os.chmod(agents_dir, 0)
+    try:
+        inaccessible: list = []
+        nodes = _collector._walk_operator_tier_nodes(root, inaccessible)
+    finally:
+        os.chmod(agents_dir, 0o755)
+    assert nodes == []
+    assert any(e.get("path") == "agents" and e.get("reason") == "unreadable"
+               for e in inaccessible)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_project_tier_nodes_commands_dir_locked_records_error(tmp_path):
+    project_root = tmp_path / "repo"
+    commands_dir = project_root / ".claude" / "commands"
+    commands_dir.mkdir(parents=True)
+    (commands_dir / "match.md").write_text("x")
+    os.chmod(commands_dir, 0)
+    try:
+        out_of_root_refs: list = []
+        errors: list = []
+        nodes = _collector._walk_project_tier_nodes(project_root, out_of_root_refs, errors)
+    finally:
+        os.chmod(commands_dir, 0o755)
+    assert nodes == []
+    assert any("project tier nodes listing failed" in e and str(commands_dir) in e
+               for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_always_loaded_projects_glob_locked_records_error(tmp_path):
+    root = tmp_path / "claude"
+    projects_dir = root / "projects"
+    projects_dir.mkdir(parents=True)
+    (projects_dir / "some-slug").mkdir()
+    os.chmod(projects_dir, 0)
+    try:
+        inaccessible: list = []
+        errors: list = []
+        _collector.walk_always_loaded(root, None, inaccessible, errors)
+    finally:
+        os.chmod(projects_dir, 0o755)
+    assert any("always-loaded projects listing failed" in e and str(projects_dir) in e
+               for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_walk_always_loaded_rules_dir_locked_records_error(tmp_path):
+    root = tmp_path / "claude"
+    rules_dir = root / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text("x")
+    os.chmod(rules_dir, 0)
+    try:
+        inaccessible: list = []
+        errors: list = []
+        files, _variants = _collector.walk_always_loaded(root, None, inaccessible, errors)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    assert files == []
+    assert any("always-loaded rules listing failed" in e and str(rules_dir) in e
+               for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_descriptions_agents_dir_locked_records_inaccessible(tmp_path):
+    root = tmp_path / "harness"
+    agents_dir = root / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "match.md").write_text("---\ndescription: d\n---\n")
+    os.chmod(agents_dir, 0)
+    try:
+        inaccessible: list = []
+        _skills, agent_descs = _collector.collect_descriptions(root, inaccessible)
+    finally:
+        os.chmod(agents_dir, 0o755)
+    assert agent_descs == []
+    assert any(e.get("path") == "agents" and e.get("reason") == "unreadable"
+               for e in inaccessible)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_on_demand_skill_internal_dir_locked_records_inaccessible(tmp_path):
+    root = tmp_path / "harness"
+    skill_dir = root / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\ndescription: d\n---\nbody\n")
+    phases_dir = skill_dir / "phases"
+    phases_dir.mkdir()
+    (phases_dir / "match.md").write_text("x")
+    os.chmod(phases_dir, 0)
+    try:
+        inaccessible: list = []
+        _skills, bodies, _mem = _collector.collect_on_demand(root, None, inaccessible)
+    finally:
+        os.chmod(phases_dir, 0o755)
+    assert bodies == []
+    assert any(e.get("path") == "skills/demo/phases" and e.get("reason") == "unreadable"
+               for e in inaccessible)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_collect_on_demand_project_memory_dir_locked_records_inaccessible(tmp_path):
+    root = tmp_path / "harness"
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    slug = _collector._project_slug(project_root)
+    mem_dir = root / "projects" / slug / "memory"
+    mem_dir.mkdir(parents=True)
+    (mem_dir / "match.md").write_text("x")
+    os.chmod(mem_dir, 0)
+    try:
+        inaccessible: list = []
+        _skills, _bodies, memory_bodies = _collector.collect_on_demand(
+            root, project_root, inaccessible)
+    finally:
+        os.chmod(mem_dir, 0o755)
+    assert memory_bodies == []
+    assert any(e.get("path") == _rel(root, mem_dir) and e.get("reason") == "unreadable"
+               for e in inaccessible)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_hook_disk_files_locked_hooks_dir_records_error(tmp_path):
+    root = tmp_path / "harness"
+    hooks_dir = root / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "match.py").write_text("# x\n")
+    os.chmod(hooks_dir, 0)
+    try:
+        errors: list = []
+        disk_files = _collector._hook_disk_files(root, errors=errors)
+    finally:
+        os.chmod(hooks_dir, 0o755)
+    assert disk_files == []
+    assert any("hook disk files listing failed" in e and str(hooks_dir) in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_project_tier_duplication_corpus_rules_dir_locked_records_blind_spot(tmp_path):
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text(
+        "some distinct normalized words here for shingles to key off of\n")
+    os.chmod(rules_dir, 0)
+    try:
+        blind_spots: list = []
+        out_of_root_refs: list = []
+        corpus = _collector._project_tier_duplication_corpus(
+            project_root, blind_spots, out_of_root_refs)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    assert corpus == []
+    assert any("project duplication corpus listing failed" in b and str(rules_dir) in b
+               for b in blind_spots)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_hook_test_stems_locked_hook_tests_dir_records_error(tmp_path):
+    root = tmp_path / "harness"
+    test_dir = root / "hooks" / "tests"
+    test_dir.mkdir(parents=True)
+    (test_dir / "test_match.py").write_text("# x\n")
+    os.chmod(test_dir, 0)
+    try:
+        errors: list = []
+        stems = _collector._hook_test_stems(root, errors)
+    finally:
+        os.chmod(test_dir, 0o755)
+    assert stems == set()
+    assert any("hook test stems listing failed" in e and str(test_dir) in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_skill_has_test_asset_symlinked_nested_dir_locked_records_error(tmp_path):
+    """`_iter_descendant_dirs` yields a nested directory SYMLINK by its own path without
+    ever scandir-ing it (os.walk(followlinks=False) never revisits a symlinked dirname as
+    its own dirpath) -- so `d.glob(...)` on that symlink is the FIRST probe of its
+    listability. This is the concrete scenario where the pre-fix silent [] previously hid
+    a genuinely locked target with zero record anywhere."""
+    skill_dir = tmp_path / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    hidden = tmp_path / "hidden-nested-target"
+    hidden.mkdir()
+    (hidden / "test_match.py").write_text("# x\n")
+    os.chmod(hidden, 0)
+    linked = skill_dir / "linked"
+    linked.symlink_to(hidden)
+    try:
+        errors: list = []
+        has_test = _collector._skill_has_test_asset(skill_dir, errors)
+    finally:
+        os.chmod(hidden, 0o755)
+    assert has_test is False
+    assert any("skill test coverage listing failed" in e and str(linked) in e for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_compose_project_input_paths_rules_dir_locked_records_error(tmp_path):
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text("x")
+    os.chmod(rules_dir, 0)
+    try:
+        errors: list = []
+        _collector._compose_project_input_paths(project_root, errors=errors)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    assert any("compose project duplication listing failed" in e and str(rules_dir) in e
+               for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_iter_input_paths_project_memory_dir_locked_records_error(tmp_path):
+    root = tmp_path / "harness"
+    mem_dir = root / "projects" / "proj-slug" / "memory"
+    mem_dir.mkdir(parents=True)
+    (mem_dir / "match.md").write_text("x")
+    os.chmod(mem_dir, 0)
+    try:
+        errors: list = []
+        _collector.iter_input_paths(root, errors=errors)
+    finally:
+        os.chmod(mem_dir, 0o755)
+    assert any("watcher projects memory listing failed" in e and str(mem_dir) in e
+               for e in errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_glob_listability_disclosure_labels_distinct_for_shared_rules_dir(tmp_path):
+    """TRK-050's review finding was that multiple scans of the SAME directory produced
+    byte-identical messages with no way to tell which scan fired. project_root/.claude/rules
+    is independently globbed by both _walk_project_tier (errors[]) and
+    _project_tier_duplication_corpus (blind_spots[]) -- this proves the two
+    glob-listability disclosures for the SAME locked directory carry distinct,
+    scan-named text, not just distinct list channels."""
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "match.md").write_text("x")
+    os.chmod(rules_dir, 0)
+    try:
+        errors: list = []
+        inaccessible: list = []
+        out_of_root_refs: list = []
+        _collector._walk_project_tier(project_root, inaccessible, errors, out_of_root_refs)
+        blind_spots: list = []
+        out_of_root_refs2: list = []
+        _collector._project_tier_duplication_corpus(project_root, blind_spots,
+                                                      out_of_root_refs2)
+    finally:
+        os.chmod(rules_dir, 0o755)
+    error_msg = next(e for e in errors if str(rules_dir) in e)
+    blind_msg = next(b for b in blind_spots if str(rules_dir) in b)
+    assert error_msg != blind_msg
+    assert error_msg.startswith("project rules listing failed")
+    assert blind_msg.startswith("project duplication corpus listing failed")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_glob_listability_disclosure_absent_dirs_record_nothing(tmp_path):
+    """TRK-050's most serious review finding was recording an ABSENT directory as a
+    failure -- the inverse of the locked-dir bug this ticket fixes. Every wired site's
+    optional surface dir here is simply never created (never chmod'd); each site must
+    record zero entries, contrasted with the present-but-locked '...records...' tests
+    above which each record exactly one."""
+    root = tmp_path / "harness"
+    project_root = tmp_path / "repo"
+    root.mkdir()
+    project_root.mkdir()
+
+    inaccessible: list = []
+    errors: list = []
+    out_of_root_refs: list = []
+    _collector._walk_project_tier(project_root, inaccessible, errors, out_of_root_refs)
+    assert errors == []
+
+    inaccessible2: list = []
+    _collector._walk_operator_tier_nodes(root, inaccessible2)
+    assert inaccessible2 == []
+
+    out_of_root_refs2: list = []
+    errors2: list = []
+    _collector._walk_project_tier_nodes(project_root, out_of_root_refs2, errors2)
+    assert errors2 == []
+
+    inaccessible3: list = []
+    errors3: list = []
+    _collector.walk_always_loaded(root, None, inaccessible3, errors3)
+    assert errors3 == []
+
+    inaccessible4: list = []
+    _collector.collect_descriptions(root, inaccessible4)
+    assert inaccessible4 == []
+
+    inaccessible5: list = []
+    _collector.collect_on_demand(root, None, inaccessible5)
+    assert inaccessible5 == []
+
+    errors4: list = []
+    disk_files = _collector._hook_disk_files(root, errors=errors4)
+    assert disk_files == []
+    assert errors4 == []
+
+    blind_spots: list = []
+    out_of_root_refs3: list = []
+    _collector._project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs3)
+    assert blind_spots == []
+
+    errors5: list = []
+    stems = _collector._hook_test_stems(root, errors5)
+    assert stems == set()
+    assert errors5 == []
+
+    errors6: list = []
+    skill_dir = root / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    has_test = _collector._skill_has_test_asset(skill_dir, errors6)
+    assert has_test is False
+    assert errors6 == []
+
+    errors7: list = []
+    _collector._compose_project_input_paths(project_root, errors=errors7)
+    assert errors7 == []
+
+    errors8: list = []
+    _collector.iter_input_paths(root, errors=errors8)
+    assert errors8 == []
+
+
+# ============================================================================
 # TRK-049 T3 -- real-root acceptance test
 # ============================================================================
 # Complements the pathological_harness battery above (conftest.py:61): that corpus is
