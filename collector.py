@@ -5128,22 +5128,21 @@ def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of
       3. Each project skill's `<repo>/.claude/skills/<name>/SKILL.md`.
 
     EVERY read routes through `_project_tier_gate` + `_read_project_file` (H2) -- an
-    escaping symlink is recorded to `out_of_root_refs` and NEVER read. Unlike
-    `_project_tier_duplication_corpus` (spec AMENDMENTS A64 known gap, left as-is there
-    per this ticket's scope fence), EVERY surface directory here -- each
-    `_PROJECT_DUP_SURFACE_DIRS` entry AND `.claude/skills` itself -- is also gated through
-    `_project_tier_gate` BEFORE it is globbed or `iterdir()`'d (post-exec Codex review F1):
-    an escaping symlink whose target is EMPTY used to be completely silent, since there
-    was nothing left to gate at the file/child level once enumeration found no
-    candidates; gating the directory first closes that regardless of whether the
-    escaping target is empty or populated. `_probe_is_dir` still runs before the gate on
-    each surface directory, so a genuinely absent one is skipped silently (matching step
-    1's "absent is normal" contract) rather than misread as an escape. No byte outside
-    `project_root` ever crosses the gate. The skill DIRECTORY is gated before its
-    `SKILL.md` is even probed for existence, unlike the duplication-corpus template this
-    function is modelled on: that template probes `SKILL.md` before the per-candidate
-    gate runs, making the file's presence an existence oracle for an escaping skill
-    directory (spec AMENDMENTS A64); this new code does not copy that shape.
+    escaping symlink is recorded to `out_of_root_refs` and NEVER read. EVERY surface
+    directory here -- each `_PROJECT_DUP_SURFACE_DIRS` entry AND `.claude/skills` itself
+    -- is also gated through `_project_tier_gate` BEFORE it is globbed or `iterdir()`'d
+    (post-exec Codex review F1): an escaping symlink whose target is EMPTY used to be
+    completely silent, since there was nothing left to gate at the file/child level once
+    enumeration found no candidates; gating the directory first closes that regardless of
+    whether the escaping target is empty or populated. `_probe_is_dir` still runs before
+    the gate on each surface directory, so a genuinely absent one is skipped silently
+    (matching step 1's "absent is normal" contract) rather than misread as an escape. No
+    byte outside `project_root` ever crosses the gate. The skill DIRECTORY is gated
+    before its `SKILL.md` is even probed for existence. `_project_tier_duplication_corpus`
+    (spec AMENDMENTS A64) originally had the same directory-level gap this function
+    closes -- TRK-026 later closed it there too, mirroring this function's shape at all
+    three sites; the two functions now differ only in that this one also records a read
+    failure to `inaccessible` (see below), which the sibling still drops silently.
 
     Unlike `_project_tier_duplication_corpus`, `_read_project_file` returning
     `text is None` is recorded to `inaccessible` here -- a deliberate divergence: the
@@ -5188,18 +5187,19 @@ def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of
 
     # 2. `.claude/{rules,agents,commands}` -- same enumeration shape
     #    `_project_tier_duplication_corpus` uses (spec Design F5/R3-6: keeping the
-    #    template's shape here rather than diverging from its sibling), EXCEPT for the
-    #    post-exec Codex review F1 fix below: the surface DIRECTORY itself is gated
-    #    through `_project_tier_gate` before its contents are ever globbed, not merely
-    #    the resulting candidate files. `_probe_is_dir` runs first and swallows a
-    #    genuinely absent directory silently (matching step 1's "absent is normal"
-    #    contract) -- it also follows a symlink to determine whether SOMETHING is a
-    #    directory there, without enumerating any child, so an escaping symlink to an
-    #    EMPTY target is no longer silent: gating runs before the glob that would
-    #    otherwise find nothing to record. Mirrors the shipped `_walk_project_tier`
-    #    rules_dir shape (is_dir, then gate, then glob) rather than the duplication-
-    #    corpus template, which still enumerates before gating (spec AMENDMENTS A64
-    #    known gap, left as-is in that sibling function per this ticket's scope fence).
+    #    template's shape here rather than diverging from its sibling). The surface
+    #    DIRECTORY itself is gated through `_project_tier_gate` before its contents are
+    #    ever globbed, not merely the resulting candidate files (originally a
+    #    post-exec Codex review F1 fix here only; TRK-026 later applied the identical
+    #    directory-level gate to the duplication-corpus template, so the two functions
+    #    now match at this site). `_probe_is_dir` runs first and swallows a genuinely
+    #    absent directory silently (matching step 1's "absent is normal" contract) --
+    #    it also follows a symlink to determine whether SOMETHING is a directory
+    #    there, without enumerating any child, so an escaping symlink to an EMPTY
+    #    target is no longer silent: gating runs before the glob that would otherwise
+    #    find nothing to record. Mirrors the shipped `_walk_project_tier` rules_dir
+    #    shape (is_dir, then gate, then glob), which the duplication-corpus template
+    #    (spec AMENDMENTS A64) now also mirrors after TRK-026.
     for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
         d = project_root / rel_dir
         try:
@@ -5232,12 +5232,13 @@ def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of
             scan_complete = False
 
     # 3. Each project skill's SKILL.md -- the skill DIRECTORY is gated BEFORE its
-    #    SKILL.md is even probed for existence (see docstring: the addendum fix this
-    #    new code must apply that the duplication-corpus template does not). F1: the
-    #    `.claude/skills` surface directory itself gets the SAME directory-level gate as
-    #    step 2 above, before it is ever probed with `iterdir()` -- previously only the
-    #    per-skill subdirectories were gated, leaving `.claude/skills` itself as silent
-    #    as the step-2 hole when the escaping target was empty.
+    #    SKILL.md is even probed for existence (see docstring). F1: the `.claude/skills`
+    #    surface directory itself gets the SAME directory-level gate as step 2 above,
+    #    before it is ever probed with `iterdir()` -- previously only the per-skill
+    #    subdirectories were gated, leaving `.claude/skills` itself as silent as the
+    #    step-2 hole when the escaping target was empty. TRK-026 later applied this
+    #    same shape to the duplication-corpus template (spec AMENDMENTS A64), so this
+    #    is no longer an addendum unique to this function.
     skills_dir = project_root / ".claude" / "skills"
     try:
         skills_dir_is_dir = _probe_is_dir(skills_dir)
