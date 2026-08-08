@@ -9364,6 +9364,45 @@ def test_project_tier_duplication_corpus_in_root_rules_dir_still_contributes(tmp
     assert blind_spots == []
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_duplication_corpus_per_skill_dir_gate_is_not_skill_md_oracle(tmp_path):
+    # TRK-026 review F-E: the per-skill-directory gate at the `contained` check just
+    # above `skill_md = skill_dir / "SKILL.md"` exists so that a SKILL.md's presence is
+    # never the only thing distinguishing "escapes containment" from "legitimate but
+    # empty" -- an escaping skill directory must be caught by the gate itself, not by
+    # what happens to be (or not be) inside it. `.claude/skills` here is legitimately
+    # IN-ROOT (not a symlink) and contains one real in-root skill plus one skill
+    # subdirectory that is a symlink escaping the root; the external target carries NO
+    # SKILL.md, so with the gate removed the `_safe_exists` probe beneath it would be
+    # the ONLY thing telling the two cases apart -- proving this is an oracle pin, not
+    # merely a containment count.
+    project_root = tmp_path / "repo"
+    skills_dir = project_root / ".claude" / "skills"
+    skills_dir.mkdir(parents=True)
+    real_skill_dir = skills_dir / "real-skill"
+    real_skill_dir.mkdir()
+    (real_skill_dir / "SKILL.md").write_text(
+        "---\ndescription: d\n---\nsome distinct normalized words here for shingles to key off of\n")
+    outside = tmp_path / "OUTSIDE_SKILL_DIR"
+    outside.mkdir()  # deliberately no SKILL.md at the external target
+    escaping_skill_dir = skills_dir / "escaping-skill"
+    escaping_skill_dir.symlink_to(outside)
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus = _collector._project_tier_duplication_corpus(
+        project_root, blind_spots, out_of_root_refs)
+    rel_paths = {rel for rel, _tier, _shingles in corpus}
+    assert rel_paths == {".claude/skills/real-skill/SKILL.md"}
+    assert len(out_of_root_refs) == 1
+    entry = out_of_root_refs[0]
+    assert set(entry) == {"name", "target", "trusted"}
+    assert entry["name"] == ".claude/skills/escaping-skill"
+    assert entry["target"] == str(outside)
+    assert entry["trusted"] is False
+    for ref in out_of_root_refs:
+        assert "OUTSIDE_SKILL_DIR" not in ref["name"]
+
+
 # TRK-023 T2: _project_tier_hygiene_corpus, the project half of the promotion-candidate
 # hygiene scan (spec Design section "The shared project-tier corpus"). Direct-call style,
 # matching the _project_tier_duplication_corpus tests immediately above.
