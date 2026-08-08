@@ -1512,6 +1512,11 @@ def test_watched_snapshot_observes_outside_root_hook_script_delete(tmp_path):
     external.unlink()
     after = srv._watched_snapshot(root)
     assert before != after
+    # TRK-022.F8 (QA review), ADDED beside the line above rather than replacing it -- binding
+    # rule 7 protects an existing assertion, and this tightening is not worth an A27 amendment.
+    # `before != after` proves the snapshot MOVED but not that `external` is WHAT moved; it
+    # would pass on any unrelated watched-value change. Name the path.
+    assert external in before and before[external] != after[external]
 
 
 def test_nested_project_command_addition_triggers_recollect(live_server_watching_compose):
