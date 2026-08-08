@@ -5034,7 +5034,10 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
         try:
             dir_matches = sorted(d.glob(pattern))
         except OSError as e:
-            blind_spots.append(f"project {rel_dir} not probed for duplication scan: {e}")
+            # TRK-026 review F-D: distinct text from the is_dir-probe failure above --
+            # same "reader could not tell which occurred when both shared one literal"
+            # rationale as the skills is_dir/listing pair at :5048-5051.
+            blind_spots.append(f"project {rel_dir} listing failed for duplication scan: {e}")
             continue
         candidates.extend(dir_matches)
         _disclose_unlistable_glob(d, pattern, dir_matches, blind_spots,
@@ -5068,7 +5071,7 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
         skill_dirs = []
         for p in skill_entries:
             try:
-                if p.is_dir():
+                if _probe_is_dir(p):
                     skill_dirs.append(p)
             except OSError as e:
                 # A single unlistable/unstat-able child must not abort the whole
