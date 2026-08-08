@@ -2357,6 +2357,35 @@ def test_compose_project_input_paths_still_drops_outside_root_hook(fake_harness,
     assert str(external) not in paths
 
 
+def test_write_target_rejects_an_outside_root_hook_script_now_in_the_input_set(fake_harness,
+                                                                               tmp_path):
+    # TRK-022.F7 (QA review): new behavior that shipped with NO test. Both write guards
+    # (serve.build_server and collector.main) populate `input_paths` from
+    # iter_input_paths(..., compose=True), which since Task 1 includes absolute OUTSIDE-ROOT
+    # hook targets -- so `--out <that path>` is REJECTED where it was previously ALLOWED. The
+    # direction is correct (the collector must never write over a file it reads), but an
+    # untested behavior change is an untested behavior change.
+    root = fake_harness
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    external = outside / "operator-hook.py"
+    external.write_text("# an operator hook living outside root\n")
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": f"python3 {external}"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    input_paths = _collector.iter_input_paths(root, proj, compose=True)
+    assert external in input_paths                 # precondition: Task 1 put it in the read set
+    assert _collector.validate_write_target(external, [root], input_paths) == (False, None)
+    # CONTROL: an outside-root path that is NOT a declared input is still ALLOWED, so the
+    # rejection above came from the input_paths clause and not from the roots clause.
+    innocent = outside / "not-an-input.json"
+    ok, resolved = _collector.validate_write_target(innocent, [root], input_paths)
+    assert ok is True and resolved == innocent.resolve()
+
+
 def test_iter_input_paths_docstring_discloses_project_tier_outside_root_hook_case(fake_harness):
     # TRK-022 finding 2 (DEFECT test): the case-(c) bullet claimed an outside-root hook target
     # is un-watchable. That is now false for the OPERATOR tier and still true for the PROJECT
