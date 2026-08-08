@@ -5143,9 +5143,13 @@ def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of
     byte outside `project_root` ever crosses the gate. The skill DIRECTORY is gated
     before its `SKILL.md` is even probed for existence. `_project_tier_duplication_corpus`
     (spec AMENDMENTS A64) originally had the same directory-level gap this function
-    closes -- TRK-026 later closed it there too, mirroring this function's shape at all
-    three sites; the two functions now differ only in that this one also records a read
-    failure to `inaccessible` (see below), which the sibling still drops silently.
+    closes -- TRK-026 closed it there too, at all three enumeration sites, matching this
+    function's shape (the corresponding spec amendment is outstanding, not yet recorded).
+    The two functions still diverge beyond that gap: the sibling has no `scan_complete`
+    (nor this function's step-1 repo-root-instructions surface) at all, does a bare
+    silent `return corpus` on an unstattable containment root where this one records a
+    blind_spot and degrades `scan_complete`, and silently drops a `_safe_exists` not-ok
+    result where this one records it to `inaccessible` (see below).
 
     Unlike `_project_tier_duplication_corpus`, `_read_project_file` returning
     `text is None` is recorded to `inaccessible` here -- a deliberate divergence: the
