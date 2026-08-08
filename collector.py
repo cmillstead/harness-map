@@ -285,6 +285,107 @@ def _probe_is_symlink(path):
     return st is not None and stat.S_ISLNK(st.st_mode)
 
 
+_TORN_READ_ATTEMPTS = 5     # measured: 5 is the first attempt count reaching BOTH zero
+                            # unparseable reads and zero exhaustions under a pathological
+                            # continuous-rewrite load (2/600 at 3, 0/600 at 5, no gain at 8).
+                            # Retries only occur when tearing is DETECTED, so the cost on a
+                            # quiet harness -- the normal case -- is zero.
+
+
+def _stat_identity_pair(path):
+    """`(st_dev, st_ino, st_mtime_ns, st_size, is_regular)` for `path`, or None if it cannot be
+    stat'd. Every element comes from ONE `os.stat` so the tuple can never disagree with itself
+    (the mixed-pair defect TRK-022 slice A shipped a fix for).
+
+    `st_dev`/`st_ino` are included because (mtime, size) is NOT file identity — a file REPLACED
+    by rename with matching size and mtime is a different inode carrying different bytes, and a
+    mtime+size pair alone accepts it as unchanged. Slice A of this same ticket added inode
+    tracking to `serve.py` for exactly this class, so including it here is consistency, not
+    novelty. `is_regular` (`stat.S_ISREG`) rides along because the retry loop needs it — see
+    `_read_text_stable`'s FIFO guard.
+
+    Deliberately NOT `_probe_stat`, and this is a considered divergence from house style, not
+    an oversight. `_probe_stat` PROPAGATES every OSError outside its ignored set — that is
+    "the entire reason this helper exists", per its own docstring. Propagating here would
+    change CALLER behavior: an EPERM on the stat would escape `_read_text_stable` and be
+    caught by `_read_text` as INACCESSIBLE, or by `parse_settings` as
+    "settings.json unreadable", on a file that reads perfectly well. This stat is a
+    best-effort TEAR DETECTOR, not a probe of whether the file exists; failing to stat means
+    only "cannot tell whether it moved", which is never treated as evidence of stability — the
+    read is not accepted on a None `before`, and the next iteration's guard returns the text
+    already in hand rather than re-reading a path we cannot stat.
+    ValueError is caught alongside OSError for the parity reason `_probe_stat`
+    documents: a non-encodable path (embedded NUL) raises ValueError, which no OSError
+    handler would catch."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, stat.S_ISREG(st.st_mode))
+
+
+def _read_text_stable(path):
+    """Read `path` as utf-8 text (errors="replace"), retrying a BOUNDED number of times when
+    the file changed UNDERNEATH the read.
+
+    A torn read -- reading a file while a writer is part-way through rewriting it -- yields
+    partial content that parses as garbage. Measured harm: a half-written settings.json flips
+    three headline numbers (hook_commands_examined 3->0, hook_commands_total 3->0,
+    orphan_script_count 0->3), i.e. the dashboard reports that the operator deleted all their
+    hooks. The condition is TRANSIENT but was reported as PERSISTENT.
+
+    Detection is one `os.stat` identity tuple BEFORE the read and again AFTER: if it moved, a
+    writer was active and the bytes just read cannot be trusted. A STABLE file never retries,
+    so every quiet read -- including a read of a genuinely malformed file -- performs exactly
+    one `read_text` and behaves byte-identically to the pre-TRK-022 implementation. That is
+    what makes this change safe for every existing assertion.
+
+    BEST-EFFORT, not elimination -- stated plainly in the same register
+    `_disclose_unlistable_glob` uses for its own accepted TOCTOU class. Four residuals, all
+    named rather than engineered around:
+      * an IN-PLACE writer that restores the SAME dev/ino/mtime_ns/size after the read is
+        undetectable at this layer and passes through unretried. This is broader than "a
+        single mtime tick" -- a writer can also restore metadata deliberately;
+      * a file whose `os.stat` fails cannot be verified, so the read is NOT accepted as
+        settled -- but neither is it re-read. The `before is None` arm of the guard below
+        returns the text already in hand at attempt 1, so such a file costs exactly ONE read,
+        the same as the pre-TRK-022 path. Re-reading a path we cannot even stat is not
+        obviously safer, and it is the same arm that prevents re-opening a FIFO. The same
+        early return covers a file that VANISHES after a successful read;
+      * a path that becomes a non-regular file mid-retry returns the last read WITHOUT
+        re-opening it (the FIFO guard below) -- deliberately, since blocking forever is worse
+        than returning slightly stale bytes;
+      * under sustained tearing the attempts are exhausted, and the LAST read is returned.
+        The caller's existing error handling then runs exactly as it does today -- no new
+        exception, no new error string, no new classification kind.
+
+    OSError propagates to the caller unchanged, so each call site keeps its own error text."""
+    # `text` is initialised so the function is total, but the initial value is UNREACHABLE at
+    # any _TORN_READ_ATTEMPTS >= 1. It is deliberately "" rather than None because every caller
+    # expects str -- though note that "" is itself the "everything vanished" signal this fix
+    # exists to prevent, so if the constant is ever set to 0 this returns the exact wrong
+    # answer silently. Do not set it to 0.
+    text = ""
+    for attempt in range(_TORN_READ_ATTEMPTS):
+        before = _stat_identity_pair(path)
+        # FIFO GUARD. Callers probe `_probe_is_file` ONCE before the first read, so a RETRY
+        # would re-open a path that has since become a FIFO -- and `read_text` on a FIFO blocks
+        # forever, a hazard the old single-read path could not have after its read succeeded.
+        # Re-check regular-file-ness before every read AFTER the first, reusing the stat we
+        # already took rather than adding a probe. `before is None` covers the
+        # vanished/unstattable case, where re-reading is also wrong.
+        if attempt > 0 and (before is None or not before[4]):
+            return text
+        text = path.read_text(encoding="utf-8", errors="replace")
+        after = _stat_identity_pair(path)
+        # A stat that FAILED on either side means "cannot verify", NOT "unchanged". Comparing
+        # two Nones as equal would silently accept a torn read on any file whose stat fails.
+        # Requiring `before is not None` makes the code match the claim.
+        if before is not None and after == before:
+            return text
+    return text
+
+
 def _read_text(path):
     """Read `path` as utf-8 text (errors="replace"). Returns `(text, "VERIFIED")` on
     success or `(None, "INACCESSIBLE")` on failure. The `is_file()` guard matches
@@ -299,7 +400,7 @@ def _read_text(path):
         # same try as the read so both fold into the one INACCESSIBLE outcome.
         if not _probe_is_file(path):
             return None, "INACCESSIBLE"
-        return path.read_text(encoding="utf-8", errors="replace"), "VERIFIED"
+        return _read_text_stable(path), "VERIFIED"
     except OSError:
         return None, "INACCESSIBLE"
 
@@ -2765,7 +2866,7 @@ def parse_settings(
         blind_spots.append("settings.json not found; permissions/config/hooks reflect defaults.")
         return {}, False
     try:
-        text = settings_path.read_text(encoding="utf-8", errors="replace")
+        text = _read_text_stable(settings_path)
     except OSError as e:
         errors.append(f"settings.json unreadable: {e!r}")
         return {}, False
