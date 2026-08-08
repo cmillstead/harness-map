@@ -2290,6 +2290,120 @@ def test_iter_input_paths_watches_lexical_inroot_hook_symlink(fake_harness):
     assert str(lexical) in paths
 
 
+def test_iter_input_paths_watches_absolute_outside_root_hook_script(fake_harness, tmp_path):
+    # TRK-022 finding 2 (DEFECT test): a hook command resolving to an ABSOLUTE path OUTSIDE
+    # root is stat()'d by reconcile_hooks, and its create/delete flips headline
+    # orphan_registration_count -- but iter_input_paths dropped it, so no watcher saw it.
+    root = fake_harness
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    external = outside / "external-hook.py"
+    external.write_text("# outside-root hook\n")
+    inroot = root / "hooks" / "inroot.py"
+    inroot.write_text("# in-root hook\n")
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 ./hooks/inroot.py"},
+            {"type": "command", "command": f"python3 {external}"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    paths = set(map(str, _collector.iter_input_paths(root)))
+    assert str(external) in paths          # the fix: outside-root target is watched
+    assert str(inroot) in paths            # regression guard: in-root still watched
+
+
+def test_iter_input_paths_skips_a_hook_path_carrying_an_embedded_nul(fake_harness, tmp_path):
+    # TRK-022.F1 (DEFECT test, post-execution review). The containment filter Task 1 removed was
+    # ALSO, incidentally, a SANITIZER: its `except (ValueError, OSError)` swallowed the
+    # ValueError that a path carrying an embedded NUL raises. With the filter gone, a malformed
+    # hook command in settings.json puts an unusable path into the watched set, and BOTH
+    # consumers raise on it -- `serve._path_value` and `collector.validate_write_target` each
+    # raise "ValueError: embedded null byte" -- which would abort a watcher sweep.
+    # Measured pre-fix: 15 paths yielded, 1 of them NUL-bearing (`main` yielded 14, 0 NUL-bearing).
+    # The NUL is built in code because a literal NUL in a source file is a syntax error.
+    root = fake_harness
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    good = outside / "good-hook.py"
+    good.write_text("# a normal absolute outside-root hook\n")
+    malformed = f"{outside}/ev{chr(0)}il/hook.py"
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": f"python3 {malformed}"},
+            {"type": "command", "command": f"python3 {good}"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    paths = [str(p) for p in _collector.iter_input_paths(root)]
+    assert [p for p in paths if "\x00" in p] == []   # the fix: no unusable path is watched
+    # CONTROL -- not optional. Without it the fix could "succeed" by dropping every outside-root
+    # target, undoing Task 1's entire point.
+    assert str(good) in paths
+
+
+def test_compose_project_input_paths_still_drops_outside_root_hook(fake_harness, tmp_path):
+    # TRK-022 finding 2 (POSITIVE CONTROL -- passes on BOTH sides of the fix). Task 1 removed
+    # the outside-root filter at the OPERATOR tier only. The PROJECT tier keeps it: a project
+    # root is UNTRUSTED, and watching an outside-root path named by a project's settings.json
+    # would let that project make the watcher stat and listdir anywhere on disk. Containment
+    # invariant -- see AMENDMENTS A64 and TRK-026.
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    external = outside / "project-hook.py"
+    external.write_text("# outside the project root\n")
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": f"python3 {external}"}]}]}}))
+    paths = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    assert str(external) not in paths
+
+
+def test_write_target_rejects_an_outside_root_hook_script_now_in_the_input_set(fake_harness,
+                                                                               tmp_path):
+    # TRK-022.F7 (QA review): new behavior that shipped with NO test. Both write guards
+    # (serve.build_server and collector.main) populate `input_paths` from
+    # iter_input_paths(..., compose=True), which since Task 1 includes absolute OUTSIDE-ROOT
+    # hook targets -- so `--out <that path>` is REJECTED where it was previously ALLOWED. The
+    # direction is correct (the collector must never write over a file it reads), but an
+    # untested behavior change is an untested behavior change.
+    root = fake_harness
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    external = outside / "operator-hook.py"
+    external.write_text("# an operator hook living outside root\n")
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": f"python3 {external}"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    input_paths = _collector.iter_input_paths(root, proj, compose=True)
+    assert external in input_paths                 # precondition: Task 1 put it in the read set
+    assert _collector.validate_write_target(external, [root], input_paths) == (False, None)
+    # CONTROL: an outside-root path that is NOT a declared input is still ALLOWED, so the
+    # rejection above came from the input_paths clause and not from the roots clause.
+    innocent = outside / "not-an-input.json"
+    ok, resolved = _collector.validate_write_target(innocent, [root], input_paths)
+    assert ok is True and resolved == innocent.resolve()
+
+
+def test_iter_input_paths_docstring_discloses_project_tier_outside_root_hook_case(fake_harness):
+    # TRK-022 finding 2 (DEFECT test): the case-(c) bullet claimed an outside-root hook target
+    # is un-watchable. That is now false for the OPERATOR tier and still true for the PROJECT
+    # tier; the docstring must say which is which.
+    #
+    # Substring choice matters here. Plan review caught an earlier version of this test that
+    # asserted "project"/"outside"/"git"/"commit" -- ALL FOUR are already present in the
+    # pre-fix docstring, so it passed pre-fix and was fully vacuous. These assertions are
+    # chosen to be FALSE pre-fix.
+    doc = _collector.iter_input_paths.__doc__
+    assert doc is not None
+    # the false claim must be GONE (present pre-fix -> this line is the red)
+    assert "cannot watch a file outside root" not in doc
+    # the remaining blind spot must be scoped to the PROJECT tier by name
+    assert "PROJECT-tier hook command" in doc
+    assert "git" in doc.lower() and "commit" in doc.lower()   # git-age bullet survives the rewrite
+
+
 def test_iter_input_paths_docstring_discloses_git_age_blind_spot():
     # S2.M3: git history (collect_git_age's `git log` reads) is a THIRD documented watcher
     # blind spot -- .git sits in _PRUNED_WALK_DIRS, so a commit alone changes
@@ -2581,6 +2695,326 @@ def test_parse_settings_broken_symlink_is_loud(tmp_path):
     assert settings == {} and parsed_ok is False
     assert any("broken symlink" in e for e in errors)
     assert not blind_spots
+
+
+# ============================================================================
+# TRK-022 finding 4 -- bounded retry on a torn read
+# ============================================================================
+
+def test_read_text_stable_does_not_retry_on_a_stable_file(tmp_path):
+    # TRK-022 finding 4 (NEW-SYMBOL test -- see the classification note below; NOT a positive
+    # control, because it cannot run pre-fix at all). The safety property: a quiet file performs
+    # exactly ONE read and zero retries, so behavior on every stable file -- including a
+    # genuinely malformed one -- is byte-identical to pre-fix. This is what keeps binding rule 7
+    # satisfied by construction. Measured: 400 reads of a quiet file fired 0 retries.
+    target = tmp_path / "quiet.json"
+    target.write_text('{"a": 1}')
+    reads = []
+    real_read_text = Path.read_text
+
+    def counting_read_text(self, *a, **k):        # mock-ok: counts reads, delegates to the real one
+        reads.append(Path(self))
+        return real_read_text(self, *a, **k)
+
+    try:
+        Path.read_text = counting_read_text
+        assert _collector._read_text_stable(target) == '{"a": 1}'
+    finally:
+        Path.read_text = real_read_text
+    assert reads.count(target) == 1               # exactly one read: no retry on a stable file
+
+
+def test_read_text_stable_retries_when_file_changes_under_the_read(tmp_path):
+    # TRK-022 finding 4 (NEW-SYMBOL test -- fails pre-fix only with AttributeError, see the
+    # classification note below). A writer rewriting the file between the pre-read stat
+    # and the post-read stat must be DETECTED and retried. Measured on a real thread writer:
+    # unparseable reads dropped 6/400 -> 1/400, and 5 attempts reached 0/600 with 0 exhaustions.
+    # A real thread race is not deterministic enough for a unit test, so the file is mutated
+    # deterministically from inside the read -- the repo's documented carve-out for races a
+    # real filesystem cannot reproduce (main already ships `# mock-ok` annotations and
+    # attribute-substitution fixtures in this file for exactly this class).
+    target = tmp_path / "torn.json"
+    target.write_text("first")
+    real_read_text = Path.read_text
+    calls = []
+
+    def tearing_read_text(self, *a, **k):         # mock-ok: simulates a concurrent writer
+        text = real_read_text(self, *a, **k)
+        calls.append(text)
+        if len(calls) == 1:
+            target.write_text("second-and-longer")   # changes mtime AND size under the read
+        return text
+
+    try:
+        Path.read_text = tearing_read_text
+        result = _collector._read_text_stable(target)
+    finally:
+        Path.read_text = real_read_text
+    assert len(calls) > 1                         # the tear was detected and retried
+    assert result == "second-and-longer"          # the retry returned the settled content
+
+
+def test_read_text_stable_returns_last_read_when_attempts_exhausted(tmp_path):
+    # TRK-022 finding 4 (NEW-SYMBOL test -- fails pre-fix only with AttributeError, see the
+    # classification note below). Sustained tearing must NOT raise, must NOT invent a new
+    # error string, and must NOT add a classification kind -- it returns the last read and lets
+    # the caller's existing error path run unchanged. Best-effort, never elimination.
+    target = tmp_path / "always-torn.json"
+    target.write_text("v")                        # 1 byte
+    real_read_text = Path.read_text
+    tear_count = []
+
+    def always_tearing(self, *a, **k):            # mock-ok: never settles
+        text = real_read_text(self, *a, **k)
+        tear_count.append(1)
+        # Every rewrite MUST change the SIZE, not just the mtime. Plan review caught an
+        # earlier version that went "v0" -> "vx" (both 2 bytes), which could only be detected
+        # via mtime granularity and would flake on a coarse-timestamp filesystem. Length here
+        # is 1 + len(tear_count), so it strictly grows on every call and size alone proves the
+        # tear.
+        target.write_text("v" * (1 + len(tear_count)))
+        return text
+
+    try:
+        Path.read_text = always_tearing
+        result = _collector._read_text_stable(target)
+    finally:
+        Path.read_text = real_read_text
+    # NOT a spec constant -- do NOT add a "requires a spec change" comment here. No spec
+    # section defines this value; it is an implementation constant chosen from the measured
+    # attempts table in the TRK-022 slice B plan's evidence section (0/600 unparseable and
+    # 0 exhaustions at 5).
+    assert len(tear_count) == _collector._TORN_READ_ATTEMPTS
+    # Assert the EXACT last successfully-read value, not merely str-ness. Codex plan review:
+    # `assert isinstance(result, str)` also accepts "", the first read, or any invented
+    # string, so it proved nothing about "returns the LAST read".
+    assert result == "v" * _collector._TORN_READ_ATTEMPTS
+
+
+def test_read_text_stable_detects_same_size_atomic_replace(tmp_path):
+    # TRK-022 finding 4 (NEW-SYMBOL test). Codex round 2: every OTHER retry test changes the
+    # file's size, so all of them would pass even if st_dev/st_ino were dropped from the
+    # identity tuple -- the inode half was completely unpinned. Here the file is replaced via
+    # os.replace with content of the SAME SIZE and the mtime is restored, so the ONLY thing
+    # that differs is the inode. This test fails if the identity tuple loses st_ino.
+    target = tmp_path / "replaced.txt"
+    target.write_text("AAAA")
+    original = os.stat(target)
+    real_read_text = Path.read_text
+    calls = []
+
+    def replacing_read_text(self, *a, **k):       # mock-ok: simulates an atomic rewrite
+        text = real_read_text(self, *a, **k)
+        calls.append(text)
+        if len(calls) == 1:
+            staged = tmp_path / "staged.txt"
+            staged.write_text("BBBB")             # same 4 bytes
+            os.replace(staged, target)            # new inode, same size
+            os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))   # same mtime
+        return text
+
+    try:
+        Path.read_text = replacing_read_text
+        result = _collector._read_text_stable(target)
+    finally:
+        Path.read_text = real_read_text
+    assert len(calls) > 1                          # the tear was detected by INODE alone
+    assert result == "BBBB"
+
+
+def test_read_text_stable_returns_after_one_read_when_stat_fails(tmp_path):
+    # TRK-022 finding 4 (NEW-SYMBOL test). Codex round 2 caught the docstring claiming an
+    # unstattable file exhausts all attempts and costs N reads. It does not: attempt 0 reads
+    # and cannot verify, attempt 1 hits the `before is None` arm and returns immediately, so
+    # the cost is ONE read -- identical to the pre-TRK-022 path. Pin the real behavior so the
+    # claim and the code cannot drift apart again.
+    target = tmp_path / "unstattable.txt"
+    target.write_text("content")
+    real_stat = os.stat
+    real_read_text = Path.read_text
+    reads = []
+    # TRK-022.F3 (post-execution review): the read count alone does NOT discriminate. A BROKEN
+    # implementation using `after == before` -- accepting two None stats as "stable" -- also
+    # returns after ONE read with the right content, so both assertions below passed against it.
+    # STAT count is the discriminator. Measured, with os.stat failing every time: the correct
+    # implementation does before(0), after(0), before(1) = 3 stats before the `before is None`
+    # guard returns; the broken one accepts at attempt 0 after 2. Both do 1 read.
+    stats = []
+
+    def failing_stat(*a, **k):                     # mock-ok: no real fs makes stat fail while read succeeds
+        stats.append(1)
+        raise OSError("stat unavailable")
+
+    def counting_read_text(self, *a, **k):         # mock-ok: counts reads, delegates to the real one
+        reads.append(1)
+        return real_read_text(self, *a, **k)
+
+    try:
+        os.stat = failing_stat
+        Path.read_text = counting_read_text
+        result = _collector._read_text_stable(target)
+    finally:
+        os.stat = real_stat
+        Path.read_text = real_read_text
+    assert len(reads) == 1                         # ONE read, not _TORN_READ_ATTEMPTS
+    assert result == "content"
+    # The `before is not None` acceptance condition, pinned. 3 only -- a broken `after == before`
+    # gives 2. Not a spec constant: no spec section defines it, it is measured from the loop shape.
+    assert len(stats) == 3
+
+
+def test_read_text_is_wired_to_the_stable_read(tmp_path):
+    # TRK-022 finding 4 (DEFECT test). Codex plan review caught that NOTHING in the original
+    # test set proved `_read_text` itself was wired to the helper: three tests call
+    # `_read_text_stable` directly and the only integration test goes through parse_settings,
+    # so leaving `_read_text` untouched would have passed the entire suite. This test tears the
+    # file underneath `_read_text` and asserts it returns the SETTLED content.
+    target = tmp_path / "via-read-text.txt"
+    target.write_text("first")
+    real_read_text = Path.read_text
+    calls = []
+
+    def tearing_read_text(self, *a, **k):         # mock-ok: simulates a concurrent writer
+        text = real_read_text(self, *a, **k)
+        calls.append(text)
+        if len(calls) == 1:
+            target.write_text("second-and-longer")
+        return text
+
+    try:
+        Path.read_text = tearing_read_text
+        text, evidence = _collector._read_text(target)
+    finally:
+        Path.read_text = real_read_text
+    assert len(calls) > 1                          # the tear was seen THROUGH _read_text
+    assert text == "second-and-longer"
+    assert evidence == "VERIFIED"                  # existing return shape unchanged
+
+
+def test_read_text_stable_returns_last_good_text_when_a_retry_read_raises(tmp_path):
+    # TRK-022.F5 (DEFECT test, QA review). The in-loop read had NO exception guard. Attempt 0
+    # can succeed, the tear is detected, and attempt 1's read can then RAISE: the pre-read stat
+    # says present-and-regular, but the open() a few lines later can still hit ENOENT (an
+    # unlink-then-recreate writer) or EACCES (recreated restrictive, then chmod'd). The OSError
+    # escaped the helper, so `_read_text` returned (None, "INACCESSIBLE") and parse_settings
+    # recorded "settings.json unreadable" plus ({}, False) -- flipping exactly the 3 headline
+    # keys this retry exists to PREVENT. The fix points backwards otherwise: a healthy read
+    # becomes a reported problem, the same inverse-bug shape TRK-050's review caught when absent
+    # directories were recorded as collection errors.
+    target = tmp_path / "raises-on-retry.txt"
+    target.write_text("first")
+    real_read_text = Path.read_text
+    calls = []
+
+    def tear_then_raise(self, *a, **k):           # mock-ok: simulates unlink-then-recreate
+        calls.append(1)
+        if len(calls) == 1:
+            text = real_read_text(self, *a, **k)
+            target.write_text("second-and-longer")    # tear: mtime AND size move
+            return text
+        raise OSError("recreated unreadable")     # attempt 1's open() loses the race
+    try:
+        Path.read_text = tear_then_raise
+        text, evidence = _collector._read_text(target)
+    finally:
+        Path.read_text = real_read_text
+    assert len(calls) == 2                        # the retry happened and it raised
+    assert (text, evidence) == ("first", "VERIFIED")   # the last GOOD read is kept, not discarded
+
+
+def test_read_text_stable_still_propagates_an_oserror_on_the_first_read(tmp_path):
+    # TRK-022.F5 (CONTROL -- not optional). Swallowing OSError at attempt 0 would buy the fix
+    # above by breaking the genuinely-unreadable-file path: a file that cannot be read AT ALL
+    # must still reach the caller as OSError, so `_read_text` classifies it INACCESSIBLE exactly
+    # as it did pre-TRK-022. Without this assertion the F5 guard could return "" and call it
+    # verified.
+    target = tmp_path / "never-readable.txt"
+    target.write_text("content")
+    real_read_text = Path.read_text
+    calls = []
+
+    def always_raises(self, *a, **k):             # mock-ok: no real fs fails a read this reliably
+        calls.append(1)
+        raise OSError("permission denied")
+    try:
+        Path.read_text = always_raises
+        text, evidence = _collector._read_text(target)
+    finally:
+        Path.read_text = real_read_text
+    assert len(calls) == 1                        # it did NOT retry past an attempt-0 failure
+    assert (text, evidence) == (None, "INACCESSIBLE")   # pre-TRK-022 behavior, unchanged
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="platform lacks mkfifo")
+def test_read_text_stable_does_not_reopen_a_path_that_became_a_fifo(tmp_path):
+    # TRK-022 finding 4 (NEW-SYMBOL test). Codex plan review, P2: callers probe _probe_is_file
+    # ONCE before the first read, so a RETRY would re-open a path that has since become a
+    # FIFO -- and read_text on a FIFO blocks forever, a hazard the old single-read path could
+    # not have. The helper must return the last read instead of re-opening.
+    # A real os.mkfifo is used; only the tear is simulated.
+    target = tmp_path / "becomes-fifo"
+    target.write_text("regular content")
+    real_read_text = Path.read_text
+    calls = []
+
+    def swap_to_fifo(self, *a, **k):              # mock-ok: real FIFO, simulated timing
+        text = real_read_text(self, *a, **k)
+        calls.append(text)
+        if len(calls) == 1:
+            target.unlink()
+            os.mkfifo(target)                     # now a FIFO: re-opening would block
+        return text
+
+    try:
+        Path.read_text = swap_to_fifo
+        result = _collector._read_text_stable(target)
+    finally:
+        Path.read_text = real_read_text
+    assert len(calls) == 1                        # exactly one read: it did NOT re-open
+    assert result == "regular content"
+
+
+def test_parse_settings_malformed_stable_file_error_text_unchanged(tmp_path):
+    # TRK-022 finding 4 (POSITIVE CONTROL). A genuinely malformed settings.json that is NOT
+    # being written must produce the SAME error text and the SAME ({}, False) return as before
+    # the change. If this moves, an existing assertion moves with it.
+    root = tmp_path / "harness"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "settings.json").write_text('{"hooks": ')
+    errors = []
+    parsed, ok = _collector.parse_settings(root, errors, [])
+    assert (parsed, ok) == ({}, False)
+    assert any(e.startswith("failed to parse settings.json:") for e in errors)
+
+
+def test_parse_settings_read_is_retried_on_a_torn_read(tmp_path):
+    # TRK-022 finding 4 (DEFECT test). The MEASURED harm lives here, not in _read_text:
+    # parse_settings reads settings.json directly. A torn read flipped 3 headline keys
+    # (hook_commands_examined 3->0, hook_commands_total 3->0, orphan_script_count 0->3).
+    root = tmp_path / "harness"
+    root.mkdir(parents=True, exist_ok=True)
+    settings = root / "settings.json"
+    good = json.dumps({"hooks": {}, "permissions": {"allow": [], "deny": []}})
+    settings.write_text(good[:len(good) // 2])        # start TORN
+    real_read_text = Path.read_text
+    calls = []
+
+    def settling_read_text(self, *a, **k):        # mock-ok: the writer finishes mid-collection
+        text = real_read_text(self, *a, **k)
+        calls.append(text)
+        if len(calls) == 1:
+            settings.write_text(good)                 # writer completes
+        return text
+
+    errors = []
+    try:
+        Path.read_text = settling_read_text
+        parsed, ok = _collector.parse_settings(root, errors, [])
+    finally:
+        Path.read_text = real_read_text
+    assert ok is True                             # the retry saw the settled file
+    assert errors == []                           # no spurious parse error recorded
+
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can read 0o000 files")
 def test_unreadable_script_recorded_once(fake_harness):

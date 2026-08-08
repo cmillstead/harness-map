@@ -1493,6 +1493,32 @@ def test_watched_set_tags_operator_and_project_entries(live_server_watching_comp
     assert op_tier == "operator"
 
 
+def test_watched_snapshot_observes_outside_root_hook_script_delete(tmp_path):
+    # TRK-022 finding 2 (DEFECT test): deleting an absolute outside-root hook target flips
+    # headline orphan_registration_count 0 -> 1; the watcher snapshot must change with it.
+    root = tmp_path / "harness"
+    for d in ("hooks", "rules", "skills", "agents", "commands", "projects"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    (root / "CLAUDE.md").write_text("# root\n")
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    external = outside / "external-hook.py"
+    external.write_text("# outside-root hook\n")
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": f"python3 {external}"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    before = srv._watched_snapshot(root)
+    external.unlink()
+    after = srv._watched_snapshot(root)
+    assert before != after
+    # TRK-022.F8 (QA review), ADDED beside the line above rather than replacing it -- binding
+    # rule 7 protects an existing assertion, and this tightening is not worth an A27 amendment.
+    # `before != after` proves the snapshot MOVED but not that `external` is WHAT moved; it
+    # would pass on any unrelated watched-value change. Name the path.
+    assert external in before and before[external] != after[external]
+
+
 def test_nested_project_command_addition_triggers_recollect(live_server_watching_compose):
     server, out_dir, root, proj = live_server_watching_compose
     _wait_settle(server)

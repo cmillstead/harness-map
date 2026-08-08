@@ -285,6 +285,154 @@ def _probe_is_symlink(path):
     return st is not None and stat.S_ISLNK(st.st_mode)
 
 
+_TORN_READ_ATTEMPTS = 5     # measured: 5 is the first attempt count reaching BOTH zero
+                            # unparseable reads and zero exhaustions under a pathological
+                            # continuous-rewrite load (2/600 at 3, 0/600 at 5, no gain at 8).
+                            # Retries only occur when tearing is DETECTED, so the cost on a
+                            # quiet harness -- the normal case -- is zero.
+
+
+def _stat_identity_pair(path):
+    """`(st_dev, st_ino, st_mtime_ns, st_size, is_regular)` for `path`, or None if it cannot be
+    stat'd. Every element comes from ONE `os.stat` so the tuple can never disagree with itself
+    (the mixed-pair defect TRK-022 slice A shipped a fix for).
+
+    `st_dev`/`st_ino` are included because (mtime, size) is NOT file identity — a file REPLACED
+    by rename with matching size and mtime is a different inode carrying different bytes, and a
+    mtime+size pair alone accepts it as unchanged. Slice A of this same ticket added inode
+    tracking to `serve.py` for exactly this class, so including it here is consistency, not
+    novelty. `is_regular` (`stat.S_ISREG`) rides along because the retry loop needs it — see
+    `_read_text_stable`'s FIFO guard.
+
+    Deliberately NOT `_probe_stat`, and this is a considered divergence from house style, not
+    an oversight. `_probe_stat` PROPAGATES every OSError outside its ignored set — that is
+    "the entire reason this helper exists", per its own docstring. Propagating here would
+    change CALLER behavior: an EPERM on the stat would escape `_read_text_stable` and be
+    caught by `_read_text` as INACCESSIBLE, or by `parse_settings` as
+    "settings.json unreadable", on a file that reads perfectly well. This stat is a
+    best-effort TEAR DETECTOR, not a probe of whether the file exists; failing to stat means
+    only "cannot tell whether it moved", which is never treated as evidence of stability — the
+    read is not accepted on a None `before`, and the next iteration's guard returns the text
+    already in hand rather than re-reading a path we cannot stat.
+    ValueError is caught alongside OSError for the parity reason `_probe_stat`
+    documents: a non-encodable path (embedded NUL) raises ValueError, which no OSError
+    handler would catch."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, stat.S_ISREG(st.st_mode))
+
+
+def _read_text_stable(path):
+    """Read `path` as utf-8 text (errors="replace"), retrying a BOUNDED number of times when
+    the file changed UNDERNEATH the read.
+
+    A torn read -- reading a file while a writer is part-way through rewriting it -- yields
+    partial content that parses as garbage. Measured harm: a half-written settings.json flips
+    three headline numbers (hook_commands_examined 3->0, hook_commands_total 3->0,
+    orphan_script_count 0->3), i.e. the dashboard reports that the operator deleted all their
+    hooks. The condition is TRANSIENT but was reported as PERSISTENT.
+
+    Detection is one `os.stat` identity tuple BEFORE the read and again AFTER: if it moved, a
+    writer was active and the bytes just read cannot be trusted. A STABLE file never retries,
+    so every quiet read -- including a read of a genuinely malformed file -- performs exactly
+    one `read_text` and behaves byte-identically to the pre-TRK-022 implementation. That is
+    what makes this change safe for every existing assertion.
+
+    BEST-EFFORT, not elimination -- stated plainly in the same register
+    `_disclose_unlistable_glob` uses for its own accepted TOCTOU class. Four residuals, all
+    named rather than engineered around:
+      * an IN-PLACE writer that restores the SAME dev/ino/mtime_ns/size after the read is
+        undetectable at this layer and passes through unretried. This is broader than "a
+        single mtime tick" -- a writer can also restore metadata deliberately;
+      * a file whose `os.stat` fails cannot be verified, so the read is NOT accepted as
+        settled -- but neither is it re-read while the stat keeps failing. A PERSISTENT stat
+        failure costs exactly ONE read, the same as the pre-TRK-022 path: the `before is None`
+        arm of the guard below returns the text already in hand at attempt 1. A TRANSIENT stat
+        failure is weaker -- if the post-read stat fails but the NEXT pre-read stat succeeds,
+        the guard does not fire and the file IS re-read, so such a file can cost an extra read
+        (bounded by `_TORN_READ_ATTEMPTS` like any other unsettled read). Re-reading a path we
+        cannot even stat is not obviously safer, and the same arm is what prevents re-opening a
+        FIFO. That early return also covers a file that VANISHES after a successful read;
+      * a path that becomes a non-regular file mid-retry returns the last read WITHOUT
+        re-opening it (the FIFO guard below) -- deliberately, since blocking forever is worse
+        than returning slightly stale bytes;
+      * under sustained tearing the attempts are exhausted, and the LAST read is returned.
+        The caller's existing error handling then runs exactly as it does today -- no new
+        exception, no new error string, no new classification kind.
+
+    OSError from the FIRST read propagates to the caller unchanged, so each call site keeps its
+    own error text on a genuinely unreadable file. OSError from a RETRY does NOT propagate
+    (TRK-022.F5): the bytes attempt 0 read successfully are returned instead, because a healthy
+    read must never be reported as a problem just because the re-read lost a race.
+
+    NOT every bare `read_text` is routed through here, and the four that are not are RULINGS,
+    not oversights (TRK-022.F6 -- the slice's not-in-scope list named `_read_head` and
+    `_read_project_file` but omitted these):
+      * `load_profile` reads operator-supplied JSON with `encoding="utf-8"` and NO `errors=`,
+        i.e. STRICT decode, and turns a UnicodeDecodeError into a ProfileError rejection. This
+        helper decodes with `errors="replace"`, which would mangle undecodable bytes into
+        U+FFFD and hand `json.loads` a string that fails for the wrong reason. Routing it here
+        would trade a precise rejection for a confusing one;
+      * the three `--check` sidecar reads (`_check_select_prior_sidecar`,
+        `_check_select_synthesis_pair` x2). The COLLECTOR sidecar is written by this module's
+        own atomic path -- a fresh inode (`os.open` O_CREAT|O_EXCL, or `tempfile.mkstemp` on
+        the explicit fallback) then `os.replace` onto the name -- so a reader structurally
+        observes either the whole old file or the whole new one, never a partial. The two
+        SYNTHESIS reads are the one place that argument does NOT apply, since the collector
+        does not write those files; they are still not routed, because all three already catch
+        UnicodeDecodeError/JSONDecodeError and degrade to a `notice:` that SKIPS the
+        comparison. They cannot flip a headline number, which is the harm this retry exists to
+        prevent.
+
+    One costed non-problem, recorded so it is not re-litigated: `collect_composed_mcp` reads
+    `~/.claude.json` through `_read_text`, and Claude Code rewrites that file during normal
+    use, so a compose-mode collect landing mid-write can perform up to `_TORN_READ_ATTEMPTS`
+    full reads of a multi-MB file. Costed at tens to hundreds of ms -- bounded, comfortably
+    inside the `--check` 5s budget -- and memory stays ONE copy because `text` rebinds. Do not
+    add a size cap or special-case that path."""
+    # `text` is initialised so the function is total, but the initial value is UNREACHABLE at
+    # any _TORN_READ_ATTEMPTS >= 1. It is deliberately "" rather than None because every caller
+    # expects str -- though note that "" is itself the "everything vanished" signal this fix
+    # exists to prevent, so if the constant is ever set to 0 this returns the exact wrong
+    # answer silently. Do not set it to 0.
+    text = ""
+    for attempt in range(_TORN_READ_ATTEMPTS):
+        before = _stat_identity_pair(path)
+        # FIFO GUARD. Callers probe `_probe_is_file` ONCE before the first read, so a RETRY
+        # would re-open a path that has since become a FIFO -- and `read_text` on a FIFO blocks
+        # forever, a hazard the old single-read path could not have after its read succeeded.
+        # Re-check regular-file-ness before every read AFTER the first, reusing the stat we
+        # already took rather than adding a probe. `before is None` covers the
+        # vanished/unstattable case, where re-reading is also wrong.
+        if attempt > 0 and (before is None or not before[4]):
+            return text
+        # TRK-022.F5 (QA review): the pre-read stat above says present-and-regular, but the
+        # `open()` here can STILL lose a race -- ENOENT from an unlink-then-recreate writer,
+        # EACCES from one that recreates restrictive and chmods after. Unguarded, that OSError
+        # escaped the helper and `_read_text` returned INACCESSIBLE / `parse_settings` recorded
+        # "settings.json unreadable" plus ({}, False), flipping the exact 3 headline keys this
+        # retry exists to prevent -- the fix pointing backwards, a healthy read reported as a
+        # problem. On a RETRY, keep the bytes attempt 0 already read successfully: a tear we
+        # cannot re-read is no reason to discard them. On attempt 0 there is nothing to keep,
+        # so RE-RAISE and leave every caller's unreadable-file path byte-identical to
+        # pre-TRK-022. Swallowing there would return "" and call it VERIFIED.
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            if attempt == 0:
+                raise
+            return text
+        after = _stat_identity_pair(path)
+        # A stat that FAILED on either side means "cannot verify", NOT "unchanged". Comparing
+        # two Nones as equal would silently accept a torn read on any file whose stat fails.
+        # Requiring `before is not None` makes the code match the claim.
+        if before is not None and after == before:
+            return text
+    return text
+
+
 def _read_text(path):
     """Read `path` as utf-8 text (errors="replace"). Returns `(text, "VERIFIED")` on
     success or `(None, "INACCESSIBLE")` on failure. The `is_file()` guard matches
@@ -299,7 +447,7 @@ def _read_text(path):
         # same try as the read so both fold into the one INACCESSIBLE outcome.
         if not _probe_is_file(path):
             return None, "INACCESSIBLE"
-        return path.read_text(encoding="utf-8", errors="replace"), "VERIFIED"
+        return _read_text_stable(path), "VERIFIED"
     except OSError:
         return None, "INACCESSIBLE"
 
@@ -2765,7 +2913,7 @@ def parse_settings(
         blind_spots.append("settings.json not found; permissions/config/hooks reflect defaults.")
         return {}, False
     try:
-        text = settings_path.read_text(encoding="utf-8", errors="replace")
+        text = _read_text_stable(settings_path)
     except OSError as e:
         errors.append(f"settings.json unreadable: {e!r}")
         return {}, False
@@ -6485,9 +6633,14 @@ def _compose_project_input_paths(project_root, errors=None):
         paths.add(skill_dir / "SKILL.md")
 
     # -- T5: a project/local settings.json hook command's resolved script existence
-    #    (`_compose_hooks`'s `.exists()` check) -- mirrors the operator-tier resolved-hook-
-    #    script loop below EXACTLY (same lexical-containment logic), reading project/local
-    #    settings via the SAME `parse_project_settings` T5's own merge uses. --
+    #    (`_compose_hooks`'s `.exists()` check), reading project/local settings via the SAME
+    #    `parse_project_settings` T5's own merge uses. This DELIBERATELY DIVERGES from the
+    #    operator-tier resolved-hook-script loop below: since TRK-022 finding 2 that loop
+    #    watches outside-root targets unconditionally, while this one KEEPS the lexical
+    #    containment filter. A project root is UNTRUSTED input -- watching a path its
+    #    settings.json names would let it make the watcher stat and listdir anywhere on disk
+    #    (containment invariant; A64, TRK-026). Pinned by
+    #    test_compose_project_input_paths_still_drops_outside_root_hook. --
     proj_settings, _ok1 = parse_project_settings(project_root, project_root, containment_stat,
                                                   [], [], [])
     local_settings, _ok2 = parse_project_settings(project_root, project_root, containment_stat,
@@ -6524,19 +6677,28 @@ def iter_input_paths(
     this function, not a hand-kept list in serve.py, is the source of truth.
 
     GUARANTEE: a SUPERSET of every STATICALLY-enumerable path build_document stats/opens/globs/
-    iterdirs, PLUS every hook-script path resolvable UNDER root from a registered settings.json
-    command (reconcile_hooks stat()s exactly those — mirrored here via _script_from_command, and
-    hooks/ is watched RECURSIVELY so a nested hook script is covered by container membership).
+    iterdirs, PLUS every hook-script path resolvable from a registered settings.json command —
+    outside-root absolute targets included since TRK-022 finding 2 (reconcile_hooks stat()s
+    exactly those — mirrored here via _script_from_command, and hooks/ is watched RECURSIVELY so
+    a nested hook script is covered by container membership).
     Each group below names the collector read it corresponds to. Add a future collector input
     HERE (or to a shared _*_GLOBS constant that both this and the scan consume) or the dashboard
-    serves stale data. NOT covered are the two honest, content-derived residuals below.
+    serves stale data. NOT covered are the three honest, content-derived residuals below.
 
     KNOWN watcher blind spots (documented for T4 — content-derived, NOT statically enumerable):
-      * A registered hook command may resolve to an ABSOLUTE path OUTSIDE root (case c). A root
-        walk cannot watch a file outside root, so its own create/delete is unobserved — but the
-        settings.json EDIT that registers (or de-registers) such a command IS watched, so a
-        re-render still fires on the registration change itself. Nested and relative-under-root
-        hook scripts ARE now covered (recursive hooks/ + resolved-command yield above).
+      * A PROJECT-tier hook command (compose mode) may resolve to an ABSOLUTE path OUTSIDE the
+        project containment root. `_compose_project_input_paths` deliberately drops it: a
+        project root is UNTRUSTED input, and watching such a path would let a project's
+        settings.json make the watcher stat and listdir arbitrary absolute paths. Its own
+        create/delete is therefore unobserved — but the project settings.json EDIT that
+        registers (or de-registers) the command IS watched, so a re-render still fires on the
+        registration change itself. The OPERATOR tier does NOT share this blind spot in
+        non-compose mode: since TRK-022 finding 2 it watches every resolved hook script,
+        outside-root included. In COMPOSE mode one qualification survives: `_watched_snapshot`
+        tags tier by LEXICAL position, so an operator-sourced hook path that happens to live
+        under `project_root` receives project-tier follow policy, and if it is additionally a
+        symlink escaping that root its target is not followed. That is still strictly better
+        than before, when such a path was not watched at all.
       * check_phantom_refs stats `root / <token>` for backtick path tokens parsed out of prose
         — an unbounded, content-derived set. Creating a referenced file OUTSIDE the dirs above
         can flip a phantom-ref verdict without a watched signal. In practice almost every
@@ -6745,28 +6907,49 @@ def iter_input_paths(
 
     # -- resolved hook-script paths from REGISTERED settings.json commands: reconcile_hooks
     #    stat()s exactly these. Reuse _script_from_command (its resolution logic is the single
-    #    source of truth) and yield each script that resolves UNDER root — a command may point
-    #    OUTSIDE hooks/ (e.g. "./scripts/x.py"). A command resolving to an ABSOLUTE path outside
-    #    root is un-watchable via a root walk (disclosed in the docstring's blind-spot list); the
-    #    settings.json edit that registers it IS watched (settings.json is yielded above). --
+    #    source of truth) and yield EVERY resolved script -- including one resolving to an
+    #    ABSOLUTE path OUTSIDE root, which reconcile_hooks stat()s just the same (TRK-022
+    #    finding 2). A command may also point OUTSIDE hooks/ but under root (e.g.
+    #    "./scripts/x.py"); both cases are watched. The PROJECT-tier sibling in
+    #    _compose_project_input_paths ABOVE deliberately does NOT do this. --
     settings, _parsed_ok = parse_settings(root, [], [], profile=profile)
-    root_resolved = root.resolve()
     for command in _iter_hook_commands(settings):
         script_path, _note, _kind = _script_from_command(command, root, profile=profile)
         if script_path is None:
             continue
-        # Root-containment is decided LEXICALLY (Codex r5 FIX 2): resolve only the DIRECTORY
-        # chain (so root-matching is correct through deploy-symlinked parents) and KEEP the
-        # leaf name unresolved, so a leaf like ./scripts/x.py that LIVES under root but is a
-        # symlink to an external target still counts as in-root. reconcile_hooks stat()s the
-        # SAME lexical path (script_path.stat() follows the leaf symlink to that target), so the
-        # watched path added below EQUALS what reconcile_hooks reads. A truly-external absolute
-        # path still fails relative_to and stays un-watchable (documented blind spot, case c).
+        # TRK-022 finding 2: watch EVERY resolved hook script, INCLUDING one that resolves to
+        # an ABSOLUTE path OUTSIDE root. reconcile_hooks stat()s exactly this path, and its
+        # create/delete flips headline orphan_registration_count with no other watched signal
+        # (measured: 0 -> 1, while the watcher snapshot stayed byte-identical). The lexical
+        # relative_to() filter that used to drop this case is gone, not relaxed: its result was
+        # never added to `paths`, so it was purely a filter.
+        #
+        # This adds NO new access class at the operator tier. That tier already follows
+        # symlinks to outside-root targets and LISTS them -- measured: _path_value on a
+        # skills/*/tests symlinked to an outside-root dir returns kind='dir' with that dir's
+        # members (pinned by test_iter_input_paths_watches_symlinked_test_dir). A hook command
+        # CAN resolve to a directory (the token filter accepts any token containing "/", with
+        # no suffix requirement), so the dir case is reachable -- and already in-class.
+        #
+        # The PROJECT tier is deliberately NOT changed: _compose_project_input_paths keeps its
+        # identical containment filter, because a project root is UNTRUSTED input and dropping
+        # it there would let a project's settings.json make the watcher stat and listdir
+        # arbitrary absolute paths. That asymmetry is the containment invariant (A64, TRK-026),
+        # and is pinned by test_compose_project_input_paths_still_drops_outside_root_hook.
+        #
+        # TRK-022.F1, post-execution review: the filter removed above was ALSO, incidentally, a
+        # SANITIZER -- its `except (ValueError, OSError)` swallowed the ValueError a path
+        # carrying an embedded NUL raises. Watching such a path crashes BOTH consumers
+        # (`serve._path_value` and `validate_write_target` each raise "embedded null byte"),
+        # aborting a watcher sweep. Probe with the real syscall and skip ONLY the malformed
+        # case. An ABSENT path must still be watched: detecting its creation is the entire
+        # point of the change above.
         try:
-            lexical = script_path.parent.resolve() / script_path.name
-            lexical.relative_to(root_resolved)
-        except (ValueError, OSError):
-            continue  # genuinely outside root (case c) — un-watchable via a root walk
+            os.stat(script_path)
+        except ValueError:
+            continue            # malformed path (embedded NUL): unusable by every consumer
+        except OSError:
+            pass                # absent / unreadable is FINE -- watch it anyway
         paths.add(script_path)
 
     # -- T8: compose-mode project-tier additions (gated on `compose`, not merely on
