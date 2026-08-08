@@ -9271,6 +9271,99 @@ def test_project_tier_duplication_corpus_rules_dir_locked_records_blind_spot(tmp
                for b in blind_spots)
 
 
+# TRK-026: _project_tier_duplication_corpus previously gated only the resulting
+# candidate FILES, never the surface DIRECTORY itself -- so an escaping directory
+# symlink still had its (glob-filtered) child names serialized into out_of_root_refs,
+# one entry per external file, even though no file bytes ever crossed the gate. These
+# four tests pin the fix: exactly one directory-level entry, never a per-child leak.
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_duplication_corpus_rules_dir_symlink_escape_is_one_entry_not_per_file(tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / ".claude").mkdir(parents=True)
+    outside = tmp_path / "OUTSIDE_THE_ROOT"
+    outside.mkdir()
+    (outside / "LEAKED_alpha.md").write_text("alpha body\n")
+    (outside / "LEAKED_beta.md").write_text("beta body\n")
+    (outside / "ignored.txt").write_text("not markdown, not globbed\n")
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.symlink_to(outside)
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus = _collector._project_tier_duplication_corpus(
+        project_root, blind_spots, out_of_root_refs)
+    assert corpus == []
+    assert len(out_of_root_refs) == 1
+    entry = out_of_root_refs[0]
+    assert entry["name"] == ".claude/rules"
+    assert entry["target"] == str(outside)
+    assert entry["trusted"] is False
+    for ref in out_of_root_refs:
+        assert "LEAKED_alpha" not in ref["name"] and "LEAKED_alpha" not in ref["target"]
+        assert "LEAKED_beta" not in ref["name"] and "LEAKED_beta" not in ref["target"]
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform lacks symlink")
+def test_project_tier_duplication_corpus_skills_dir_symlink_escape_is_one_entry_not_per_skill(tmp_path):
+    project_root = tmp_path / "repo"
+    (project_root / ".claude").mkdir(parents=True)
+    outside = tmp_path / "OUTSIDE_SKILLS"
+    outside.mkdir()
+    (outside / "leaked-skill-one").mkdir()
+    (outside / "leaked-skill-one" / "SKILL.md").write_text("---\ndescription: d\n---\nbody\n")
+    (outside / "leaked-skill-two").mkdir()
+    (outside / "leaked-skill-two" / "SKILL.md").write_text("---\ndescription: d\n---\nbody\n")
+    skills_dir = project_root / ".claude" / "skills"
+    skills_dir.symlink_to(outside)
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus = _collector._project_tier_duplication_corpus(
+        project_root, blind_spots, out_of_root_refs)
+    assert corpus == []
+    assert len(out_of_root_refs) == 1
+    entry = out_of_root_refs[0]
+    assert entry["name"] == ".claude/skills"
+    assert entry["target"] == str(outside)
+    assert entry["trusted"] is False
+    for ref in out_of_root_refs:
+        assert "leaked-skill-one" not in ref["name"] and "leaked-skill-one" not in ref["target"]
+        assert "leaked-skill-two" not in ref["name"] and "leaked-skill-two" not in ref["target"]
+
+
+def test_project_tier_duplication_corpus_absent_rules_dir_records_nothing(tmp_path):
+    # TRK-050 inverse-bug regression pin: an absent optional directory must stay
+    # silent. _project_tier_gate returns (False, None) for BOTH "absent" and "escapes
+    # containment" -- gating before the _probe_is_dir existence check would misreport
+    # every project that simply lacks `.claude/rules` as an out-of-root escape.
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus = _collector._project_tier_duplication_corpus(
+        project_root, blind_spots, out_of_root_refs)
+    assert corpus == []
+    assert out_of_root_refs == []
+    assert blind_spots == []
+
+
+def test_project_tier_duplication_corpus_in_root_rules_dir_still_contributes(tmp_path):
+    # Proves the directory-level gate did not simply disable the feature: a legitimate
+    # IN-ROOT .claude/rules must still feed its files into the corpus.
+    project_root = tmp_path / "repo"
+    rules_dir = project_root / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "a.md").write_text(
+        "some distinct normalized words here for shingles to key off of\n")
+    blind_spots: list = []
+    out_of_root_refs: list = []
+    corpus = _collector._project_tier_duplication_corpus(
+        project_root, blind_spots, out_of_root_refs)
+    rel_paths = {rel for rel, _tier, _shingles in corpus}
+    assert rel_paths == {".claude/rules/a.md"}
+    assert out_of_root_refs == []
+    assert blind_spots == []
+
+
 # TRK-023 T2: _project_tier_hygiene_corpus, the project half of the promotion-candidate
 # hygiene scan (spec Design section "The shared project-tier corpus"). Direct-call style,
 # matching the _project_tier_duplication_corpus tests immediately above.

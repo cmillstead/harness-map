@@ -4988,7 +4988,14 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
     EVERY read routes through T3's `_project_tier_gate` + `_read_project_file` (H2) — an
     escaping symlink is recorded as an `out_of_root_ref` and excluded, never body-read or
     excerpted. Feeds `duplication.pairs[].shared_sample`, one of T3's three named
-    excerpt sinks."""
+    excerpt sinks. TRK-026: each surface DIRECTORY (`.claude/rules`, `.claude/agents`,
+    `.claude/commands`, `.claude/skills`, and each per-skill directory) is also gated
+    BEFORE it is globbed or `iterdir()`'d, not merely the resulting candidate files —
+    previously an escaping directory symlink still had its (glob-filtered) child names
+    serialized into `out_of_root_refs`, one entry per external file, even though no file
+    bytes ever crossed the gate. `_probe_is_dir` still runs first: `_project_tier_gate`
+    cannot distinguish "absent" from "escapes containment", so gating before the
+    existence check would misreport a project that simply lacks the directory."""
     project_root = Path(project_root)
     harness_root = project_root / ".claude"
     seen_refs: set[str] = set()
@@ -5003,17 +5010,35 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
     for rel_dir, pattern in _PROJECT_DUP_SURFACE_DIRS:
         d = project_root / rel_dir
         try:
-            if _probe_is_dir(d):
-                dir_matches = sorted(d.glob(pattern))
-                candidates.extend(dir_matches)
-                _disclose_unlistable_glob(d, pattern, dir_matches, blind_spots,
-                                           "project duplication corpus")
+            d_is_dir = _probe_is_dir(d)
         except OSError as e:
             # Inaccessible is NOT clean: an unreadable project-tier surface dir yields
             # zero candidates for it, which reads identically to "nothing there" unless
             # recorded. blind_spots is the existing recording channel for this function.
             blind_spots.append(f"project {rel_dir} not probed for duplication scan: {e}")
             continue
+        if not d_is_dir:
+            continue
+        # TRK-026: the surface DIRECTORY itself must clear the gate before it is ever
+        # globbed -- previously only the resulting candidate FILES were gated, so a
+        # directory symlink escaping project_root still had its (filtered) child names
+        # serialized into out_of_root_refs, one entry per external file. _probe_is_dir
+        # stays first: _project_tier_gate returns (False, None) for both "absent" and
+        # "escapes containment", and gating before the existence check would misreport
+        # every project that simply lacks this directory as an escape (the TRK-050
+        # "absent is not an error" inverse bug).
+        contained, _identity = _project_tier_gate(d, project_root, containment_stat)
+        if not contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, d)
+            continue                       # never glob an escaping directory's children
+        try:
+            dir_matches = sorted(d.glob(pattern))
+        except OSError as e:
+            blind_spots.append(f"project {rel_dir} not probed for duplication scan: {e}")
+            continue
+        candidates.extend(dir_matches)
+        _disclose_unlistable_glob(d, pattern, dir_matches, blind_spots,
+                                   "project duplication corpus")
     skills_dir = harness_root / "skills"
     try:
         skills_dir_is_dir = _probe_is_dir(skills_dir)
@@ -5026,7 +5051,15 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
         # occurred when both shared one literal.
         blind_spots.append(f"project skills is_dir failed for duplication scan: {e}")
         skills_dir_is_dir = False
+    skills_dir_contained = False
     if skills_dir_is_dir:
+        # TRK-026: gate `.claude/skills` itself before it is ever iterdir()'d, the same
+        # directory-level fix as the loop above.
+        skills_dir_contained, _identity = _project_tier_gate(
+            skills_dir, project_root, containment_stat)
+        if not skills_dir_contained:
+            _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skills_dir)
+    if skills_dir_is_dir and skills_dir_contained:
         try:
             skill_entries = sorted(skills_dir.iterdir())
         except OSError as e:
@@ -5042,6 +5075,13 @@ def _project_tier_duplication_corpus(project_root, blind_spots, out_of_root_refs
                 # comprehension and discard every sibling with it (TRK-050 T2).
                 blind_spots.append(f"project skills child is_dir failed for {p}: {e}")
         for skill_dir in skill_dirs:
+            # TRK-026: gate each skill DIRECTORY before its SKILL.md is even probed for
+            # existence -- otherwise the file's presence is an existence oracle for an
+            # escaping skill directory.
+            contained, _identity = _project_tier_gate(skill_dir, project_root, containment_stat)
+            if not contained:
+                _record_out_of_root_ref(out_of_root_refs, seen_refs, project_root, skill_dir)
+                continue                       # never probe SKILL.md beneath an escaping dir
             skill_md = skill_dir / "SKILL.md"
             present, ok = _safe_exists(skill_md)
             if ok and present:
