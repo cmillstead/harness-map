@@ -6535,7 +6535,7 @@ def iter_input_paths(
     a nested hook script is covered by container membership).
     Each group below names the collector read it corresponds to. Add a future collector input
     HERE (or to a shared _*_GLOBS constant that both this and the scan consume) or the dashboard
-    serves stale data. NOT covered are the two honest, content-derived residuals below.
+    serves stale data. NOT covered are the three honest, content-derived residuals below.
 
     KNOWN watcher blind spots (documented for T4 — content-derived, NOT statically enumerable):
       * A PROJECT-tier hook command (compose mode) may resolve to an ABSOLUTE path OUTSIDE the
