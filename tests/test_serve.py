@@ -937,6 +937,82 @@ def test_empty_stream_creation_detected(streams_server_no_watch):
     assert c2 == "grown" and key in changed2
 
 
+def test_same_size_rotation_classifies_truncated(streams_server_no_watch):
+    # TRK-022 finding 3 (measured): a telemetry stream renamed aside and replaced by a NEW file
+    # of IDENTICAL byte length yielded size 16 -> 16 and classified "none", so the watcher never
+    # re-rendered and the dashboard served stale friction data. The inode changes across the
+    # rename-and-replace, so file identity is a sufficient signal.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    stream_path.write_text('{"a":1}\n{"a":2}\n')
+    srv._rebuild(server.state, out_dir, root, root)   # seeds BOTH the size and the inode
+    size_before = stream_path.stat().st_size
+    inode_before = server.state.stream_inodes[key]
+
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text('{"z":9}\n{"z":8}\n')      # same length, different records
+
+    assert stream_path.stat().st_size == size_before, \
+        "fixture precondition: the size really is unchanged"
+    assert stream_path.stat().st_ino != inode_before, \
+        "fixture precondition: the file identity really did change"
+    classification, changed = srv._classify_stream_sweep(server.state)
+    assert classification == "truncated", \
+        "a same-size rotation must force a FULL re-collect, not read as no-change (finding 3)"
+    assert changed == [key]
+
+
+def test_append_still_classifies_grown_after_rotation_check(streams_server_no_watch):
+    # Positive control for TRK-022 finding 3: the rotation branch sits BEFORE the size ladder, so
+    # it must not swallow ordinary growth. An append leaves the inode alone. Had the check
+    # compared the full `_stat_identity` tuple (which carries st_mtime_ns, and mtime moves on
+    # every append), every append would classify "truncated" and force a full re-collect --
+    # destroying the B2 cheap path.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    srv._rebuild(server.state, out_dir, root, root)
+    _append_decision_record(stream_path)
+    classification, changed = srv._classify_stream_sweep(server.state)
+    assert classification == "grown"
+    assert changed == [key]
+
+
+def test_unchanged_stream_still_classifies_none(streams_server_no_watch):
+    # Positive control: the extra per-sweep inode stat must not manufacture a change on a stream
+    # nobody touched -- that would re-render on every single poll.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    srv._rebuild(server.state, out_dir, root, root)
+    assert srv._classify_stream_sweep(server.state) == ("none", [])
+
+
+def test_rotation_with_growth_classifies_truncated_exactly_once(streams_server_no_watch):
+    # A rotation whose replacement file is LARGER must still classify "truncated" -- records
+    # disappeared, so the cheap append-only path would serve stale data -- and the key must be
+    # recorded exactly ONCE. The rotation branch and the size ladder are `elif` arms of one
+    # chain, never two appends.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    stream_path.write_text('{"a":1}\n')
+    srv._rebuild(server.state, out_dir, root, root)
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text('{"z":9}\n{"z":8}\n{"z":7}\n')   # NEW file, strictly larger
+    classification, changed = srv._classify_stream_sweep(server.state)
+    assert classification == "truncated"
+    assert changed == [key], "the key must be recorded once, not once per matching arm"
+
+
+def test_unseeded_inode_does_not_fabricate_a_rotation(streams_server_no_watch):
+    # An UNKNOWN inode on either side must fall through to the size ladder rather than report a
+    # rotation -- otherwise an unavailable signal would force an endless full re-collect. This is
+    # reachable in production for a stream configured but not yet seeded at either publish site.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    srv._rebuild(server.state, out_dir, root, root)
+    server.state.stream_inodes = {}   # a real assignment on a real object: the never-seeded case
+    assert srv._classify_stream_sweep(server.state) == ("none", [])
+
+
 def test_stream_deletion_forces_rerender(live_server_with_streams):
     # FIX 2 (Codex P2): a previously-loaded stream that is DELETED (size -> None) must force
     # a FULL re-collect so the collector/friction reflect the removed file — otherwise the

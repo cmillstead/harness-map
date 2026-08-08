@@ -126,8 +126,11 @@ class _State:
     (forces a full re-collect) -- it is NEVER used to slice a partial tail, the cheap path
     always re-reads each stream file in FULL (C18 parity). It is seeded from the size observed
     BEFORE a render consumes the streams (FIX 1) and carries an existence bit -- None marks an
-    absent stream, distinct from an empty one (size 0) (FIX 2). `generation` is the monotonic
-    publish counter (FIX 4) baked into the served page + reported to SSE clients on connect.
+    absent stream, distinct from an empty one (size 0) (FIX 2). `stream_inodes` (TRK-022 finding
+    3) is its parallel {str(stream_path): st_ino-or-None} identity dict, seeded in lockstep at
+    the same two publish sites, catching a same-size rotation the size heuristic alone misses.
+    `generation` is the monotonic publish counter (FIX 4) baked into the served page + reported
+    to SSE clients on connect.
     """
 
     def __init__(self, streams: dict[str, Any], no_friction: bool) -> None:
@@ -150,6 +153,15 @@ class _State:
         # re-collect) -- NEVER used to slice a partial tail (the cheap path always re-reads
         # each stream file in FULL, C18 parity).
         self.stream_offsets: dict[str, Any] = {}
+        # {str(stream_path): st_ino-or-None}, seeded in LOCKSTEP with `stream_offsets` at BOTH
+        # publish sites (`_rebuild` and `_rebuild_friction_only`). It is a PARALLEL dict rather
+        # than a widened `stream_offsets` value on purpose: six pre-existing assertions compare
+        # `stream_offsets` values to plain integers (tests/test_serve.py:694, 715, 739, 910, 928,
+        # 934), and widening that value would break every one of them. `_classify_stream_sweep`
+        # reads this to catch a SAME-SIZE rotation -- the live file renamed aside and replaced by
+        # a new file of identical length -- which the size ladder alone reads as "no change"
+        # (TRK-022 finding 3, measured).
+        self.stream_inodes: dict[str, Any] = {}
         # FIX 4 (Codex challenge): stream keys whose last-observed truncation/rotation/deletion
         # has NOT yet been consumed by a successful full `_rebuild`. Touched ONLY by the single
         # watcher thread (no lock needed). Set when `_classify_stream_sweep` reports "truncated";
@@ -254,12 +266,13 @@ def _write_guard_roots(ctx):
 
 def _rebuild(state, out_dir, root, project_root, compose=False):
     """Write-then-publish (publish only AFTER the fallible on-disk write succeeds):
-    0. snapshot each stream's PRE-render size (FIX 1) and the next publish generation (FIX 4)
+    0. snapshot each stream's PRE-render size and inode (FIX 1; TRK-022 finding 3) and the
+       next publish generation (FIX 4)
     1. run the collector (P30-guarded) to produce today's sidecar
     2. render in memory from that sidecar (baking in the generation as a <meta>)
     3. write the HTML artifact to disk (the operation that can raise OSError)
     4. ONLY on write success: atomically publish state.ctx + bump collect_count + generation
-       + seed stream_offsets from the step-0 PRE-render sizes
+       + seed stream_offsets and stream_inodes from the step-0 PRE-render snapshots
     5. broadcast a `refresh` to every connected SSE client
 
     Any exception raised before step 4 propagates to the caller (the watcher loop catches
@@ -283,6 +296,7 @@ def _rebuild(state, out_dir, root, project_root, compose=False):
     # then leaves size>offset next sweep (a safe redundant re-render), never recorded as
     # already-consumed (which would drop the last event of a burst until another append).
     pre_sizes = _snapshot_stream_sizes(state)
+    pre_inodes = _snapshot_stream_inodes(state)  # TRK-022 finding 3: captured in the same sweep
     next_gen = state.generation + 1  # FIX 4: the generation this render is published at
     today = datetime.now().strftime("%Y-%m-%d")
     sidecar_path = out_dir / f"harness-map-{today}.json"
@@ -302,6 +316,7 @@ def _rebuild(state, out_dir, root, project_root, compose=False):
         state.collect_count += 1
         state.generation = next_gen
         state.stream_offsets = pre_sizes  # FIX 1: seed from PRE-read sizes, not post-render
+        state.stream_inodes = pre_inodes  # TRK-022 finding 3: seeded in lockstep with the sizes
     _broadcast_refresh(state)
 
 
@@ -473,8 +488,10 @@ def _rebuild_friction_only(state, out_dir):
     with state.lock:
         ctx = state.ctx
     # FIX 1: pre-read stream sizes (before build_friction_overlay consumes them) seed the
-    # offsets, so an append during this cheap render is never marked already-consumed.
+    # offsets, so an append during this cheap render is never marked already-consumed. TRK-022
+    # finding 3: the inode is captured in the same pre-read pass, seeding stream_inodes too.
     pre_sizes = _snapshot_stream_sizes(state)
+    pre_inodes = _snapshot_stream_inodes(state)
     next_gen = state.generation + 1  # FIX 4: the cheap re-render also advances the generation
     out_dir = Path(out_dir)
     new_friction = render_html.build_friction_overlay(
@@ -490,6 +507,7 @@ def _rebuild_friction_only(state, out_dir):
             state.ctx, friction=new_friction, html_text=html_text, html_bytes=html_bytes)
         state.generation = next_gen
         state.stream_offsets = pre_sizes  # FIX 1: seed from PRE-read sizes, not post-render
+        state.stream_inodes = pre_inodes  # TRK-022 finding 3: seeded in lockstep with the sizes
     _broadcast_refresh(state)
 
 
@@ -547,6 +565,76 @@ def _snapshot_stream_sizes(state):
     return {key: _stream_size(key) for key in _stream_paths_list(state.streams)}
 
 
+def _stream_inode(path):
+    """The st_ino of one friction-stream path, or None if it does not exist.
+
+    Mirrors `_stream_size`'s stat shape exactly (same try/except, same S_ISREG gate) and reads a
+    different field. It deliberately does NOT reuse `_stat_identity` (serve.py:78), for two
+    independent reasons -- both of which would be bugs if ignored:
+
+    1. `_stat_identity` returns (st_ino, st_mtime_ns), and mtime changes on EVERY append. Comparing
+       the full tuple would classify every ordinary append as a rotation and force a full
+       re-collect each sweep -- destroying the B2 cheap path `_classify_stream_sweep` exists to
+       protect. Inode ALONE is the file-IDENTITY signal: it changes on the rename-aside-and-replace
+       a log rotation performs, and does not change on an append.
+    2. `_stat_identity` has NO S_ISREG gate -- it returns an identity for a directory or a FIFO --
+       whereas `_stream_size` returns None for anything that is not a regular file. See the
+       presence paragraph below.
+
+    PRESENCE MUST MATCH `_stream_size`'s NOTION OF PRESENCE. `stream_offsets` and `stream_inodes`
+    are read in the SAME pass by `_classify_stream_sweep`, so if the two helpers disagree about
+    whether a path counts as present, one input produces two contradictory answers. A path that
+    is a directory would be ABSENT to the size ladder and PRESENT to the identity check, and the
+    rotation arm would fire on a stream the size ladder considers gone. The S_ISREG gate above
+    makes the two dicts agree by construction rather than by coincidence.
+
+    RESIDUAL, disclosed and not fixed: a filesystem that REUSES inode numbers can hand the
+    replacement file the same st_ino as the file it replaced, in which case a same-size rotation
+    stays invisible exactly as it is today. This narrows the blind spot; it does not close it."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return st.st_ino
+
+
+def _snapshot_stream_inodes(state):
+    """{key: st_ino-or-None} for every configured stream, captured to seed `stream_inodes`.
+    Called at BOTH publish sites immediately after `_snapshot_stream_sizes`, so the two dicts
+    always describe the same sweep. Seeding at only ONE site is a real defect, not a style nit:
+    a stream CREATED after startup is seeded by the cheap `_rebuild_friction_only` path, so a
+    missing seed there would leave its inode None forever and silently degrade the rotation check
+    off for that stream -- reintroducing this ticket's blind spot through the back door (pinned by
+    tests/test_serve.py::test_friction_only_rebuild_seeds_stream_inodes).
+
+    The sizes and the inodes are captured in two passes, so a rotation landing between them
+    records the NEW file's inode against the OLD file's size; next sweep the inodes then match and
+    the size ladder governs. That residual window is microseconds wide and strictly narrower than
+    the bug being fixed -- the same accepted-TOCTOU class serve.py:290-294 already documents for
+    the P30 sidecar freshness check."""
+    return {key: _stream_inode(key) for key in _stream_paths_list(state.streams)}
+
+
+def _stream_rotated(state, key):
+    """True iff `key`'s CURRENT inode differs from the one seeded at the last publish -- i.e. the
+    path still exists but now names a DIFFERENT file, the rename-aside-and-replace of a log
+    rotation. Consulted by `_classify_stream_sweep` only on the both-present branch, where
+    `_stream_size` has already proved the stream was a regular file at seed time and is one now,
+    so the two inodes are directly comparable.
+
+    An UNKNOWN inode on either side -- never seeded, or the file vanished between this sweep's
+    size stat and this one -- returns False rather than FABRICATING a rotation: the size ladder
+    still governs, and a genuinely vanished stream is caught next sweep by the present->absent
+    branch. Failing this way keeps an unavailable signal from forcing an endless full re-collect."""
+    prev_inode = state.stream_inodes.get(key)
+    current_inode = _stream_inode(key)
+    if prev_inode is None or current_inode is None:
+        return False
+    return current_inode != prev_inode
+
+
 def _classify_stream_sweep(state):
     """(classification, changed_keys) for the CURRENT friction-stream state against
     `state.stream_offsets`. Classification tracks EXISTENCE, not just size (FIX 2):
@@ -556,6 +644,13 @@ def _classify_stream_sweep(state):
         path re-reads every stream in full, so it correctly picks up a newly-created file)
       * a stream that shrank (rotation/truncation) -> "truncated"
       * a stream that grew (pure append) -> "grown"
+      * a stream whose path still exists but now names a DIFFERENT FILE (st_ino changed -- the
+        rename-aside-and-replace of a log rotation) -> "truncated", checked BEFORE the size
+        comparison so it fires even when the replacement file is the SAME SIZE (which the size
+        ladder alone reads as "no change") and even when it is LARGER (records still disappeared,
+        so the cheap append-only path would serve stale friction data). It is an `elif` in the
+        same chain, so a rotation that ALSO changed size appends the key exactly ONCE
+        (TRK-022 finding 3, measured).
     "truncated" takes PRIORITY over "grown" (a shrink/deletion must force the full path,
     never a cheap re-render), which takes priority over "none" (nothing moved). A shrunk
     stream is NEVER treated as growth -- that offset-drift failure mode would read a
@@ -570,6 +665,8 @@ def _classify_stream_sweep(state):
             truncated.append(key)
         elif prev is None:                       # absent -> present: CREATION (even empty)
             grown.append(key)
+        elif _stream_rotated(state, key):         # same path, DIFFERENT file: ROTATION
+            truncated.append(key)
         elif size < prev:                        # shrank: rotation/truncation
             truncated.append(key)
         elif size > prev:                        # pure append
