@@ -1013,6 +1013,34 @@ def test_unseeded_inode_does_not_fabricate_a_rotation(streams_server_no_watch):
     assert srv._classify_stream_sweep(server.state) == ("none", [])
 
 
+def test_friction_only_rebuild_seeds_stream_inodes(streams_server_no_watch):
+    # SEEDING ASYMMETRY (TRK-022 finding 3): `stream_inodes` must be seeded at BOTH publish sites.
+    # A stream CREATED after startup is seeded by the cheap `_rebuild_friction_only` path, so if
+    # only `_rebuild` seeded inodes, that stream's inode would stay None forever, `_stream_rotated`
+    # would degrade off for it, and a later same-size rotation would go undetected -- exactly the
+    # blind spot this ticket closes, reintroduced through the back door. Every rotation test that
+    # starts from a full `_rebuild` passes under the broken one-sided version, which is why this
+    # sequence (absent -> created via the cheap path -> rotated) is the one that catches it.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    stream_path.unlink()
+    srv._rebuild(server.state, out_dir, root, root)   # re-seed with the stream ABSENT
+    assert server.state.stream_inodes.get(key) is None, \
+        "an absent stream must seed to None (existence tracked)"
+
+    stream_path.write_text('{"a":1}\n{"a":2}\n')      # absent -> present
+    assert srv._classify_stream_sweep(server.state)[0] == "grown"
+    srv._rebuild_friction_only(server.state, out_dir)  # the CHEAP path must seed BOTH dicts
+    assert server.state.stream_inodes.get(key) == stream_path.stat().st_ino, \
+        "the cheap path must seed stream_inodes, not just stream_offsets"
+
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text('{"z":9}\n{"z":8}\n')      # same length, different file
+    assert srv._classify_stream_sweep(server.state)[0] == "truncated", \
+        "a same-size rotation after a cheap-path publish must still force a full re-collect"
+
+
 def test_stream_deletion_forces_rerender(live_server_with_streams):
     # FIX 2 (Codex P2): a previously-loaded stream that is DELETED (size -> None) must force
     # a FULL re-collect so the collector/friction reflect the removed file — otherwise the
