@@ -322,9 +322,15 @@ def _path_value(path, tier="operator", project_root=None):
 
     Returns a small comparable tuple:
       * missing:            (False, None, None, None)
-      * directory:          (True, "dir", sorted-listdir tuple | None, symlink-target mtime | None)
-      * regular file:       (True, "file", (mtime_ns, size), symlink-target mtime | None)
+      * directory:          (True, "dir", sorted-listdir tuple | None, target identity | None)
+      * regular file:       (True, "file", (mtime_ns, size), target identity | None)
       * escaping symlink:   (True, "symlink-escaping", readlink() target | None, None)
+    Element 3 is the entry's OWN policy-permitted content identity: listdir membership for a
+    dir, (mtime_ns, size) for a file, and -- for an ESCAPING project-tier symlink, which this
+    function may never follow -- the readlink() target. Element 4 is what FOLLOWING the entry
+    landed on: (realpath target, target mtime_ns) for a symlink on the follow branch, None for
+    a non-symlink, and None on the escaping branch (which never follows, by policy). The two
+    slots answer different questions and are not competing homes for one fact.
     A container dir's sorted-listdir membership flips when a skill/hook/rule/agent/project is
     added or removed (even an EMPTY dir appearing). An unreadable dir's listdir OSError degrades
     to None membership — the existence bit still records the flip."""
@@ -361,14 +367,24 @@ def _path_value(path, tier="operator", project_root=None):
             return (True, "file", (lst.st_mtime_ns, lst.st_size), None)
     # operator tier (default) OR a CONTAINED project-tier entry: unchanged follow-symlinks
     # behavior.
-    link_target_mtime = None
+    link_target_identity = None
     if os.path.islink(path):
-        # os.stat below already follows the link, but fold the realpath target's mtime in
-        # explicitly so intent is unmistakable and a multi-hop link is covered.
+        # os.stat below already follows the link, but fold the target's IDENTITY in explicitly
+        # so intent is unmistakable and a multi-hop link is covered. The identity is
+        # (resolved-target, target-mtime_ns), NOT the mtime alone: a symlink RETARGETED to a
+        # different file that happens to carry the SAME size and the SAME mtime_ns produced a
+        # byte-identical value under the mtime-only form, so the content flipped while the
+        # watcher's value did not -- no re-render fired and the dashboard served stale bytes
+        # (TRK-022 finding 6, measured). `os.path.realpath` is the expression this branch
+        # already follows, is non-strict (it never raises OSError, unlike os.readlink), and
+        # resolves a multi-hop chain -- so it also catches a retargeted INTERMEDIATE directory
+        # symlink, which readlink() on the final component alone would miss.
+        resolved = os.path.realpath(path)
         try:
-            link_target_mtime = os.stat(os.path.realpath(path)).st_mtime_ns
+            target_mtime = os.stat(resolved).st_mtime_ns
         except OSError:
-            link_target_mtime = None
+            target_mtime = None
+        link_target_identity = (resolved, target_mtime)
     try:
         st = os.stat(path)  # follows symlinks
     except OSError:
@@ -378,8 +394,8 @@ def _path_value(path, tier="operator", project_root=None):
             members = tuple(sorted(os.listdir(path)))
         except OSError:
             members = None
-        return (True, "dir", members, link_target_mtime)
-    return (True, "file", (st.st_mtime_ns, st.st_size), link_target_mtime)
+        return (True, "dir", members, link_target_identity)
+    return (True, "file", (st.st_mtime_ns, st.st_size), link_target_identity)
 
 
 def _classify_watch_tier(path, project_root):

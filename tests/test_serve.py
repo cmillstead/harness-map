@@ -439,6 +439,139 @@ def test_symlinked_input_target_change_triggers_recollect(live_server_watching_p
     assert server.state.collect_count > before
 
 
+def test_path_value_detects_metadata_identical_symlink_retarget(tmp_path):
+    # TRK-022 finding 6 (measured): a symlink retargeted to a DIFFERENT file carrying the SAME
+    # size and the SAME mtime_ns produced a byte-identical _path_value under the mtime-only
+    # element 4 -- the content flipped A->B while the watcher's value did not, so no re-render
+    # fired and the dashboard served stale bytes. The followed target must be part of the value.
+    alpha = tmp_path / "alpha.md"
+    beta = tmp_path / "beta.md"
+    alpha.write_text("AAAAAAAAAA")   # 10 bytes
+    beta.write_text("BBBBBBBBBB")    # 10 bytes: identical size, different content
+    fixed_ns = 1_700_000_000_000_000_000
+    os.utime(alpha, ns=(fixed_ns, fixed_ns))
+    os.utime(beta, ns=(fixed_ns, fixed_ns))
+    link = tmp_path / "watched.md"
+    link.symlink_to(alpha)
+    before = srv._path_value(str(link))
+    link.unlink()
+    link.symlink_to(beta)
+    after = srv._path_value(str(link))
+    assert link.read_text() == "BBBBBBBBBB", "fixture precondition: the content really did change"
+    assert alpha.stat().st_size == beta.stat().st_size, "fixture precondition: sizes really are equal"
+    assert alpha.stat().st_mtime_ns == beta.stat().st_mtime_ns, \
+        "fixture precondition: mtimes really are equal"
+    assert before != after, \
+        "a metadata-identical symlink retarget must change the watched value (TRK-022 finding 6)"
+
+
+def test_path_value_unchanged_symlink_compares_equal(tmp_path):
+    # Positive control for TRK-022 finding 6: recording the followed target must not make a
+    # STABLE symlink look changed on every sweep -- that would re-render on every poll.
+    target = tmp_path / "target.md"
+    target.write_text("stable\n")
+    link = tmp_path / "watched.md"
+    link.symlink_to(target)
+    assert srv._path_value(str(link)) == srv._path_value(str(link))
+
+
+def test_path_value_still_detects_same_size_symlink_target_rewrite(tmp_path):
+    # Positive control: element 4 keeps the target mtime_ns ALONGSIDE the resolved path, so a
+    # same-size content rewrite through an UNCHANGED link is still seen. The pre-existing mtime
+    # signal must not be traded away for the new retarget signal.
+    target = tmp_path / "target.md"
+    target.write_text("AAAA")
+    os.utime(target, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+    link = tmp_path / "watched.md"
+    link.symlink_to(target)
+    before = srv._path_value(str(link))
+    target.write_text("BBBB")   # same size, different content
+    os.utime(target, ns=(1_700_000_001_000_000_000, 1_700_000_001_000_000_000))
+    assert srv._path_value(str(link)) != before
+
+
+def test_path_value_dangling_symlink_returns_missing_tuple(tmp_path):
+    # A symlink whose target does not exist returns the MISSING tuple, and element 4 is never
+    # reached at all. os.path.realpath is non-strict so it returns the unresolved path rather
+    # than raising, and the target stat's OSError would degrade the mtime half to None -- but
+    # the OUTER os.stat(path) at serve.py:373 follows the link and raises for the same reason,
+    # so the function returns at serve.py:375 before any identity is assembled. The existence
+    # bit alone carries the change, which is the correct and safe direction.
+    #
+    # DISCLOSED CONSEQUENCE: retargeting one dangling link to a DIFFERENT dangling target is
+    # therefore invisible -- both states are (False, None, None, None). Finding 6 is about
+    # retargets between targets that EXIST; this residual is not in its scope and is not
+    # narrowed by it.
+    link = tmp_path / "dangling.md"
+    link.symlink_to(tmp_path / "never_created.md")
+    assert srv._path_value(str(link)) == (False, None, None, None)
+
+
+def test_path_value_escaping_symlink_shape_unchanged(tmp_path):
+    # The escaping project-tier branch must KEEP its (True, "symlink-escaping", readlink, None)
+    # shape: it never follows, so element 4 -- "what following it landed on" -- stays None. This
+    # pins that the finding-6 fix did not leak target resolution into the branch that is
+    # forbidden by the T8/T3 containment policy from resolving the target at all.
+    proj = tmp_path / "proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    external = tmp_path / "outside.md"
+    external.write_text("external\n")
+    link = proj / ".claude" / "rules" / "escaping.md"
+    link.symlink_to(external)
+    value = srv._path_value(str(link), "project", str(proj))
+    assert value[1] == "symlink-escaping"
+    assert value[2] == str(external)
+    assert value[3] is None
+
+
+def test_path_value_plain_file_has_no_target_identity(tmp_path):
+    # A non-symlink has nothing to follow, so element 4 stays None -- unchanged from before.
+    plain = tmp_path / "plain.md"
+    plain.write_text("x\n")
+    assert srv._path_value(str(plain))[3] is None
+
+
+def test_metadata_identical_skill_symlink_retarget_triggers_recollect(
+        live_server_watching_proj, tmp_path):
+    # End-to-end for TRK-022 finding 6. Mirrors test_symlinked_input_target_change_triggers_
+    # recollect (tests/test_serve.py:429) but flips the TARGET instead of the target's bytes.
+    # VACUITY TRAP: every mtime on both candidate trees is pinned to the same value, so the ONLY
+    # thing that differs pre-fix vs post-fix is the resolved target path. Without the pinning
+    # this test would pass pre-fix on the two dirs' differing creation mtimes and prove nothing.
+    # The `skills/linked/SKILL.md` entry is NOT itself a symlink, so its element 4 is None on
+    # both sides -- the `skills/linked` DIR entry is what carries the signal.
+    server, out_dir, root, proj = live_server_watching_proj
+    fixed_ns = 1_700_000_000_000_000_000
+    first = tmp_path / "skill_one"
+    second = tmp_path / "skill_two"
+    for skill_dir, body in ((first, "# one\n"), (second, "# two\n")):
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(body)   # both 6 bytes
+        os.utime(skill_dir / "SKILL.md", ns=(fixed_ns, fixed_ns))
+        os.utime(skill_dir, ns=(fixed_ns, fixed_ns))
+    link = root / "skills" / "linked"
+    link.symlink_to(first)
+    _wait_settle(server)   # settle the symlink-creation rebuild
+    before = server.state.collect_count
+    # ATOMIC retarget, staged OUTSIDE the watched tree. Two windows have to stay closed here and
+    # they pull in opposite directions:
+    #   (a) a plain link.unlink() + link.symlink_to(second) leaves root/skills one member SHORT;
+    #   (b) staging the replacement as root/skills/linked.swap leaves it one member LONG,
+    #       flipping listdir membership from ("linked",) to ("linked", "linked.swap").
+    # Either one is a MEMBERSHIP change that makes the watcher recollect on its own, so the test
+    # would pass PRE-FIX and the Step 9 stash-proof would report a spurious PASS -- sending you
+    # hunting a fixture bug that does not exist. Stage in tmp_path, which is OUTSIDE --root (so
+    # it is not in the watched set) and on the SAME filesystem (so os.replace is a real atomic
+    # rename, not a copy). os.replace then swaps the symlink itself without ever removing it and
+    # without root/skills ever holding a different member set.
+    staging = tmp_path / "linked.swap"
+    os.symlink(second, staging)
+    os.replace(staging, link)
+    _wait_settle(server)
+    assert server.state.collect_count > before, \
+        "a metadata-identical deploy-symlink retarget must force a re-collect (TRK-022 finding 6)"
+
+
 def test_watched_set_equals_collector_iter_input_paths(live_server_watching_proj):
     server, out_dir, root, proj = live_server_watching_proj
     snap = srv._watched_snapshot(root, proj)
