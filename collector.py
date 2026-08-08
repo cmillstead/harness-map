@@ -5225,7 +5225,11 @@ def _project_tier_hygiene_corpus(project_root, inaccessible, blind_spots, out_of
         try:
             dir_matches = sorted(d.glob(pattern))
         except OSError as e:
-            blind_spots.append(f"project {rel_dir} not probed for hygiene scan: {e}")
+            # Distinct from the is_dir-probe failure above (TRK-050 T5 F5): a reader could
+            # not tell which step failed if both shared one literal. Matches the wording
+            # this function already uses for its own skills is_dir/listing pair, and the
+            # duplication sibling's pair after TRK-026 F-D.
+            blind_spots.append(f"project {rel_dir} listing failed for hygiene scan: {e}")
             scan_complete = False
             continue
         candidates.extend(dir_matches)
