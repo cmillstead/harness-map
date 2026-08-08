@@ -2311,6 +2311,25 @@ def test_iter_input_paths_watches_absolute_outside_root_hook_script(fake_harness
     assert str(inroot) in paths            # regression guard: in-root still watched
 
 
+def test_compose_project_input_paths_still_drops_outside_root_hook(fake_harness, tmp_path):
+    # TRK-022 finding 2 (POSITIVE CONTROL -- passes on BOTH sides of the fix). Task 1 removed
+    # the outside-root filter at the OPERATOR tier only. The PROJECT tier keeps it: a project
+    # root is UNTRUSTED, and watching an outside-root path named by a project's settings.json
+    # would let that project make the watcher stat and listdir anywhere on disk. Containment
+    # invariant -- see AMENDMENTS A64 and TRK-026.
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    external = outside / "project-hook.py"
+    external.write_text("# outside the project root\n")
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": f"python3 {external}"}]}]}}))
+    paths = set(map(str, _collector.iter_input_paths(fake_harness, proj, compose=True)))
+    assert str(external) not in paths
+
+
 def test_iter_input_paths_docstring_discloses_project_tier_outside_root_hook_case(fake_harness):
     # TRK-022 finding 2 (DEFECT test): the case-(c) bullet claimed an outside-root hook target
     # is un-watchable. That is now false for the OPERATOR tier and still true for the PROJECT
