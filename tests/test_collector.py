@@ -2862,6 +2862,60 @@ def test_read_text_is_wired_to_the_stable_read(tmp_path):
     assert evidence == "VERIFIED"                  # existing return shape unchanged
 
 
+def test_read_text_stable_returns_last_good_text_when_a_retry_read_raises(tmp_path):
+    # TRK-022.F5 (DEFECT test, QA review). The in-loop read had NO exception guard. Attempt 0
+    # can succeed, the tear is detected, and attempt 1's read can then RAISE: the pre-read stat
+    # says present-and-regular, but the open() a few lines later can still hit ENOENT (an
+    # unlink-then-recreate writer) or EACCES (recreated restrictive, then chmod'd). The OSError
+    # escaped the helper, so `_read_text` returned (None, "INACCESSIBLE") and parse_settings
+    # recorded "settings.json unreadable" plus ({}, False) -- flipping exactly the 3 headline
+    # keys this retry exists to PREVENT. The fix points backwards otherwise: a healthy read
+    # becomes a reported problem, the same inverse-bug shape TRK-050's review caught when absent
+    # directories were recorded as collection errors.
+    target = tmp_path / "raises-on-retry.txt"
+    target.write_text("first")
+    real_read_text = Path.read_text
+    calls = []
+
+    def tear_then_raise(self, *a, **k):           # mock-ok: simulates unlink-then-recreate
+        calls.append(1)
+        if len(calls) == 1:
+            text = real_read_text(self, *a, **k)
+            target.write_text("second-and-longer")    # tear: mtime AND size move
+            return text
+        raise OSError("recreated unreadable")     # attempt 1's open() loses the race
+    try:
+        Path.read_text = tear_then_raise
+        text, evidence = _collector._read_text(target)
+    finally:
+        Path.read_text = real_read_text
+    assert len(calls) == 2                        # the retry happened and it raised
+    assert (text, evidence) == ("first", "VERIFIED")   # the last GOOD read is kept, not discarded
+
+
+def test_read_text_stable_still_propagates_an_oserror_on_the_first_read(tmp_path):
+    # TRK-022.F5 (CONTROL -- not optional). Swallowing OSError at attempt 0 would buy the fix
+    # above by breaking the genuinely-unreadable-file path: a file that cannot be read AT ALL
+    # must still reach the caller as OSError, so `_read_text` classifies it INACCESSIBLE exactly
+    # as it did pre-TRK-022. Without this assertion the F5 guard could return "" and call it
+    # verified.
+    target = tmp_path / "never-readable.txt"
+    target.write_text("content")
+    real_read_text = Path.read_text
+    calls = []
+
+    def always_raises(self, *a, **k):             # mock-ok: no real fs fails a read this reliably
+        calls.append(1)
+        raise OSError("permission denied")
+    try:
+        Path.read_text = always_raises
+        text, evidence = _collector._read_text(target)
+    finally:
+        Path.read_text = real_read_text
+    assert len(calls) == 1                        # it did NOT retry past an attempt-0 failure
+    assert (text, evidence) == (None, "INACCESSIBLE")   # pre-TRK-022 behavior, unchanged
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="platform lacks mkfifo")
 def test_read_text_stable_does_not_reopen_a_path_that_became_a_fifo(tmp_path):
     # TRK-022 finding 4 (NEW-SYMBOL test). Codex plan review, P2: callers probe _probe_is_file

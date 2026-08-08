@@ -362,7 +362,10 @@ def _read_text_stable(path):
         The caller's existing error handling then runs exactly as it does today -- no new
         exception, no new error string, no new classification kind.
 
-    OSError propagates to the caller unchanged, so each call site keeps its own error text."""
+    OSError from the FIRST read propagates to the caller unchanged, so each call site keeps its
+    own error text on a genuinely unreadable file. OSError from a RETRY does NOT propagate
+    (TRK-022.F5): the bytes attempt 0 read successfully are returned instead, because a healthy
+    read must never be reported as a problem just because the re-read lost a race."""
     # `text` is initialised so the function is total, but the initial value is UNREACHABLE at
     # any _TORN_READ_ATTEMPTS >= 1. It is deliberately "" rather than None because every caller
     # expects str -- though note that "" is itself the "everything vanished" signal this fix
@@ -379,7 +382,22 @@ def _read_text_stable(path):
         # vanished/unstattable case, where re-reading is also wrong.
         if attempt > 0 and (before is None or not before[4]):
             return text
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # TRK-022.F5 (QA review): the pre-read stat above says present-and-regular, but the
+        # `open()` here can STILL lose a race -- ENOENT from an unlink-then-recreate writer,
+        # EACCES from one that recreates restrictive and chmods after. Unguarded, that OSError
+        # escaped the helper and `_read_text` returned INACCESSIBLE / `parse_settings` recorded
+        # "settings.json unreadable" plus ({}, False), flipping the exact 3 headline keys this
+        # retry exists to prevent -- the fix pointing backwards, a healthy read reported as a
+        # problem. On a RETRY, keep the bytes attempt 0 already read successfully: a tear we
+        # cannot re-read is no reason to discard them. On attempt 0 there is nothing to keep,
+        # so RE-RAISE and leave every caller's unreadable-file path byte-identical to
+        # pre-TRK-022. Swallowing there would return "" and call it VERIFIED.
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            if attempt == 0:
+                raise
+            return text
         after = _stat_identity_pair(path)
         # A stat that FAILED on either side means "cannot verify", NOT "unchanged". Comparing
         # two Nones as equal would silently accept a torn read on any file whose stat fails.
