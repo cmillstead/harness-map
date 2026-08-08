@@ -2804,8 +2804,16 @@ def test_read_text_stable_returns_after_one_read_when_stat_fails(tmp_path):
     real_stat = os.stat
     real_read_text = Path.read_text
     reads = []
+    # TRK-022.F3 (post-execution review): the read count alone does NOT discriminate. A BROKEN
+    # implementation using `after == before` -- accepting two None stats as "stable" -- also
+    # returns after ONE read with the right content, so both assertions below passed against it.
+    # STAT count is the discriminator. Measured, with os.stat failing every time: the correct
+    # implementation does before(0), after(0), before(1) = 3 stats before the `before is None`
+    # guard returns; the broken one accepts at attempt 0 after 2. Both do 1 read.
+    stats = []
 
     def failing_stat(*a, **k):                     # mock-ok: no real fs makes stat fail while read succeeds
+        stats.append(1)
         raise OSError("stat unavailable")
 
     def counting_read_text(self, *a, **k):         # mock-ok: counts reads, delegates to the real one
@@ -2821,6 +2829,9 @@ def test_read_text_stable_returns_after_one_read_when_stat_fails(tmp_path):
         Path.read_text = real_read_text
     assert len(reads) == 1                         # ONE read, not _TORN_READ_ATTEMPTS
     assert result == "content"
+    # The `before is not None` acceptance condition, pinned. 3 only -- a broken `after == before`
+    # gives 2. Not a spec constant: no spec section defines it, it is measured from the loop shape.
+    assert len(stats) == 3
 
 
 def test_read_text_is_wired_to_the_stable_read(tmp_path):
