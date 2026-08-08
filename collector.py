@@ -365,7 +365,33 @@ def _read_text_stable(path):
     OSError from the FIRST read propagates to the caller unchanged, so each call site keeps its
     own error text on a genuinely unreadable file. OSError from a RETRY does NOT propagate
     (TRK-022.F5): the bytes attempt 0 read successfully are returned instead, because a healthy
-    read must never be reported as a problem just because the re-read lost a race."""
+    read must never be reported as a problem just because the re-read lost a race.
+
+    NOT every bare `read_text` is routed through here, and the four that are not are RULINGS,
+    not oversights (TRK-022.F6 -- the slice's not-in-scope list named `_read_head` and
+    `_read_project_file` but omitted these):
+      * `load_profile` reads operator-supplied JSON with `encoding="utf-8"` and NO `errors=`,
+        i.e. STRICT decode, and turns a UnicodeDecodeError into a ProfileError rejection. This
+        helper decodes with `errors="replace"`, which would mangle undecodable bytes into
+        U+FFFD and hand `json.loads` a string that fails for the wrong reason. Routing it here
+        would trade a precise rejection for a confusing one;
+      * the three `--check` sidecar reads (`_check_select_prior_sidecar`,
+        `_check_select_synthesis_pair` x2). The COLLECTOR sidecar is written by this module's
+        own atomic path -- a fresh inode (`os.open` O_CREAT|O_EXCL, or `tempfile.mkstemp` on
+        the explicit fallback) then `os.replace` onto the name -- so a reader structurally
+        observes either the whole old file or the whole new one, never a partial. The two
+        SYNTHESIS reads are the one place that argument does NOT apply, since the collector
+        does not write those files; they are still not routed, because all three already catch
+        UnicodeDecodeError/JSONDecodeError and degrade to a `notice:` that SKIPS the
+        comparison. They cannot flip a headline number, which is the harm this retry exists to
+        prevent.
+
+    One costed non-problem, recorded so it is not re-litigated: `collect_composed_mcp` reads
+    `~/.claude.json` through `_read_text`, and Claude Code rewrites that file during normal
+    use, so a compose-mode collect landing mid-write can perform up to `_TORN_READ_ATTEMPTS`
+    full reads of a multi-MB file. Costed at tens to hundreds of ms -- bounded, comfortably
+    inside the `--check` 5s budget -- and memory stays ONE copy because `text` rebinds. Do not
+    add a size cap or special-case that path."""
     # `text` is initialised so the function is total, but the initial value is UNREACHABLE at
     # any _TORN_READ_ATTEMPTS >= 1. It is deliberately "" rather than None because every caller
     # expects str -- though note that "" is itself the "everything vanished" signal this fix
