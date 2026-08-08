@@ -6485,9 +6485,14 @@ def _compose_project_input_paths(project_root, errors=None):
         paths.add(skill_dir / "SKILL.md")
 
     # -- T5: a project/local settings.json hook command's resolved script existence
-    #    (`_compose_hooks`'s `.exists()` check) -- mirrors the operator-tier resolved-hook-
-    #    script loop below EXACTLY (same lexical-containment logic), reading project/local
-    #    settings via the SAME `parse_project_settings` T5's own merge uses. --
+    #    (`_compose_hooks`'s `.exists()` check), reading project/local settings via the SAME
+    #    `parse_project_settings` T5's own merge uses. This DELIBERATELY DIVERGES from the
+    #    operator-tier resolved-hook-script loop below: since TRK-022 finding 2 that loop
+    #    watches outside-root targets unconditionally, while this one KEEPS the lexical
+    #    containment filter. A project root is UNTRUSTED input -- watching a path its
+    #    settings.json names would let it make the watcher stat and listdir anywhere on disk
+    #    (containment invariant; A64, TRK-026). Pinned by
+    #    test_compose_project_input_paths_still_drops_outside_root_hook. --
     proj_settings, _ok1 = parse_project_settings(project_root, project_root, containment_stat,
                                                   [], [], [])
     local_settings, _ok2 = parse_project_settings(project_root, project_root, containment_stat,
@@ -6524,19 +6529,28 @@ def iter_input_paths(
     this function, not a hand-kept list in serve.py, is the source of truth.
 
     GUARANTEE: a SUPERSET of every STATICALLY-enumerable path build_document stats/opens/globs/
-    iterdirs, PLUS every hook-script path resolvable UNDER root from a registered settings.json
-    command (reconcile_hooks stat()s exactly those — mirrored here via _script_from_command, and
-    hooks/ is watched RECURSIVELY so a nested hook script is covered by container membership).
+    iterdirs, PLUS every hook-script path resolvable from a registered settings.json command —
+    outside-root absolute targets included since TRK-022 finding 2 (reconcile_hooks stat()s
+    exactly those — mirrored here via _script_from_command, and hooks/ is watched RECURSIVELY so
+    a nested hook script is covered by container membership).
     Each group below names the collector read it corresponds to. Add a future collector input
     HERE (or to a shared _*_GLOBS constant that both this and the scan consume) or the dashboard
     serves stale data. NOT covered are the two honest, content-derived residuals below.
 
     KNOWN watcher blind spots (documented for T4 — content-derived, NOT statically enumerable):
-      * A registered hook command may resolve to an ABSOLUTE path OUTSIDE root (case c). A root
-        walk cannot watch a file outside root, so its own create/delete is unobserved — but the
-        settings.json EDIT that registers (or de-registers) such a command IS watched, so a
-        re-render still fires on the registration change itself. Nested and relative-under-root
-        hook scripts ARE now covered (recursive hooks/ + resolved-command yield above).
+      * A PROJECT-tier hook command (compose mode) may resolve to an ABSOLUTE path OUTSIDE the
+        project containment root. `_compose_project_input_paths` deliberately drops it: a
+        project root is UNTRUSTED input, and watching such a path would let a project's
+        settings.json make the watcher stat and listdir arbitrary absolute paths. Its own
+        create/delete is therefore unobserved — but the project settings.json EDIT that
+        registers (or de-registers) the command IS watched, so a re-render still fires on the
+        registration change itself. The OPERATOR tier does NOT share this blind spot in
+        non-compose mode: since TRK-022 finding 2 it watches every resolved hook script,
+        outside-root included. In COMPOSE mode one qualification survives: `_watched_snapshot`
+        tags tier by LEXICAL position, so an operator-sourced hook path that happens to live
+        under `project_root` receives project-tier follow policy, and if it is additionally a
+        symlink escaping that root its target is not followed. That is still strictly better
+        than before, when such a path was not watched at all.
       * check_phantom_refs stats `root / <token>` for backtick path tokens parsed out of prose
         — an unbounded, content-derived set. Creating a referenced file OUTSIDE the dirs above
         can flip a phantom-ref verdict without a watched signal. In practice almost every
@@ -6745,28 +6759,35 @@ def iter_input_paths(
 
     # -- resolved hook-script paths from REGISTERED settings.json commands: reconcile_hooks
     #    stat()s exactly these. Reuse _script_from_command (its resolution logic is the single
-    #    source of truth) and yield each script that resolves UNDER root — a command may point
-    #    OUTSIDE hooks/ (e.g. "./scripts/x.py"). A command resolving to an ABSOLUTE path outside
-    #    root is un-watchable via a root walk (disclosed in the docstring's blind-spot list); the
-    #    settings.json edit that registers it IS watched (settings.json is yielded above). --
+    #    source of truth) and yield EVERY resolved script -- including one resolving to an
+    #    ABSOLUTE path OUTSIDE root, which reconcile_hooks stat()s just the same (TRK-022
+    #    finding 2). A command may also point OUTSIDE hooks/ but under root (e.g.
+    #    "./scripts/x.py"); both cases are watched. The PROJECT-tier sibling in
+    #    _compose_project_input_paths ABOVE deliberately does NOT do this. --
     settings, _parsed_ok = parse_settings(root, [], [], profile=profile)
-    root_resolved = root.resolve()
     for command in _iter_hook_commands(settings):
         script_path, _note, _kind = _script_from_command(command, root, profile=profile)
         if script_path is None:
             continue
-        # Root-containment is decided LEXICALLY (Codex r5 FIX 2): resolve only the DIRECTORY
-        # chain (so root-matching is correct through deploy-symlinked parents) and KEEP the
-        # leaf name unresolved, so a leaf like ./scripts/x.py that LIVES under root but is a
-        # symlink to an external target still counts as in-root. reconcile_hooks stat()s the
-        # SAME lexical path (script_path.stat() follows the leaf symlink to that target), so the
-        # watched path added below EQUALS what reconcile_hooks reads. A truly-external absolute
-        # path still fails relative_to and stays un-watchable (documented blind spot, case c).
-        try:
-            lexical = script_path.parent.resolve() / script_path.name
-            lexical.relative_to(root_resolved)
-        except (ValueError, OSError):
-            continue  # genuinely outside root (case c) — un-watchable via a root walk
+        # TRK-022 finding 2: watch EVERY resolved hook script, INCLUDING one that resolves to
+        # an ABSOLUTE path OUTSIDE root. reconcile_hooks stat()s exactly this path, and its
+        # create/delete flips headline orphan_registration_count with no other watched signal
+        # (measured: 0 -> 1, while the watcher snapshot stayed byte-identical). The lexical
+        # relative_to() filter that used to drop this case is gone, not relaxed: its result was
+        # never added to `paths`, so it was purely a filter.
+        #
+        # This adds NO new access class at the operator tier. That tier already follows
+        # symlinks to outside-root targets and LISTS them -- measured: _path_value on a
+        # skills/*/tests symlinked to an outside-root dir returns kind='dir' with that dir's
+        # members (pinned by test_iter_input_paths_watches_symlinked_test_dir). A hook command
+        # CAN resolve to a directory (the token filter accepts any token containing "/", with
+        # no suffix requirement), so the dir case is reachable -- and already in-class.
+        #
+        # The PROJECT tier is deliberately NOT changed: _compose_project_input_paths keeps its
+        # identical containment filter, because a project root is UNTRUSTED input and dropping
+        # it there would let a project's settings.json make the watcher stat and listdir
+        # arbitrary absolute paths. That asymmetry is the containment invariant (A64, TRK-026),
+        # and is pinned by test_compose_project_input_paths_still_drops_outside_root_hook.
         paths.add(script_path)
 
     # -- T8: compose-mode project-tier additions (gated on `compose`, not merely on

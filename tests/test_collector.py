@@ -2290,6 +2290,45 @@ def test_iter_input_paths_watches_lexical_inroot_hook_symlink(fake_harness):
     assert str(lexical) in paths
 
 
+def test_iter_input_paths_watches_absolute_outside_root_hook_script(fake_harness, tmp_path):
+    # TRK-022 finding 2 (DEFECT test): a hook command resolving to an ABSOLUTE path OUTSIDE
+    # root is stat()'d by reconcile_hooks, and its create/delete flips headline
+    # orphan_registration_count -- but iter_input_paths dropped it, so no watcher saw it.
+    root = fake_harness
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    external = outside / "external-hook.py"
+    external.write_text("# outside-root hook\n")
+    inroot = root / "hooks" / "inroot.py"
+    inroot.write_text("# in-root hook\n")
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 ./hooks/inroot.py"},
+            {"type": "command", "command": f"python3 {external}"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    paths = set(map(str, _collector.iter_input_paths(root)))
+    assert str(external) in paths          # the fix: outside-root target is watched
+    assert str(inroot) in paths            # regression guard: in-root still watched
+
+
+def test_iter_input_paths_docstring_discloses_project_tier_outside_root_hook_case(fake_harness):
+    # TRK-022 finding 2 (DEFECT test): the case-(c) bullet claimed an outside-root hook target
+    # is un-watchable. That is now false for the OPERATOR tier and still true for the PROJECT
+    # tier; the docstring must say which is which.
+    #
+    # Substring choice matters here. Plan review caught an earlier version of this test that
+    # asserted "project"/"outside"/"git"/"commit" -- ALL FOUR are already present in the
+    # pre-fix docstring, so it passed pre-fix and was fully vacuous. These assertions are
+    # chosen to be FALSE pre-fix.
+    doc = _collector.iter_input_paths.__doc__
+    assert doc is not None
+    # the false claim must be GONE (present pre-fix -> this line is the red)
+    assert "cannot watch a file outside root" not in doc
+    # the remaining blind spot must be scoped to the PROJECT tier by name
+    assert "PROJECT-tier hook command" in doc
+    assert "git" in doc.lower() and "commit" in doc.lower()   # git-age bullet survives the rewrite
+
+
 def test_iter_input_paths_docstring_discloses_git_age_blind_spot():
     # S2.M3: git history (collect_git_age's `git log` reads) is a THIRD documented watcher
     # blind spot -- .git sits in _PRUNED_WALK_DIRS, so a commit alone changes
