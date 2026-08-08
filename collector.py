@@ -347,11 +347,14 @@ def _read_text_stable(path):
         undetectable at this layer and passes through unretried. This is broader than "a
         single mtime tick" -- a writer can also restore metadata deliberately;
       * a file whose `os.stat` fails cannot be verified, so the read is NOT accepted as
-        settled -- but neither is it re-read. The `before is None` arm of the guard below
-        returns the text already in hand at attempt 1, so such a file costs exactly ONE read,
-        the same as the pre-TRK-022 path. Re-reading a path we cannot even stat is not
-        obviously safer, and it is the same arm that prevents re-opening a FIFO. The same
-        early return covers a file that VANISHES after a successful read;
+        settled -- but neither is it re-read while the stat keeps failing. A PERSISTENT stat
+        failure costs exactly ONE read, the same as the pre-TRK-022 path: the `before is None`
+        arm of the guard below returns the text already in hand at attempt 1. A TRANSIENT stat
+        failure is weaker -- if the post-read stat fails but the NEXT pre-read stat succeeds,
+        the guard does not fire and the file IS re-read, so such a file can cost an extra read
+        (bounded by `_TORN_READ_ATTEMPTS` like any other unsettled read). Re-reading a path we
+        cannot even stat is not obviously safer, and the same arm is what prevents re-opening a
+        FIFO. That early return also covers a file that VANISHES after a successful read;
       * a path that becomes a non-regular file mid-retry returns the last read WITHOUT
         re-opening it (the FIFO guard below) -- deliberately, since blocking forever is worse
         than returning slightly stale bytes;
