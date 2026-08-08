@@ -2311,6 +2311,33 @@ def test_iter_input_paths_watches_absolute_outside_root_hook_script(fake_harness
     assert str(inroot) in paths            # regression guard: in-root still watched
 
 
+def test_iter_input_paths_skips_a_hook_path_carrying_an_embedded_nul(fake_harness, tmp_path):
+    # TRK-022.F1 (DEFECT test, post-execution review). The containment filter Task 1 removed was
+    # ALSO, incidentally, a SANITIZER: its `except (ValueError, OSError)` swallowed the
+    # ValueError that a path carrying an embedded NUL raises. With the filter gone, a malformed
+    # hook command in settings.json puts an unusable path into the watched set, and BOTH
+    # consumers raise on it -- `serve._path_value` and `collector.validate_write_target` each
+    # raise "ValueError: embedded null byte" -- which would abort a watcher sweep.
+    # Measured pre-fix: 15 paths yielded, 1 of them NUL-bearing (`main` yielded 14, 0 NUL-bearing).
+    # The NUL is built in code because a literal NUL in a source file is a syntax error.
+    root = fake_harness
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    good = outside / "good-hook.py"
+    good.write_text("# a normal absolute outside-root hook\n")
+    malformed = f"{outside}/ev{chr(0)}il/hook.py"
+    (root / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": f"python3 {malformed}"},
+            {"type": "command", "command": f"python3 {good}"}]}]},
+        "permissions": {"allow": [], "deny": []}}))
+    paths = [str(p) for p in _collector.iter_input_paths(root)]
+    assert [p for p in paths if "\x00" in p] == []   # the fix: no unusable path is watched
+    # CONTROL -- not optional. Without it the fix could "succeed" by dropping every outside-root
+    # target, undoing Task 1's entire point.
+    assert str(good) in paths
+
+
 def test_compose_project_input_paths_still_drops_outside_root_hook(fake_harness, tmp_path):
     # TRK-022 finding 2 (POSITIVE CONTROL -- passes on BOTH sides of the fix). Task 1 removed
     # the outside-root filter at the OPERATOR tier only. The PROJECT tier keeps it: a project

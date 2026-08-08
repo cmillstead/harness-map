@@ -6889,6 +6889,20 @@ def iter_input_paths(
         # it there would let a project's settings.json make the watcher stat and listdir
         # arbitrary absolute paths. That asymmetry is the containment invariant (A64, TRK-026),
         # and is pinned by test_compose_project_input_paths_still_drops_outside_root_hook.
+        #
+        # TRK-022.F1, post-execution review: the filter removed above was ALSO, incidentally, a
+        # SANITIZER -- its `except (ValueError, OSError)` swallowed the ValueError a path
+        # carrying an embedded NUL raises. Watching such a path crashes BOTH consumers
+        # (`serve._path_value` and `validate_write_target` each raise "embedded null byte"),
+        # aborting a watcher sweep. Probe with the real syscall and skip ONLY the malformed
+        # case. An ABSENT path must still be watched: detecting its creation is the entire
+        # point of the change above.
+        try:
+            os.stat(script_path)
+        except ValueError:
+            continue            # malformed path (embedded NUL): unusable by every consumer
+        except OSError:
+            pass                # absent / unreadable is FINE -- watch it anyway
         paths.add(script_path)
 
     # -- T8: compose-mode project-tier additions (gated on `compose`, not merely on
