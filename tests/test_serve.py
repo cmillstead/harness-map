@@ -439,6 +439,139 @@ def test_symlinked_input_target_change_triggers_recollect(live_server_watching_p
     assert server.state.collect_count > before
 
 
+def test_path_value_detects_metadata_identical_symlink_retarget(tmp_path):
+    # TRK-022 finding 6 (measured): a symlink retargeted to a DIFFERENT file carrying the SAME
+    # size and the SAME mtime_ns produced a byte-identical _path_value under the mtime-only
+    # element 4 -- the content flipped A->B while the watcher's value did not, so no re-render
+    # fired and the dashboard served stale bytes. The followed target must be part of the value.
+    alpha = tmp_path / "alpha.md"
+    beta = tmp_path / "beta.md"
+    alpha.write_text("AAAAAAAAAA")   # 10 bytes
+    beta.write_text("BBBBBBBBBB")    # 10 bytes: identical size, different content
+    fixed_ns = 1_700_000_000_000_000_000
+    os.utime(alpha, ns=(fixed_ns, fixed_ns))
+    os.utime(beta, ns=(fixed_ns, fixed_ns))
+    link = tmp_path / "watched.md"
+    link.symlink_to(alpha)
+    before = srv._path_value(str(link))
+    link.unlink()
+    link.symlink_to(beta)
+    after = srv._path_value(str(link))
+    assert link.read_text() == "BBBBBBBBBB", "fixture precondition: the content really did change"
+    assert alpha.stat().st_size == beta.stat().st_size, "fixture precondition: sizes really are equal"
+    assert alpha.stat().st_mtime_ns == beta.stat().st_mtime_ns, \
+        "fixture precondition: mtimes really are equal"
+    assert before != after, \
+        "a metadata-identical symlink retarget must change the watched value (TRK-022 finding 6)"
+
+
+def test_path_value_unchanged_symlink_compares_equal(tmp_path):
+    # Positive control for TRK-022 finding 6: recording the followed target must not make a
+    # STABLE symlink look changed on every sweep -- that would re-render on every poll.
+    target = tmp_path / "target.md"
+    target.write_text("stable\n")
+    link = tmp_path / "watched.md"
+    link.symlink_to(target)
+    assert srv._path_value(str(link)) == srv._path_value(str(link))
+
+
+def test_path_value_still_detects_same_size_symlink_target_rewrite(tmp_path):
+    # Positive control: element 4 keeps the target mtime_ns ALONGSIDE the resolved path, so a
+    # same-size content rewrite through an UNCHANGED link is still seen. The pre-existing mtime
+    # signal must not be traded away for the new retarget signal.
+    target = tmp_path / "target.md"
+    target.write_text("AAAA")
+    os.utime(target, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+    link = tmp_path / "watched.md"
+    link.symlink_to(target)
+    before = srv._path_value(str(link))
+    target.write_text("BBBB")   # same size, different content
+    os.utime(target, ns=(1_700_000_001_000_000_000, 1_700_000_001_000_000_000))
+    assert srv._path_value(str(link)) != before
+
+
+def test_path_value_dangling_symlink_returns_missing_tuple(tmp_path):
+    # A symlink whose target does not exist returns the MISSING tuple, and element 4 is never
+    # reached at all. os.path.realpath is non-strict so it returns the unresolved path rather
+    # than raising, and the target stat's OSError would degrade the mtime half to None -- but
+    # the OUTER os.stat(path) at serve.py:373 follows the link and raises for the same reason,
+    # so the function returns at serve.py:375 before any identity is assembled. The existence
+    # bit alone carries the change, which is the correct and safe direction.
+    #
+    # DISCLOSED CONSEQUENCE: retargeting one dangling link to a DIFFERENT dangling target is
+    # therefore invisible -- both states are (False, None, None, None). Finding 6 is about
+    # retargets between targets that EXIST; this residual is not in its scope and is not
+    # narrowed by it.
+    link = tmp_path / "dangling.md"
+    link.symlink_to(tmp_path / "never_created.md")
+    assert srv._path_value(str(link)) == (False, None, None, None)
+
+
+def test_path_value_escaping_symlink_shape_unchanged(tmp_path):
+    # The escaping project-tier branch must KEEP its (True, "symlink-escaping", readlink, None)
+    # shape: it never follows, so element 4 -- "what following it landed on" -- stays None. This
+    # pins that the finding-6 fix did not leak target resolution into the branch that is
+    # forbidden by the T8/T3 containment policy from resolving the target at all.
+    proj = tmp_path / "proj"
+    (proj / ".claude" / "rules").mkdir(parents=True)
+    external = tmp_path / "outside.md"
+    external.write_text("external\n")
+    link = proj / ".claude" / "rules" / "escaping.md"
+    link.symlink_to(external)
+    value = srv._path_value(str(link), "project", str(proj))
+    assert value[1] == "symlink-escaping"
+    assert value[2] == str(external)
+    assert value[3] is None
+
+
+def test_path_value_plain_file_has_no_target_identity(tmp_path):
+    # A non-symlink has nothing to follow, so element 4 stays None -- unchanged from before.
+    plain = tmp_path / "plain.md"
+    plain.write_text("x\n")
+    assert srv._path_value(str(plain))[3] is None
+
+
+def test_metadata_identical_skill_symlink_retarget_triggers_recollect(
+        live_server_watching_proj, tmp_path):
+    # End-to-end for TRK-022 finding 6. Mirrors test_symlinked_input_target_change_triggers_
+    # recollect (tests/test_serve.py:429) but flips the TARGET instead of the target's bytes.
+    # VACUITY TRAP: every mtime on both candidate trees is pinned to the same value, so the ONLY
+    # thing that differs pre-fix vs post-fix is the resolved target path. Without the pinning
+    # this test would pass pre-fix on the two dirs' differing creation mtimes and prove nothing.
+    # The `skills/linked/SKILL.md` entry is NOT itself a symlink, so its element 4 is None on
+    # both sides -- the `skills/linked` DIR entry is what carries the signal.
+    server, out_dir, root, proj = live_server_watching_proj
+    fixed_ns = 1_700_000_000_000_000_000
+    first = tmp_path / "skill_one"
+    second = tmp_path / "skill_two"
+    for skill_dir, body in ((first, "# one\n"), (second, "# two\n")):
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(body)   # both 6 bytes
+        os.utime(skill_dir / "SKILL.md", ns=(fixed_ns, fixed_ns))
+        os.utime(skill_dir, ns=(fixed_ns, fixed_ns))
+    link = root / "skills" / "linked"
+    link.symlink_to(first)
+    _wait_settle(server)   # settle the symlink-creation rebuild
+    before = server.state.collect_count
+    # ATOMIC retarget, staged OUTSIDE the watched tree. Two windows have to stay closed here and
+    # they pull in opposite directions:
+    #   (a) a plain link.unlink() + link.symlink_to(second) leaves root/skills one member SHORT;
+    #   (b) staging the replacement as root/skills/linked.swap leaves it one member LONG,
+    #       flipping listdir membership from ("linked",) to ("linked", "linked.swap").
+    # Either one is a MEMBERSHIP change that makes the watcher recollect on its own, so the test
+    # would pass PRE-FIX and the Step 9 stash-proof would report a spurious PASS -- sending you
+    # hunting a fixture bug that does not exist. Stage in tmp_path, which is OUTSIDE --root (so
+    # it is not in the watched set) and on the SAME filesystem (so os.replace is a real atomic
+    # rename, not a copy). os.replace then swaps the symlink itself without ever removing it and
+    # without root/skills ever holding a different member set.
+    staging = tmp_path / "linked.swap"
+    os.symlink(second, staging)
+    os.replace(staging, link)
+    _wait_settle(server)
+    assert server.state.collect_count > before, \
+        "a metadata-identical deploy-symlink retarget must force a re-collect (TRK-022 finding 6)"
+
+
 def test_watched_set_equals_collector_iter_input_paths(live_server_watching_proj):
     server, out_dir, root, proj = live_server_watching_proj
     snap = srv._watched_snapshot(root, proj)
@@ -804,6 +937,110 @@ def test_empty_stream_creation_detected(streams_server_no_watch):
     assert c2 == "grown" and key in changed2
 
 
+def test_same_size_rotation_classifies_truncated(streams_server_no_watch):
+    # TRK-022 finding 3 (measured): a telemetry stream renamed aside and replaced by a NEW file
+    # of IDENTICAL byte length yielded size 16 -> 16 and classified "none", so the watcher never
+    # re-rendered and the dashboard served stale friction data. The inode changes across the
+    # rename-and-replace, so file identity is a sufficient signal.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    stream_path.write_text('{"a":1}\n{"a":2}\n')
+    srv._rebuild(server.state, out_dir, root, root)   # seeds BOTH the size and the inode
+    size_before = stream_path.stat().st_size
+    inode_before = server.state.stream_inodes[key]
+
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text('{"z":9}\n{"z":8}\n')      # same length, different records
+
+    assert stream_path.stat().st_size == size_before, \
+        "fixture precondition: the size really is unchanged"
+    assert stream_path.stat().st_ino != inode_before, \
+        "fixture precondition: the file identity really did change"
+    classification, changed = srv._classify_stream_sweep(server.state)
+    assert classification == "truncated", \
+        "a same-size rotation must force a FULL re-collect, not read as no-change (finding 3)"
+    assert changed == [key]
+
+
+def test_append_still_classifies_grown_after_rotation_check(streams_server_no_watch):
+    # Positive control for TRK-022 finding 3: the rotation branch sits BEFORE the size ladder, so
+    # it must not swallow ordinary growth. An append leaves the inode alone. Had the check
+    # compared the full `_stat_identity` tuple (which carries st_mtime_ns, and mtime moves on
+    # every append), every append would classify "truncated" and force a full re-collect --
+    # destroying the B2 cheap path.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    srv._rebuild(server.state, out_dir, root, root)
+    _append_decision_record(stream_path)
+    classification, changed = srv._classify_stream_sweep(server.state)
+    assert classification == "grown"
+    assert changed == [key]
+
+
+def test_unchanged_stream_still_classifies_none(streams_server_no_watch):
+    # Positive control: the extra per-sweep inode stat must not manufacture a change on a stream
+    # nobody touched -- that would re-render on every single poll.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    srv._rebuild(server.state, out_dir, root, root)
+    assert srv._classify_stream_sweep(server.state) == ("none", [])
+
+
+def test_rotation_with_growth_classifies_truncated_exactly_once(streams_server_no_watch):
+    # A rotation whose replacement file is LARGER must still classify "truncated" -- records
+    # disappeared, so the cheap append-only path would serve stale data -- and the key must be
+    # recorded exactly ONCE. The rotation branch and the size ladder are `elif` arms of one
+    # chain, never two appends.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    stream_path.write_text('{"a":1}\n')
+    srv._rebuild(server.state, out_dir, root, root)
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text('{"z":9}\n{"z":8}\n{"z":7}\n')   # NEW file, strictly larger
+    classification, changed = srv._classify_stream_sweep(server.state)
+    assert classification == "truncated"
+    assert changed == [key], "the key must be recorded once, not once per matching arm"
+
+
+def test_unseeded_inode_does_not_fabricate_a_rotation(streams_server_no_watch):
+    # An UNKNOWN inode on either side must fall through to the size ladder rather than report a
+    # rotation -- otherwise an unavailable signal would force an endless full re-collect. This is
+    # reachable in production for a stream configured but not yet seeded at either publish site.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    srv._rebuild(server.state, out_dir, root, root)
+    server.state.stream_inodes = {}   # a real assignment on a real object: the never-seeded case
+    assert srv._classify_stream_sweep(server.state) == ("none", [])
+
+
+def test_friction_only_rebuild_seeds_stream_inodes(streams_server_no_watch):
+    # SEEDING ASYMMETRY (TRK-022 finding 3): `stream_inodes` must be seeded at BOTH publish sites.
+    # A stream CREATED after startup is seeded by the cheap `_rebuild_friction_only` path, so if
+    # only `_rebuild` seeded inodes, that stream's inode would stay None forever, `_stream_rotated`
+    # would degrade off for it, and a later same-size rotation would go undetected -- exactly the
+    # blind spot this ticket closes, reintroduced through the back door. Every rotation test that
+    # starts from a full `_rebuild` passes under the broken one-sided version, which is why this
+    # sequence (absent -> created via the cheap path -> rotated) is the one that catches it.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    stream_path.unlink()
+    srv._rebuild(server.state, out_dir, root, root)   # re-seed with the stream ABSENT
+    assert server.state.stream_inodes.get(key) is None, \
+        "an absent stream must seed to None (existence tracked)"
+
+    stream_path.write_text('{"a":1}\n{"a":2}\n')      # absent -> present
+    assert srv._classify_stream_sweep(server.state)[0] == "grown"
+    srv._rebuild_friction_only(server.state, out_dir)  # the CHEAP path must seed BOTH dicts
+    assert server.state.stream_inodes.get(key) == stream_path.stat().st_ino, \
+        "the cheap path must seed stream_inodes, not just stream_offsets"
+
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text('{"z":9}\n{"z":8}\n')      # same length, different file
+    assert srv._classify_stream_sweep(server.state)[0] == "truncated", \
+        "a same-size rotation after a cheap-path publish must still force a full re-collect"
+
+
 def test_stream_deletion_forces_rerender(live_server_with_streams):
     # FIX 2 (Codex P2): a previously-loaded stream that is DELETED (size -> None) must force
     # a FULL re-collect so the collector/friction reflect the removed file — otherwise the
@@ -821,6 +1058,52 @@ def test_stream_deletion_forces_rerender(live_server_with_streams):
     assert server._watcher_thread.is_alive()
     assert "Friction events: 1" not in _get_root_body(port), \
         "the deleted stream's records must no longer be served"
+
+
+def test_same_size_rotation_forces_rerender(live_server_with_streams):
+    # QA gap: rotation DETECTION is unit-tested (test_same_size_rotation_classifies_truncated
+    # and friends, above), and the shared pending_truncation/force-full dispatch is proven
+    # end-to-end only by the DELETION trigger (test_stream_deletion_forces_rerender, above).
+    # Nothing proved a same-size ROTATION reaches a live re-render through the watcher thread
+    # and replaces the stale served bytes.
+    #
+    # VACUITY TRAP: the replacement must be the SAME byte length as the original, or the size
+    # ladder catches it and the test passes pre-fix. It must also carry a DIFFERENT record count,
+    # or the served body never changes and the end-to-end half asserts nothing. Both are achieved
+    # by padding `component`: it is a plain ASCII string with no JSON escaping, so N extra
+    # characters lengthen the serialized record by exactly N bytes.
+    #
+    # Both seed records use the SAME component ("rules/a.md", the fixture's one real map node):
+    # measured, a record whose "component" does not resolve to a real node is dropped from the
+    # friction join entirely (two records on distinct real/fake components rendered "Friction
+    # events: 1", not 2) -- an unrelated join behavior, not something this fix touches.
+    server, out_dir, root, stream_path = live_server_with_streams
+    port = server.server_address[1]
+    _append_decision_record(stream_path)
+    _append_decision_record(stream_path)
+    _wait_settle(server)
+    assert "Friction events: 2" in _get_root_body(port)
+    before = server.state.collect_count
+    target_len = stream_path.stat().st_size
+
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    seed = json.dumps({"date": today, "component": "x"}) + "\n"
+    pad = target_len - len(seed)
+    assert pad >= 0, "fixture precondition: one record must fit inside two"
+    one_record = json.dumps({"date": today, "component": "x" * (1 + pad)}) + "\n"
+    assert len(one_record) == target_len, "the replacement must be byte-identical in length"
+
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text(one_record)
+    assert stream_path.stat().st_size == target_len, \
+        "fixture precondition: the size really is unchanged"
+    _wait_settle(server)
+    assert server.state.collect_count > before, \
+        "a same-size rotation must force a FULL re-collect through the live watcher"
+    assert server._watcher_thread.is_alive()
+    assert "Friction events: 2" not in _get_root_body(port), \
+        "the rotated-away records must no longer be served"
 
 
 def _read_sync_generation(resp, timeout=6.0):
@@ -1262,6 +1545,40 @@ def test_project_contained_symlink_target_mutation_triggers_recollect(live_serve
         "a CONTAINED project symlink's target change must still trigger a recollect"
 
 
+def test_project_contained_symlink_metadata_identical_retarget_triggers_recollect(
+        live_server_watching_compose, tmp_path):
+    # QA gap: TRK-022 finding 6 (metadata-identical symlink retarget) is pinned end-to-end only
+    # for the OPERATOR tier (test_metadata_identical_skill_symlink_retarget_triggers_recollect,
+    # above). The CONTAINED project-tier entry runs the IDENTICAL code path -- the branch there
+    # is commented "operator tier (default) OR a CONTAINED project-tier entry" -- but its own
+    # end-to-end test (test_project_contained_symlink_target_mutation_triggers_recollect, above)
+    # only ever changes the target's CONTENT/SIZE, never a metadata-identical retarget. The same
+    # vacuity trap finding 6 exists to close is uncovered for this variant.
+    server, out_dir, root, proj = live_server_watching_compose
+    fixed_ns = 1_700_000_000_000_000_000
+    first = proj / "internal_one.md"
+    second = proj / "internal_two.md"
+    for target, body in ((first, "one\n"), (second, "two\n")):   # both 4 bytes
+        target.write_text(body)
+        os.utime(target, ns=(fixed_ns, fixed_ns))
+    link = proj / ".claude" / "rules" / "aliased.md"
+    link.symlink_to(first)
+    _wait_settle(server)   # settle the symlink-creation rebuild
+    before = server.state.collect_count
+    # ATOMIC retarget, staged OUTSIDE the watched tree (mirrors the operator-tier test above --
+    # see its comment for why a plain unlink()+symlink_to(), or staging the replacement inside
+    # .claude/rules, both leak a listdir-membership change that would make this test pass
+    # PRE-FIX for the wrong reason). tmp_path is outside both --root and --project-root, and on
+    # the same filesystem, so os.replace is a real atomic rename.
+    staging = tmp_path / "aliased.swap"
+    os.symlink(second, staging)
+    os.replace(staging, link)
+    _wait_settle(server)
+    assert server.state.collect_count > before, \
+        "a metadata-identical CONTAINED project-tier symlink retarget must force a recollect " \
+        "(TRK-022 finding 6, project tier)"
+
+
 def test_out_dir_inside_operator_root_rejected_in_compose_mode(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
@@ -1611,3 +1928,63 @@ def test_stream_paths_list_includes_the_interventions_path(tmp_path):
     with _home(home):
         paths = srv._stream_paths_list(srv._build_streams(False, claude))
     assert any(p.endswith("memory/interventions.jsonl") for p in paths)
+
+
+# ============================================= TRK-022 review finding P2 (mixed-pair seeding)
+def test_stream_identity_presence_halves_never_disagree(tmp_path):
+    # The mixed pair (known size, None inode) permanently disables the rotation check: the sweep
+    # reads both-present, `_stream_rotated` returns False on the None inode, neither size arm
+    # fires, so it classifies "none" -- and because nothing reports a change, no rebuild reseeds
+    # the inode. One stat makes the two halves agree by construction (TRK-022, review finding P2).
+    present = tmp_path / "decisions.jsonl"
+    present.write_text('{"a":1}\n')
+    size, ino = srv._stream_identity(str(present))
+    assert size is not None and ino is not None
+
+    absent = tmp_path / "never_created.jsonl"
+    assert srv._stream_identity(str(absent)) == (None, None)
+
+    a_dir = tmp_path / "a_directory"
+    a_dir.mkdir()
+    assert srv._stream_identity(str(a_dir)) == (None, None), \
+        "a non-regular path must be absent to BOTH halves, matching _stream_size's notion of presence"
+
+
+def test_publish_seeds_offsets_and_inodes_consistently(streams_server_no_watch):
+    # Both publish sites must leave the two dicts agreeing about presence for every key: a key
+    # whose size is None must have a None inode and vice versa. This is the invariant the
+    # single-stat capture establishes.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    for publish in ("full", "cheap"):
+        if publish == "full":
+            srv._rebuild(server.state, out_dir, root, root)
+        else:
+            srv._rebuild_friction_only(server.state, out_dir)
+        assert set(server.state.stream_offsets) == set(server.state.stream_inodes), \
+            f"{publish} publish seeded different key sets"
+        for key in server.state.stream_offsets:
+            assert (server.state.stream_offsets[key] is None) == \
+                   (server.state.stream_inodes[key] is None), \
+                f"{publish} publish left a mixed pair for {key}"
+
+
+def test_mixed_pair_would_disable_rotation_detection(streams_server_no_watch):
+    # DOCUMENTS THE DEFECT the single-stat capture prevents, by constructing the mixed pair
+    # directly (a real assignment on a real object, the same pattern
+    # test_unseeded_inode_does_not_fabricate_a_rotation already uses -- not a mock).
+    # This pins WHY the invariant above matters: with a known size and a None inode, a genuine
+    # same-size rotation is invisible. The fix stops this pair from ever being PUBLISHED; it does
+    # not change `_stream_rotated`'s fail-open behavior, which is correct on its own terms.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    stream_path.write_text('{"a":1}\n{"a":2}\n')
+    srv._rebuild(server.state, out_dir, root, root)
+    server.state.stream_inodes = {key: None}          # the mixed pair, constructed directly
+
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text('{"z":9}\n{"z":8}\n')      # same length, DIFFERENT file
+    assert stream_path.stat().st_size == server.state.stream_offsets[key], \
+        "fixture precondition: the size really is unchanged"
+    assert srv._classify_stream_sweep(server.state) == ("none", []), \
+        "a mixed pair hides a real rotation -- which is why publishing one must be impossible"
