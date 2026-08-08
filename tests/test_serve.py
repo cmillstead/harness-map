@@ -1060,6 +1060,52 @@ def test_stream_deletion_forces_rerender(live_server_with_streams):
         "the deleted stream's records must no longer be served"
 
 
+def test_same_size_rotation_forces_rerender(live_server_with_streams):
+    # QA gap: rotation DETECTION is unit-tested (test_same_size_rotation_classifies_truncated
+    # and friends, above), and the shared pending_truncation/force-full dispatch is proven
+    # end-to-end only by the DELETION trigger (test_stream_deletion_forces_rerender, above).
+    # Nothing proved a same-size ROTATION reaches a live re-render through the watcher thread
+    # and replaces the stale served bytes.
+    #
+    # VACUITY TRAP: the replacement must be the SAME byte length as the original, or the size
+    # ladder catches it and the test passes pre-fix. It must also carry a DIFFERENT record count,
+    # or the served body never changes and the end-to-end half asserts nothing. Both are achieved
+    # by padding `component`: it is a plain ASCII string with no JSON escaping, so N extra
+    # characters lengthen the serialized record by exactly N bytes.
+    #
+    # Both seed records use the SAME component ("rules/a.md", the fixture's one real map node):
+    # measured, a record whose "component" does not resolve to a real node is dropped from the
+    # friction join entirely (two records on distinct real/fake components rendered "Friction
+    # events: 1", not 2) -- an unrelated join behavior, not something this fix touches.
+    server, out_dir, root, stream_path = live_server_with_streams
+    port = server.server_address[1]
+    _append_decision_record(stream_path)
+    _append_decision_record(stream_path)
+    _wait_settle(server)
+    assert "Friction events: 2" in _get_root_body(port)
+    before = server.state.collect_count
+    target_len = stream_path.stat().st_size
+
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    seed = json.dumps({"date": today, "component": "x"}) + "\n"
+    pad = target_len - len(seed)
+    assert pad >= 0, "fixture precondition: one record must fit inside two"
+    one_record = json.dumps({"date": today, "component": "x" * (1 + pad)}) + "\n"
+    assert len(one_record) == target_len, "the replacement must be byte-identical in length"
+
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text(one_record)
+    assert stream_path.stat().st_size == target_len, \
+        "fixture precondition: the size really is unchanged"
+    _wait_settle(server)
+    assert server.state.collect_count > before, \
+        "a same-size rotation must force a FULL re-collect through the live watcher"
+    assert server._watcher_thread.is_alive()
+    assert "Friction events: 2" not in _get_root_body(port), \
+        "the rotated-away records must no longer be served"
+
+
 def _read_sync_generation(resp, timeout=6.0):
     """Read the SSE stream until the connect-time `event: sync` + its `data:` generation
     line, returning the int generation (or None on timeout/EOF). The server sends this as
@@ -1497,6 +1543,40 @@ def test_project_contained_symlink_target_mutation_triggers_recollect(live_serve
     _wait_settle(server)
     assert server.state.collect_count > before, \
         "a CONTAINED project symlink's target change must still trigger a recollect"
+
+
+def test_project_contained_symlink_metadata_identical_retarget_triggers_recollect(
+        live_server_watching_compose, tmp_path):
+    # QA gap: TRK-022 finding 6 (metadata-identical symlink retarget) is pinned end-to-end only
+    # for the OPERATOR tier (test_metadata_identical_skill_symlink_retarget_triggers_recollect,
+    # above). The CONTAINED project-tier entry runs the IDENTICAL code path -- the branch there
+    # is commented "operator tier (default) OR a CONTAINED project-tier entry" -- but its own
+    # end-to-end test (test_project_contained_symlink_target_mutation_triggers_recollect, above)
+    # only ever changes the target's CONTENT/SIZE, never a metadata-identical retarget. The same
+    # vacuity trap finding 6 exists to close is uncovered for this variant.
+    server, out_dir, root, proj = live_server_watching_compose
+    fixed_ns = 1_700_000_000_000_000_000
+    first = proj / "internal_one.md"
+    second = proj / "internal_two.md"
+    for target, body in ((first, "one\n"), (second, "two\n")):   # both 4 bytes
+        target.write_text(body)
+        os.utime(target, ns=(fixed_ns, fixed_ns))
+    link = proj / ".claude" / "rules" / "aliased.md"
+    link.symlink_to(first)
+    _wait_settle(server)   # settle the symlink-creation rebuild
+    before = server.state.collect_count
+    # ATOMIC retarget, staged OUTSIDE the watched tree (mirrors the operator-tier test above --
+    # see its comment for why a plain unlink()+symlink_to(), or staging the replacement inside
+    # .claude/rules, both leak a listdir-membership change that would make this test pass
+    # PRE-FIX for the wrong reason). tmp_path is outside both --root and --project-root, and on
+    # the same filesystem, so os.replace is a real atomic rename.
+    staging = tmp_path / "aliased.swap"
+    os.symlink(second, staging)
+    os.replace(staging, link)
+    _wait_settle(server)
+    assert server.state.collect_count > before, \
+        "a metadata-identical CONTAINED project-tier symlink retarget must force a recollect " \
+        "(TRK-022 finding 6, project tier)"
 
 
 def test_out_dir_inside_operator_root_rejected_in_compose_mode(tmp_path):
