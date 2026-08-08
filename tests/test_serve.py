@@ -1848,3 +1848,63 @@ def test_stream_paths_list_includes_the_interventions_path(tmp_path):
     with _home(home):
         paths = srv._stream_paths_list(srv._build_streams(False, claude))
     assert any(p.endswith("memory/interventions.jsonl") for p in paths)
+
+
+# ============================================= TRK-022 review finding P2 (mixed-pair seeding)
+def test_stream_identity_presence_halves_never_disagree(tmp_path):
+    # The mixed pair (known size, None inode) permanently disables the rotation check: the sweep
+    # reads both-present, `_stream_rotated` returns False on the None inode, neither size arm
+    # fires, so it classifies "none" -- and because nothing reports a change, no rebuild reseeds
+    # the inode. One stat makes the two halves agree by construction (TRK-022, review finding P2).
+    present = tmp_path / "decisions.jsonl"
+    present.write_text('{"a":1}\n')
+    size, ino = srv._stream_identity(str(present))
+    assert size is not None and ino is not None
+
+    absent = tmp_path / "never_created.jsonl"
+    assert srv._stream_identity(str(absent)) == (None, None)
+
+    a_dir = tmp_path / "a_directory"
+    a_dir.mkdir()
+    assert srv._stream_identity(str(a_dir)) == (None, None), \
+        "a non-regular path must be absent to BOTH halves, matching _stream_size's notion of presence"
+
+
+def test_publish_seeds_offsets_and_inodes_consistently(streams_server_no_watch):
+    # Both publish sites must leave the two dicts agreeing about presence for every key: a key
+    # whose size is None must have a None inode and vice versa. This is the invariant the
+    # single-stat capture establishes.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    for publish in ("full", "cheap"):
+        if publish == "full":
+            srv._rebuild(server.state, out_dir, root, root)
+        else:
+            srv._rebuild_friction_only(server.state, out_dir)
+        assert set(server.state.stream_offsets) == set(server.state.stream_inodes), \
+            f"{publish} publish seeded different key sets"
+        for key in server.state.stream_offsets:
+            assert (server.state.stream_offsets[key] is None) == \
+                   (server.state.stream_inodes[key] is None), \
+                f"{publish} publish left a mixed pair for {key}"
+
+
+def test_mixed_pair_would_disable_rotation_detection(streams_server_no_watch):
+    # DOCUMENTS THE DEFECT the single-stat capture prevents, by constructing the mixed pair
+    # directly (a real assignment on a real object, the same pattern
+    # test_unseeded_inode_does_not_fabricate_a_rotation already uses -- not a mock).
+    # This pins WHY the invariant above matters: with a known size and a None inode, a genuine
+    # same-size rotation is invisible. The fix stops this pair from ever being PUBLISHED; it does
+    # not change `_stream_rotated`'s fail-open behavior, which is correct on its own terms.
+    server, out_dir, root, stream_path = streams_server_no_watch
+    key = str(stream_path)
+    stream_path.write_text('{"a":1}\n{"a":2}\n')
+    srv._rebuild(server.state, out_dir, root, root)
+    server.state.stream_inodes = {key: None}          # the mixed pair, constructed directly
+
+    rotated = stream_path.parent / (stream_path.name + ".1")
+    stream_path.rename(rotated)
+    stream_path.write_text('{"z":9}\n{"z":8}\n')      # same length, DIFFERENT file
+    assert stream_path.stat().st_size == server.state.stream_offsets[key], \
+        "fixture precondition: the size really is unchanged"
+    assert srv._classify_stream_sweep(server.state) == ("none", []), \
+        "a mixed pair hides a real rotation -- which is why publishing one must be impossible"

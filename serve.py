@@ -295,8 +295,7 @@ def _rebuild(state, out_dir, root, project_root, compose=False):
     # what was actually consumed seeds the offsets. Any append that lands during the render
     # then leaves size>offset next sweep (a safe redundant re-render), never recorded as
     # already-consumed (which would drop the last event of a burst until another append).
-    pre_sizes = _snapshot_stream_sizes(state)
-    pre_inodes = _snapshot_stream_inodes(state)  # TRK-022 finding 3: captured in the same sweep
+    pre_sizes, pre_inodes = _snapshot_stream_state(state)  # ONE stat per path: the pair cannot disagree
     next_gen = state.generation + 1  # FIX 4: the generation this render is published at
     today = datetime.now().strftime("%Y-%m-%d")
     sidecar_path = out_dir / f"harness-map-{today}.json"
@@ -490,8 +489,7 @@ def _rebuild_friction_only(state, out_dir):
     # FIX 1: pre-read stream sizes (before build_friction_overlay consumes them) seed the
     # offsets, so an append during this cheap render is never marked already-consumed. TRK-022
     # finding 3: the inode is captured in the same pre-read pass, seeding stream_inodes too.
-    pre_sizes = _snapshot_stream_sizes(state)
-    pre_inodes = _snapshot_stream_inodes(state)
+    pre_sizes, pre_inodes = _snapshot_stream_state(state)  # ONE stat per path: the pair cannot disagree
     next_gen = state.generation + 1  # FIX 4: the cheap re-render also advances the generation
     out_dir = Path(out_dir)
     new_friction = render_html.build_friction_overlay(
@@ -555,16 +553,6 @@ def _stream_size(path):
     return st.st_size
 
 
-def _snapshot_stream_sizes(state):
-    """{key: size-or-None} for every configured stream, captured to seed `stream_offsets`.
-    Called with the sizes read BEFORE a render consumes the streams (FIX 1): seeding from a
-    PRE-render lower bound means bytes appended during the render leave size>offset next
-    sweep (a safe redundant re-render) rather than being recorded as already-consumed. The
-    value carries the existence bit -- None marks an absent/non-regular stream, kept DISTINCT
-    from an empty one (size 0) so a create/delete transition is detectable (FIX 2)."""
-    return {key: _stream_size(key) for key in _stream_paths_list(state.streams)}
-
-
 def _stream_inode(path):
     """The st_ino of one friction-stream path, or None if it does not exist.
 
@@ -600,21 +588,47 @@ def _stream_inode(path):
     return st.st_ino
 
 
-def _snapshot_stream_inodes(state):
-    """{key: st_ino-or-None} for every configured stream, captured to seed `stream_inodes`.
-    Called at BOTH publish sites immediately after `_snapshot_stream_sizes`, so the two dicts
-    always describe the same sweep. Seeding at only ONE site is a real defect, not a style nit:
-    a stream CREATED after startup is seeded by the cheap `_rebuild_friction_only` path, so a
-    missing seed there would leave its inode None forever and silently degrade the rotation check
-    off for that stream -- reintroducing this ticket's blind spot through the back door (pinned by
-    tests/test_serve.py::test_friction_only_rebuild_seeds_stream_inodes).
+def _stream_identity(path):
+    """`(size, st_ino)` for one friction-stream path from a SINGLE stat, or `(None, None)`
+    if it is absent or not a regular file.
 
-    The sizes and the inodes are captured in two passes, so a rotation landing between them
-    records the NEW file's inode against the OLD file's size; next sweep the inodes then match and
-    the size ladder governs. That residual window is microseconds wide and strictly narrower than
-    the bug being fixed -- the same accepted-TOCTOU class serve.py:290-294 already documents for
-    the P30 sidecar freshness check."""
-    return {key: _stream_inode(key) for key in _stream_paths_list(state.streams)}
+    ONE stat, not two, is the whole point. `stream_offsets` and `stream_inodes` were previously
+    captured in two separate passes, so a rotation landing BETWEEN them published an inconsistent
+    pair -- a known size against a None inode. That pair is not a transient: `_classify_stream_sweep`
+    reads size and prev as both-present, `_stream_rotated` returns False on the None inode, neither
+    size arm fires, and the sweep classifies "none". Nothing reports a change, so no rebuild runs,
+    so the inode is never reseeded -- the rotation check stays OFF for that stream indefinitely,
+    reopening the blind spot TRK-022 closes (measured, with a positive control proving the same
+    fixture and the same rotation classify "truncated" once the inode is seeded).
+
+    Both halves come from one `os.stat`, so presence agrees by construction: either both are None
+    or both are set. There is no interleaving that can produce a mixed pair."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (None, None)
+    if not stat.S_ISREG(st.st_mode):
+        return (None, None)
+    return (st.st_size, st.st_ino)
+
+
+def _snapshot_stream_state(state):
+    """`({key: size-or-None}, {key: st_ino-or-None})` for every configured stream, captured from
+    ONE stat per path and used to seed `stream_offsets` and `stream_inodes` together.
+
+    Replaces the former `_snapshot_stream_sizes` + `_snapshot_stream_inodes` pair, which were two
+    passes and could publish a mixed pair (see `_stream_identity`). The sizes are still read BEFORE
+    a render consumes the streams (FIX 1): seeding from a PRE-render lower bound means bytes
+    appended during the render leave size>offset next sweep -- a safe redundant re-render -- rather
+    than being recorded as already-consumed. The size value still carries the existence bit: None
+    marks an absent/non-regular stream, kept DISTINCT from an empty one (size 0) so a create/delete
+    transition stays detectable (FIX 2)."""
+    sizes, inodes = {}, {}
+    for key in _stream_paths_list(state.streams):
+        size, ino = _stream_identity(key)
+        sizes[key] = size
+        inodes[key] = ino
+    return sizes, inodes
 
 
 def _stream_rotated(state, key):
