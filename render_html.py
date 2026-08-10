@@ -129,7 +129,19 @@ def _neutralize_controls(text):
     "cd"` neutralizes to `ab\\x00cd`, and `max_chars=5` yields `ab\\x…`. This is the same
     class as slicing `hello` into `hel`, which `_fit_label` already does by design; the
     ellipsis carries the same meaning, and backslash/x/hex are literal characters with no
-    injection surface."""
+    injection surface.
+
+    ACCEPTED RESIDUAL, non-injective mapping (review FIX 4, reviewer P3): the mapping is
+    not one-to-one. A real control character and the LITERAL text of its own escape
+    collapse to the same output -- measured, `esc_html(chr(0x85))` and
+    `esc_html("\\x85")` (the four-character literal) both produce `'\\x85'`. Where two
+    distinct source values share a `data-node-key` derived through this path, the
+    click-to-highlight equality check selects both rows. This is not a new defect class:
+    `esc_html`'s pre-existing lone-surrogate escape has had the identical property since
+    before this slice -- measured, `esc_html(chr(0xD800))` and `esc_html("\\ud800")` (the
+    six-character literal) both produce `'\\ud800'` too. This slice only extends that same
+    accepted, already-shipped shape to the DEL/C1 character class; it does not introduce
+    a new one."""
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]",
                   lambda m: f"\\x{ord(m.group(0)):02x}", text)
 
