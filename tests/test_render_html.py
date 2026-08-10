@@ -6090,6 +6090,80 @@ def test_esc_html_bounds_deeply_nested_structure_instead_of_crashing():
     assert "<" not in out and ">" not in out
 
 
+def test_esc_html_escapes_c0_control_characters(tmp_path):
+    # TRK-022 finding 5 (DEFECT test). html.escape does not touch control characters, so
+    # 29 C0 code points reached the rendered page raw. Measured end-to-end: a planted NUL
+    # and BEL survived into the HTML while a '<' in the SAME field was escaped.
+    assert rh.esc_html("a" + chr(0) + "b") == "a\\x00b"
+    assert rh.esc_html(chr(7)) == "\\x07"
+    assert rh.esc_html(chr(0x1F)) == "\\x1f"
+
+
+def test_esc_html_escapes_c1_control_characters():
+    # TRK-022 finding 5 (DEFECT test). The C1 block (U+0080-U+009F) is equally invisible
+    # and equally unescaped -- 32 code points measured passing through unchanged.
+    assert rh.esc_html(chr(0x80)) == "\\x80"
+    assert rh.esc_html(chr(0x9F)) == "\\x9f"
+
+
+def test_esc_html_preserves_tab_lf_cr():
+    # TRK-022 finding 5 (POSITIVE CONTROL -- passes on BOTH sides). TAB/LF/CR are
+    # legitimate in HTML text; escaping them would alter multi-line values. This is the
+    # carve-out that makes the fix safe, so it must pass before AND after.
+    assert rh.esc_html("a\tb\nc\rd") == "a\tb\nc\rd"
+
+
+def test_esc_html_still_escapes_surrogates_and_entities_after_control_fix():
+    # TRK-022 finding 5 (POSITIVE CONTROL -- passes on BOTH sides). Surrogate and entity
+    # behavior must be untouched by the control fix. Codex plan review caught that an
+    # earlier version of this test ALSO asserted the surrogate+NUL combination, which fails
+    # pre-fix -- that made it a defect test wearing a control's label, the exact mislabeling
+    # a prior slice's review flagged. The combined assertion now lives in its own DEFECT
+    # test below, and this one holds only assertions that are true before AND after.
+    assert rh.esc_html("\ud800") == "\\ud800"
+    assert rh.esc_html('<a href="x">&') == "&lt;a href=&quot;x&quot;&gt;&amp;"
+
+
+def test_esc_html_escapes_a_surrogate_and_a_control_together():
+    # TRK-022 finding 5 (DEFECT test -- fails pre-fix on the NUL half). Pins the ORDERING:
+    # surrogates are neutralized first, controls second, html.escape last, with no
+    # double-processing of either.
+    assert rh.esc_html("\ud800" + chr(0)) == "\\ud800\\x00"
+
+
+def test_esc_html_escapes_del_and_the_full_control_ranges():
+    # TRK-022 finding 5 (DEFECT test). Codex plan review, P3: the fix's range covers DEL
+    # (U+007F) but no planned assertion exercised it, so omitting DEL would have left every
+    # other assertion green. Assert the ranges EXHAUSTIVELY rather than by sample, so a
+    # future edit that narrows the range cannot pass silently.
+    assert rh.esc_html(chr(0x7F)) == "\\x7f"          # DEL, the specific P3 gap
+    escaped = list(range(0x00, 0x09)) + [0x0B, 0x0C] + list(range(0x0E, 0x20)) \
+        + [0x7F] + list(range(0x80, 0xA0))
+    for cp in escaped:
+        assert rh.esc_html(chr(cp)) == f"\\x{cp:02x}", f"U+{cp:04X} not escaped"
+    for cp in (0x09, 0x0A, 0x0D):                      # the carve-out, asserted in the same place
+        assert rh.esc_html(chr(cp)) == chr(cp), f"U+{cp:04X} must be preserved"
+
+
+def test_control_characters_do_not_reach_the_rendered_page(tmp_path):
+    # TRK-022 finding 5 (DEFECT test) -- the END-TO-END pin, which is the one that matters:
+    # a unit test on esc_html proves the primitive, not the pipeline. Plant a NUL and a BEL
+    # beside a '<' in a real sidecar leaf and render. The '<' assertion is the positive
+    # control proving the value travelled the escaping path.
+    out_dir = tmp_path / "ctrl"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["blind_spots"] = ["hook" + chr(0) + "name" + chr(7) + "<b>"]
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "&lt;b&gt;" in text                       # positive control: it took the escape path
+    assert chr(0) not in text                        # the fix
+    assert chr(7) not in text
+    assert "\\x00" in text and "\\x07" in text       # visible, not silently dropped
+
+
 # S2 gate fix (Control 2): ONE shared numeric gate. Values verified against live code.
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"),
                                  # Explicit id REQUIRED: pytest builds parameter ids with

@@ -107,7 +107,10 @@ def esc_html(value: Any) -> str:
     telemetry string leaf (§3.1). Covers text content, attributes, and SVG text/attrs
     (shared HTML5 tokenizer). Lone UTF-16 surrogates (the collector deliberately
     preserves them — Codex F9) are neutralized to a deterministic backslash escape
-    BEFORE html.escape, since json.dumps/str() pass them through untouched otherwise."""
+    BEFORE html.escape, since json.dumps/str() pass them through untouched otherwise.
+    C0 (minus TAB/LF/CR), DEL, and C1 control characters are likewise neutralized to a
+    visible `\\xNN` escape before html.escape, which does not touch them at all
+    (TRK-022 finding 5) -- see `_neutralize_controls`."""
     try:
         text = str(value)
     except (ValueError, RecursionError) as exc:
@@ -122,6 +125,20 @@ def esc_html(value: Any) -> str:
         # empty string, which would look like a legitimately blank field.
         return f"[unrenderable value: {type(value).__name__} ({type(exc).__name__})]"
     text = re.sub(r"[\ud800-\udfff]", lambda m: f"\\u{ord(m.group(0)):04x}", text)
+    # TRK-022 finding 5: html.escape does NOT touch control characters, so a C0/C1 byte in
+    # any scanned or telemetry leaf reached the page raw -- measured end-to-end, a planted
+    # NUL and BEL survived into the rendered HTML while a '<' in the SAME field was escaped.
+    # A NUL can arrive from a settings.json hook command (the input class slice B's collector
+    # fix had to sanitize), so this is a reachable path, not a hypothetical one.
+    #
+    # Same deterministic backslash form the surrogate line above already uses -- the byte is
+    # made VISIBLE, never silently dropped, which keeps the renderer's signals-not-judgments
+    # posture: the page shows that something odd is in the data rather than hiding it.
+    # TAB/LF/CR are deliberately EXCLUDED: they are legitimate in HTML text and escaping them
+    # would alter multi-line values. The output (backslash + 'x' + hex digits) contains
+    # nothing that needs further escaping.
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]",
+                  lambda m: f"\\x{ord(m.group(0)):02x}", text)
     return html.escape(text, quote=True)
 
 
