@@ -3062,6 +3062,41 @@ def test_csp_policy_directives_are_pinned(tmp_path):
     assert re.search(r"script-src 'sha256-[A-Za-z0-9+/=]+'", policy)
 
 
+def test_csp_policy_directive_set_is_exact(tmp_path):
+    """review FIX 2. The sibling test above asserts SUBSTRINGS and rejects only a
+    literal `*`. A realistic weakening slips through both checks: `default-src 'none'
+    https:` still contains the substring `default-src 'none'`, contains no `*`, and
+    matches both hash-shape regexes -- yet it weakens the policy from "block everything"
+    to "allow any https origin". The substring test also permits an entirely NEW
+    directive to be appended silently (e.g. `img-src data:`, which also carries no `*`).
+    Pin the EXACT directive SET instead: split the policy on `;`, replace each sha256
+    value with a fixed placeholder (the hash VALUES are pinned separately, byte-for-byte,
+    by `test_csp_hashes_cover_the_emitted_blocks`), sort, and compare against an exact
+    expected list. This is additive to the substring test above, not a replacement for
+    it -- neither test's assertions are edited."""
+    out_dir = tmp_path / "csp_policy_exact"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    m = re.search(r'<meta http-equiv="Content-Security-Policy" content="([^"]+)"', text)
+    assert m, "no CSP meta emitted"
+    policy = m.group(1)
+    normalized = sorted(
+        re.sub(r"'sha256-[A-Za-z0-9+/=]+'", "'sha256-PLACEHOLDER'", d.strip())
+        for d in policy.split(";") if d.strip()
+    )
+    assert normalized == sorted([
+        "default-src 'none'",
+        "style-src 'sha256-PLACEHOLDER'",
+        "script-src 'sha256-PLACEHOLDER'",
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "form-action 'none'",
+    ]), f"CSP directive set changed: {normalized}"
+
+
 # ============================================================= 10. Codex+QA gate follow-ups
 def test_build_civc_model_rejects_unallowlisted_verdict():
     """FIX 1 (P1): a crafted synthesis `verdict` must not pass through unallowlisted —
