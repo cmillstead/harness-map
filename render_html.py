@@ -102,6 +102,17 @@ STREAM_MAX_LINES = 20_000
 
 
 # --------------------------------------------------------------------------- escaping
+def _neutralize_surrogates(text):
+    """Map a lone UTF-16 surrogate (U+D800-U+DFFF -- the collector deliberately
+    preserves them, Codex F9) to the deterministic `\\uXXXX` backslash escape `esc_html`
+    has always used. Extracted (review FIX 5, TRK-022.F5) so `_fit_label` can call it
+    too, mirroring `_neutralize_controls`'s role for the control-character half — see
+    `_fit_label`'s docstring for why measuring width on the raw surrogate is unsafe.
+    Idempotent: the escape's own output (backslash + 'u' + 4 hex digits) contains no
+    surrogate code point, so a second pass is a no-op."""
+    return re.sub(r"[\ud800-\udfff]", lambda m: f"\\u{ord(m.group(0)):04x}", text)
+
+
 def _neutralize_controls(text):
     """Map C0 (minus TAB/LF/CR), DEL and C1 to a visible `\\xNN` escape. Shared by
     `esc_html` and by `_fit_label`, so a label's width is measured on the DISPLAY form
@@ -168,7 +179,7 @@ def esc_html(value: Any) -> str:
         # identifiers, so the marker itself needs no further escaping) -- never a silent
         # empty string, which would look like a legitimately blank field.
         return f"[unrenderable value: {type(value).__name__} ({type(exc).__name__})]"
-    text = re.sub(r"[\ud800-\udfff]", lambda m: f"\\u{ord(m.group(0)):04x}", text)
+    text = _neutralize_surrogates(text)
     text = _neutralize_controls(text)
     return html.escape(text, quote=True)
 
@@ -3071,11 +3082,24 @@ def _fit_label(text, avail_w):
     label font — returns "" when there is no room for even one character plus
     the ellipsis (the caller then omits the `<text>` element entirely).
 
-    TRK-022 finding 5: `text` is neutralized BEFORE measuring, so width is fitted on the
-    DISPLAY form (post-`esc_html`) rather than the raw one -- a control character expands
-    1 char to 4 under `_neutralize_controls`, and fitting the raw form would let a
-    near-limit label overflow its tile, the exact overflow class the treemap comment above
-    already fixed once."""
+    TRK-022 finding 5, widened by review FIX 5 (TRK-022.F5): `text` is neutralized
+    BEFORE measuring, so width is fitted on the DISPLAY form (the same form `esc_html`
+    will later render) rather than the raw one. `esc_html` applies exactly three
+    transformations to text, by enumeration: a lone-surrogate escape
+    (`_neutralize_surrogates`, 1 char -> 6 under `\\uXXXX`), a control-character escape
+    (`_neutralize_controls`, 1 char -> 4 under `\\xNN`), and `html.escape`'s entity
+    substitution (e.g. `<` -> `&lt;`, 1 char -> 4). This function must, and does, apply
+    the FIRST TWO before measuring -- fitting the raw form would let a near-limit label
+    overflow its tile once esc_html expands it downstream, the exact overflow class the
+    treemap comment above already fixed once (originally for controls; FIX 5 found the
+    identical gap still open for surrogates, since only `_neutralize_controls` ran here).
+
+    The THIRD transformation, `html.escape`'s entity substitution, is deliberately NOT
+    applied here and must never be: `<` becomes 4 characters of HTML SOURCE (`&lt;`) but
+    renders as exactly ONE glyph in the browser, so entity substitution does not affect
+    the on-screen width this function is fitting for. Pre-escaping for it here would
+    shrink every label containing `<`/`>`/`&`/quotes for no visual reason."""
+    text = _neutralize_surrogates(text)
     text = _neutralize_controls(text)
     max_chars = int((float(avail_w) - _LABEL_INSET_PX) / _LABEL_CHAR_PX)
     if max_chars < 2:

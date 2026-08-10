@@ -4847,6 +4847,29 @@ def test_fit_label_measures_the_neutralized_display_form_not_the_raw_one():
     assert chr(0) not in fitted                                   # sliced away, not leaked raw
 
 
+def test_fit_label_measures_the_neutralized_surrogate_form_too():
+    # review FIX 5 (TRK-022.F5). `_fit_label` neutralizes CONTROL characters before
+    # measuring width (the sibling test above) but NOT lone surrogates -- `esc_html`
+    # expands a lone surrogate 1 char -> 6 chars (`\uXXXX`) AFTER `_fit_label` already
+    # returned, so the sibling test's own budget check (`len(fitted) <= max_chars`) is
+    # not the right measure here: what must fit within `max_chars` is the RENDERED
+    # form, i.e. `len(esc_html(fitted))`. avail_w=100 yields max_chars=12 (pinned
+    # above); 11 'a' + one lone surrogate is 12 chars RAW (fits verbatim pre-fix) but
+    # would render 17 chars once esc_html's surrogate escape runs on the fitted
+    # result -- overflowing the tile by 5, the exact overflow class Finding 5 exists
+    # to prevent.
+    avail_w = 100
+    max_chars = int((float(avail_w) - rh._LABEL_INSET_PX) / rh._LABEL_CHAR_PX)
+    assert max_chars == 12                                        # pin the fixture's own math
+    text = "a" * (max_chars - 1) + chr(0xD800)          # 12 raw chars, 17 once esc_html-escaped
+    fitted = rh._fit_label(text, avail_w)
+    escaped_len = len(rh.esc_html(fitted))
+    assert escaped_len <= max_chars, (
+        f"fitted label overflows its own budget once rendered: {escaped_len} > {max_chars}"
+    )
+    assert chr(0xD800) not in fitted                              # sliced away, not leaked raw
+
+
 def test_maximal_fixture_is_byte_identical_across_pythonhashseed(tmp_path):
     """Step 3: extends the determinism net to the FULL maximal fixture (mirrors
     test_full_ia_determinism_cross_pythonhashseed's structure) — the same-seed
