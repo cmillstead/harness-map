@@ -2968,6 +2968,45 @@ def test_csp_hashes_cover_the_emitted_blocks(tmp_path):
     assert exe.group(1) == exe2.group(1)
 
 
+def test_csp_policy_directives_are_pinned(tmp_path):
+    # TRK-022 finding 7 (GAP-CLOSING test -- a third category, and the plan says so rather
+    # than forcing it into a binary that would misdescribe it). It is NOT a defect test:
+    # there is no production fix here, so it PASSES today by construction. It is NOT a
+    # positive control either: a control passes on both sides OF A FIX, and no fix exists.
+    # For finding 7 the test IS the deliverable, so its honesty rests entirely on the
+    # MUTATION proof (see the commit body) -- if it does not fail when the policy weakens,
+    # it pins nothing. Do not let its green run be mistaken for evidence.
+    #
+    # The finding's NAME is misleading and this docstring corrects it:
+    # the HASHES are already well pinned by test_csp_hashes_cover_the_emitted_blocks, which
+    # recomputes sha256 over the ACTUAL emitted block bytes. What was unpinned is the POLICY.
+    #
+    # Proven by MUTATION in a throwaway worktree, not by reading: deleting
+    # "base-uri 'none'; form-action 'none'" left the renderer suite at 552 passed, and
+    # changing "default-src 'none'" to "default-src *" -- a real security weakening -- ALSO
+    # left it at 552 passed. Three of six directives could be deleted or wildcarded silently.
+    out_dir = tmp_path / "csp_policy"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    m = re.search(r'<meta http-equiv="Content-Security-Policy" content="([^"]+)"', text)
+    assert m, "no CSP meta emitted"
+    policy = m.group(1)
+    # every directive that does NOT carry a per-render hash is pinned literally
+    assert "default-src 'none'" in policy
+    assert "connect-src 'self'" in policy
+    assert "base-uri 'none'" in policy
+    assert "form-action 'none'" in policy
+    # and no wildcard source may appear anywhere in the policy
+    assert "*" not in policy
+    # the two hash-bearing directives are pinned by SHAPE here; their VALUES are pinned by
+    # test_csp_hashes_cover_the_emitted_blocks against the real emitted bytes.
+    assert re.search(r"style-src 'sha256-[A-Za-z0-9+/=]+'", policy)
+    assert re.search(r"script-src 'sha256-[A-Za-z0-9+/=]+'", policy)
+
+
 # ============================================================= 10. Codex+QA gate follow-ups
 def test_build_civc_model_rejects_unallowlisted_verdict():
     """FIX 1 (P1): a crafted synthesis `verdict` must not pass through unallowlisted —
