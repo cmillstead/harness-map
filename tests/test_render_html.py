@@ -4700,6 +4700,24 @@ def test_fit_label_truncates_and_drops_when_no_room():
     assert rh._fit_label("anything", 4) == ""                    # no room -> "" (caller omits <text>)
 
 
+def test_fit_label_measures_the_neutralized_display_form_not_the_raw_one():
+    # TRK-022 finding 5 regression: a control character expands 1 char -> 4 chars under
+    # `_neutralize_controls` (`\xNN`). Fitting on the RAW string would let a label that
+    # measures within budget raw actually render 3 characters wider than the tile it
+    # labels once esc_html/`_neutralize_controls` runs on the fitted result -- the same
+    # overflow class the treemap comment already fixed once (long basenames stacking
+    # illegibly). avail_w=100 with the module's own inset/char-px constants yields
+    # max_chars=12; an 11-char prefix plus one NUL is 12 chars RAW (fits verbatim under
+    # the pre-fix rule) but 15 chars once neutralized, so it must be truncated.
+    avail_w = 100
+    max_chars = int((float(avail_w) - rh._LABEL_INSET_PX) / rh._LABEL_CHAR_PX)
+    assert max_chars == 12                                        # pin the fixture's own math
+    text = "a" * (max_chars - 1) + chr(0)                         # 12 raw chars, 15 neutralized
+    fitted = rh._fit_label(text, avail_w)
+    assert len(fitted) <= max_chars, "fitted label overflows its own budget"
+    assert chr(0) not in fitted                                   # sliced away, not leaked raw
+
+
 def test_maximal_fixture_is_byte_identical_across_pythonhashseed(tmp_path):
     """Step 3: extends the determinism net to the FULL maximal fixture (mirrors
     test_full_ia_determinism_cross_pythonhashseed's structure) — the same-seed
@@ -6162,6 +6180,39 @@ def test_control_characters_do_not_reach_the_rendered_page(tmp_path):
     assert chr(0) not in text                        # the fix
     assert chr(7) not in text
     assert "\\x00" in text and "\\x07" in text       # visible, not silently dropped
+
+
+def test_json_islands_do_not_carry_raw_c1_or_del(tmp_path):
+    # TRK-022 finding 5, JSON-island half (DEFECT test). esc_json_script's docstring claim
+    # "NOT used by default" is FALSE -- a default render emits 7 islands. json.dumps escapes
+    # C0 per the JSON spec but leaves DEL and C1 raw, so those two classes reach the page
+    # inside an island even after esc_html is fixed.
+    #
+    # FIXTURE CHOICE IS LOAD-BEARING, and an earlier draft got it wrong. Planting into
+    # `blind_spots` does NOT work: that field is rendered by the provenance footer and never
+    # enters a copy/brief island. Measured -- with the payload only in blind_spots, no
+    # control character appears in any island and this test PASSES pre-fix, i.e. it is
+    # vacuous. Worse, its `\\u003c` assertion still passed, but for an unrelated reason:
+    # _minimal_doc's duplication payload already contains "<->". Plant into `phantom_refs`,
+    # which measurably reaches 2 islands, and make the control assertion key on a UNIQUE
+    # marker from THIS payload so it cannot pass on some other field's data.
+    out_dir = tmp_path / "island_ctrl"
+    out_dir.mkdir()
+    marker = "ZQXmarker"
+    payload = marker + chr(0x85) + "a" + chr(0x7F) + "<b>"
+    doc = _minimal_doc()
+    doc.setdefault("phantom_refs", []).append({"file": payload, "ref": payload})
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    islands = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', text, re.S)
+    mine = "".join(i for i in islands if marker in i)
+    assert mine, "payload reached no JSON island -- fixture no longer exercises the path"
+    # positive control: MY payload took the island escaping path (not some other field's)
+    assert "\\u003cb\\u003e" in mine
+    assert chr(0x85) not in mine          # the fix: C1
+    assert chr(0x7F) not in mine          # the fix: DEL
 
 
 # S2 gate fix (Control 2): ONE shared numeric gate. Values verified against live code.

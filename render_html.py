@@ -102,6 +102,38 @@ STREAM_MAX_LINES = 20_000
 
 
 # --------------------------------------------------------------------------- escaping
+def _neutralize_controls(text):
+    """Map C0 (minus TAB/LF/CR), DEL and C1 to a visible `\\xNN` escape. Shared by
+    `esc_html` and by `_fit_label`, so a label's width is measured on the DISPLAY form
+    rather than the raw one -- a control character expands 1 char to 4, and fitting the
+    raw form would let a near-limit label overflow its tile (the regression Codex plan
+    review caught, and the same overflow class the treemap comment above already fixed
+    once). Idempotent: its own output contains no control characters, so a second pass
+    is a no-op and double-calling is safe.
+
+    TRK-022 finding 5: html.escape does NOT touch control characters, so a C0/C1 byte in
+    any scanned or telemetry leaf reached the page raw -- measured end-to-end, a planted
+    NUL and BEL survived into the rendered HTML while a '<' in the SAME field was escaped.
+    A NUL can arrive from a settings.json hook command (the input class slice B's collector
+    fix had to sanitize), so this is a reachable path, not a hypothetical one.
+
+    Same deterministic backslash form `esc_html`'s surrogate handling already uses -- the
+    byte is made VISIBLE, never silently dropped, which keeps the renderer's
+    signals-not-judgments posture: the page shows that something odd is in the data rather
+    than hiding it. TAB/LF/CR are deliberately EXCLUDED: they are legitimate in HTML text
+    and escaping them would alter multi-line values. The output (backslash + 'x' + hex
+    digits) contains nothing that needs further escaping.
+
+    ACCEPTED RESIDUAL (measured during planning, ruled accepted, not engineered around):
+    `_fit_label`'s ellipsis truncation can slice a `\\xNN` escape in half -- `"ab" + NUL +
+    "cd"` neutralizes to `ab\\x00cd`, and `max_chars=5` yields `ab\\x…`. This is the same
+    class as slicing `hello` into `hel`, which `_fit_label` already does by design; the
+    ellipsis carries the same meaning, and backslash/x/hex are literal characters with no
+    injection surface."""
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]",
+                  lambda m: f"\\x{ord(m.group(0)):02x}", text)
+
+
 def esc_html(value: Any) -> str:
     """HTML/attribute/SVG-text escaping — the single primitive for every scanned or
     telemetry string leaf (§3.1). Covers text content, attributes, and SVG text/attrs
@@ -125,30 +157,36 @@ def esc_html(value: Any) -> str:
         # empty string, which would look like a legitimately blank field.
         return f"[unrenderable value: {type(value).__name__} ({type(exc).__name__})]"
     text = re.sub(r"[\ud800-\udfff]", lambda m: f"\\u{ord(m.group(0)):04x}", text)
-    # TRK-022 finding 5: html.escape does NOT touch control characters, so a C0/C1 byte in
-    # any scanned or telemetry leaf reached the page raw -- measured end-to-end, a planted
-    # NUL and BEL survived into the rendered HTML while a '<' in the SAME field was escaped.
-    # A NUL can arrive from a settings.json hook command (the input class slice B's collector
-    # fix had to sanitize), so this is a reachable path, not a hypothetical one.
-    #
-    # Same deterministic backslash form the surrogate line above already uses -- the byte is
-    # made VISIBLE, never silently dropped, which keeps the renderer's signals-not-judgments
-    # posture: the page shows that something odd is in the data rather than hiding it.
-    # TAB/LF/CR are deliberately EXCLUDED: they are legitimate in HTML text and escaping them
-    # would alter multi-line values. The output (backslash + 'x' + hex digits) contains
-    # nothing that needs further escaping.
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]",
-                  lambda m: f"\\x{ord(m.group(0)):02x}", text)
+    text = _neutralize_controls(text)
     return html.escape(text, quote=True)
+
+
+# The DEL/C1 half of `_ESC_JSON_TRANSLATE` (TRK-022 finding 5). `json.dumps` escapes every
+# C0 character per the JSON spec, so C0 keys are deliberately OMITTED here -- after
+# serialization there are zero C0 characters left in the text, so including them would be
+# redundant, not protective (checked: including them leaves the output byte-identical).
+# DEL (0x7F) and the C1 block (0x80-0x9F) are NOT covered by the JSON spec's mandatory
+# escapes and survive `json.dumps` raw, so they need the same treatment `<`/`>`/`&` already
+# get below.
+_ESC_JSON_TRANSLATE = {ord("<"): "\\u003c", ord(">"): "\\u003e", ord("&"): "\\u0026"}
+_ESC_JSON_TRANSLATE.update({cp: f"\\u{cp:04x}" for cp in [0x7F, *range(0x80, 0xA0)]})
 
 
 def esc_json_script(value: Any, *, ordered: bool = True) -> str:
     """Fallback-only helper (§3.1) for the sole content of a `<script
     type="application/json">` data island read via `.textContent` + `JSON.parse`.
-    NOT used by default — the renderer keeps dynamic data out of executable script
-    blocks entirely (§9-R C)."""
+    Reached from `_render_json_island` on the DEFAULT render path (7 islands: the A8
+    per-view copy digests and the B3/D6 per-finding brief islands) -- despite this
+    docstring once claiming otherwise, the renderer's dynamic-data-out-of-executable-
+    script-blocks posture (§9-R C) is about keeping data OUT of `<script>` blocks that
+    execute, not about this helper being unused.
+
+    Post-serialization `translate` is the correct layer here (TRK-022 finding 5):
+    `json.dumps` emits `\\uXXXX` as six ASCII characters, so a later `translate` cannot
+    corrupt an escape it already produced, and a literal backslash in the data is
+    likewise untouched. See `_ESC_JSON_TRANSLATE` for what else it neutralizes and why."""
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=ordered)
-    return text.translate({ord("<"): "\\u003c", ord(">"): "\\u003e", ord("&"): "\\u0026"})
+    return text.translate(_ESC_JSON_TRANSLATE)
 
 
 # --------------------------------------------------------------------- numeric gate
@@ -3019,7 +3057,14 @@ _LABEL_INSET_PX = 8
 def _fit_label(text, avail_w):
     """Truncate `text` with an ellipsis so it fits within `avail_w` px of the
     label font — returns "" when there is no room for even one character plus
-    the ellipsis (the caller then omits the `<text>` element entirely)."""
+    the ellipsis (the caller then omits the `<text>` element entirely).
+
+    TRK-022 finding 5: `text` is neutralized BEFORE measuring, so width is fitted on the
+    DISPLAY form (post-`esc_html`) rather than the raw one -- a control character expands
+    1 char to 4 under `_neutralize_controls`, and fitting the raw form would let a
+    near-limit label overflow its tile, the exact overflow class the treemap comment above
+    already fixed once."""
+    text = _neutralize_controls(text)
     max_chars = int((float(avail_w) - _LABEL_INSET_PX) / _LABEL_CHAR_PX)
     if max_chars < 2:
         return ""
