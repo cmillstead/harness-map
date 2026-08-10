@@ -2384,6 +2384,61 @@ def test_brief_control_wraps_brief_in_copy_preview(tmp_path):
     assert text.count('<details class="copy-preview">') >= 2   # per-view + at least one brief
 
 
+def test_copy_preview_matches_what_the_clipboard_actually_copies(tmp_path):
+    """review FIX 1 (TRK-022 finding 5 follow-up). `_render_copy_disclosure`'s own
+    docstring contract: the <pre> reveals "the EXACT payload the copy button will
+    grab". Before this fix that was false for any payload carrying a DEL/C1 control
+    character. `esc_json_script`'s translate map emits a valid JSON `\\uXXXX` escape
+    for DEL/C1, so `JSON.parse(island.textContent)` decodes it back to the RAW
+    character -- but the preview renders `esc_html(payload)`, which neutralizes the
+    same control to the 4-character literal text `\\x85`. The user sees `\\x85` and
+    copies the raw byte. Plant a control character in the hygiene payload (via
+    `phantom_refs`, which reaches the "hygiene" copy view) and assert the island's
+    JSON-decoded value and the preview's HTML-unescaped text denote the SAME string."""
+    import html as html_mod
+    marker = "FIXONEmarker"
+    payload = marker + chr(0x85) + "tail"
+    doc = _minimal_doc()
+    doc.setdefault("phantom_refs", []).append({"file": payload, "ref": payload})
+    out_dir = tmp_path / "copyfix1"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+
+    hyg_view = re.search(r'<section id="view-hygiene".*?</section>', text, re.S)
+    assert hyg_view, "hygiene view not found"
+    pre = re.search(r'<pre class="copy-preview-body">(.*?)</pre>', hyg_view.group(0), re.S)
+    assert pre and marker in pre.group(1), "payload did not reach the hygiene copy preview"
+    preview_text = html_mod.unescape(pre.group(1))
+
+    island = re.search(r'<script type="application/json" id="copy-hygiene">(.*?)</script>', text, re.S)
+    assert island, "hygiene copy island not found"
+    island_value = json.loads(island.group(1))
+    assert marker in island_value, "payload did not reach the hygiene copy island"
+
+    # the contract: what JSON.parse(island.textContent) would hand to the clipboard is
+    # exactly what the operator sees in the preview
+    assert island_value == preview_text, (
+        "preview and clipboard disagree: "
+        f"island(JSON.parse)={island_value!r} preview(unescaped)={preview_text!r}"
+    )
+
+
+def test_esc_json_script_escapes_del_and_c1():
+    # TRK-022 finding 5, review FIX 1 coverage backstop. `_render_json_island` now
+    # neutralizes its payload upstream, so the island-level test above no longer
+    # exercises `_ESC_JSON_TRANSLATE`'s DEL/C1 entries directly (the input it sees is
+    # already the 4-char literal text, which contains no control bytes for translate to
+    # act on). Pin the translate map's DEL/C1 entries directly on the primitive, or that
+    # half becomes dead weight nothing would catch removing.
+    out = rh.esc_json_script("a" + chr(0x85) + "b" + chr(0x7F) + "c")
+    assert chr(0x85) not in out
+    assert chr(0x7F) not in out
+    assert "\\u0085" in out and "\\u007f" in out
+
+
 def test_summary_in_focus_visible_rule():
     assert "summary:focus-visible" in rh.STATIC_STYLE
 

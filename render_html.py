@@ -3613,7 +3613,17 @@ def _render_json_island(island_id, payload):
     """Shared inert data-island builder — `type="application/json"` so it is never
     counted as an executable `<script>` (CSP §9-R C); the payload is a plain markdown
     string. Both the A8 per-view copy islands and the B3/D6 per-finding brief islands
-    delegate here, differing only in their id-string format."""
+    delegate here, differing only in their id-string format.
+
+    Review FIX 1 (TRK-022 finding 5 follow-up): the payload is neutralized BEFORE
+    serialization, not left to `esc_json_script`'s translate map alone. `json.dumps`
+    emits a DEL/C1 control as a valid JSON `\\uXXXX` escape, which `JSON.parse` decodes
+    back to the RAW character at copy time -- while `_render_copy_disclosure`'s preview
+    shows `esc_html(payload)`, which neutralizes the same control to the 4-character
+    literal text `\\xNN`. That divergence meant the operator SAW `\\x85` but COPIED the
+    raw byte. Neutralizing here first means the island holds the same display-form text
+    the preview shows, so `JSON.parse` and the preview agree."""
+    payload = _neutralize_controls(payload)
     return f'<script type="application/json" id="{island_id}">{esc_json_script(payload)}</script>'
 
 
