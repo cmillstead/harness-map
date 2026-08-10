@@ -2384,6 +2384,61 @@ def test_brief_control_wraps_brief_in_copy_preview(tmp_path):
     assert text.count('<details class="copy-preview">') >= 2   # per-view + at least one brief
 
 
+def test_copy_preview_matches_what_the_clipboard_actually_copies(tmp_path):
+    """review FIX 1 (TRK-022 finding 5 follow-up). `_render_copy_disclosure`'s own
+    docstring contract: the <pre> reveals "the EXACT payload the copy button will
+    grab". Before this fix that was false for any payload carrying a DEL/C1 control
+    character. `esc_json_script`'s translate map emits a valid JSON `\\uXXXX` escape
+    for DEL/C1, so `JSON.parse(island.textContent)` decodes it back to the RAW
+    character -- but the preview renders `esc_html(payload)`, which neutralizes the
+    same control to the 4-character literal text `\\x85`. The user sees `\\x85` and
+    copies the raw byte. Plant a control character in the hygiene payload (via
+    `phantom_refs`, which reaches the "hygiene" copy view) and assert the island's
+    JSON-decoded value and the preview's HTML-unescaped text denote the SAME string."""
+    import html as html_mod
+    marker = "FIXONEmarker"
+    payload = marker + chr(0x85) + "tail"
+    doc = _minimal_doc()
+    doc.setdefault("phantom_refs", []).append({"file": payload, "ref": payload})
+    out_dir = tmp_path / "copyfix1"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", "--no-friction")
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+
+    hyg_view = re.search(r'<section id="view-hygiene".*?</section>', text, re.S)
+    assert hyg_view, "hygiene view not found"
+    pre = re.search(r'<pre class="copy-preview-body">(.*?)</pre>', hyg_view.group(0), re.S)
+    assert pre and marker in pre.group(1), "payload did not reach the hygiene copy preview"
+    preview_text = html_mod.unescape(pre.group(1))
+
+    island = re.search(r'<script type="application/json" id="copy-hygiene">(.*?)</script>', text, re.S)
+    assert island, "hygiene copy island not found"
+    island_value = json.loads(island.group(1))
+    assert marker in island_value, "payload did not reach the hygiene copy island"
+
+    # the contract: what JSON.parse(island.textContent) would hand to the clipboard is
+    # exactly what the operator sees in the preview
+    assert island_value == preview_text, (
+        "preview and clipboard disagree: "
+        f"island(JSON.parse)={island_value!r} preview(unescaped)={preview_text!r}"
+    )
+
+
+def test_esc_json_script_escapes_del_and_c1():
+    # TRK-022 finding 5, review FIX 1 coverage backstop. `_render_json_island` now
+    # neutralizes its payload upstream, so the island-level test above no longer
+    # exercises `_ESC_JSON_TRANSLATE`'s DEL/C1 entries directly (the input it sees is
+    # already the 4-char literal text, which contains no control bytes for translate to
+    # act on). Pin the translate map's DEL/C1 entries directly on the primitive, or that
+    # half becomes dead weight nothing would catch removing.
+    out = rh.esc_json_script("a" + chr(0x85) + "b" + chr(0x7F) + "c")
+    assert chr(0x85) not in out
+    assert chr(0x7F) not in out
+    assert "\\u0085" in out and "\\u007f" in out
+
+
 def test_summary_in_focus_visible_rule():
     assert "summary:focus-visible" in rh.STATIC_STYLE
 
@@ -2966,6 +3021,80 @@ def test_csp_hashes_cover_the_emitted_blocks(tmp_path):
     text2 = emit(d2, extra=["--decisions-file", str(dec)])
     exe2 = re.search(r'<script(?![^>]*application/json)[^>]*>(.*?)</script>', text2, re.S)
     assert exe.group(1) == exe2.group(1)
+
+
+def test_csp_policy_directives_are_pinned(tmp_path):
+    # TRK-022 finding 7 (GAP-CLOSING test -- a third category, and the plan says so rather
+    # than forcing it into a binary that would misdescribe it). It is NOT a defect test:
+    # there is no production fix here, so it PASSES today by construction. It is NOT a
+    # positive control either: a control passes on both sides OF A FIX, and no fix exists.
+    # For finding 7 the test IS the deliverable, so its honesty rests entirely on the
+    # MUTATION proof (see the commit body) -- if it does not fail when the policy weakens,
+    # it pins nothing. Do not let its green run be mistaken for evidence.
+    #
+    # The finding's NAME is misleading and this docstring corrects it:
+    # the HASHES are already well pinned by test_csp_hashes_cover_the_emitted_blocks, which
+    # recomputes sha256 over the ACTUAL emitted block bytes. What was unpinned is the POLICY.
+    #
+    # Proven by MUTATION in a throwaway worktree, not by reading: deleting
+    # "base-uri 'none'; form-action 'none'" left the renderer suite at 552 passed, and
+    # changing "default-src 'none'" to "default-src *" -- a real security weakening -- ALSO
+    # left it at 552 passed. Three of six directives could be deleted or wildcarded silently.
+    out_dir = tmp_path / "csp_policy"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    m = re.search(r'<meta http-equiv="Content-Security-Policy" content="([^"]+)"', text)
+    assert m, "no CSP meta emitted"
+    policy = m.group(1)
+    # every directive that does NOT carry a per-render hash is pinned literally
+    assert "default-src 'none'" in policy
+    assert "connect-src 'self'" in policy
+    assert "base-uri 'none'" in policy
+    assert "form-action 'none'" in policy
+    # and no wildcard source may appear anywhere in the policy
+    assert "*" not in policy
+    # the two hash-bearing directives are pinned by SHAPE here; their VALUES are pinned by
+    # test_csp_hashes_cover_the_emitted_blocks against the real emitted bytes.
+    assert re.search(r"style-src 'sha256-[A-Za-z0-9+/=]+'", policy)
+    assert re.search(r"script-src 'sha256-[A-Za-z0-9+/=]+'", policy)
+
+
+def test_csp_policy_directive_set_is_exact(tmp_path):
+    """review FIX 2. The sibling test above asserts SUBSTRINGS and rejects only a
+    literal `*`. A realistic weakening slips through both checks: `default-src 'none'
+    https:` still contains the substring `default-src 'none'`, contains no `*`, and
+    matches both hash-shape regexes -- yet it weakens the policy from "block everything"
+    to "allow any https origin". The substring test also permits an entirely NEW
+    directive to be appended silently (e.g. `img-src data:`, which also carries no `*`).
+    Pin the EXACT directive SET instead: split the policy on `;`, replace each sha256
+    value with a fixed placeholder (the hash VALUES are pinned separately, byte-for-byte,
+    by `test_csp_hashes_cover_the_emitted_blocks`), sort, and compare against an exact
+    expected list. This is additive to the substring test above, not a replacement for
+    it -- neither test's assertions are edited."""
+    out_dir = tmp_path / "csp_policy_exact"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    m = re.search(r'<meta http-equiv="Content-Security-Policy" content="([^"]+)"', text)
+    assert m, "no CSP meta emitted"
+    policy = m.group(1)
+    normalized = sorted(
+        re.sub(r"'sha256-[A-Za-z0-9+/=]+'", "'sha256-PLACEHOLDER'", d.strip())
+        for d in policy.split(";") if d.strip()
+    )
+    assert normalized == sorted([
+        "default-src 'none'",
+        "style-src 'sha256-PLACEHOLDER'",
+        "script-src 'sha256-PLACEHOLDER'",
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "form-action 'none'",
+    ]), f"CSP directive set changed: {normalized}"
 
 
 # ============================================================= 10. Codex+QA gate follow-ups
@@ -4700,6 +4829,47 @@ def test_fit_label_truncates_and_drops_when_no_room():
     assert rh._fit_label("anything", 4) == ""                    # no room -> "" (caller omits <text>)
 
 
+def test_fit_label_measures_the_neutralized_display_form_not_the_raw_one():
+    # TRK-022 finding 5 regression: a control character expands 1 char -> 4 chars under
+    # `_neutralize_controls` (`\xNN`). Fitting on the RAW string would let a label that
+    # measures within budget raw actually render 3 characters wider than the tile it
+    # labels once esc_html/`_neutralize_controls` runs on the fitted result -- the same
+    # overflow class the treemap comment already fixed once (long basenames stacking
+    # illegibly). avail_w=100 with the module's own inset/char-px constants yields
+    # max_chars=12; an 11-char prefix plus one NUL is 12 chars RAW (fits verbatim under
+    # the pre-fix rule) but 15 chars once neutralized, so it must be truncated.
+    avail_w = 100
+    max_chars = int((float(avail_w) - rh._LABEL_INSET_PX) / rh._LABEL_CHAR_PX)
+    assert max_chars == 12                                        # pin the fixture's own math
+    text = "a" * (max_chars - 1) + chr(0)                         # 12 raw chars, 15 neutralized
+    fitted = rh._fit_label(text, avail_w)
+    assert len(fitted) <= max_chars, "fitted label overflows its own budget"
+    assert chr(0) not in fitted                                   # sliced away, not leaked raw
+
+
+def test_fit_label_measures_the_neutralized_surrogate_form_too():
+    # review FIX 5 (TRK-022.F5). `_fit_label` neutralizes CONTROL characters before
+    # measuring width (the sibling test above) but NOT lone surrogates -- `esc_html`
+    # expands a lone surrogate 1 char -> 6 chars (`\uXXXX`) AFTER `_fit_label` already
+    # returned, so the sibling test's own budget check (`len(fitted) <= max_chars`) is
+    # not the right measure here: what must fit within `max_chars` is the RENDERED
+    # form, i.e. `len(esc_html(fitted))`. avail_w=100 yields max_chars=12 (pinned
+    # above); 11 'a' + one lone surrogate is 12 chars RAW (fits verbatim pre-fix) but
+    # would render 17 chars once esc_html's surrogate escape runs on the fitted
+    # result -- overflowing the tile by 5, the exact overflow class Finding 5 exists
+    # to prevent.
+    avail_w = 100
+    max_chars = int((float(avail_w) - rh._LABEL_INSET_PX) / rh._LABEL_CHAR_PX)
+    assert max_chars == 12                                        # pin the fixture's own math
+    text = "a" * (max_chars - 1) + chr(0xD800)          # 12 raw chars, 17 once esc_html-escaped
+    fitted = rh._fit_label(text, avail_w)
+    escaped_len = len(rh.esc_html(fitted))
+    assert escaped_len <= max_chars, (
+        f"fitted label overflows its own budget once rendered: {escaped_len} > {max_chars}"
+    )
+    assert chr(0xD800) not in fitted                              # sliced away, not leaked raw
+
+
 def test_maximal_fixture_is_byte_identical_across_pythonhashseed(tmp_path):
     """Step 3: extends the determinism net to the FULL maximal fixture (mirrors
     test_full_ia_determinism_cross_pythonhashseed's structure) — the same-seed
@@ -6088,6 +6258,155 @@ def test_esc_html_bounds_deeply_nested_structure_instead_of_crashing():
     assert "unrenderable value" in out
     assert "RecursionError" in out
     assert "<" not in out and ">" not in out
+
+
+def test_esc_html_escapes_c0_control_characters(tmp_path):
+    # TRK-022 finding 5 (DEFECT test). html.escape does not touch control characters, so
+    # 29 C0 code points reached the rendered page raw. Measured end-to-end: a planted NUL
+    # and BEL survived into the HTML while a '<' in the SAME field was escaped.
+    assert rh.esc_html("a" + chr(0) + "b") == "a\\x00b"
+    assert rh.esc_html(chr(7)) == "\\x07"
+    assert rh.esc_html(chr(0x1F)) == "\\x1f"
+
+
+def test_esc_html_escapes_c1_control_characters():
+    # TRK-022 finding 5 (DEFECT test). The C1 block (U+0080-U+009F) is equally invisible
+    # and equally unescaped -- 32 code points measured passing through unchanged.
+    assert rh.esc_html(chr(0x80)) == "\\x80"
+    assert rh.esc_html(chr(0x9F)) == "\\x9f"
+
+
+def test_esc_html_preserves_tab_lf_cr():
+    # TRK-022 finding 5 (POSITIVE CONTROL -- passes on BOTH sides). TAB/LF/CR are
+    # legitimate in HTML text; escaping them would alter multi-line values. This is the
+    # carve-out that makes the fix safe, so it must pass before AND after.
+    assert rh.esc_html("a\tb\nc\rd") == "a\tb\nc\rd"
+
+
+def test_esc_html_still_escapes_surrogates_and_entities_after_control_fix():
+    # TRK-022 finding 5 (POSITIVE CONTROL -- passes on BOTH sides). Surrogate and entity
+    # behavior must be untouched by the control fix. Codex plan review caught that an
+    # earlier version of this test ALSO asserted the surrogate+NUL combination, which fails
+    # pre-fix -- that made it a defect test wearing a control's label, the exact mislabeling
+    # a prior slice's review flagged. The combined assertion now lives in its own DEFECT
+    # test below, and this one holds only assertions that are true before AND after.
+    assert rh.esc_html("\ud800") == "\\ud800"
+    assert rh.esc_html('<a href="x">&') == "&lt;a href=&quot;x&quot;&gt;&amp;"
+
+
+def test_esc_html_escapes_a_surrogate_and_a_control_together():
+    # TRK-022 finding 5 (DEFECT test -- fails pre-fix on the NUL half). Pins the ORDERING:
+    # surrogates are neutralized first, controls second, html.escape last, with no
+    # double-processing of either.
+    assert rh.esc_html("\ud800" + chr(0)) == "\\ud800\\x00"
+
+
+def test_esc_html_escapes_del_and_the_full_control_ranges():
+    # TRK-022 finding 5 (DEFECT test). Codex plan review, P3: the fix's range covers DEL
+    # (U+007F) but no planned assertion exercised it, so omitting DEL would have left every
+    # other assertion green. Assert the ranges EXHAUSTIVELY rather than by sample, so a
+    # future edit that narrows the range cannot pass silently.
+    assert rh.esc_html(chr(0x7F)) == "\\x7f"          # DEL, the specific P3 gap
+    escaped = list(range(0x00, 0x09)) + [0x0B, 0x0C] + list(range(0x0E, 0x20)) \
+        + [0x7F] + list(range(0x80, 0xA0))
+    for cp in escaped:
+        assert rh.esc_html(chr(cp)) == f"\\x{cp:02x}", f"U+{cp:04X} not escaped"
+    for cp in (0x09, 0x0A, 0x0D):                      # the carve-out, asserted in the same place
+        assert rh.esc_html(chr(cp)) == chr(cp), f"U+{cp:04X} must be preserved"
+
+
+def test_control_characters_do_not_reach_the_rendered_page(tmp_path):
+    # TRK-022 finding 5 (DEFECT test) -- the END-TO-END pin, which is the one that matters:
+    # a unit test on esc_html proves the primitive, not the pipeline. Plant a NUL and a BEL
+    # beside a '<' in a real sidecar leaf and render. The '<' assertion is the positive
+    # control proving the value travelled the escaping path.
+    out_dir = tmp_path / "ctrl"
+    out_dir.mkdir()
+    doc = _minimal_doc()
+    doc["blind_spots"] = ["hook" + chr(0) + "name" + chr(7) + "<b>"]
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    assert "&lt;b&gt;" in text                       # positive control: it took the escape path
+    assert chr(0) not in text                        # the fix
+    assert chr(7) not in text
+    assert "\\x00" in text and "\\x07" in text       # visible, not silently dropped
+
+
+def test_json_islands_do_not_carry_raw_c1_or_del(tmp_path):
+    # TRK-022 finding 5, JSON-island half (DEFECT test). esc_json_script's docstring claim
+    # "NOT used by default" is FALSE -- a default render emits 7 islands. json.dumps escapes
+    # C0 per the JSON spec but leaves DEL and C1 raw, so those two classes reach the page
+    # inside an island even after esc_html is fixed.
+    #
+    # FIXTURE CHOICE IS LOAD-BEARING, and an earlier draft got it wrong. Planting into
+    # `blind_spots` does NOT work: that field is rendered by the provenance footer and never
+    # enters a copy/brief island. Measured -- with the payload only in blind_spots, no
+    # control character appears in any island and this test PASSES pre-fix, i.e. it is
+    # vacuous. Worse, its `\\u003c` assertion still passed, but for an unrelated reason:
+    # _minimal_doc's duplication payload already contains "<->". Plant into `phantom_refs`,
+    # which measurably reaches 2 islands, and make the control assertion key on a UNIQUE
+    # marker from THIS payload so it cannot pass on some other field's data.
+    out_dir = tmp_path / "island_ctrl"
+    out_dir.mkdir()
+    marker = "ZQXmarker"
+    payload = marker + chr(0x85) + "a" + chr(0x7F) + "<b>"
+    doc = _minimal_doc()
+    doc.setdefault("phantom_refs", []).append({"file": payload, "ref": payload})
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+    islands = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', text, re.S)
+    mine = "".join(i for i in islands if marker in i)
+    assert mine, "payload reached no JSON island -- fixture no longer exercises the path"
+    # positive control: MY payload took the island escaping path (not some other field's)
+    assert "\\u003cb\\u003e" in mine
+    assert chr(0x85) not in mine          # the fix: C1
+    assert chr(0x7F) not in mine          # the fix: DEL
+
+
+def test_control_character_in_treemap_label_reaches_svg_neutralized(tmp_path):
+    # review FIX 3 (TRK-022 finding 5, reviewer P3). `_fit_label` is unit-tested in
+    # isolation; nothing exercised a control character through the treemap SVG path
+    # end-to-end. The field that feeds a treemap tile's `<text class="cell-label">` is
+    # `Path(c["path"]).name` (`_render_treemap_svg`, reading `always_loaded.files[].path`
+    # via `_tokens_treemap`) -- so a control character in an `always_loaded` file's
+    # `path` reaches a label on the default profile, with no `--*-file` flag needed.
+    marker = "F3marker"
+    doc = _minimal_doc()
+    doc["always_loaded"]["files"][1]["path"] = f"rules/{marker}" + chr(0x0B) + "bell.md"
+    out_dir = tmp_path / "svg_ctrl"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+
+    svg = re.search(r'<svg id="treemap-always".*?</svg>', text, re.S)
+    assert svg, "always-loaded treemap SVG not found"
+    labels = re.findall(r'<text x="[^"]+" y="[^"]+" class="cell-label">([^<]*)</text>',
+                         svg.group(0))
+    mine = [content for content in labels if marker in content]
+    assert mine, (
+        "payload did not reach a treemap cell label -- tile likely below the "
+        "TREEMAP_LABEL_MIN_W/H auto-hide threshold; adjust the fixture, don't skip "
+        "the assertion"
+    )
+    content = mine[0]
+    # (a) no raw control character anywhere on the page
+    assert chr(0x0B) not in text
+    # (b) the visible \xNN form is present, inside the label
+    assert "\\x0b" in content
+    # (c) the <text> element is well-formed: exactly one open tag, one matching close,
+    # and its content parses as valid XML (a raw control byte would make it not).
+    # xml.etree, not defusedxml: stdlib-only is a project rule (no new dependencies,
+    # period) and the input here is a string THIS TEST just constructed, not untrusted
+    # external data, so XXE/entity-expansion is not a live concern for this parse.
+    assert svg.group(0).count(f'>{content}</text>') == 1
+    import xml.etree.ElementTree as ET
+    ET.fromstring(f'<text>{content}</text>')
 
 
 # S2 gate fix (Control 2): ONE shared numeric gate. Values verified against live code.
