@@ -6344,6 +6344,48 @@ def test_json_islands_do_not_carry_raw_c1_or_del(tmp_path):
     assert chr(0x7F) not in mine          # the fix: DEL
 
 
+def test_control_character_in_treemap_label_reaches_svg_neutralized(tmp_path):
+    # review FIX 3 (TRK-022 finding 5, reviewer P3). `_fit_label` is unit-tested in
+    # isolation; nothing exercised a control character through the treemap SVG path
+    # end-to-end. The field that feeds a treemap tile's `<text class="cell-label">` is
+    # `Path(c["path"]).name` (`_render_treemap_svg`, reading `always_loaded.files[].path`
+    # via `_tokens_treemap`) -- so a control character in an `always_loaded` file's
+    # `path` reaches a label on the default profile, with no `--*-file` flag needed.
+    marker = "F3marker"
+    doc = _minimal_doc()
+    doc["always_loaded"]["files"][1]["path"] = f"rules/{marker}" + chr(0x0B) + "bell.md"
+    out_dir = tmp_path / "svg_ctrl"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", doc)
+    proc = run_render(out_dir, "--date", "2026-07-15", extra=["--no-friction"])
+    assert proc.returncode == 0, proc.stderr
+    text = (out_dir / "harness-map-2026-07-15.html").read_text(encoding="utf-8")
+
+    svg = re.search(r'<svg id="treemap-always".*?</svg>', text, re.S)
+    assert svg, "always-loaded treemap SVG not found"
+    labels = re.findall(r'<text x="[^"]+" y="[^"]+" class="cell-label">([^<]*)</text>',
+                         svg.group(0))
+    mine = [content for content in labels if marker in content]
+    assert mine, (
+        "payload did not reach a treemap cell label -- tile likely below the "
+        "TREEMAP_LABEL_MIN_W/H auto-hide threshold; adjust the fixture, don't skip "
+        "the assertion"
+    )
+    content = mine[0]
+    # (a) no raw control character anywhere on the page
+    assert chr(0x0B) not in text
+    # (b) the visible \xNN form is present, inside the label
+    assert "\\x0b" in content
+    # (c) the <text> element is well-formed: exactly one open tag, one matching close,
+    # and its content parses as valid XML (a raw control byte would make it not).
+    # xml.etree, not defusedxml: stdlib-only is a project rule (no new dependencies,
+    # period) and the input here is a string THIS TEST just constructed, not untrusted
+    # external data, so XXE/entity-expansion is not a live concern for this parse.
+    assert svg.group(0).count(f'>{content}</text>') == 1
+    import xml.etree.ElementTree as ET
+    ET.fromstring(f'<text>{content}</text>')
+
+
 # S2 gate fix (Control 2): ONE shared numeric gate. Values verified against live code.
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"),
                                  # Explicit id REQUIRED: pytest builds parameter ids with
