@@ -222,8 +222,14 @@ class _State:
         len(self.clients) < MAX_SSE_CLIENTS before any of them appends, and the list overshoots the
         ceiling by up to N-1 (TRK-022 slice A's "parallel state must be atomic per key, not merely
         adjacent"). Refusal returns None rather than raising, so `_serve_events` answers 503 on
-        ordinary control flow and never has to unregister a queue that was never created — which is
-        why the queue is constructed INSIDE the lock, after the check, rather than before it."""
+        ordinary control flow.
+
+        Two separate facts about the refusal path, deliberately not chained into one: the ceiling
+        check runs BEFORE the queue is allocated, so a refused call allocates nothing and registers
+        nothing; and registration IS the append, so where the queue object is CONSTRUCTED is
+        independent of that — constructing it before the check would still register nothing and
+        still need no unregistering. Construction placement carries no correctness weight here; the
+        shared lock hold above is what carries it."""
         with self.clients_lock:
             if len(self.clients) >= MAX_SSE_CLIENTS:
                 return None
@@ -1034,11 +1040,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             # comment sits inside MANDATORY, not optional: every queue operation below it (the
             # client_queue.get in the stream loop, the unregister_client in the finally) assumes a
             # real queue. This returns BEFORE that try/finally because there is no stream to serve.
-            # `unregister_client(None)` also happening not to raise (its
-            # contextlib.suppress(ValueError) swallows list.remove(None)) is SEPARATE defensive
-            # behavior, covering the idempotent double-unregister; it is not the reason this branch
-            # is safe and it does not remove the need for this guard. Response shape matches the
-            # 404 in do_GET,
+            # Two SEPARATE properties of unregister_client, neither of them the reason this branch
+            # is safe. (1) Its contextlib.suppress(ValueError) makes REPEATED removal of a REAL
+            # queue non-raising, so the stream's finally can unregister unconditionally without
+            # tracking whether it already did. (2) unregister_client(None) also happens not to
+            # raise -- same list.remove-of-an-absent-value mechanism, but a distinct case, since
+            # passing None is not the same call as double-unregistering a real queue. That None
+            # tolerance is defensive and separately tested, and this refusal path does NOT rely on
+            # it: it branches on `is None` here, before any queue operation, and returns.
+            # Response shape matches the 404 in do_GET,
             # with the same _CLIENT_GONE guard the 200 header write below already uses.
             try:
                 self.send_response(503)

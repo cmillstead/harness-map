@@ -365,6 +365,62 @@ class _LengthRecordingLock:
         return False
 
 
+class _HoldIdentifyingLock:
+    """A REAL mutual-exclusion lock (it delegates to threading.Lock and genuinely blocks) that
+    additionally publishes the IDENTITY of the hold currently in effect: a distinct integer per
+    acquisition while held, and None whenever the lock is free. Not a mock: the locking behavior
+    under test is the real thing; the id is the only addition.
+
+    It exists because neither the acquisition COUNT (`_CountingLock`) nor the length delta across a
+    hold (`_LengthRecordingLock`) observes WHERE a length read happens — only how many holds were
+    taken and what the length was at their edges. Pairing this lock with `_HoldObservingList` below
+    lets each individual `len()` and `append()` record the hold it ran under, which is the property
+    "the check and the append share one hold" states directly.
+
+    Deliberately NOT built on `_LengthRecordingLock`: that lock calls `len(state.clients)` itself at
+    acquire and release, which would inject `__len__` observations the implementation never made and
+    contaminate the record this test reads."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._holds_taken = 0
+        self.current_hold_id = None   # None whenever the lock is not held
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._holds_taken += 1
+        self.current_hold_id = self._holds_taken
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.current_hold_id = None
+        self._lock.release()
+        return False
+
+
+class _HoldObservingList(list):
+    """A REAL list (it subclasses list and stores its elements normally) that additionally records,
+    for every `len()` and every `append()`, the id of the `_HoldIdentifyingLock` hold in effect at
+    that exact moment — None when the lock was free. Not a mock: the list behavior under test is the
+    real thing; the op log is the only addition.
+
+    `ops` is a plain list of (operation_name, hold_id_in_effect) pairs in call order. Reading `.ops`
+    is a bare attribute access and records nothing, so a snapshot never perturbs the log."""
+
+    def __init__(self, iterable, lock):
+        self._lock = lock
+        self.ops = []
+        super().__init__(iterable)
+
+    def __len__(self):
+        self.ops.append(("len", self._lock.current_hold_id))
+        return super().__len__()
+
+    def append(self, item):
+        self.ops.append(("append", self._lock.current_hold_id))
+        super().append(item)
+
+
 def test_sse_client_cap_refuses_connections_beyond_the_ceiling(live_server_watching):
     # TRK-022 finding 1: `register_client()` appended unconditionally, so an unbounded number of
     # /events streams could pin an unbounded number of ThreadingHTTPServer threads (MEASURED on
@@ -436,6 +492,56 @@ def test_register_client_appends_inside_the_hold_that_checked_the_ceiling():
     assert length_at_release - length_at_acquire == 1, \
         f"the append must happen INSIDE the hold that checked the ceiling, so that hold's " \
         f"length delta is +1: {state.clients_lock.holds}"
+
+
+def test_register_client_reads_the_length_and_appends_under_the_SAME_hold():
+    # Strictly stronger than the two tests above, which observe only how many holds were taken and
+    # what the length was at their edges. Neither discriminates this genuinely broken shape:
+    #     if len(self.clients) >= MAX_SSE_CLIENTS:   # ceiling read OUTSIDE the lock
+    #         with self.clients_lock:
+    #             return None
+    #     with self.clients_lock:
+    #         self.clients.append(client_queue)      # append in a SEPARATE hold
+    # Seeded one below the ceiling the refusal branch never runs, so the only hold recorded is the
+    # append's — one acquisition, length delta +1 — and both prior tests pass while concurrent
+    # callers can still overshoot the ceiling. What separates the shapes is WHERE each operation
+    # runs, not how many holds exist or what the length was at their edges, so this records the hold
+    # in effect at each individual len() and append() and asserts they are the SAME hold.
+    # No threads and no sleeps: the property is structural, so it is observable deterministically.
+    state = srv._State(streams={}, no_friction=True)
+    # Seed with PLAIN queues, never via register_client(): that method appends to state.clients
+    # itself, so seeding through it would both double-count the entries and pollute the op log (the
+    # same trap the two tests above document). The observing list is installed AFTER seeding for
+    # the same reason — seeding traffic must not appear in the record.
+    seeded = [queue.Queue(maxsize=1) for _ in range(srv.MAX_SSE_CLIENTS - 1)]
+    state.clients_lock = _HoldIdentifyingLock()
+    state.clients = _HoldObservingList(seeded, state.clients_lock)
+
+    client_queue = state.register_client()
+    # Snapshot BEFORE any assertion, so nothing an assertion does can add to the record.
+    ops = list(state.clients.ops)
+    assert client_queue is not None, "one free slot remains, so this registration must succeed"
+
+    append_positions = [index for index, (op, _) in enumerate(ops) if op == "append"]
+    assert append_positions, f"register_client must append the new queue: {ops}"
+    append_position = append_positions[0]
+    gating_reads = [
+        hold_id for index, (op, hold_id) in enumerate(ops)
+        if op == "len" and index < append_position
+    ]
+    assert gating_reads, f"register_client must read len(state.clients) before appending: {ops}"
+
+    gating_hold_id = gating_reads[-1]
+    append_hold_id = ops[append_position][1]
+    assert gating_hold_id is not None, \
+        f"the ceiling read ran with clients_lock FREE — a concurrent connect can observe the same " \
+        f"free slot before this one appends: {ops}"
+    assert append_hold_id is not None, \
+        f"the append ran with clients_lock FREE — nothing serializes it against a concurrent " \
+        f"append: {ops}"
+    assert gating_hold_id == append_hold_id, \
+        f"the ceiling read and the append ran under DIFFERENT clients_lock holds, so the lock was " \
+        f"released between them (TOCTOU): {ops}"
 
 
 def test_sse_client_cap_holds_under_concurrent_connects(live_server_watching):
@@ -1437,6 +1543,26 @@ def test_sse_stream_sets_the_client_reconnect_backoff(live_server_watching):
         assert lines[retry_index + 1] == b"\n", \
             f"the retry: field must be terminated by a blank line, or it is not a standalone " \
             f"field-only block: {lines}"
+        # `startswith(b"data:")` is not the spec's definition of a data field. Per the WHATWG SSE
+        # parsing algorithm a line with NO colon is a field whose name is the whole line and whose
+        # value is empty, so a bare `data` line IS a data field and dispatches an empty message
+        # event — and `data\nretry: 5000\n\nevent: sync` satisfies every assertion above. Extract
+        # each preamble field NAME the way the spec does (everything before the first colon, or the
+        # whole line when there is none) and reject `data` in either form. This is a test-
+        # completeness fix, NOT a live defect: the preamble is a fixed byte string with no path that
+        # can emit a bare `data` line.
+        preamble_field_names = [
+            line.split(b":", 1)[0].strip() if b":" in line else line.strip()
+            for line in lines[:sync_index]
+        ]
+        assert b"data" not in preamble_field_names, \
+            f"a data field before the first event dispatches a message event, however it is " \
+            f"spelled — a COLONLESS `data` line is a data field with an empty value: {lines}"
+        # A field-only block also needs a blank line BEFORE it, not only after: without one the
+        # retry: field belongs to whatever block precedes it rather than standing alone.
+        assert retry_index == 0 or lines[retry_index - 1] == b"\n", \
+            f"the retry: field must open the stream or follow a blank line, or it is part of the " \
+            f"preceding block rather than a standalone field-only one: {lines}"
         # Parsed from the bytes actually received, NOT from srv.SSE_RETRY_SECONDS * 1000 —
         # recomputing the constant inside the test proves nothing about the write site, which is
         # the vacuity test_sse_backoff_interval_is_positive documents about itself below.
