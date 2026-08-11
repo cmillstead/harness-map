@@ -69,6 +69,13 @@ MAX_SSE_CLIENTS = 16
 # non-browser clients only -- per the WHATWG EventSource processing model a non-200 response FAILS
 # the connection (fire `error`, readyState = CLOSED, no reconnect), and `Retry-After` is not an
 # EventSource input.
+# Task 2 wires the second: the `retry:` field written into the SSE stream itself, before every
+# connect-time `event: sync`, on every ACCEPTED (200) stream. The client reads it in
+# MILLISECONDS (hence the *1000 at the write site). Its verified effect is on a stream that was
+# ESTABLISHED and then DROPPED -- a server restart -- where it replaces a user-agent-defined
+# reconnection interval with an explicit, server-chosen one. It does NOT reach a client refused
+# by MAX_SSE_CLIENTS: that stream never opened (503, not 200), so the field never arrived --
+# that client is stuck with the `Retry-After` header above, or nothing at all if non-browser.
 SSE_RETRY_SECONDS = 5
 
 # B2/D5 degrade switch: when True, EVERY sweep that would otherwise take the cheap
@@ -993,7 +1000,21 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 # FIX 4: report the current generation on (re)connect so a client that missed
                 # a refresh while disconnected can catch up (reload iff serverGen > pageGen).
-                self.wfile.write(f"event: sync\ndata: {current_gen}\n\n".encode("ascii"))
+                # `retry:` sets the client's reconnect interval (MILLISECONDS -- hence the *1000)
+                # explicitly, replacing a value the WHATWG standard leaves user-agent-defined.
+                # What that actually buys: a stream that was ESTABLISHED and
+                # then DROPPED -- a server restart -- comes back at an interval THIS SERVER chose,
+                # rather than one it does not control.
+                # It does NOT reach a client refused by MAX_SSE_CLIENTS: that
+                # stream never opened, so this field never arrived (see SSE_RETRY_SECONDS). It
+                # carries no `data:`, so per the SSE spec it dispatches no event and can never
+                # trigger a reload. Written in the SAME single write+flush as the sync below, so it
+                # shares that write's existing _CLIENT_GONE boundary and adds no new failure point.
+                # That is NOT a claim of atomic delivery: a write is not transactional at the socket
+                # layer, so a prefix can still reach the peer before an error.
+                self.wfile.write(
+                    f"retry: {SSE_RETRY_SECONDS * 1000}\n\n"
+                    f"event: sync\ndata: {current_gen}\n\n".encode("ascii"))
                 self.wfile.flush()
             except _client_gone:
                 return

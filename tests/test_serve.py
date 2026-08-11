@@ -1323,6 +1323,62 @@ def _read_sync_generation(resp, timeout=6.0):
     return None
 
 
+def _read_preamble_lines(resp, timeout=6.0):
+    """Return the raw SSE lines the server writes on connect, up to and including the
+    `event: sync` line, in wire order."""
+    lines = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            line = resp.fp.readline()
+        except (socket.timeout, TimeoutError, OSError):
+            break
+        if not line:
+            break
+        lines.append(line)
+        if b"event: sync" in line:
+            break
+    return lines
+
+
+def test_sse_stream_sets_the_client_reconnect_backoff(live_server_watching):
+    # Without a `retry:` field a client that was streaming and then LOST the connection — a server
+    # restart — reconnects at a user-agent-defined interval the server does not control (the WHATWG
+    # standard leaves the initial reconnection time to the UA). This makes it EXPLICIT and
+    # server-controlled. It does NOT help a client refused by MAX_SSE_CLIENTS: that stream never
+    # opens, so the field never arrives (see SSE_RETRY_SECONDS' comment). The field is written
+    # before `event: sync` and carries no `data:`, so per the SSE spec it sets the reconnection
+    # time and dispatches no event — it can never itself trigger a page reload.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    conn, resp = _open_events(port)
+    try:
+        lines = _read_preamble_lines(resp)
+        expected = f"retry: {srv.SSE_RETRY_SECONDS * 1000}\n".encode("ascii")
+        assert expected in lines, f"no reconnect backoff on the wire: {lines}"
+        retry_index = lines.index(expected)
+        sync_index = next(i for i, line in enumerate(lines) if b"event: sync" in line)
+        assert retry_index < sync_index, "the backoff must be set before the first event"
+        assert not any(line.startswith(b"data:") for line in lines[:sync_index]), \
+            "the retry block must carry no data: field, or it would dispatch an event"
+    finally:
+        conn.close()
+
+
+def test_sse_backoff_interval_is_positive():
+    # One real contract, independent of any browser's default: the interval must be positive.
+    # `retry: 0` is a legal SSE field that permits the client to reconnect immediately, which
+    # defeats the point of setting a backoff at all. An earlier draft asserted `> 3` against
+    # "EventSource's ~3s default"; the WHATWG standard makes the initial reconnection time
+    # user-agent-defined, so that pinned an implementation habit, not a contract.
+    #
+    # It deliberately does NOT assert the seconds-to-milliseconds conversion: multiplying the
+    # constant by 1000 inside the test proves nothing about the write site, and would still pass if
+    # production emitted `retry: 5`. `test_sse_stream_sets_the_client_reconnect_backoff` reads the
+    # actual wire bytes and is the only honest place to pin *1000.
+    assert srv.SSE_RETRY_SECONDS > 0
+
+
 def test_initial_connect_does_not_loop_reload(live_server_with_streams):
     # FIX 4 (Codex P2): on the INITIAL connect of a just-loaded page (page-gen == server-gen)
     # the server sends the current generation as an informational `sync` (NOT an unconditional
