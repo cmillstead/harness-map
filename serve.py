@@ -1029,11 +1029,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             # fails the connection (error fires, readyState = CLOSED, no reconnect) and Retry-After
             # is not an EventSource input -- so a refused tab most likely stays dead until the user
             # reloads. That is reasoned from the spec plus render_html.py's empty `error` handler,
-            # NOT driven in a browser. This returns BEFORE the try/finally below because there is no
-            # stream to serve, not because the finally would be unsafe: `unregister_client(None)` is
-            # already tolerant (its contextlib.suppress(ValueError) swallows list.remove(None)),
-            # which is why register_client signals refusal by returning None instead of raising and
-            # no `is None` guard is needed downstream. Response shape matches the 404 in do_GET,
+            # NOT driven in a browser. Refusal is signalled by returning None rather than raising,
+            # so the refusal is ordinary control flow -- and that makes the `is None` branch this
+            # comment sits inside MANDATORY, not optional: every queue operation below it (the
+            # client_queue.get in the stream loop, the unregister_client in the finally) assumes a
+            # real queue. This returns BEFORE that try/finally because there is no stream to serve.
+            # `unregister_client(None)` also happening not to raise (its
+            # contextlib.suppress(ValueError) swallows list.remove(None)) is SEPARATE defensive
+            # behavior, covering the idempotent double-unregister; it is not the reason this branch
+            # is safe and it does not remove the need for this guard. Response shape matches the
+            # 404 in do_GET,
             # with the same _CLIENT_GONE guard the 200 header write below already uses.
             try:
                 self.send_response(503)
