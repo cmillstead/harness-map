@@ -1043,16 +1043,24 @@ class RequestHandler(BaseHTTPRequestHandler):
             except self._CLIENT_GONE:
                 pass  # client vanished during the refusal write -> nothing left to tell it
             return
-        with state.lock:
-            current_gen = state.generation
-        # A stuck/slow-reading or disconnected client makes wfile.write/flush raise on the
-        # connection socket (TimeoutError after the 10s idle timeout, BrokenPipeError/
-        # ConnectionResetError on a hard disconnect, bare OSError otherwise). All are expected
-        # client-side end states, NOT server bugs -- catch them via the shared `_CLIENT_GONE`
-        # tuple (identical to the GET `/` handler, FIX 8) and return cleanly (the finally
-        # unregisters) so socketserver never prints a traceback to stderr.
-        _client_gone = self._CLIENT_GONE
+        # The try/finally opens IMMEDIATELY after a successful registration -- before the
+        # generation read below -- so the docstring's "every exit path" is literal rather than
+        # nearly-true. Registration has already mutated state.clients at this point; anything
+        # raising between here and the stream loop would otherwise leak that slot PERMANENTLY,
+        # and with a hard MAX_SSE_CLIENTS ceiling a leaked slot is capacity lost for the life of
+        # the process, not a transient. Nothing in the generation read can raise in ordinary
+        # operation (an uncontended threading.Lock acquire does not, and state.generation is a
+        # plain int attribute), so this closes a window that is structural rather than observed.
         try:
+            with state.lock:
+                current_gen = state.generation
+            # A stuck/slow-reading or disconnected client makes wfile.write/flush raise on the
+            # connection socket (TimeoutError after the 10s idle timeout, BrokenPipeError/
+            # ConnectionResetError on a hard disconnect, bare OSError otherwise). All are expected
+            # client-side end states, NOT server bugs -- catch them via the shared `_CLIENT_GONE`
+            # tuple (identical to the GET `/` handler, FIX 8) and return cleanly (the finally
+            # unregisters) so socketserver never prints a traceback to stderr.
+            _client_gone = self._CLIENT_GONE
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
