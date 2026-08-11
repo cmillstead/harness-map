@@ -309,8 +309,8 @@ def _sse_slots_filled(port, count):
     try:
         for _ in range(count):
             conn, resp = _open_events(port)
+            conns.append(conn)  # append BEFORE asserting: a failed assert must not leak the socket
             assert resp.status == 200, f"a slot below the ceiling must be accepted, got {resp.status}"
-            conns.append(conn)
         yield conns
     finally:
         for conn in conns:
