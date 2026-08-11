@@ -71,8 +71,10 @@ MAX_SSE_CLIENTS = 16
 # EventSource input.
 # Task 2 wires the second: the `retry:` field written into the SSE stream itself, before every
 # connect-time `event: sync`, on every ACCEPTED (200) stream. The client reads it in
-# MILLISECONDS (hence the *1000 at the write site). Its verified effect is on a stream that was
-# ESTABLISHED and then DROPPED -- a server restart -- where it replaces a user-agent-defined
+# MILLISECONDS (hence the *1000 at the write site). What the tests VERIFY is narrower than what
+# the field DOES: they pin that it reaches the wire, in that position, carrying no `data:`. No
+# browser reconnect was measured. Its effect lands on a stream that was ESTABLISHED and then
+# DROPPED -- a server restart -- where it replaces a user-agent-defined
 # reconnection interval with an explicit, server-chosen one. It does NOT reach a client refused
 # by MAX_SSE_CLIENTS: that stream never opened (503, not 200), so the field never arrived --
 # that client is stuck with the `Retry-After` header above, or nothing at all if non-browser.
@@ -1012,9 +1014,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # shares that write's existing _CLIENT_GONE boundary and adds no new failure point.
                 # That is NOT a claim of atomic delivery: a write is not transactional at the socket
                 # layer, so a prefix can still reach the peer before an error.
+                # The parentheses are load-bearing for the READER, not the parser: implicit
+                # string-literal concatenation already binds before `.encode`, so both literals are
+                # encoded either way -- but unparenthesized, `.encode` reads as if it applied to the
+                # second literal alone. It misled this change's own author once already.
                 self.wfile.write(
-                    f"retry: {SSE_RETRY_SECONDS * 1000}\n\n"
-                    f"event: sync\ndata: {current_gen}\n\n".encode("ascii"))
+                    (f"retry: {SSE_RETRY_SECONDS * 1000}\n\n"
+                     f"event: sync\ndata: {current_gen}\n\n").encode("ascii"))
                 self.wfile.flush()
             except _client_gone:
                 return
