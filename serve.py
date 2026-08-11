@@ -58,6 +58,19 @@ POLL_SECONDS = 2.0
 DEBOUNCE_SECONDS = 1.0
 HEARTBEAT_SECONDS = 3.0
 
+# Ceiling on simultaneously registered SSE (`/events`) streams. A loopback dashboard is 1-5
+# browser tabs, so 16 is far above any human workflow. It is not a comfort limit: a stream whose
+# peer stops reading is NOT reapable (see `_serve_events`' accepted-residual note), so this is what
+# bounds how many ThreadingHTTPServer threads a stalled or hostile co-resident process can pin.
+MAX_SSE_CLIENTS = 16
+
+# Reconnect interval, in seconds. ONE home, so the wire surfaces that carry it cannot drift apart.
+# Task 1 wires the first: the `Retry-After` header on a cap refusal, which is ADVISORY and reaches
+# non-browser clients only -- per the WHATWG EventSource processing model a non-200 response FAILS
+# the connection (fire `error`, readyState = CLOSED, no reconnect), and `Retry-After` is not an
+# EventSource input.
+SSE_RETRY_SECONDS = 5
+
 # B2/D5 degrade switch: when True, EVERY sweep that would otherwise take the cheap
 # friction-only path instead runs a full `_rebuild`. The tool stays fully correct with
 # this flipped True (just slower, no incremental optimization) -- it exists so the cheap
@@ -186,12 +199,23 @@ class _State:
         # watch_snapshot's pre-rebuild ordering; advanced only after a successful settled rebuild.
         self.synth_snapshot: Any = None
 
-    def register_client(self) -> "queue.Queue[str]":
-        """Add and return a fresh bounded (maxsize=1) queue for one SSE connection. The
-        bound + Full-coalescing broadcast means a stalled client holds at most ONE pending
-        refresh — a single reload subsumes every refresh it missed."""
-        client_queue: "queue.Queue[str]" = queue.Queue(maxsize=1)
+    def register_client(self) -> "queue.Queue[str] | None":
+        """Add and return a fresh bounded (maxsize=1) queue for one SSE connection, or None when
+        MAX_SSE_CLIENTS streams are already registered. The bound + Full-coalescing broadcast means
+        a stalled client holds at most ONE pending refresh — a single reload subsumes every refresh
+        it missed.
+
+        The ceiling test and the append happen under ONE clients_lock acquisition. Splitting them
+        across two acquisitions is a TOCTOU: N concurrent connects can all observe
+        len(self.clients) < MAX_SSE_CLIENTS before any of them appends, and the list overshoots the
+        ceiling by up to N-1 (TRK-022 slice A's "parallel state must be atomic per key, not merely
+        adjacent"). Refusal returns None rather than raising, so `_serve_events` answers 503 on
+        ordinary control flow and never has to unregister a queue that was never created — which is
+        why the queue is constructed INSIDE the lock, after the check, rather than before it."""
         with self.clients_lock:
+            if len(self.clients) >= MAX_SSE_CLIENTS:
+                return None
+            client_queue: "queue.Queue[str]" = queue.Queue(maxsize=1)
             self.clients.append(client_queue)
         return client_queue
 
@@ -855,7 +879,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     _CLIENT_GONE = (BrokenPipeError, ConnectionResetError, TimeoutError, OSError)
 
     def _send_security_headers(self):
-        """Anti-framing headers on EVERY response (200/400/404): this server holds the
+        """Anti-framing headers on EVERY response (200/400/404/503): this server holds the
         user's PRIVATE harness dashboard. Loopback binding alone does not stop a
         malicious external page from framing it in a hidden <iframe> if the user's
         browser can also reach 127.0.0.1 (clickjacking)."""
@@ -926,6 +950,27 @@ class RequestHandler(BaseHTTPRequestHandler):
         # AND advances past the already-read generation -> the page stays stale until the next
         # rebuild. An equal generation on a fresh connect still never reloads (no loop).
         client_queue = state.register_client()
+        if client_queue is None:
+            # MAX_SSE_CLIENTS streams are already registered. 503 + Retry-After is the honest answer
+            # for a temporary capacity limit, and a non-browser client can act on it. A BROWSER tab
+            # most likely will not: per the WHATWG EventSource processing model a non-200 response
+            # fails the connection (error fires, readyState = CLOSED, no reconnect) and Retry-After
+            # is not an EventSource input -- so a refused tab most likely stays dead until the user
+            # reloads. That is reasoned from the spec plus render_html.py's empty `error` handler,
+            # NOT driven in a browser. This returns BEFORE the try/finally below because there is no
+            # stream to serve, not because the finally would be unsafe: `unregister_client(None)` is
+            # already tolerant (its contextlib.suppress(ValueError) swallows list.remove(None)),
+            # which is why register_client signals refusal by returning None instead of raising and
+            # no `is None` guard is needed downstream. Response shape matches the 404 in do_GET,
+            # with the same _CLIENT_GONE guard the 200 header write below already uses.
+            try:
+                self.send_response(503)
+                self.send_header("Retry-After", str(SSE_RETRY_SECONDS))
+                self._send_security_headers()
+                self.end_headers()
+            except self._CLIENT_GONE:
+                pass  # client vanished during the refusal write -> nothing left to tell it
+            return
         with state.lock:
             current_gen = state.generation
         # A stuck/slow-reading or disconnected client makes wfile.write/flush raise on the

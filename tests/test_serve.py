@@ -5,6 +5,7 @@ import http.client
 import importlib.util
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -297,6 +298,200 @@ def _open_events(port):
     sock.settimeout(_HEARTBEAT + 1.5)
     resp = conn.getresponse()
     return conn, resp
+
+
+@contextlib.contextmanager
+def _sse_slots_filled(port, count):
+    """Hold `count` real /events connections open for the duration of the block, closing every
+    one on exit. No sleep is needed: `_serve_events` registers the client queue BEFORE writing
+    the response headers, so a returned 200 already implies registration."""
+    conns = []
+    try:
+        for _ in range(count):
+            conn, resp = _open_events(port)
+            assert resp.status == 200, f"a slot below the ceiling must be accepted, got {resp.status}"
+            conns.append(conn)
+        yield conns
+    finally:
+        for conn in conns:
+            conn.close()
+
+
+class _CountingLock:
+    """A REAL mutual-exclusion lock (it delegates to threading.Lock and genuinely blocks) that
+    additionally counts how many times it is entered. Not a mock and not a stand-in: the locking
+    behavior under test is the real thing; the counter is the only addition. It exists because the
+    difference between an atomic check-and-append and a check-then-append TOCTOU is exactly the
+    number of acquisitions, and that number is not observable any other way without patching."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.acquisitions = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.acquisitions += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._lock.release()
+        return False
+
+
+def test_sse_client_cap_refuses_connections_beyond_the_ceiling(live_server_watching):
+    # TRK-022 finding 1: `register_client()` appended unconditionally, so an unbounded number of
+    # /events streams could pin an unbounded number of ThreadingHTTPServer threads (MEASURED on
+    # main: 40 concurrent connects, 40 registered, 0 refused). A stalled stream is not reapable
+    # (see `_serve_events`' accepted-residual note), so this ceiling IS the bound on that.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    with _sse_slots_filled(port, srv.MAX_SSE_CLIENTS):
+        assert len(server.state.clients) == srv.MAX_SSE_CLIENTS
+        conn, resp = _open_events(port)
+        try:
+            assert resp.status == 503, \
+                "a connect beyond MAX_SSE_CLIENTS must be refused, not accepted"
+            assert len(server.state.clients) == srv.MAX_SSE_CLIENTS, \
+                "a refused connect must register nothing"
+        finally:
+            conn.close()
+
+
+def test_register_client_checks_and_appends_under_one_lock_hold():
+    # The ceiling test and the append MUST share ONE clients_lock acquisition. Split across two
+    # acquisitions they are a TOCTOU: N concurrent connects can all observe len() < MAX before any
+    # of them appends, and the list overshoots the ceiling by up to N-1. This is TRK-022 slice A's
+    # "parallel state must be atomic per key, not merely adjacent" lesson applied here. A real lock
+    # that counts its own entries is the only way to observe the acquisition count without patching.
+    state = srv._State(streams={}, no_friction=True)
+    state.clients_lock = _CountingLock()
+
+    client_queue = state.register_client()
+    assert client_queue is not None
+    assert state.clients_lock.acquisitions == 1, \
+        "the ceiling check and the append must happen under ONE clients_lock hold"
+
+    # Fill past the ceiling with PLAIN queues, never via register_client(): that method appends to
+    # state.clients itself, so `extend(register_client() ...)` would append each queue TWICE and
+    # then pad the list with the None values register_client returns once the ceiling is hit
+    # (MEASURED: len 25, of which 8 are None). state.clients is typed list[queue.Queue[str]] and
+    # _broadcast_refresh calls put_nowait on every element, so a None in there is a latent crash.
+    state.clients.extend(queue.Queue(maxsize=1) for _ in range(srv.MAX_SSE_CLIENTS))
+    before = state.clients_lock.acquisitions
+    assert state.register_client() is None, "at the ceiling, register_client must refuse"
+    assert state.clients_lock.acquisitions - before == 1, \
+        "the refusal path must also take exactly one clients_lock hold"
+
+
+def test_sse_client_cap_holds_under_concurrent_connects(live_server_watching):
+    # Real threads, real sockets, released from one barrier so the connects genuinely race at the
+    # ceiling boundary. Pre-fix (no cap at all) all four are accepted, so the status-set assertion
+    # REDs. A two-acquisition check-then-append can let multiple racers observe a free slot before
+    # any of them appends, and the 200-count assertion catches that overshoot when the scheduler
+    # actually interleaves them (Test B pins the same property deterministically, without relying on
+    # scheduling). Only 4 race at once, deliberately: 24 would be flaky against a listen backlog
+    # of 5.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    n_racing = 4
+    free_slots = 3
+    with _sse_slots_filled(port, srv.MAX_SSE_CLIENTS - free_slots):
+        barrier = threading.Barrier(n_racing, timeout=15.0)
+        statuses = [None] * n_racing
+        failures = [None] * n_racing
+        conns = [None] * n_racing
+
+        def connect(index):
+            try:
+                barrier.wait()
+                conn, resp = _open_events(port)
+                conns[index] = conn
+                statuses[index] = resp.status
+            except Exception as exc:  # noqa: BLE001  # recorded, never swallowed — asserted below
+                failures[index] = repr(exc)
+
+        threads = [threading.Thread(target=connect, args=(i,)) for i in range(n_racing)]
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30.0)
+                assert not t.is_alive(), "a connect thread hung"
+            assert [f for f in failures if f] == [], f"connect threads raised: {failures}"
+            assert sorted({s for s in statuses}) == [200, 503], \
+                f"every connect must be either accepted or cleanly refused: {statuses}"
+            assert statuses.count(200) == free_slots, \
+                "exactly the free slots may be accepted (a two-acquisition check-then-append " \
+                "can let multiple racers past the check and overshoot)"
+            assert statuses.count(503) == n_racing - free_slots
+            assert len(server.state.clients) == srv.MAX_SSE_CLIENTS
+        finally:
+            for conn in conns:
+                if conn is not None:
+                    conn.close()
+
+
+def test_sse_cap_slot_is_reclaimed_after_a_client_disconnects(live_server_watching):
+    # The cap must bound concurrency, not permanently exhaust the server. When a client
+    # disconnects, its handler's next heartbeat write fails, the finally unregisters the queue,
+    # and the freed slot must accept a new stream.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    with _sse_slots_filled(port, srv.MAX_SSE_CLIENTS) as conns:
+        conns.pop().close()                      # popped so the context manager will not re-close it
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and len(server.state.clients) >= srv.MAX_SSE_CLIENTS:
+            time.sleep(0.1)
+        assert len(server.state.clients) < srv.MAX_SSE_CLIENTS, \
+            "a disconnected client's slot must be released by the /events finally"
+        conn, resp = _open_events(port)
+        try:
+            assert resp.status == 200, "the reclaimed slot must accept a new stream"
+        finally:
+            conn.close()
+
+
+def test_unregister_client_tolerates_a_refused_registration():
+    # MEASURED on main: `unregister_client` wraps `list.remove(...)` in
+    # contextlib.suppress(ValueError), and `list.remove(None)` against a list of queues raises
+    # exactly ValueError — so passing the refusal sentinel through is already safe and the
+    # /events `finally` needs no guard. Nothing asserted that before this slice, and the cap makes
+    # it load-bearing: `register_client` now returns None, so the tolerance is the reason no
+    # `is None` check has to be sprinkled around the handler. Pin it, so a future "tightening" of
+    # unregister_client (narrowing the suppress, or dropping it) cannot silently break the
+    # refused path.
+    state = srv._State(streams={}, no_friction=True)
+    live = state.register_client()
+    assert live is not None
+
+    state.unregister_client(None)                       # must not raise
+    assert state.clients == [live], \
+        "unregistering the refusal sentinel must not disturb a live client's registration"
+
+    state.unregister_client(live)
+    assert state.clients == []
+    state.unregister_client(live)                       # idempotent: the second removal is a no-op
+    assert state.clients == []
+
+
+def test_sse_cap_refusal_response_shape(live_server_watching):
+    # A refused client must be told (a) this is temporary — 503, not 403/404 — and (b) how long to
+    # wait. The interval comes from SSE_RETRY_SECONDS rather than a literal, so it has ONE home;
+    # two homes for one interval is the exact drift this repo has been bitten by elsewhere.
+    # Retry-After is ADVISORY and reaches non-browser clients only — see the header's
+    # own comment for why a browser EventSource does not act on it.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    with _sse_slots_filled(port, srv.MAX_SSE_CLIENTS):
+        conn, resp = _open_events(port)
+        try:
+            assert resp.status == 503
+            assert resp.getheader("Retry-After") == str(srv.SSE_RETRY_SECONDS)
+            # the security headers ride on EVERY response, refusals included
+            assert resp.getheader("X-Frame-Options") == "DENY"
+            assert "frame-ancestors 'none'" in resp.getheader("Content-Security-Policy", "")
+        finally:
+            conn.close()
 
 
 def _iter_refresh_lines(resp, deadline):
