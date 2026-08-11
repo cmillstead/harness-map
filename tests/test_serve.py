@@ -2265,3 +2265,66 @@ def test_mixed_pair_would_disable_rotation_detection(streams_server_no_watch):
         "fixture precondition: the size really is unchanged"
     assert srv._classify_stream_sweep(server.state) == ("none", []), \
         "a mixed pair hides a real rotation -- which is why publishing one must be impossible"
+
+
+def _watch_stream(port, seconds, socket_timeout=1.0):
+    """Connect to /events, READ CONTINUOUSLY for `seconds`, and report
+    (still_open, keepalive_count). A clean EOF or an OSError means the server closed the stream.
+    Deliberately does NOT use _open_events: that helper's socket timeout is tuned to the fixture
+    heartbeat, and this reads a stream whose heartbeat is far longer."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    got, closed = b"", False
+    try:
+        sock.sendall(b"GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        sock.settimeout(socket_timeout)
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(4096)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                closed = True
+                break
+            if not chunk:
+                closed = True
+                break
+            got += chunk
+    finally:
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        sock.close()
+    return (not closed), got.count(b": keepalive")
+
+
+def test_heartbeat_above_the_idle_timeout_does_not_close_a_healthy_stream(tmp_path):
+    # TRK-022 findings 4/5/6: three comments asserted that the SSE heartbeat MUST stay below
+    # RequestHandler.timeout or a healthy stream would be misread as idle and reaped. MEASURED
+    # FALSE. Between writes `_serve_events` blocks in `queue.get(timeout=heartbeat)` — a Python
+    # queue wait, not a socket operation — so no socket op is in flight and the socket timeout
+    # cannot fire. This pins the corrected claim in RUNTIME behavior so the coupling cannot be
+    # reintroduced as code by a future reader "restoring" the constraint.
+    #
+    # SLOW BY NECESSITY (~13s): RequestHandler.timeout is 10 and must not be edited, so proving a
+    # stream survives past it takes more than 10 seconds of wall clock. This is the only test in
+    # the file that costs that much; the cost buys the one assertion that stops a measured-false
+    # claim from returning.
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    root = tmp_path / "fakeroot"
+    root.mkdir()
+    heartbeat = srv.RequestHandler.timeout + 1.0        # ABOVE the idle timeout on purpose
+    server = srv.build_server(out_dir=out_dir, root=root, project_root=root,
+                              host="127.0.0.1", port=0, no_friction=True, heartbeat=heartbeat)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        still_open, keepalives = _watch_stream(server.server_address[1], heartbeat + 2.0)
+        assert still_open, \
+            "a healthy stream with heartbeat > RequestHandler.timeout must NOT be closed"
+        assert keepalives >= 1, \
+            "the watcher must actually have read the live stream (probe liveness control)"
+    finally:
+        server.shutdown()
+        server.server_close()

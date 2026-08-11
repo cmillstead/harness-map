@@ -50,10 +50,13 @@ render_html = _load_sibling("harness_map_serve_render_html", "render_html.py")
 # Loopback allowlist (single-value, never a blocklist): the ONLY host this server may bind.
 _ALLOWED_HOSTS = {"127.0.0.1"}
 
-# Realtime-watcher timings. POLL: base sweep interval. DEBOUNCE: quiet window a burst must
-# clear before ONE settled rebuild fires. HEARTBEAT: SSE keepalive interval — MUST stay
-# below RequestHandler.timeout (10s) or an established, healthy stream is misread as idle
-# and reaped. Tests shrink all three via build_server kwargs; these DEFAULTS are production.
+# Realtime-watcher timings. POLL: base sweep interval. DEBOUNCE: quiet window a burst must clear
+# before ONE settled rebuild fires. HEARTBEAT: SSE keepalive interval, which keeps an otherwise
+# silent stream's bytes flowing. HEARTBEAT is INDEPENDENT of RequestHandler.timeout — an earlier
+# version of this comment claimed it MUST stay below that timeout or a healthy stream would be
+# reaped; that was measured false in both directions, and the measurement plus the mechanism are
+# recorded at RequestHandler.timeout. Tests shrink all three via build_server kwargs; these
+# DEFAULTS are production.
 POLL_SECONDS = 2.0
 DEBOUNCE_SECONDS = 1.0
 HEARTBEAT_SECONDS = 3.0
@@ -871,12 +874,36 @@ class RequestHandler(BaseHTTPRequestHandler):
     # every call site — `_Server` IS-A `BaseServer`, so this is a type-safe narrowing.
     server: "_Server"
 
-    # Idle-connection read timeout: reaps a connect-but-never-sends-a-request-line socket
-    # after 10s, so a co-resident process cannot pin ThreadingHTTPServer threads forever by
-    # opening sockets and going silent (local DoS). NOTE for the forthcoming SSE /events
-    # handler (a later task): an established SSE stream WRITES rather than reads after its
-    # initial request, so its heartbeat interval MUST stay below this timeout, or an
-    # open, healthy stream will be misclassified as idle and closed.
+    # Idle-connection read timeout: reaps a connect-but-never-sends-a-request-line socket after
+    # 10s, so a co-resident process cannot pin ThreadingHTTPServer threads forever by opening
+    # sockets and going silent (local DoS). That is a socket-operation timeout, NOT an
+    # application-layer idle timer: it fires only while a socket op is actually in flight and
+    # blocked. On the read side that is the case above. On the write side it can fire too, but
+    # only once the send genuinely blocks — see the buffer arithmetic below.
+    #
+    # What it does NOT do is act as an SSE idle timer. Measured: it does not fire during the queue
+    # wait between keepalives, and it did not reap any of the 40 observed non-reading streams within
+    # 25s. It can still surface on an established stream once a WRITE genuinely blocks -- which the
+    # buffer arithmetic below puts at roughly 26 hours. An earlier version of this comment
+    # claimed the opposite: that an SSE heartbeat MUST stay below this timeout or an open, healthy
+    # stream would be misclassified as idle and closed. MEASURED FALSE in both directions on
+    # Python 3.11.14 / Darwin. (a) A server built with
+    # heartbeat=14.0, above this timeout, with a
+    # continuously-reading client: still streaming at t+16s, keepalive delivered, no close; the
+    # same probe at heartbeat=0.4 saw 8 keepalives in 3s, so the probe was working. (b) 40 streams
+    # whose peer read the headers and then stopped reading were ALL still registered at t+25s --
+    # measured BEFORE MAX_SSE_CLIENTS existed, so 40 is no longer reproducible against this file:
+    # the cap now refuses past 16, and re-running that probe here registers 16, not 40. What the
+    # measurement establishes is unchanged by the cap -- the timeout does not reach an established
+    # stream -- and 16 is the number the cap bounds it to.
+    #
+    # The mechanism, so the claim is not reintroduced: between writes `_serve_events` blocks in
+    # `queue.get(timeout=heartbeat)` — a Python queue wait, NOT a socket operation. No socket op is
+    # in flight, so no socket timeout can fire. `settimeout` surfaces on a WRITE only when the send
+    # actually blocks, which requires a full kernel buffer: a 13-byte keepalive every 3s against a
+    # measured 408,128-byte client receive buffer is roughly 26 hours, and that is a lower bound.
+    # The heartbeat interval and this timeout are independent; do not couple them. What bounds the
+    # unreapable case is MAX_SSE_CLIENTS — see `_serve_events`' accepted-residual note.
     timeout = 10
 
     # Expected client-side end states on ANY write to the connection socket: a hard disconnect
@@ -933,19 +960,55 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def _serve_events(self):
-        """Server-Sent Events stream: register a fresh bounded queue, then block on it and
-        forward each `refresh` token as an SSE event. On an empty get (no refresh within one
-        HEARTBEAT) write a `: keepalive` comment so the connection stays established — the
-        heartbeat interval is < RequestHandler.timeout (10s), otherwise a healthy stream is
-        misclassified as idle and reaped. A broken/reset/timed-out socket (on either the
-        header write or a streaming write) unregisters the queue and returns; the finally
-        guarantees unregistration on every exit path.
+        """Server-Sent Events stream: register a fresh bounded queue, then block on it and forward
+        each `refresh` token as an SSE event. On an empty get (no refresh within one HEARTBEAT)
+        write a `: keepalive` comment so the connection stays established. The heartbeat interval is
+        INDEPENDENT of RequestHandler.timeout — an earlier version of this docstring said it must
+        stay below it; see that attribute's comment for the measurement showing the coupling does
+        not exist. A broken/reset/timed-out socket (on either the header write or a streaming write)
+        unregisters the queue and returns; the finally guarantees unregistration on every exit path
+        AFTER a successful registration. A refused registration returns before the try/finally and
+        has nothing to unregister.
 
-        FIX 4 reconnect resync: on connect the CURRENT build generation is sent immediately as
-        an `event: sync` (before the blocking loop). A client compares it to the generation
-        its page was rendered from and reloads only when the server is AHEAD -- so a refresh
-        that was broadcast to a since-dead queue while the client was disconnected is caught up
-        on reconnect, while a fresh page (equal generations) never reloads (no reload loop)."""
+        Registration CAN be refused: at MAX_SSE_CLIENTS `register_client` returns None, and this
+        handler answers 503 + Retry-After and returns before the stream loop, having registered
+        nothing.
+
+        Connect-time preamble: a `retry:` field (SSE_RETRY_SECONDS, in milliseconds) sets the
+        reconnect interval of a stream that was ESTABLISHED and then DROPPED -- a server restart --
+        explicitly, replacing an interval the WHATWG standard leaves user-agent-defined. It does
+        nothing for a REFUSED client, whose stream never
+        opened and so never received it. It carries no `data:`, so per the SSE spec it dispatches no
+        event and never triggers a reload.
+
+        FIX 4 reconnect resync: on connect the CURRENT build generation is sent immediately as an
+        `event: sync` (before the blocking loop). A client compares it to the generation its page
+        was rendered from and reloads only when the server is AHEAD -- so a refresh that was
+        broadcast to a since-dead queue while the client was disconnected is caught up on reconnect,
+        while a fresh page (equal generations) never reloads (no reload loop).
+
+        ACCEPTED RESIDUAL -- a stalled stream is not reaped. There is no application-layer signal
+        that an SSE peer has stopped reading: keepalive writes keep succeeding into the kernel send
+        buffer until that buffer fills (roughly 26h at this keepalive size and interval -- see
+        RequestHandler.timeout), and SSE has no acknowledgement, so for any practical horizon a peer
+        that reads its headers and then stops is
+        indistinguishable here from a healthy idle one (MEASURED: 40 such streams still registered
+        at t+25s, 2.5x RequestHandler.timeout -- taken BEFORE MAX_SSE_CLIENTS existed; re-running
+        that probe against this file registers 16, since the cap refuses the rest. The
+        indistinguishability is what the measurement shows, and the cap does not change it).
+        The portable levers all cost more than the gap --
+        shrinking SO_SNDBUF moves ~26h to ~15min without closing it, TCP_USER_TIMEOUT is Linux-only
+        while this module is stdlib-only and macOS-tested, and a total-lifetime cap would close the
+        healthy long-lived dashboards this server exists to serve. MAX_SSE_CLIENTS is the mitigation
+        rather than the cure: with registrations bounded at 16, stalled streams pin at most 16
+        threads, which is the local-DoS an idle reap would have prevented. The bound has its own
+        cost, stated rather than glossed: 16 stalled streams refuse a legitimate 17th tab, and that
+        tab most likely stays dead until the user reloads the page -- per the WHATWG EventSource
+        processing model a non-200 response FAILS the connection (fire `error`, readyState = CLOSED,
+        no reconnect), Retry-After is not an EventSource input, and this stream's `retry:` never
+        arrives because the stream never opened. render_html.py's `error` handler is empty and
+        relies entirely on auto-reconnect. That browser consequence is reasoned from the spec and
+        the shipped client, NOT driven in a browser. This is disclosed, not closed."""
         state = self.server.state
         heartbeat = getattr(self.server, "heartbeat_seconds", HEARTBEAT_SECONDS)
         # Register the client queue BEFORE capturing the generation (Codex r2 residual-race
