@@ -50,13 +50,38 @@ render_html = _load_sibling("harness_map_serve_render_html", "render_html.py")
 # Loopback allowlist (single-value, never a blocklist): the ONLY host this server may bind.
 _ALLOWED_HOSTS = {"127.0.0.1"}
 
-# Realtime-watcher timings. POLL: base sweep interval. DEBOUNCE: quiet window a burst must
-# clear before ONE settled rebuild fires. HEARTBEAT: SSE keepalive interval — MUST stay
-# below RequestHandler.timeout (10s) or an established, healthy stream is misread as idle
-# and reaped. Tests shrink all three via build_server kwargs; these DEFAULTS are production.
+# Realtime-watcher timings. POLL: base sweep interval. DEBOUNCE: quiet window a burst must clear
+# before ONE settled rebuild fires. HEARTBEAT: SSE keepalive interval, which keeps an otherwise
+# silent stream's bytes flowing. HEARTBEAT is INDEPENDENT of RequestHandler.timeout — an earlier
+# version of this comment claimed it MUST stay below that timeout or a healthy stream would be
+# reaped; that was measured false in both directions, and the measurement plus the mechanism are
+# recorded at RequestHandler.timeout. Tests shrink all three via build_server kwargs; these
+# DEFAULTS are production.
 POLL_SECONDS = 2.0
 DEBOUNCE_SECONDS = 1.0
 HEARTBEAT_SECONDS = 3.0
+
+# Ceiling on simultaneously registered SSE (`/events`) streams. A loopback dashboard is 1-5
+# browser tabs, so 16 is far above any human workflow. It is not a comfort limit: a stream whose
+# peer stops reading is NOT reapable (see `_serve_events`' accepted-residual note), so this is what
+# bounds how many ThreadingHTTPServer threads a stalled or hostile co-resident process can pin.
+MAX_SSE_CLIENTS = 16
+
+# Reconnect interval, in seconds. ONE home, so the wire surfaces that carry it cannot drift apart.
+# Task 1 wires the first: the `Retry-After` header on a cap refusal, which is ADVISORY and reaches
+# non-browser clients only -- per the WHATWG EventSource processing model a non-200 response FAILS
+# the connection (fire `error`, readyState = CLOSED, no reconnect), and `Retry-After` is not an
+# EventSource input.
+# Task 2 wires the second: the `retry:` field written into the SSE stream itself, before every
+# connect-time `event: sync`, on every ACCEPTED (200) stream. The client reads it in
+# MILLISECONDS (hence the *1000 at the write site). What the tests VERIFY is narrower than what
+# the field DOES: they pin that it reaches the wire, in that position, carrying no `data:`. No
+# browser reconnect was measured. Its effect lands on a stream that was ESTABLISHED and then
+# DROPPED -- a server restart -- where it replaces a user-agent-defined
+# reconnection interval with an explicit, server-chosen one. It does NOT reach a client refused
+# by MAX_SSE_CLIENTS: that stream never opened (503, not 200), so the field never arrived --
+# that client is stuck with the `Retry-After` header above, or nothing at all if non-browser.
+SSE_RETRY_SECONDS = 5
 
 # B2/D5 degrade switch: when True, EVERY sweep that would otherwise take the cheap
 # friction-only path instead runs a full `_rebuild`. The tool stays fully correct with
@@ -186,12 +211,29 @@ class _State:
         # watch_snapshot's pre-rebuild ordering; advanced only after a successful settled rebuild.
         self.synth_snapshot: Any = None
 
-    def register_client(self) -> "queue.Queue[str]":
-        """Add and return a fresh bounded (maxsize=1) queue for one SSE connection. The
-        bound + Full-coalescing broadcast means a stalled client holds at most ONE pending
-        refresh — a single reload subsumes every refresh it missed."""
-        client_queue: "queue.Queue[str]" = queue.Queue(maxsize=1)
+    def register_client(self) -> "queue.Queue[str] | None":
+        """Add and return a fresh bounded (maxsize=1) queue for one SSE connection, or None when
+        MAX_SSE_CLIENTS streams are already registered. The bound + Full-coalescing broadcast means
+        a stalled client holds at most ONE pending refresh — a single reload subsumes every refresh
+        it missed.
+
+        The ceiling test and the append happen under ONE clients_lock acquisition. Splitting them
+        across two acquisitions is a TOCTOU: N concurrent connects can all observe
+        len(self.clients) < MAX_SSE_CLIENTS before any of them appends, and the list overshoots the
+        ceiling by up to N-1 (TRK-022 slice A's "parallel state must be atomic per key, not merely
+        adjacent"). Refusal returns None rather than raising, so `_serve_events` answers 503 on
+        ordinary control flow.
+
+        Two separate facts about the refusal path, deliberately not chained into one: the ceiling
+        check runs BEFORE the queue is allocated, so a refused call allocates nothing and registers
+        nothing; and registration IS the append, so where the queue object is CONSTRUCTED is
+        independent of that — constructing it before the check would still register nothing and
+        still need no unregistering. Construction placement carries no correctness weight here; the
+        shared lock hold above is what carries it."""
         with self.clients_lock:
+            if len(self.clients) >= MAX_SSE_CLIENTS:
+                return None
+            client_queue: "queue.Queue[str]" = queue.Queue(maxsize=1)
             self.clients.append(client_queue)
         return client_queue
 
@@ -838,12 +880,36 @@ class RequestHandler(BaseHTTPRequestHandler):
     # every call site — `_Server` IS-A `BaseServer`, so this is a type-safe narrowing.
     server: "_Server"
 
-    # Idle-connection read timeout: reaps a connect-but-never-sends-a-request-line socket
-    # after 10s, so a co-resident process cannot pin ThreadingHTTPServer threads forever by
-    # opening sockets and going silent (local DoS). NOTE for the forthcoming SSE /events
-    # handler (a later task): an established SSE stream WRITES rather than reads after its
-    # initial request, so its heartbeat interval MUST stay below this timeout, or an
-    # open, healthy stream will be misclassified as idle and closed.
+    # Idle-connection read timeout: reaps a connect-but-never-sends-a-request-line socket after
+    # 10s, so a co-resident process cannot pin ThreadingHTTPServer threads forever by opening
+    # sockets and going silent (local DoS). That is a socket-operation timeout, NOT an
+    # application-layer idle timer: it fires only while a socket op is actually in flight and
+    # blocked. On the read side that is the case above. On the write side it can fire too, but
+    # only once the send genuinely blocks — see the buffer arithmetic below.
+    #
+    # What it does NOT do is act as an SSE idle timer. Measured: it does not fire during the queue
+    # wait between keepalives, and it did not reap any of the 40 observed non-reading streams within
+    # 25s. It can still surface on an established stream once a WRITE genuinely blocks -- which the
+    # buffer arithmetic below puts at roughly 26 hours. An earlier version of this comment
+    # claimed the opposite: that an SSE heartbeat MUST stay below this timeout or an open, healthy
+    # stream would be misclassified as idle and closed. MEASURED FALSE in both directions on
+    # Python 3.11.14 / Darwin. (a) A server built with
+    # heartbeat=14.0, above this timeout, with a
+    # continuously-reading client: still streaming at t+16s, keepalive delivered, no close; the
+    # same probe at heartbeat=0.4 saw 8 keepalives in 3s, so the probe was working. (b) 40 streams
+    # whose peer read the headers and then stopped reading were ALL still registered at t+25s --
+    # measured BEFORE MAX_SSE_CLIENTS existed, so 40 is no longer reproducible against this file:
+    # the cap now refuses past 16, and re-running that probe here registers 16, not 40. What the
+    # measurement establishes is unchanged by the cap -- the timeout does not reach an established
+    # stream -- and 16 is the number the cap bounds it to.
+    #
+    # The mechanism, so the claim is not reintroduced: between writes `_serve_events` blocks in
+    # `queue.get(timeout=heartbeat)` — a Python queue wait, NOT a socket operation. No socket op is
+    # in flight, so no socket timeout can fire. `settimeout` surfaces on a WRITE only when the send
+    # actually blocks, which requires a full kernel buffer: a 13-byte keepalive every 3s against a
+    # measured 408,128-byte client receive buffer is roughly 26 hours, and that is a lower bound.
+    # The heartbeat interval and this timeout are independent; do not couple them. What bounds the
+    # unreapable case is MAX_SSE_CLIENTS — see `_serve_events`' accepted-residual note.
     timeout = 10
 
     # Expected client-side end states on ANY write to the connection socket: a hard disconnect
@@ -855,7 +921,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     _CLIENT_GONE = (BrokenPipeError, ConnectionResetError, TimeoutError, OSError)
 
     def _send_security_headers(self):
-        """Anti-framing headers on EVERY response (200/400/404): this server holds the
+        """Anti-framing headers on EVERY response (200/400/404/503): this server holds the
         user's PRIVATE harness dashboard. Loopback binding alone does not stop a
         malicious external page from framing it in a hidden <iframe> if the user's
         browser can also reach 127.0.0.1 (clickjacking)."""
@@ -900,19 +966,55 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def _serve_events(self):
-        """Server-Sent Events stream: register a fresh bounded queue, then block on it and
-        forward each `refresh` token as an SSE event. On an empty get (no refresh within one
-        HEARTBEAT) write a `: keepalive` comment so the connection stays established — the
-        heartbeat interval is < RequestHandler.timeout (10s), otherwise a healthy stream is
-        misclassified as idle and reaped. A broken/reset/timed-out socket (on either the
-        header write or a streaming write) unregisters the queue and returns; the finally
-        guarantees unregistration on every exit path.
+        """Server-Sent Events stream: register a fresh bounded queue, then block on it and forward
+        each `refresh` token as an SSE event. On an empty get (no refresh within one HEARTBEAT)
+        write a `: keepalive` comment so the connection stays established. The heartbeat interval is
+        INDEPENDENT of RequestHandler.timeout — an earlier version of this docstring said it must
+        stay below it; see that attribute's comment for the measurement showing the coupling does
+        not exist. A broken/reset/timed-out socket (on either the header write or a streaming write)
+        unregisters the queue and returns; the finally guarantees unregistration on every exit path
+        AFTER a successful registration. A refused registration returns before the try/finally and
+        has nothing to unregister.
 
-        FIX 4 reconnect resync: on connect the CURRENT build generation is sent immediately as
-        an `event: sync` (before the blocking loop). A client compares it to the generation
-        its page was rendered from and reloads only when the server is AHEAD -- so a refresh
-        that was broadcast to a since-dead queue while the client was disconnected is caught up
-        on reconnect, while a fresh page (equal generations) never reloads (no reload loop)."""
+        Registration CAN be refused: at MAX_SSE_CLIENTS `register_client` returns None, and this
+        handler answers 503 + Retry-After and returns before the stream loop, having registered
+        nothing.
+
+        Connect-time preamble: a `retry:` field (SSE_RETRY_SECONDS, in milliseconds) sets the
+        reconnect interval of a stream that was ESTABLISHED and then DROPPED -- a server restart --
+        explicitly, replacing an interval the WHATWG standard leaves user-agent-defined. It does
+        nothing for a REFUSED client, whose stream never
+        opened and so never received it. It carries no `data:`, so per the SSE spec it dispatches no
+        event and never triggers a reload.
+
+        FIX 4 reconnect resync: on connect the CURRENT build generation is sent immediately as an
+        `event: sync` (before the blocking loop). A client compares it to the generation its page
+        was rendered from and reloads only when the server is AHEAD -- so a refresh that was
+        broadcast to a since-dead queue while the client was disconnected is caught up on reconnect,
+        while a fresh page (equal generations) never reloads (no reload loop).
+
+        ACCEPTED RESIDUAL -- a stalled stream is not reaped. There is no application-layer signal
+        that an SSE peer has stopped reading: keepalive writes keep succeeding into the kernel send
+        buffer until that buffer fills (roughly 26h at this keepalive size and interval -- see
+        RequestHandler.timeout), and SSE has no acknowledgement, so for any practical horizon a peer
+        that reads its headers and then stops is
+        indistinguishable here from a healthy idle one (MEASURED: 40 such streams still registered
+        at t+25s, 2.5x RequestHandler.timeout -- taken BEFORE MAX_SSE_CLIENTS existed; re-running
+        that probe against this file registers 16, since the cap refuses the rest. The
+        indistinguishability is what the measurement shows, and the cap does not change it).
+        The portable levers all cost more than the gap --
+        shrinking SO_SNDBUF moves ~26h to ~15min without closing it, TCP_USER_TIMEOUT is Linux-only
+        while this module is stdlib-only and macOS-tested, and a total-lifetime cap would close the
+        healthy long-lived dashboards this server exists to serve. MAX_SSE_CLIENTS is the mitigation
+        rather than the cure: with registrations bounded at 16, stalled streams pin at most 16
+        threads, which is the local-DoS an idle reap would have prevented. The bound has its own
+        cost, stated rather than glossed: 16 stalled streams refuse a legitimate 17th tab, and that
+        tab most likely stays dead until the user reloads the page -- per the WHATWG EventSource
+        processing model a non-200 response FAILS the connection (fire `error`, readyState = CLOSED,
+        no reconnect), Retry-After is not an EventSource input, and this stream's `retry:` never
+        arrives because the stream never opened. render_html.py's `error` handler is empty and
+        relies entirely on auto-reconnect. That browser consequence is reasoned from the spec and
+        the shipped client, NOT driven in a browser. This is disclosed, not closed."""
         state = self.server.state
         heartbeat = getattr(self.server, "heartbeat_seconds", HEARTBEAT_SECONDS)
         # Register the client queue BEFORE capturing the generation (Codex r2 residual-race
@@ -926,16 +1028,54 @@ class RequestHandler(BaseHTTPRequestHandler):
         # AND advances past the already-read generation -> the page stays stale until the next
         # rebuild. An equal generation on a fresh connect still never reloads (no loop).
         client_queue = state.register_client()
-        with state.lock:
-            current_gen = state.generation
-        # A stuck/slow-reading or disconnected client makes wfile.write/flush raise on the
-        # connection socket (TimeoutError after the 10s idle timeout, BrokenPipeError/
-        # ConnectionResetError on a hard disconnect, bare OSError otherwise). All are expected
-        # client-side end states, NOT server bugs -- catch them via the shared `_CLIENT_GONE`
-        # tuple (identical to the GET `/` handler, FIX 8) and return cleanly (the finally
-        # unregisters) so socketserver never prints a traceback to stderr.
-        _client_gone = self._CLIENT_GONE
+        if client_queue is None:
+            # MAX_SSE_CLIENTS streams are already registered. 503 + Retry-After is the honest answer
+            # for a temporary capacity limit, and a non-browser client can act on it. A BROWSER tab
+            # most likely will not: per the WHATWG EventSource processing model a non-200 response
+            # fails the connection (error fires, readyState = CLOSED, no reconnect) and Retry-After
+            # is not an EventSource input -- so a refused tab most likely stays dead until the user
+            # reloads. That is reasoned from the spec plus render_html.py's empty `error` handler,
+            # NOT driven in a browser. Refusal is signalled by returning None rather than raising,
+            # so the refusal is ordinary control flow -- and that makes the `is None` branch this
+            # comment sits inside MANDATORY, not optional: every queue operation below it (the
+            # client_queue.get in the stream loop, the unregister_client in the finally) assumes a
+            # real queue. This returns BEFORE that try/finally because there is no stream to serve.
+            # Two SEPARATE properties of unregister_client, neither of them the reason this branch
+            # is safe. (1) Its contextlib.suppress(ValueError) makes REPEATED removal of a REAL
+            # queue non-raising, so the stream's finally can unregister unconditionally without
+            # tracking whether it already did. (2) unregister_client(None) also happens not to
+            # raise -- same list.remove-of-an-absent-value mechanism, but a distinct case, since
+            # passing None is not the same call as double-unregistering a real queue. That None
+            # tolerance is defensive and separately tested, and this refusal path does NOT rely on
+            # it: it branches on `is None` here, before any queue operation, and returns.
+            # Response shape matches the 404 in do_GET,
+            # with the same _CLIENT_GONE guard the 200 header write below already uses.
+            try:
+                self.send_response(503)
+                self.send_header("Retry-After", str(SSE_RETRY_SECONDS))
+                self._send_security_headers()
+                self.end_headers()
+            except self._CLIENT_GONE:
+                pass  # client vanished during the refusal write -> nothing left to tell it
+            return
+        # The try/finally opens IMMEDIATELY after a successful registration -- before the
+        # generation read below -- so the docstring's "every exit path" is literal rather than
+        # nearly-true. Registration has already mutated state.clients at this point; anything
+        # raising between here and the stream loop would otherwise leak that slot PERMANENTLY,
+        # and with a hard MAX_SSE_CLIENTS ceiling a leaked slot is capacity lost for the life of
+        # the process, not a transient. Nothing in the generation read can raise in ordinary
+        # operation (an uncontended threading.Lock acquire does not, and state.generation is a
+        # plain int attribute), so this closes a window that is structural rather than observed.
         try:
+            with state.lock:
+                current_gen = state.generation
+            # A stuck/slow-reading or disconnected client makes wfile.write/flush raise on the
+            # connection socket (TimeoutError after the 10s idle timeout, BrokenPipeError/
+            # ConnectionResetError on a hard disconnect, bare OSError otherwise). All are expected
+            # client-side end states, NOT server bugs -- catch them via the shared `_CLIENT_GONE`
+            # tuple (identical to the GET `/` handler, FIX 8) and return cleanly (the finally
+            # unregisters) so socketserver never prints a traceback to stderr.
+            _client_gone = self._CLIENT_GONE
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -948,7 +1088,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 # FIX 4: report the current generation on (re)connect so a client that missed
                 # a refresh while disconnected can catch up (reload iff serverGen > pageGen).
-                self.wfile.write(f"event: sync\ndata: {current_gen}\n\n".encode("ascii"))
+                # `retry:` sets the client's reconnect interval (MILLISECONDS -- hence the *1000)
+                # explicitly, replacing a value the WHATWG standard leaves user-agent-defined.
+                # What that actually buys: a stream that was ESTABLISHED and
+                # then DROPPED -- a server restart -- comes back at an interval THIS SERVER chose,
+                # rather than one it does not control.
+                # It does NOT reach a client refused by MAX_SSE_CLIENTS: that
+                # stream never opened, so this field never arrived (see SSE_RETRY_SECONDS). It
+                # carries no `data:`, so per the SSE spec it dispatches no event and can never
+                # trigger a reload. Written in the SAME single write+flush as the sync below, so it
+                # shares that write's existing _CLIENT_GONE boundary and adds no new failure point.
+                # That is NOT a claim of atomic delivery: a write is not transactional at the socket
+                # layer, so a prefix can still reach the peer before an error.
+                # The parentheses are load-bearing for the READER, not the parser: implicit
+                # string-literal concatenation already binds before `.encode`, so both literals are
+                # encoded either way -- but unparenthesized, `.encode` reads as if it applied to the
+                # second literal alone. It misled this change's own author once already.
+                self.wfile.write(
+                    (f"retry: {SSE_RETRY_SECONDS * 1000}\n\n"
+                     f"event: sync\ndata: {current_gen}\n\n").encode("ascii"))
                 self.wfile.flush()
             except _client_gone:
                 return

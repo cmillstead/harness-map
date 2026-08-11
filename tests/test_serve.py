@@ -5,6 +5,7 @@ import http.client
 import importlib.util
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -299,6 +300,373 @@ def _open_events(port):
     return conn, resp
 
 
+@contextlib.contextmanager
+def _sse_slots_filled(port, count):
+    """Hold `count` real /events connections open for the duration of the block, closing every
+    one on exit. No sleep is needed: `_serve_events` registers the client queue BEFORE writing
+    the response headers, so a returned 200 already implies registration."""
+    conns = []
+    try:
+        for _ in range(count):
+            conn, resp = _open_events(port)
+            conns.append(conn)  # append BEFORE asserting: a failed assert must not leak the socket
+            assert resp.status == 200, f"a slot below the ceiling must be accepted, got {resp.status}"
+        yield conns
+    finally:
+        for conn in conns:
+            conn.close()
+
+
+class _CountingLock:
+    """A REAL mutual-exclusion lock (it delegates to threading.Lock and genuinely blocks) that
+    additionally counts how many times it is entered. Not a mock and not a stand-in: the locking
+    behavior under test is the real thing; the counter is the only addition. It exists because the
+    difference between an atomic check-and-append and a check-then-append TOCTOU is exactly the
+    number of acquisitions, and that number is not observable any other way without patching."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.acquisitions = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.acquisitions += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._lock.release()
+        return False
+
+
+class _LengthRecordingLock:
+    """A REAL mutual-exclusion lock (it delegates to threading.Lock and genuinely blocks) that
+    additionally records, per acquisition, `len(state.clients)` at acquire time and again at
+    release time. Not a mock: the locking behavior under test is the real thing; the recording is
+    the only addition. It exists because `_CountingLock` observes only HOW MANY holds were taken,
+    which cannot distinguish an append made inside the hold from one made after releasing it —
+    both show exactly one acquisition. The length delta across a single hold is what separates
+    them."""
+
+    def __init__(self, state):
+        self._lock = threading.Lock()
+        self._state = state
+        self.holds = []          # one (len_at_acquire, len_at_release) pair per acquisition
+        self._entry_length = None
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._entry_length = len(self._state.clients)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.holds.append((self._entry_length, len(self._state.clients)))
+        self._entry_length = None
+        self._lock.release()
+        return False
+
+
+class _HoldIdentifyingLock:
+    """A REAL mutual-exclusion lock (it delegates to threading.Lock and genuinely blocks) that
+    additionally publishes the IDENTITY of the hold currently in effect: a distinct integer per
+    acquisition while held, and None whenever the lock is free. Not a mock: the locking behavior
+    under test is the real thing; the id is the only addition.
+
+    It exists because neither the acquisition COUNT (`_CountingLock`) nor the length delta across a
+    hold (`_LengthRecordingLock`) observes WHERE a length read happens — only how many holds were
+    taken and what the length was at their edges. Pairing this lock with `_HoldObservingList` below
+    lets each individual `len()` and `append()` record the hold it ran under, which is the property
+    "the check and the append share one hold" states directly.
+
+    Deliberately NOT built on `_LengthRecordingLock`: that lock calls `len(state.clients)` itself at
+    acquire and release, which would inject `__len__` observations the implementation never made and
+    contaminate the record this test reads."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._holds_taken = 0
+        self.current_hold_id = None   # None whenever the lock is not held
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._holds_taken += 1
+        self.current_hold_id = self._holds_taken
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.current_hold_id = None
+        self._lock.release()
+        return False
+
+
+class _HoldObservingList(list):
+    """A REAL list (it subclasses list and stores its elements normally) that additionally records,
+    for every `len()` and every `append()`, the id of the `_HoldIdentifyingLock` hold in effect at
+    that exact moment — None when the lock was free. Not a mock: the list behavior under test is the
+    real thing; the op log is the only addition.
+
+    `ops` is a plain list of (operation_name, hold_id_in_effect) pairs in call order. Reading `.ops`
+    is a bare attribute access and records nothing, so a snapshot never perturbs the log."""
+
+    def __init__(self, iterable, lock):
+        self._lock = lock
+        self.ops = []
+        super().__init__(iterable)
+
+    def __len__(self):
+        self.ops.append(("len", self._lock.current_hold_id))
+        return super().__len__()
+
+    def append(self, item):
+        self.ops.append(("append", self._lock.current_hold_id))
+        super().append(item)
+
+
+def test_sse_client_cap_refuses_connections_beyond_the_ceiling(live_server_watching):
+    # TRK-022 finding 1: `register_client()` appended unconditionally, so an unbounded number of
+    # /events streams could pin an unbounded number of ThreadingHTTPServer threads (MEASURED on
+    # main: 40 concurrent connects, 40 registered, 0 refused). A stalled stream is not reapable
+    # (see `_serve_events`' accepted-residual note), so this ceiling IS the bound on that.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    with _sse_slots_filled(port, srv.MAX_SSE_CLIENTS):
+        assert len(server.state.clients) == srv.MAX_SSE_CLIENTS
+        conn, resp = _open_events(port)
+        try:
+            assert resp.status == 503, \
+                "a connect beyond MAX_SSE_CLIENTS must be refused, not accepted"
+            assert len(server.state.clients) == srv.MAX_SSE_CLIENTS, \
+                "a refused connect must register nothing"
+        finally:
+            conn.close()
+
+
+def test_register_client_checks_and_appends_under_one_lock_hold():
+    # The ceiling test and the append MUST share ONE clients_lock acquisition. Split across two
+    # acquisitions they are a TOCTOU: N concurrent connects can all observe len() < MAX before any
+    # of them appends, and the list overshoots the ceiling by up to N-1. This is TRK-022 slice A's
+    # "parallel state must be atomic per key, not merely adjacent" lesson applied here. A real lock
+    # that counts its own entries is the only way to observe the acquisition count without patching.
+    state = srv._State(streams={}, no_friction=True)
+    state.clients_lock = _CountingLock()
+
+    client_queue = state.register_client()
+    assert client_queue is not None
+    assert state.clients_lock.acquisitions == 1, \
+        "the ceiling check and the append must happen under ONE clients_lock hold"
+
+    # Fill past the ceiling with PLAIN queues, never via register_client(): that method appends to
+    # state.clients itself, so `extend(register_client() ...)` would append each queue TWICE and
+    # then pad the list with the None values register_client returns once the ceiling is hit
+    # (MEASURED: len 25, of which 8 are None). state.clients is typed list[queue.Queue[str]] and
+    # _broadcast_refresh calls put_nowait on every element, so a None in there is a latent crash.
+    state.clients.extend(queue.Queue(maxsize=1) for _ in range(srv.MAX_SSE_CLIENTS))
+    before = state.clients_lock.acquisitions
+    assert state.register_client() is None, "at the ceiling, register_client must refuse"
+    assert state.clients_lock.acquisitions - before == 1, \
+        "the refusal path must also take exactly one clients_lock hold"
+
+
+def test_register_client_appends_inside_the_hold_that_checked_the_ceiling():
+    # The acquisition COUNT alone does not prove atomicity: an implementation that takes the lock
+    # for the ceiling check, releases it, and appends outside the lock also shows exactly one
+    # acquisition. What separates the implementations is how state.clients changes ACROSS a single
+    # hold, so this records (len at acquire, len at release) per hold. Discrimination, with 15
+    # clients seeded:
+    #   check-and-append under one hold  -> [(15, 16)]            both assertions pass
+    #   append made after releasing      -> [(15, 15)]            delta 0 -> assertion 2 fails
+    #   two-acquisition check-then-append -> [(15, 15), (15, 16)] two holds -> assertion 1 fails
+    # No threads and no sleeps: the property is structural, so it is observable deterministically.
+    state = srv._State(streams={}, no_friction=True)
+    # Seed with PLAIN queues, never via register_client(): that method appends to state.clients
+    # itself, so seeding through it would both double-count the entries and pollute the recorded
+    # holds (the same trap the ceiling test above documents).
+    state.clients.extend(queue.Queue(maxsize=1) for _ in range(srv.MAX_SSE_CLIENTS - 1))
+    state.clients_lock = _LengthRecordingLock(state)
+
+    client_queue = state.register_client()
+    assert client_queue is not None, "one free slot remains, so this registration must succeed"
+    assert len(state.clients_lock.holds) == 1, \
+        f"the ceiling check and the append must share ONE clients_lock hold: " \
+        f"{state.clients_lock.holds}"
+    length_at_acquire, length_at_release = state.clients_lock.holds[0]
+    assert length_at_release - length_at_acquire == 1, \
+        f"the append must happen INSIDE the hold that checked the ceiling, so that hold's " \
+        f"length delta is +1: {state.clients_lock.holds}"
+
+
+def test_register_client_reads_the_length_and_appends_under_the_SAME_hold():
+    # Strictly stronger than the two tests above, which observe only how many holds were taken and
+    # what the length was at their edges. Neither discriminates this genuinely broken shape:
+    #     if len(self.clients) >= MAX_SSE_CLIENTS:   # ceiling read OUTSIDE the lock
+    #         with self.clients_lock:
+    #             return None
+    #     with self.clients_lock:
+    #         self.clients.append(client_queue)      # append in a SEPARATE hold
+    # Seeded one below the ceiling the refusal branch never runs, so the only hold recorded is the
+    # append's — one acquisition, length delta +1 — and both prior tests pass while concurrent
+    # callers can still overshoot the ceiling. What separates the shapes is WHERE each operation
+    # runs, not how many holds exist or what the length was at their edges, so this records the hold
+    # in effect at each individual len() and append() and asserts they are the SAME hold.
+    # No threads and no sleeps: the property is structural, so it is observable deterministically.
+    state = srv._State(streams={}, no_friction=True)
+    # Seed with PLAIN queues, never via register_client(): that method appends to state.clients
+    # itself, so seeding through it would both double-count the entries and pollute the op log (the
+    # same trap the two tests above document). The observing list is installed AFTER seeding for
+    # the same reason — seeding traffic must not appear in the record.
+    seeded = [queue.Queue(maxsize=1) for _ in range(srv.MAX_SSE_CLIENTS - 1)]
+    state.clients_lock = _HoldIdentifyingLock()
+    state.clients = _HoldObservingList(seeded, state.clients_lock)
+
+    client_queue = state.register_client()
+    # Snapshot BEFORE any assertion, so nothing an assertion does can add to the record.
+    ops = list(state.clients.ops)
+    assert client_queue is not None, "one free slot remains, so this registration must succeed"
+
+    append_positions = [index for index, (op, _) in enumerate(ops) if op == "append"]
+    assert append_positions, f"register_client must append the new queue: {ops}"
+    append_position = append_positions[0]
+    gating_reads = [
+        hold_id for index, (op, hold_id) in enumerate(ops)
+        if op == "len" and index < append_position
+    ]
+    assert gating_reads, f"register_client must read len(state.clients) before appending: {ops}"
+
+    gating_hold_id = gating_reads[-1]
+    append_hold_id = ops[append_position][1]
+    assert gating_hold_id is not None, \
+        f"the ceiling read ran with clients_lock FREE — a concurrent connect can observe the same " \
+        f"free slot before this one appends: {ops}"
+    assert append_hold_id is not None, \
+        f"the append ran with clients_lock FREE — nothing serializes it against a concurrent " \
+        f"append: {ops}"
+    assert gating_hold_id == append_hold_id, \
+        f"the ceiling read and the append ran under DIFFERENT clients_lock holds, so the lock was " \
+        f"released between them (TOCTOU): {ops}"
+
+
+def test_sse_client_cap_holds_under_concurrent_connects(live_server_watching):
+    # Real threads, real sockets, released from one barrier so the connects genuinely race at the
+    # ceiling boundary. Pre-fix (no cap at all) all four are accepted, so the status-set assertion
+    # REDs. A two-acquisition check-then-append can let multiple racers observe a free slot before
+    # any of them appends, and the 200-count assertion catches that overshoot when the scheduler
+    # actually interleaves them (Test B pins the same property deterministically, without relying on
+    # scheduling). Only 4 race at once, deliberately: 24 would be flaky against a listen backlog
+    # of 5.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    n_racing = 4
+    free_slots = 3
+    with _sse_slots_filled(port, srv.MAX_SSE_CLIENTS - free_slots):
+        barrier = threading.Barrier(n_racing, timeout=15.0)
+        statuses = [None] * n_racing
+        failures = [None] * n_racing
+        conns = [None] * n_racing
+
+        def connect(index):
+            try:
+                barrier.wait()
+                conn, resp = _open_events(port)
+                conns[index] = conn
+                statuses[index] = resp.status
+            except Exception as exc:  # noqa: BLE001  # recorded, never swallowed — asserted below
+                failures[index] = repr(exc)
+
+        threads = [threading.Thread(target=connect, args=(i,)) for i in range(n_racing)]
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30.0)
+                assert not t.is_alive(), "a connect thread hung"
+            assert [f for f in failures if f] == [], f"connect threads raised: {failures}"
+            assert sorted({s for s in statuses}) == [200, 503], \
+                f"every connect must be either accepted or cleanly refused: {statuses}"
+            assert statuses.count(200) == free_slots, \
+                "exactly the free slots may be accepted (a two-acquisition check-then-append " \
+                "can let multiple racers past the check and overshoot)"
+            assert statuses.count(503) == n_racing - free_slots
+            assert len(server.state.clients) == srv.MAX_SSE_CLIENTS
+        finally:
+            # Join EVERY worker before closing anything. On an assertion failure inside the try the
+            # loop above unwinds with workers still running, and a live worker publishes its
+            # connection into `conns` AFTER the close loop has already read that slot — the socket
+            # then survives the test, pinning a server handler thread and one of the
+            # MAX_SSE_CLIENTS slots for the rest of the session, which can wedge later tests. The
+            # join makes every slot final before it is read. `ident` is None until a thread has
+            # been started and join() on an unstarted thread raises RuntimeError, so a failure
+            # partway through the start loop must not have its exception masked here.
+            for t in threads:
+                if t.ident is not None:
+                    t.join(timeout=30.0)
+            for conn in conns:
+                if conn is not None:
+                    conn.close()
+
+
+def test_sse_cap_slot_is_reclaimed_after_a_client_disconnects(live_server_watching):
+    # The cap must bound concurrency, not permanently exhaust the server. When a client
+    # disconnects, its handler's next heartbeat write fails, the finally unregisters the queue,
+    # and the freed slot must accept a new stream.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    with _sse_slots_filled(port, srv.MAX_SSE_CLIENTS) as conns:
+        conns.pop().close()                      # popped so the context manager will not re-close it
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and len(server.state.clients) >= srv.MAX_SSE_CLIENTS:
+            time.sleep(0.1)
+        assert len(server.state.clients) < srv.MAX_SSE_CLIENTS, \
+            "a disconnected client's slot must be released by the /events finally"
+        conn, resp = _open_events(port)
+        try:
+            assert resp.status == 200, "the reclaimed slot must accept a new stream"
+        finally:
+            conn.close()
+
+
+def test_unregister_client_tolerates_a_refused_registration():
+    # MEASURED on main: `unregister_client` wraps `list.remove(...)` in
+    # contextlib.suppress(ValueError), and `list.remove(None)` against a list of queues raises
+    # exactly ValueError — so passing the refusal sentinel through does not raise. That tolerance
+    # is NOT what makes the refused path safe. `_serve_events` branches on `client_queue is None`
+    # and returns BEFORE its try/finally, so the finally never sees the sentinel; that guard is
+    # required, because the stream loop's `get` and the finally's unregister both assume a real
+    # queue. What the suppress actually covers is the idempotent DOUBLE-unregister asserted at the
+    # end of this test. Both properties are pinned here so a future "tightening" of
+    # unregister_client (narrowing the suppress, or dropping it) cannot silently change either.
+    state = srv._State(streams={}, no_friction=True)
+    live = state.register_client()
+    assert live is not None
+
+    state.unregister_client(None)                       # must not raise
+    assert state.clients == [live], \
+        "unregistering the refusal sentinel must not disturb a live client's registration"
+
+    state.unregister_client(live)
+    assert state.clients == []
+    state.unregister_client(live)                       # idempotent: the second removal is a no-op
+    assert state.clients == []
+
+
+def test_sse_cap_refusal_response_shape(live_server_watching):
+    # A refused client must be told (a) this is temporary — 503, not 403/404 — and (b) how long to
+    # wait. The interval comes from SSE_RETRY_SECONDS rather than a literal, so it has ONE home;
+    # two homes for one interval is the exact drift this repo has been bitten by elsewhere.
+    # Retry-After is ADVISORY and reaches non-browser clients only — see the header's
+    # own comment for why a browser EventSource does not act on it.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    with _sse_slots_filled(port, srv.MAX_SSE_CLIENTS):
+        conn, resp = _open_events(port)
+        try:
+            assert resp.status == 503
+            assert resp.getheader("Retry-After") == str(srv.SSE_RETRY_SECONDS)
+            # the security headers ride on EVERY response, refusals included
+            assert resp.getheader("X-Frame-Options") == "DENY"
+            assert "frame-ancestors 'none'" in resp.getheader("Content-Security-Policy", "")
+        finally:
+            conn.close()
+
+
 def _iter_refresh_lines(resp, deadline):
     """Shared SSE read loop: yield once per `event: refresh` line until `deadline`,
     stopping on a socket timeout or EOF (heartbeat comment lines are skipped). Both
@@ -355,6 +723,7 @@ def test_debounce_burst_yields_single_refresh(live_server_watching):
 def test_slow_client_queue_bounded_to_one_pending(live_server_watching):
     server, out_dir, root = live_server_watching
     q = server.state.register_client()
+    assert q is not None, "the fixture server starts with no SSE clients, so this must not refuse"
     try:
         # Never drain q; drive 10 rebuilds -> each broadcasts. maxsize=1 + Full-coalesce
         # keeps at most one pending refresh, so a stalled client cannot grow unbounded.
@@ -1126,6 +1495,96 @@ def _read_sync_generation(resp, timeout=6.0):
         if saw_sync and line.startswith(b"data:"):
             return int(line.split(b":", 1)[1].strip())
     return None
+
+
+def _read_preamble_lines(resp, timeout=6.0):
+    """Return the raw SSE lines the server writes on connect, up to and including the
+    `event: sync` line, in wire order."""
+    lines = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            line = resp.fp.readline()
+        except (socket.timeout, TimeoutError, OSError):
+            break
+        if not line:
+            break
+        lines.append(line)
+        if b"event: sync" in line:
+            break
+    return lines
+
+
+def test_sse_stream_sets_the_client_reconnect_backoff(live_server_watching):
+    # Without a `retry:` field a client that was streaming and then LOST the connection — a server
+    # restart — reconnects at a user-agent-defined interval the server does not control (the WHATWG
+    # standard leaves the initial reconnection time to the UA). This makes it EXPLICIT and
+    # server-controlled. It does NOT help a client refused by MAX_SSE_CLIENTS: that stream never
+    # opens, so the field never arrives (see SSE_RETRY_SECONDS' comment). The field is written
+    # before `event: sync` and carries no `data:`, so per the SSE spec it sets the reconnection
+    # time and dispatches no event — it can never itself trigger a page reload.
+    server, out_dir, root = live_server_watching
+    port = server.server_address[1]
+    conn, resp = _open_events(port)
+    try:
+        lines = _read_preamble_lines(resp)
+        expected = f"retry: {srv.SSE_RETRY_SECONDS * 1000}\n".encode("ascii")
+        assert expected in lines, f"no reconnect backoff on the wire: {lines}"
+        retry_index = lines.index(expected)
+        sync_index = next(i for i, line in enumerate(lines) if b"event: sync" in line)
+        assert retry_index < sync_index, "the backoff must be set before the first event"
+        assert not any(line.startswith(b"data:") for line in lines[:sync_index]), \
+            "the retry block must carry no data: field, or it would dispatch an event"
+        # The absence of a data: line is only half of "field-only block". Per the SSE spec a block
+        # ends at a BLANK line, so without the blank separator the retry: field would be part of
+        # the `event: sync` block rather than a standalone field-only one — and every assertion
+        # above still passes in that case (`retry: 5000\nevent: sync\ndata: 0\n\n` satisfies all
+        # three). The separator is what makes the dispatches-no-event property true, so pin it.
+        assert lines[retry_index + 1] == b"\n", \
+            f"the retry: field must be terminated by a blank line, or it is not a standalone " \
+            f"field-only block: {lines}"
+        # `startswith(b"data:")` is not the spec's definition of a data field. Per the WHATWG SSE
+        # parsing algorithm a line with NO colon is a field whose name is the whole line and whose
+        # value is empty, so a bare `data` line IS a data field and dispatches an empty message
+        # event — and `data\nretry: 5000\n\nevent: sync` satisfies every assertion above. Extract
+        # each preamble field NAME the way the spec does (everything before the first colon, or the
+        # whole line when there is none) and reject `data` in either form. This is a test-
+        # completeness fix, NOT a live defect: the preamble is a fixed byte string with no path that
+        # can emit a bare `data` line.
+        preamble_field_names = [
+            line.split(b":", 1)[0].strip() if b":" in line else line.strip()
+            for line in lines[:sync_index]
+        ]
+        assert b"data" not in preamble_field_names, \
+            f"a data field before the first event dispatches a message event, however it is " \
+            f"spelled — a COLONLESS `data` line is a data field with an empty value: {lines}"
+        # A field-only block also needs a blank line BEFORE it, not only after: without one the
+        # retry: field belongs to whatever block precedes it rather than standing alone.
+        assert retry_index == 0 or lines[retry_index - 1] == b"\n", \
+            f"the retry: field must open the stream or follow a blank line, or it is part of the " \
+            f"preceding block rather than a standalone field-only one: {lines}"
+        # Parsed from the bytes actually received, NOT from srv.SSE_RETRY_SECONDS * 1000 —
+        # recomputing the constant inside the test proves nothing about the write site, which is
+        # the vacuity test_sse_backoff_interval_is_positive documents about itself below.
+        wire_milliseconds = int(lines[retry_index].split(b":", 1)[1].strip())
+        assert wire_milliseconds > 0, \
+            f"a retry: of 0 permits immediate reconnection, defeating the backoff: {lines}"
+    finally:
+        conn.close()
+
+
+def test_sse_backoff_interval_is_positive():
+    # One real contract, independent of any browser's default: the interval must be positive.
+    # `retry: 0` is a legal SSE field that permits the client to reconnect immediately, which
+    # defeats the point of setting a backoff at all. An earlier draft asserted `> 3` against
+    # "EventSource's ~3s default"; the WHATWG standard makes the initial reconnection time
+    # user-agent-defined, so that pinned an implementation habit, not a contract.
+    #
+    # It deliberately does NOT assert the seconds-to-milliseconds conversion: multiplying the
+    # constant by 1000 inside the test proves nothing about the write site, and would still pass if
+    # production emitted `retry: 5`. `test_sse_stream_sets_the_client_reconnect_backoff` reads the
+    # actual wire bytes and is the only honest place to pin *1000.
+    assert srv.SSE_RETRY_SECONDS > 0
 
 
 def test_initial_connect_does_not_loop_reload(live_server_with_streams):
@@ -2014,3 +2473,66 @@ def test_mixed_pair_would_disable_rotation_detection(streams_server_no_watch):
         "fixture precondition: the size really is unchanged"
     assert srv._classify_stream_sweep(server.state) == ("none", []), \
         "a mixed pair hides a real rotation -- which is why publishing one must be impossible"
+
+
+def _watch_stream(port, seconds, socket_timeout=1.0):
+    """Connect to /events, READ CONTINUOUSLY for `seconds`, and report
+    (still_open, keepalive_count). A clean EOF or an OSError means the server closed the stream.
+    Deliberately does NOT use _open_events: that helper's socket timeout is tuned to the fixture
+    heartbeat, and this reads a stream whose heartbeat is far longer."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    got, closed = b"", False
+    try:
+        sock.sendall(b"GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        sock.settimeout(socket_timeout)
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(4096)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                closed = True
+                break
+            if not chunk:
+                closed = True
+                break
+            got += chunk
+    finally:
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        sock.close()
+    return (not closed), got.count(b": keepalive")
+
+
+def test_heartbeat_above_the_idle_timeout_does_not_close_a_healthy_stream(tmp_path):
+    # TRK-022 findings 4/5/6: three comments asserted that the SSE heartbeat MUST stay below
+    # RequestHandler.timeout or a healthy stream would be misread as idle and reaped. MEASURED
+    # FALSE. Between writes `_serve_events` blocks in `queue.get(timeout=heartbeat)` — a Python
+    # queue wait, not a socket operation — so no socket op is in flight and the socket timeout
+    # cannot fire. This pins the corrected claim in RUNTIME behavior so the coupling cannot be
+    # reintroduced as code by a future reader "restoring" the constraint.
+    #
+    # SLOW BY NECESSITY (~13s): RequestHandler.timeout is 10 and must not be edited, so proving a
+    # stream survives past it takes more than 10 seconds of wall clock. This is the only test in
+    # the file that costs that much; the cost buys the one assertion that stops a measured-false
+    # claim from returning.
+    out_dir = tmp_path / "served"
+    out_dir.mkdir()
+    _write_sidecar(out_dir, "2026-07-15", _minimal_doc())
+    root = tmp_path / "fakeroot"
+    root.mkdir()
+    heartbeat = srv.RequestHandler.timeout + 1.0        # ABOVE the idle timeout on purpose
+    server = srv.build_server(out_dir=out_dir, root=root, project_root=root,
+                              host="127.0.0.1", port=0, no_friction=True, heartbeat=heartbeat)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        still_open, keepalives = _watch_stream(server.server_address[1], heartbeat + 2.0)
+        assert still_open, \
+            "a healthy stream with heartbeat > RequestHandler.timeout must NOT be closed"
+        assert keepalives >= 1, \
+            "the watcher must actually have read the live stream (probe liveness control)"
+    finally:
+        server.shutdown()
+        server.server_close()
