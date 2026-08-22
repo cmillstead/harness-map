@@ -1292,6 +1292,41 @@ def test_eventsource_gated_on_generation_marker(tmp_path):
         "a one-shot/static render (generation=None) must emit NO marker -> its EventSource gate stays closed"
 
 
+def test_active_tab_persisted_and_restored_across_reload():
+    # TRK-167: an SSE-driven reload must NOT snap the user back to Overview. activate()
+    # persists the chosen view to sessionStorage, and the initial activation restores it
+    # when that view still exists (else falls back to Overview). Browser runtime isn't
+    # unit-testable in pytest, so assert the client wiring is present in STATIC_SCRIPT.
+    script = rh.STATIC_SCRIPT
+    # persistence: activate() writes the active id under a stable key
+    assert "sessionStorage.setItem('hm-active-view'" in script
+    # restore: the initial activation reads that key AND verifies the view still exists
+    # before using it (a stale stored id must not select a non-existent view)
+    assert "sessionStorage.getItem('hm-active-view')" in script
+    # the stored id is used only when it names a view that still exists, else Overview —
+    # this single ternary pins "restore the stored view, fall back to overview" as one unit
+    assert "document.getElementById(stored) ? stored : 'view-overview'" in script
+
+
+def test_sse_refresh_reload_is_debounced_not_immediate():
+    # TRK-167: a live Claude session makes serve.py broadcast 'refresh' every ~2s (cheap
+    # friction-only rebuilds), so a direct location.reload() per event reloaded the dashboard
+    # constantly. The refresh handler must route through a coalescing debounce, not reload
+    # immediately. Browser runtime isn't unit-testable in pytest, so assert the wiring.
+    script = rh.STATIC_SCRIPT
+    # the immediate-reload form is GONE from the refresh handler
+    assert "es.addEventListener('refresh', function(){ location.reload(); })" not in script
+    # a coalescing debounce helper exists (clearTimeout + setTimeout) ...
+    assert "clearTimeout" in script
+    assert "setTimeout" in script
+    assert "scheduleReload" in script
+    # ... and BOTH the refresh handler and the sync catch-up branch route through it
+    assert "es.addEventListener('refresh', function(){ scheduleReload(); })" in script
+    idx_sync_guard = script.index("serverGen > pageGen")
+    idx_sync_call = script.index("scheduleReload();", idx_sync_guard)
+    assert idx_sync_call > idx_sync_guard, "the serverGen>pageGen branch must call scheduleReload"
+
+
 # ============================================================= 4. determinism
 def test_self_run_twice_byte_identical(tmp_path):
     doc = _minimal_doc()
