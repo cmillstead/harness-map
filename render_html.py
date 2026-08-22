@@ -2600,7 +2600,7 @@ details > summary{cursor:pointer;color:var(--accent)}
 .badge.verdict-covered{border-color:var(--good);color:var(--good)}
 .badge.verdict-empty{border-color:var(--crit);color:var(--crit)}
 .coverage-grid{display:grid;grid-template-columns:1fr 320px;gap:14px;align-items:start}
-.matrix{display:grid;grid-template-columns:88px repeat(6,1fr);gap:6px}
+.matrix{display:grid;grid-template-columns:88px repeat(6,minmax(0,1fr));gap:6px}
 .matrix .mhead{font-family:var(--mono);font-size:0.72rem;color:var(--muted);display:flex;align-items:center;padding:4px 6px}
 .matrix .mhead.mhead-row{justify-content:flex-end;text-align:right}
 .matrix .cell{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;aspect-ratio:1/.74;border-radius:8px;border:1px solid var(--line);background:var(--surface);cursor:pointer;transition:transform .15s ease,box-shadow .15s ease}
@@ -2765,6 +2765,9 @@ STATIC_SCRIPT = """
     // single-view page.
     if (expand){ expand.setAttribute('aria-pressed', 'false'); }
     document.body.classList.remove('expand-all-on');
+    // TRK-167: remember the active tab so an SSE-driven reload restores it instead of
+    // snapping back to Overview. Guarded for private-mode / disabled storage (throws).
+    try { sessionStorage.setItem('hm-active-view', id); } catch (e) {}
   }
   vbtns.forEach(function(b){ b.addEventListener('click', function(){ activate(b.dataset.target); }); });
 
@@ -2992,7 +2995,13 @@ STATIC_SCRIPT = """
     });
   }
 
-  if (views.length){ activate('view-overview'); }
+  if (views.length){
+    // TRK-167: restore the tab persisted by activate() across an SSE-driven reload, but
+    // only when that view still exists in this render; otherwise fall back to Overview.
+    var stored = null;
+    try { stored = sessionStorage.getItem('hm-active-view'); } catch (e) {}
+    activate(stored && document.getElementById(stored) ? stored : 'view-overview');
+  }
 
   // Treemap/ladder click-to-act (item 6): clicking a cell jumps to the Friction tab (the
   // keyboard-accessible home for per-cell data) and highlights that node_key's row in the
@@ -3035,11 +3044,27 @@ STATIC_SCRIPT = """
     var pageGen = genMeta ? parseInt(genMeta.getAttribute('content'), 10) : NaN;
     var isHttp = (location.protocol === 'http:' || location.protocol === 'https:');
     if (genMeta && !isNaN(pageGen) && isHttp) {
+      // TRK-167: an active Claude session appends to friction telemetry constantly, so
+      // serve.py broadcasts 'refresh' on every cheap friction-only rebuild (~every 2s).
+      // A direct location.reload() per event made the dashboard unusable. Coalesce a burst
+      // into a SINGLE reload after a ~2s quiet window, but cap the total wait at ~20s so a
+      // never-quiet session still reloads eventually and friction data cannot go stale
+      // forever. firstReq stamps the first pending request; the cap shortens the delay as
+      // that deadline approaches.
+      var reloadTimer = null, firstReq = 0;
+      function scheduleReload(){
+        var now = Date.now();
+        if (!reloadTimer) { firstReq = now; }
+        if (reloadTimer) { clearTimeout(reloadTimer); }
+        var waited = now - firstReq;
+        var delay = Math.min(2000, Math.max(0, 20000 - waited));
+        reloadTimer = setTimeout(function(){ location.reload(); }, delay);
+      }
       var es = new EventSource('/events');
-      es.addEventListener('refresh', function(){ location.reload(); });
+      es.addEventListener('refresh', function(){ scheduleReload(); });
       es.addEventListener('sync', function(ev){
         var serverGen = parseInt(ev.data, 10);
-        if (!isNaN(serverGen) && serverGen > pageGen) { location.reload(); }
+        if (!isNaN(serverGen) && serverGen > pageGen) { scheduleReload(); }
       });
       es.addEventListener('error', function(){ /* transient drop: EventSource auto-reconnects and the sync-on-reconnect catches up any missed refresh */ });
     }
