@@ -2458,6 +2458,16 @@ def test_keyboard_activation_wired_for_button_cells(tmp_path):
     assert "e.preventDefault()" in text          # Space must not scroll
 
 
+def test_coverage_matrix_columns_share_width_equally():
+    # TRK-168: the six surface columns must be equal width. Plain `1fr` is `minmax(auto,1fr)`,
+    # so a wide header ("orchestration"/"observability") keeps a larger min-content and steals
+    # width from the flexible tracks, squeezing context/tools/memory. A zero-minimum track
+    # (`minmax(0,1fr)`) forces all six to share the row equally. This is a layout contract.
+    assert "grid-template-columns:88px repeat(6,minmax(0,1fr))" in rh.STATIC_STYLE
+    # the old squeeze-prone form must be gone
+    assert "grid-template-columns:88px repeat(6,1fr)" not in rh.STATIC_STYLE
+
+
 # ============================================================= 7. Overview digest + hero + nav
 def test_overview_default_view_has_full_matrix_and_no_friction_heat(tmp_path):
     """Task B-t2 tab merge: Overview's main area is the FULL 36-cell Coverage Matrix

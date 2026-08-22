@@ -2600,7 +2600,7 @@ details > summary{cursor:pointer;color:var(--accent)}
 .badge.verdict-covered{border-color:var(--good);color:var(--good)}
 .badge.verdict-empty{border-color:var(--crit);color:var(--crit)}
 .coverage-grid{display:grid;grid-template-columns:1fr 320px;gap:14px;align-items:start}
-.matrix{display:grid;grid-template-columns:88px repeat(6,1fr);gap:6px}
+.matrix{display:grid;grid-template-columns:88px repeat(6,minmax(0,1fr));gap:6px}
 .matrix .mhead{font-family:var(--mono);font-size:0.72rem;color:var(--muted);display:flex;align-items:center;padding:4px 6px}
 .matrix .mhead.mhead-row{justify-content:flex-end;text-align:right}
 .matrix .cell{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;aspect-ratio:1/.74;border-radius:8px;border:1px solid var(--line);background:var(--surface);cursor:pointer;transition:transform .15s ease,box-shadow .15s ease}
